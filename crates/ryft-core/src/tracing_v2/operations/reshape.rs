@@ -206,15 +206,12 @@ where
         if input_type == output_type {
             return Ok(self);
         }
-        Ok(Tracer::apply_staged_op(
-            self.engine,
-            self.builder.clone(),
-            std::slice::from_ref(&self),
-            O::reshape_operation(input_type, output_type),
-        )?
-        .into_iter()
-        .next()
-        .expect("reshape should produce one traced output"))
+        let engine = self.engine.clone();
+        Ok(engine
+            .apply_staged_op(std::slice::from_ref(&self), O::reshape_operation(input_type, output_type))?
+            .into_iter()
+            .next()
+            .expect("reshape should produce one traced output"))
     }
 }
 

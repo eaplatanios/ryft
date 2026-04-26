@@ -598,15 +598,12 @@ mod tests {
     where
         E: Engine<Type = ArrayType, Value = f64, TracingOperation = PrimitiveOperation<f64>> + ?Sized + 'static,
     {
-        Ok(Tracer::apply_staged_op(
-            input.engine,
-            input.builder.clone(),
-            std::slice::from_ref(&input),
-            PrimitiveOperation::Custom(Arc::new(primitive)),
-        )?
-        .into_iter()
-        .next()
-        .expect("unary custom primitive should produce one output"))
+        let engine = input.engine.clone();
+        Ok(engine
+            .apply_staged_op(std::slice::from_ref(&input), PrimitiveOperation::Custom(Arc::new(primitive)))?
+            .into_iter()
+            .next()
+            .expect("unary custom primitive should produce one output"))
     }
 
     /// Applies one unary custom primitive to one traced scalar and expects staging to succeed.

@@ -132,12 +132,13 @@ where
     let (outputs, pushforward) = linearize_traced_program(engine, tracing_builder, traced_program, traced_primals)?;
     ensure_single_gradient_output::<ArrayType, _>(outputs.as_slice())?;
     let traced_output = outputs[0].clone();
-    let pullback = transpose_traced_linear_program(engine, traced_output.builder.clone(), &pushforward)?;
+    let tracing_builder = traced_output.builder().clone();
+    let pullback = transpose_traced_linear_program(engine, tracing_builder.clone(), &pushforward)?;
     let seed_type = traced_output.r#type().into_owned();
     let _ = <V as One<ArrayType>>::one(&seed_type)?;
     let seed_value = engine.one(&seed_type)?;
-    let seed_atom = traced_output.builder.borrow_mut().add_constant(seed_value);
-    let seed = Tracer::from_staged_parts(seed_atom, seed_type, traced_output.builder.clone(), engine);
+    let seed_atom = tracing_builder.borrow_mut().add_constant(seed_value);
+    let seed = traced_output.engine.tracer_from_staged_parts(seed_atom, seed_type);
     let traced_gradient = pullback.interpret(vec![seed])?;
     Ok((traced_output, traced_gradient))
 }

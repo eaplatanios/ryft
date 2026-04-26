@@ -88,14 +88,18 @@ where
         E::TracingOperation,
         _,
     >(
-        exemplar_traced_primal.engine,
+        exemplar_traced_primal.outer_engine(),
         move |staged_input| function(staged_input),
         staged_input_types,
     )?;
     let output_structure = primal_output_types.parameter_structure();
-    let tracing_builder = exemplar_traced_primal.builder.clone();
-    let (traced_primal_output, pushforward) =
-        linearize_traced_program(exemplar_traced_primal.engine, tracing_builder, &traced_program, traced_primals)?;
+    let tracing_builder = exemplar_traced_primal.builder().clone();
+    let (traced_primal_output, pushforward) = linearize_traced_program(
+        exemplar_traced_primal.outer_engine(),
+        tracing_builder,
+        &traced_program,
+        traced_primals,
+    )?;
     let traced_tangent_output = pushforward.interpret(traced_tangents)?;
     Ok((
         Output::from_parameters(output_structure.clone(), traced_primal_output)?,
@@ -264,6 +268,7 @@ where
             input_structure.clone(),
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
+        let tracing_engine = traced_primals[0].engine.clone();
         let (_, traced_program) = trace_flat_program_from_input_types::<
             Input::To<ArrayType>,
             V::To<ArrayType>,
@@ -272,13 +277,13 @@ where
             E::TracingOperation,
             _,
         >(
-            traced_primals[0].engine,
+            tracing_engine.outer_engine(),
             |staged_input| Ok(function(staged_input)),
             staged_input_types,
         )?;
         let (traced_output, traced_gradient) = reverse_mode_scalar_traced_program::<V, E, E::TracingOperation>(
-            traced_primals[0].engine,
-            traced_primals[0].builder.clone(),
+            tracing_engine.outer_engine(),
+            tracing_engine.builder().clone(),
             &traced_program,
             traced_primals,
         )?;

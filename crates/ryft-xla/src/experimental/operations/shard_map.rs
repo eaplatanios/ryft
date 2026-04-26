@@ -14,7 +14,7 @@ use ryft_core::{
     },
     tracing_v2::{
         CustomPrimitive, DifferentiableOperation, JvpContext, LinearCustomPrimitive, LinearOperation,
-        LinearPrimitiveOperation, Tracer,
+        LinearPrimitiveOperation, Tracer, TracingEngine,
         engines::DifferentiableEngine,
         forward::{Differentiable, JvpTracer},
         linear::{linearize_traced_program, transpose_traced_linear_program},
@@ -358,12 +358,8 @@ impl LinearShardMapOperation<ShardMapTracer> {
     ) -> Result<Vec<ShardMapTracer>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        Tracer::apply_staged_op(
-            XlaEngine::token(),
-            tracing_builder,
-            inputs,
-            XlaPrimitiveOperation::LinearShardMap(Box::new(self.to_tensor_xla_op())),
-        )
+        TracingEngine::new(XlaEngine::token(), tracing_builder)
+            .apply_staged_op(inputs, XlaPrimitiveOperation::LinearShardMap(Box::new(self.to_tensor_xla_op())))
     }
 }
 
@@ -376,12 +372,8 @@ impl LinearShardMapOperation<ShardMapTensor> {
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_outputs = Tracer::apply_staged_op(
-            XlaEngine::token(),
-            tracing_builder,
-            primal_inputs.as_slice(),
-            XlaPrimitiveOperation::LinearShardMap(Box::new(self.clone())),
-        )?;
+        let primal_outputs = TracingEngine::new(XlaEngine::token(), tracing_builder)
+            .apply_staged_op(primal_inputs.as_slice(), XlaPrimitiveOperation::LinearShardMap(Box::new(self.clone())))?;
         let traced_op = self.to_tracer_linear_op(primal_inputs.as_slice())?;
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let tangent_outputs = context.apply_operation(
@@ -708,7 +700,7 @@ impl Operation<ArrayType> for ShardMapOperation<ShardMapTracer> {
 impl InterpretableOperation<ArrayType, ShardMapTracer> for ShardMapOperation<ShardMapTracer> {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
         let tracing_builder = match inputs.first() {
-            Some(input) => input.builder.clone(),
+            Some(input) => input.builder().clone(),
             None if self.output_types.is_empty() => return Ok(Vec::new()),
             None => return Err(missing_traced_shard_map_staging_context()),
         };
@@ -734,7 +726,7 @@ impl Operation<ArrayType> for LinearShardMapOperation<ShardMapTracer> {
 impl InterpretableOperation<ArrayType, ShardMapTracer> for LinearShardMapOperation<ShardMapTracer> {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
         let tracing_builder = match inputs.first() {
-            Some(input) => input.builder.clone(),
+            Some(input) => input.builder().clone(),
             None if self.output_types.is_empty() => return Ok(Vec::new()),
             None => return Err(missing_traced_shard_map_staging_context()),
         };
@@ -801,7 +793,7 @@ where
                 Err(missing_linear_shard_map_staging_context())
             };
         };
-        self.jvp_with_builders(first_input.primal.builder.clone(), context, inputs)
+        self.jvp_with_builders(first_input.primal.builder().clone(), context, inputs)
     }
 }
 
@@ -1287,13 +1279,12 @@ fn apply_flat_traced_shard_map(
     body: FlatTracedShardMap,
     traced_inputs: Vec<ShardMapTracer>,
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
-    Tracer::apply_staged_op(
-        XlaEngine::token(),
-        tracing_builder,
-        traced_inputs.as_slice(),
-        XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(body.clone()))),
-    )
-    .map_err(ShardMapTraceError::from)
+    TracingEngine::new(XlaEngine::token(), tracing_builder)
+        .apply_staged_op(
+            traced_inputs.as_slice(),
+            XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(body.clone()))),
+        )
+        .map_err(ShardMapTraceError::from)
 }
 
 fn build_traced_xla_program(
@@ -1509,9 +1500,7 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     traced_inputs: Vec<ShardMapTracer>,
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError> {
-    let staged_outputs = Tracer::apply_staged_op(
-        XlaEngine::token(),
-        tracing_builder,
+    let staged_outputs = TracingEngine::new(XlaEngine::token(), tracing_builder).apply_staged_op(
         traced_inputs.as_slice(),
         XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))),
     )?;
@@ -1634,7 +1623,7 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
         >(in_specs, global_input_types.parameter_structure())?;
         let traced_inputs = inputs.into_parameters().collect::<Vec<_>>();
         let tracing_builder = match traced_inputs.first() {
-            Some(input) => input.builder.clone(),
+            Some(input) => input.builder().clone(),
             None if output_structure.parameter_count() == 0 => {
                 return Ok(Output::To::<ShardMapTracer>::from_parameters(output_structure, Vec::new())?);
             }

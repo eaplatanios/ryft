@@ -333,34 +333,24 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaPrimitiveOperation
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                ryft_core::tracing_v2::Tracer::apply_staged_op(
-                    exemplar.engine,
-                    exemplar.builder.clone(),
-                    inputs,
-                    XlaPrimitiveOperation::Condition(condition.clone()),
-                )
+                exemplar.engine.apply_staged_op(inputs, XlaPrimitiveOperation::Condition(condition.clone()))
             }
             Self::While(while_operation) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                ryft_core::tracing_v2::Tracer::apply_staged_op(
-                    exemplar.engine,
-                    exemplar.builder.clone(),
-                    inputs,
-                    XlaPrimitiveOperation::While(while_operation.clone()),
-                )
+                exemplar.engine.apply_staged_op(inputs, XlaPrimitiveOperation::While(while_operation.clone()))
             }
             Self::ShardMap(op) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                op.interpret_traced_with_context(exemplar.builder.clone(), inputs)
+                op.interpret_traced_with_context(exemplar.builder().clone(), inputs)
             }
             Self::LinearShardMap(op) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                op.interpret_traced_with_context(exemplar.builder.clone(), inputs)
+                op.interpret_traced_with_context(exemplar.builder().clone(), inputs)
             }
             Self::WithShardingConstraint(op) => op.interpret(inputs),
             Self::Custom(op) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                let replay_context = ShardMapReplayContext::new(exemplar.builder.clone());
+                let replay_context = ShardMapReplayContext::new(exemplar.builder().clone());
                 op.extensions()
                     .get::<ShardMapCustomReplayExtension>()
                     .ok_or_else(|| {
@@ -466,15 +456,16 @@ impl TracedLinearizableOperation<'static, XlaEngine<'static>, XlaPrimitiveOperat
             Self::LinearShardMap(op) => op.jvp_traced_with_builders(engine.tracing_builder().clone(), context, inputs),
             Self::WithShardingConstraint(op) => {
                 let input = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                let primal = ryft_core::tracing_v2::Tracer::apply_staged_op(
-                    XlaEngine::token(),
-                    engine.tracing_builder().clone(),
-                    std::slice::from_ref(&input.primal),
-                    XlaPrimitiveOperation::WithShardingConstraint(op.clone()),
-                )?
-                .into_iter()
-                .next()
-                .expect("with_sharding_constraint should produce one primal output");
+                let primal = input
+                    .primal
+                    .engine
+                    .apply_staged_op(
+                        std::slice::from_ref(&input.primal),
+                        XlaPrimitiveOperation::WithShardingConstraint(op.clone()),
+                    )?
+                    .into_iter()
+                    .next()
+                    .expect("with_sharding_constraint should produce one primal output");
                 let tangent = context
                     .apply_operation(
                         &[input.tangent],

@@ -169,7 +169,7 @@ where
 /// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine).
 ///
 /// Stages the primal effect by applying the rematerialize op in the outer trace via
-/// [`Tracer::apply_staged_op`], then recursively linearizes the body through
+/// [`TracingEngine::apply_staged_op`](crate::tracing_v2::TracingEngine::apply_staged_op), then recursively linearizes the body through
 /// [`linearize_traced_program`] to obtain a pushforward over `Tracer` values, and finally wraps
 /// that pushforward (paired with its transpose) in a
 /// [`LinearPrimitiveOperation::Rematerialize`] variant that the active linear builder can stage
@@ -216,12 +216,9 @@ where
             Vec::new()
         } else {
             let exemplar = primal_inputs[0].clone();
-            Tracer::apply_staged_op(
-                exemplar.engine,
-                exemplar.builder.clone(),
-                primal_inputs.as_slice(),
-                OInner::rematerialize_operation(self.clone()),
-            )?
+            exemplar
+                .engine
+                .apply_staged_op(primal_inputs.as_slice(), OInner::rematerialize_operation(self.clone()))?
         };
 
         if tangent_inputs.is_empty() && !self.body.output_types.is_empty() {
@@ -341,12 +338,9 @@ where
             };
         }
         let exemplar_input = inputs[0].clone();
-        Tracer::apply_staged_op(
-            exemplar_input.engine,
-            exemplar_input.builder.clone(),
-            inputs,
-            E::TracingOperation::rematerialize_operation(self.clone()),
-        )
+        exemplar_input
+            .engine
+            .apply_staged_op(inputs, E::TracingOperation::rematerialize_operation(self.clone()))
     }
 }
 
@@ -610,7 +604,7 @@ where
                 E::TracingOperation,
                 _,
             >(
-                exemplar_traced_input.engine, |staged_input| Ok(function(staged_input)), exemplar_input_types
+                exemplar_traced_input.outer_engine(), |staged_input| Ok(function(staged_input)), exemplar_input_types
             )?;
 
         let output_structure = exemplar_output_types.parameter_structure();
@@ -632,9 +626,7 @@ where
             builder.build(output_ids, vec![Placeholder; input_leaf_count], vec![Placeholder; output_leaf_count])?,
         );
 
-        let staged_outputs = Tracer::apply_staged_op(
-            exemplar_traced_input.engine,
-            exemplar_traced_input.builder.clone(),
+        let staged_outputs = exemplar_traced_input.engine.apply_staged_op(
             traced_inputs.as_slice(),
             E::TracingOperation::rematerialize_operation(RematerializeOperation::new(body)),
         )?;

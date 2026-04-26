@@ -29,7 +29,7 @@ pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batc
 pub use differentiation::DifferentiationError;
 pub use engines::{DifferentiableEngine, Engine};
 pub use forward::{Differentiable, JvpContext, JvpTracer, LinearizationEngine, jvp};
-pub use jit::{Tracer, TracerState, interpret_and_trace, trace};
+pub use jit::{Tracer, TracerState, TracingEngine, interpret_and_trace, trace};
 pub use linear::{
     CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad,
     grad_with_aux, hessian, jacfwd, jacrev, jvp_program, value_and_grad, value_and_grad_with_aux, vjp,
