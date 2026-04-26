@@ -13,15 +13,15 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type, TypeError};
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearScaleOperation,
-    Operation, sin::Sin, unary_abstract,
+    DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsNeg, SupportsScale, sin::Sin,
+    unary_abstract,
 };
 
-/// Hidden staging trait for the cosine primitive.
+/// Hidden carrier capability for staging the cosine primitive.
 #[doc(hidden)]
-pub trait CosTracingOperation<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsCos<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the cosine primitive.
-    fn cos_op() -> Self;
+    fn cos_operation() -> Self;
 }
 
 /// Elementwise cosine capability.
@@ -87,9 +87,8 @@ impl<E> DifferentiableOperation<E> for CosOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Cos + Sin + Neg<Output = E::Value> + Differentiable<ArrayType>,
-    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
-        + LinearNegOperation<ArrayType, E::Value>
-        + LinearScaleOperation<ArrayType, E::Value>,
+    E::LinearOperation:
+        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
@@ -118,10 +117,10 @@ impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<Arra
 impl<'engine, V: Traceable<ArrayType> + Cos, E, O> Cos for Tracer<'engine, E, O>
 where
     E: Engine<Type = ArrayType, Value = V> + ?Sized,
-    O: Clone + Operation<ArrayType> + CosTracingOperation<ArrayType, V>,
+    O: Clone + Operation<ArrayType> + SupportsCos<ArrayType, V>,
 {
     #[inline]
     fn cos(self) -> Self {
-        self.unary(O::cos_op())
+        self.unary(O::cos_operation())
     }
 }

@@ -15,7 +15,7 @@ use crate::{
     tracing_v2::{
         engines::{DifferentiableEngine, Engine},
         operations::{
-            AddTracingOperation, MulTracingOperation, NegTracingOperation,
+            SupportsAdd, SupportsMul, SupportsNeg,
             constants::{OneLike, ZeroLike},
         },
     },
@@ -278,36 +278,36 @@ impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> OneLike for Tra
     }
 }
 
-impl<'engine, E: Engine + ?Sized, O: Clone + AddTracingOperation<E::Type, E::Value> + Operation<E::Type>> Add
+impl<'engine, E: Engine + ?Sized, O: Clone + SupportsAdd<E::Type, E::Value> + Operation<E::Type>> Add
     for Tracer<'engine, E, O>
 {
     type Output = Self;
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, O::add_op())
+        self.binary(rhs, O::add_operation())
     }
 }
 
-impl<'engine, E: Engine + ?Sized, O: Clone + MulTracingOperation<E::Type, E::Value> + Operation<E::Type>> Mul
+impl<'engine, E: Engine + ?Sized, O: Clone + SupportsMul<E::Type, E::Value> + Operation<E::Type>> Mul
     for Tracer<'engine, E, O>
 {
     type Output = Self;
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, O::mul_op())
+        self.binary(rhs, O::mul_operation())
     }
 }
 
-impl<'engine, E: Engine + ?Sized, O: Clone + NegTracingOperation<E::Type, E::Value> + Operation<E::Type>> Neg
+impl<'engine, E: Engine + ?Sized, O: Clone + SupportsNeg<E::Type, E::Value> + Operation<E::Type>> Neg
     for Tracer<'engine, E, O>
 {
     type Output = Self;
 
     #[inline]
     fn neg(self) -> Self::Output {
-        self.unary(O::neg_op())
+        self.unary(O::neg_operation())
     }
 }
 
@@ -760,8 +760,8 @@ mod tests {
             }
         }
 
-        impl AddTracingOperation<TestType, TestValue> for TestAddOp {
-            fn add_op() -> Self {
+        impl SupportsAdd<TestType, TestValue> for TestAddOp {
+            fn add_operation() -> Self {
                 Self
             }
         }

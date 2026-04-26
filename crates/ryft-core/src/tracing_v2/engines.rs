@@ -5,7 +5,7 @@ use crate::{
     tracing_v2::{
         Differentiable, DifferentiableOperation as DifferentiableOperationTrait,
         LinearOperation as LinearOperationTrait, LinearPrimitiveOperation, PrimitiveOperation,
-        operations::{LinearAddOperation, LinearNegOperation, LinearScaleOperation},
+        operations::{SupportsAdd, SupportsNeg, SupportsScale},
     },
     types::{ArrayType, Type},
 };
@@ -91,9 +91,9 @@ where
     /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
     type LinearOperation: Clone
         + LinearOperationTrait<Self::Type, Self::Value, Self::LinearOperation>
-        + LinearAddOperation<Self::Type, Self::Value>
-        + LinearNegOperation<Self::Type, Self::Value>
-        + LinearScaleOperation<Self::Type, Self::Value>
+        + SupportsAdd<Self::Type, Self::Value>
+        + SupportsNeg<Self::Type, Self::Value>
+        + SupportsScale<Self::Type, Self::Value>
         + 'static;
 }
 

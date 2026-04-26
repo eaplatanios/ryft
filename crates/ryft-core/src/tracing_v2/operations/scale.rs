@@ -19,22 +19,18 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearOperation,
-    Operation, lift_jit_constant, mul::MulTracingOperation, unary_abstract,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd, SupportsNeg,
+    lift_jit_constant, mul::SupportsMul, unary_abstract,
 };
 
-/// Hidden staging trait for the scaling primitive.
+/// Hidden carrier capability for staging the scaling primitive.
+///
+/// Ordinary tracing carriers and linear-program carriers can both implement this trait when they
+/// support representing a captured-factor scale operation in their own operation universe.
 #[doc(hidden)]
-pub trait ScaleTracingOperation<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsScale<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the scaling primitive with a captured factor.
-    fn scale_op(factor: V) -> Self;
-}
-
-/// Hidden staging trait for the scaling primitive in linear programs.
-#[doc(hidden)]
-pub trait LinearScaleOperation<T: Type, V: Traceable<T>>: Clone {
-    /// Constructs the carrier-specific representation of the linear scaling primitive with a captured factor.
-    fn linear_scale_op(factor: V) -> Self;
+    fn scale_operation(factor: V) -> Self;
 }
 
 /// Unary linear operation that multiplies its input by a captured factor.
@@ -127,13 +123,13 @@ impl<
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     InnerLinearOperation: Clone
         + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, Tracer<'engine, E>>
-        + LinearNegOperation<ArrayType, Tracer<'engine, E>>
-        + LinearScaleOperation<ArrayType, Tracer<'engine, E>>,
+        + SupportsAdd<ArrayType, Tracer<'engine, E>>
+        + SupportsNeg<ArrayType, Tracer<'engine, E>>
+        + SupportsScale<ArrayType, Tracer<'engine, E>>,
 > InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>
     for ScaleOperation<ArrayType, V>
 where
-    E::TracingOperation: MulTracingOperation<ArrayType, V> + ScaleTracingOperation<ArrayType, V> + 'static,
+    E::TracingOperation: SupportsMul<ArrayType, V> + SupportsScale<ArrayType, V> + 'static,
 {
     fn interpret(
         &self,
@@ -154,8 +150,7 @@ where
     V: Traceable<ArrayType> + Mul<Output = V>,
     E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
     V: Differentiable<ArrayType>,
-    E::LinearOperation:
-        LinearAddOperation<ArrayType, V> + LinearNegOperation<ArrayType, V> + LinearScaleOperation<ArrayType, V>,
+    E::LinearOperation: SupportsAdd<ArrayType, V> + SupportsNeg<ArrayType, V> + SupportsScale<ArrayType, V>,
 {
     fn jvp(
         &self,

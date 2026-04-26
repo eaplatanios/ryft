@@ -10,15 +10,15 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type, TypeError};
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearScaleOperation,
-    Operation, cos::Cos, unary_abstract,
+    DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsNeg, SupportsScale, cos::Cos,
+    unary_abstract,
 };
 
-/// Hidden staging trait for the sine primitive.
+/// Hidden carrier capability for staging the sine primitive.
 #[doc(hidden)]
-pub trait SinTracingOperation<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsSin<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the sine primitive.
-    fn sin_op() -> Self;
+    fn sin_operation() -> Self;
 }
 
 /// Elementwise sine capability.
@@ -85,9 +85,8 @@ impl<E> DifferentiableOperation<E> for SinOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Sin + Cos + Differentiable<ArrayType>,
-    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
-        + LinearNegOperation<ArrayType, E::Value>
-        + LinearScaleOperation<ArrayType, E::Value>,
+    E::LinearOperation:
+        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
@@ -113,10 +112,10 @@ impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>> Sin for
 impl<'engine, V: Traceable<ArrayType> + Sin, E, O> Sin for Tracer<'engine, E, O>
 where
     E: Engine<Type = ArrayType, Value = V> + ?Sized,
-    O: Clone + Operation<ArrayType> + SinTracingOperation<ArrayType, V>,
+    O: Clone + Operation<ArrayType> + SupportsSin<ArrayType, V>,
 {
     #[inline]
     fn sin(self) -> Self {
-        self.unary(O::sin_op())
+        self.unary(O::sin_operation())
     }
 }

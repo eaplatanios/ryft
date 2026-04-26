@@ -11,13 +11,12 @@ use ryft_core::{
         forward::{Differentiable, EngineTangent, JvpTracer},
         linear::{Linearized, linearize_program, transpose_linear_program_with_output_examples},
         operations::{
-            AddOperation, AddTracingOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation,
-            CosTracingOperation, CustomTracingOperation, FlatTracedRematerialize, LeftMatMulOperation,
-            LeftMatMulTracingOperation, LinearRematerializeOperation, MatMulOperation, MatMulTracingOperation,
-            MatrixTransposeOperation, MatrixTransposeTracingOperation, MulOperation, MulTracingOperation, NegOperation,
-            NegTracingOperation, RematerializeOperation, RematerializeTracingOperation, ReshapeOperation,
-            ReshapeTracingOperation, RightMatMulOperation, RightMatMulTracingOperation, ScaleOperation,
-            ScaleTracingOperation, SinOperation, SinTracingOperation, WhileOperation,
+            AddOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation,
+            FlatTracedRematerialize, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation,
+            MatrixTransposeOperation, MulOperation, NegOperation, RematerializeOperation, ReshapeOperation,
+            RightMatMulOperation, ScaleOperation, SinOperation, SupportsAdd, SupportsCos, SupportsCustom,
+            SupportsLeftMatMul, SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg,
+            SupportsRematerialize, SupportsReshape, SupportsRightMatMul, SupportsScale, SupportsSin, WhileOperation,
             left_matmul::left_matmul_abstract_eval, lift_jit_constant, right_matmul::right_matmul_abstract_eval,
         },
     },
@@ -475,82 +474,82 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for XlaPrimit
     }
 }
 
-impl AddTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn add_op() -> Self {
+impl SupportsAdd<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn add_operation() -> Self {
         XlaPrimitiveOperation::Add
     }
 }
 
-impl MulTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn mul_op() -> Self {
+impl SupportsMul<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn mul_operation() -> Self {
         XlaPrimitiveOperation::Mul
     }
 }
 
-impl NegTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn neg_op() -> Self {
+impl SupportsNeg<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn neg_operation() -> Self {
         XlaPrimitiveOperation::Neg
     }
 }
 
-impl SinTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn sin_op() -> Self {
+impl SupportsSin<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn sin_operation() -> Self {
         XlaPrimitiveOperation::Sin
     }
 }
 
-impl CosTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn cos_op() -> Self {
+impl SupportsCos<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn cos_operation() -> Self {
         XlaPrimitiveOperation::Cos
     }
 }
 
-impl MatMulTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn matmul_op() -> Self {
+impl SupportsMatMul<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn matmul_operation() -> Self {
         XlaPrimitiveOperation::MatMul
     }
 }
 
-impl MatrixTransposeTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn matrix_transpose_op() -> Self {
+impl SupportsMatrixTranspose<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn matrix_transpose_operation() -> Self {
         XlaPrimitiveOperation::MatrixTranspose
     }
 }
 
-impl CustomTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn custom_op(primitive: Arc<CustomPrimitive<ArrayType, ShardMapTensor>>) -> Self {
+impl SupportsCustom<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn custom_operation(primitive: Arc<CustomPrimitive<ArrayType, ShardMapTensor>>) -> Self {
         XlaPrimitiveOperation::Custom(primitive)
     }
 }
 
-impl RematerializeTracingOperation<ArrayType, ShardMapTensor, XlaLinearOperation> for XlaPrimitiveOperation {
-    fn rematerialize_op(
+impl SupportsRematerialize<ArrayType, ShardMapTensor, XlaLinearOperation> for XlaPrimitiveOperation {
+    fn rematerialize_operation(
         op: RematerializeOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation, XlaLinearOperation>,
     ) -> Self {
         XlaPrimitiveOperation::Rematerialize(Box::new(op))
     }
 }
 
-impl ScaleTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn scale_op(factor: ShardMapTensor) -> Self {
+impl SupportsScale<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn scale_operation(factor: ShardMapTensor) -> Self {
         XlaPrimitiveOperation::Scale { factor }
     }
 }
 
-impl LeftMatMulTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn left_matmul_op(factor: ShardMapTensor) -> Self {
+impl SupportsLeftMatMul<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn left_matmul_operation(factor: ShardMapTensor) -> Self {
         XlaPrimitiveOperation::LeftMatMul { factor }
     }
 }
 
-impl RightMatMulTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn right_matmul_op(factor: ShardMapTensor) -> Self {
+impl SupportsRightMatMul<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn right_matmul_operation(factor: ShardMapTensor) -> Self {
         XlaPrimitiveOperation::RightMatMul { factor }
     }
 }
 
-impl ReshapeTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn reshape_op(input_type: ArrayType, output_type: ArrayType) -> Self {
+impl SupportsReshape<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+    fn reshape_operation(input_type: ArrayType, output_type: ArrayType) -> Self {
         XlaPrimitiveOperation::Reshape { input_type, output_type }
     }
 }

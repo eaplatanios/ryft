@@ -13,23 +13,16 @@ use crate::{
 };
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearOperation,
-    LinearPrimitiveOperation, LinearScaleOperation, Operation,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, Operation, SupportsAdd,
+    SupportsNeg, SupportsScale,
     matrix::{MatrixOps, MatrixValue, transpose_abstract},
 };
 
-/// Hidden staging trait for the matrix transposition primitive.
+/// Hidden carrier capability for staging the matrix transposition primitive.
 #[doc(hidden)]
-pub trait MatrixTransposeTracingOperation<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsMatrixTranspose<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the matrix transposition primitive.
-    fn matrix_transpose_op() -> Self;
-}
-
-/// Hidden staging trait for the matrix transposition primitive in linear programs.
-#[doc(hidden)]
-pub trait LinearMatrixTransposeOperation<T: Type, V: Traceable<T>>: Clone {
-    /// Constructs the carrier-specific representation of the linear matrix transposition primitive.
-    fn linear_matrix_transpose_op() -> Self;
+    fn matrix_transpose_operation() -> Self;
 }
 
 /// Primitive representing matrix transposition.
@@ -98,9 +91,8 @@ impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: MatrixValue + Differentiable<ArrayType>,
-    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
-        + LinearNegOperation<ArrayType, E::Value>
-        + LinearScaleOperation<ArrayType, E::Value>,
+    E::LinearOperation:
+        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
     EngineTangent<E>: super::matrix::MatrixTangentSpace<E::Value>,
 {
     fn jvp(

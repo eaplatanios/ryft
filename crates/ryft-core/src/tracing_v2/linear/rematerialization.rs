@@ -144,7 +144,7 @@ where
     V: Value<ArrayType> + ZeroLike + OneLike,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
         + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, E::DifferentiableOperation>>
-        + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
+        + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
     LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>:
         CoreLinearProgramOperation<DifferentiableTracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
@@ -189,7 +189,7 @@ where
     V: Value<ArrayType> + ZeroLike + OneLike,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
         + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, E::DifferentiableOperation>>
-        + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
+        + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
     LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>:
         CoreLinearProgramOperation<DifferentiableTracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
@@ -245,7 +245,7 @@ where
     O: Clone
         + Operation<ArrayType>
         + InterpretableOperation<ArrayType, V>
-        + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
+        + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
 {
     let program = program;
     let instructions = program.instructions.as_slice();
@@ -381,7 +381,7 @@ where
         let outer_outputs =
             output_types.into_iter().map(|r#type| outer_builder.add_variable(r#type)).collect::<Vec<_>>();
         outer_builder.instructions.push(Instruction {
-            operation: O::rematerialize_op(remat_op),
+            operation: O::rematerialize_operation(remat_op),
             inputs: outer_inputs,
             outputs: outer_outputs.clone(),
         });
@@ -416,7 +416,7 @@ fn wrap_program_in_rematerialize<E, V, O>(
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType> + Differentiable<ArrayType>,
-    O: Clone + Operation<ArrayType> + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
+    O: Clone + Operation<ArrayType> + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
 {
     let program = program;
     let input_types: Vec<_> = program
@@ -451,7 +451,7 @@ where
 
     let outer_outputs = output_types.into_iter().map(|r#type| outer_builder.add_variable(r#type)).collect::<Vec<_>>();
     outer_builder.instructions.push(Instruction {
-        operation: O::rematerialize_op(remat_op),
+        operation: O::rematerialize_operation(remat_op),
         inputs: outer_inputs.clone(),
         outputs: outer_outputs.clone(),
     });

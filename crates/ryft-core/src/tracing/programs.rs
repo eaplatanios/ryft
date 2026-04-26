@@ -475,33 +475,32 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
 
-    // TODO(eaplatanios): Review this function.
-    /// Generic replay engine that walks this [`Program`]'s [`Instruction`]s under caller-supplied leaf semantics.
-    ///
-    /// The same atom-walking logic powers ordinary interpretation, batched interpretation, and MLIR lowering;
-    /// transforms specialize the engine by choosing a runtime value type `W`, a constant-lifting closure, and an
-    /// instruction-application closure. Inputs and outputs are flat [`Vec`]s aligned with the program's
-    /// [`Self::input_ids`] and [`Self::output_ids`]; structured-input/output handling stays at the call site so that
-    /// callers can use any parameter family of their choice.
-    ///
-    /// The engine counts each atom's future consumers so that values are moved out at their last use and only
-    /// cloned when a later consumer still needs them.
+    /// Interprets/executes this [`Program`]'s [`Instruction`]s using the caller-supplied value semantics. Transforms
+    /// can specialize this interpretation function by choosing a runtime value type `Value`, a constant-lifting
+    /// closure, and an instruction-interpretation closure. Inputs and outputs are flat [`Vec`]s aligned with the
+    /// program's [`Self::input_ids`] and [`Self::output_ids`]; structured-input/output handling stays at the call
+    /// site so that callers can use any parameter family of their choice.
     ///
     /// # Parameters
     ///
     ///   - `inputs`: Flat input values aligned with [`Self::input_ids`].
-    ///   - `lift_constant`: Lifts an [`Atom::Constant`]'s carried `V` into the runtime leaf type `W`. Receives the
-    ///     constant's [`AtomId`] for callers that surface diagnostics or maintain parallel atom tables. Invoked at
-    ///     most once per live constant atom, in atom-index order.
-    ///   - `apply_op`: Applies one [`Instruction`]'s [`Operation`] to its already-lifted inputs and returns the
-    ///     instruction's outputs. The full [`Instruction`] is provided so that the closure can inspect the
-    ///     operation's expected output [`Atom`] ids when needed (for example, to look up output [`Type`]s).
-    pub fn interpret_with<W, E, F, G>(&self, inputs: Vec<W>, mut lift_constant: F, mut apply_op: G) -> Result<Vec<W>, E>
+    ///   - `lift_constant`: Closure that lifts an [`Atom::Constant`]'s carried `V` into the runtime leaf type `Value`.
+    ///     THis closure receives the constant's [`AtomId`] for callers that surface diagnostics or maintain parallel
+    ///     atom tables and is invoked at most once per live constant atom, in atom-index order.
+    ///   - `interpret_instruction`: Closure that interprets one [`Instruction`]'s [`Operation`] to its already-lifted
+    ///     inputs and returns the instruction's outputs. The full [`Instruction`] is provided so that the closure can
+    ///     inspect the operation's expected output [`Atom`] IDs when needed (e.g., to look up output [`Type`]s).
+    pub fn interpret_with<Value, Error, LiftConstantFn, InterpretInstructionFn>(
+        &self,
+        inputs: Vec<Value>,
+        mut lift_constant: LiftConstantFn,
+        mut interpret_instruction: InterpretInstructionFn,
+    ) -> Result<Vec<Value>, Error>
     where
-        W: Clone,
-        E: From<TracingError>,
-        F: FnMut(AtomId, &V) -> Result<W, E>,
-        G: FnMut(&Instruction<O>, &[W]) -> Result<Vec<W>, E>,
+        Value: Clone,
+        Error: From<TracingError>,
+        LiftConstantFn: FnMut(AtomId, &V) -> Result<Value, Error>,
+        InterpretInstructionFn: FnMut(&Instruction<O>, &[Value]) -> Result<Vec<Value>, Error>,
     {
         if inputs.len() != self.input_ids.len() {
             return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: inputs.len() }.into());
@@ -562,7 +561,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             }
 
             // Apply the operation using the supplied dispatcher and ensure it produces the expected number of outputs.
-            let outputs = apply_op(instruction, instruction_inputs.as_slice())?;
+            let outputs = interpret_instruction(instruction, instruction_inputs.as_slice())?;
             if outputs.len() != instruction.outputs.len() {
                 return Err(TracingError::InvalidOutputCount {
                     expected: instruction.outputs.len(),

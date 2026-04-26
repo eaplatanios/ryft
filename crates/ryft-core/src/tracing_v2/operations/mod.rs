@@ -63,30 +63,30 @@ pub mod scale;
 /// Elementwise sine.
 pub mod sin;
 
-pub use add::{AddOperation, AddTracingOperation, LinearAddOperation};
+pub use add::{AddOperation, SupportsAdd};
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
     flat_program_input_types, flat_program_output_types,
 };
-pub use cos::{Cos, CosOperation, CosTracingOperation};
+pub use cos::{Cos, CosOperation, SupportsCos};
 pub use custom::{
-    CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, CustomTracingOperation, LinearCustomOperation,
-    LinearCustomPrimitive,
+    CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, LinearCustomPrimitive, SupportsCustom,
+    SupportsLinearCustom,
 };
-pub use left_matmul::{LeftMatMulOperation, LeftMatMulTracingOperation, LinearLeftMatMulOperation};
-pub use matmul::{MatMulOperation, MatMulTracingOperation};
-pub use matrix_transpose::{LinearMatrixTransposeOperation, MatrixTransposeOperation, MatrixTransposeTracingOperation};
-pub use mul::{MulOperation, MulTracingOperation};
-pub use neg::{LinearNegOperation, NegOperation, NegTracingOperation};
+pub use left_matmul::{LeftMatMulOperation, SupportsLeftMatMul};
+pub use matmul::{MatMulOperation, SupportsMatMul};
+pub use matrix_transpose::{MatrixTransposeOperation, SupportsMatrixTranspose};
+pub use mul::{MulOperation, SupportsMul};
+pub use neg::{NegOperation, SupportsNeg};
 pub use primitive::{LinearPrimitiveOperation, PrimitiveOperation};
 pub use rematerialize::{
-    FlatTracedRematerialize, LinearRematerializeCarrierOperation, LinearRematerializeOperation, RematerializeOperation,
-    RematerializeTracingOperation,
+    FlatTracedRematerialize, LinearRematerializeOperation, RematerializeOperation, SupportsLinearRematerialize,
+    SupportsRematerialize,
 };
-pub use reshape::{LinearReshapeOperation, ReshapeOperation, ReshapeTracingOperation};
-pub use right_matmul::{LinearRightMatMulOperation, RightMatMulOperation, RightMatMulTracingOperation};
-pub use scale::{LinearScaleOperation, ScaleOperation, ScaleTracingOperation};
-pub use sin::{Sin, SinOperation, SinTracingOperation};
+pub use reshape::{ReshapeOperation, SupportsReshape};
+pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
+pub use scale::{ScaleOperation, SupportsScale};
+pub use sin::{Sin, SinOperation, SupportsSin};
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
 pub fn lift_jit_constant<'engine, V: Traceable<ArrayType>, E: Engine<Type = ArrayType, Value = V> + ?Sized>(
@@ -282,17 +282,17 @@ impl<V: Traceable<ArrayType>, O: Clone + CoreLinearReplayOperation<V> + LinearOp
 /// This bundle is `'static` because it must satisfy the `'static` requirements imposed by the JIT
 /// tracer's storage of staged instructions and is bounded over the [`Tracer`] flavor that backs
 /// linearized JIT replay rules. Any inner linear operation type that implements
-/// [`LinearAddOperation`](add::LinearAddOperation),
-/// [`LinearNegOperation`](neg::LinearNegOperation), and
-/// [`LinearScaleOperation`](scale::LinearScaleOperation) for the appropriate Tracer leaf
+/// [`SupportsAdd`](add::SupportsAdd),
+/// [`SupportsNeg`](neg::SupportsNeg), and
+/// [`SupportsScale`](scale::SupportsScale) for the appropriate Tracer leaf
 /// automatically satisfies it.
 #[doc(hidden)]
 pub trait TracerLinearOperation<V: Traceable<ArrayType>, E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static>:
     Clone + Operation<ArrayType> + 'static
 where
-    for<'engine> Self: add::LinearAddOperation<ArrayType, Tracer<'engine, E>>
-        + neg::LinearNegOperation<ArrayType, Tracer<'engine, E>>
-        + scale::LinearScaleOperation<ArrayType, Tracer<'engine, E>>,
+    for<'engine> Self: add::SupportsAdd<ArrayType, Tracer<'engine, E>>
+        + neg::SupportsNeg<ArrayType, Tracer<'engine, E>>
+        + scale::SupportsScale<ArrayType, Tracer<'engine, E>>,
 {
 }
 
@@ -302,9 +302,9 @@ impl<
     InnerLinearOperation: Clone + Operation<ArrayType> + 'static,
 > TracerLinearOperation<V, E> for InnerLinearOperation
 where
-    for<'engine> InnerLinearOperation: add::LinearAddOperation<ArrayType, Tracer<'engine, E>>
-        + neg::LinearNegOperation<ArrayType, Tracer<'engine, E>>
-        + scale::LinearScaleOperation<ArrayType, Tracer<'engine, E>>,
+    for<'engine> InnerLinearOperation: add::SupportsAdd<ArrayType, Tracer<'engine, E>>
+        + neg::SupportsNeg<ArrayType, Tracer<'engine, E>>
+        + scale::SupportsScale<ArrayType, Tracer<'engine, E>>,
 {
 }
 

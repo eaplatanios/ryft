@@ -87,7 +87,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, V, O> {
     #[inline]
     pub fn add(self, rhs: Self) -> Self
     where
-        O: LinearAddOperation<T, V>,
+        O: SupportsAdd<T, V>,
     {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         let mut borrow = self.builder.borrow_mut();
@@ -95,7 +95,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, V, O> {
         let abstract_value = input_atom.r#type().into_owned();
         let atom = borrow.add_variable(abstract_value);
         borrow.instructions.push(Instruction {
-            operation: O::linear_add_op(),
+            operation: O::add_operation(),
             inputs: vec![self.atom, rhs.atom],
             outputs: vec![atom],
         });
@@ -107,26 +107,23 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, V, O> {
     #[inline]
     pub fn neg(self) -> Self
     where
-        O: LinearNegOperation<T, V>,
+        O: SupportsNeg<T, V>,
     {
-        self.apply_linear_op(O::linear_neg_op())
+        self.apply_linear_op(O::neg_operation())
     }
 
     /// Stages a scaling of this tangent term by a concrete factor.
     #[inline]
     pub fn scale(self, factor: V) -> Self
     where
-        O: LinearScaleOperation<T, V>,
+        O: SupportsScale<T, V>,
     {
-        self.apply_linear_op(O::linear_scale_op(factor))
+        self.apply_linear_op(O::scale_operation(factor))
     }
 }
 
-impl<
-    T: Type,
-    V: Traceable<T> + ZeroLike,
-    O: LinearAddOperation<T, V> + LinearNegOperation<T, V> + LinearScaleOperation<T, V> + Operation<T>,
-> TangentSpace<T, V> for LinearTerm<T, V, O>
+impl<T: Type, V: Traceable<T> + ZeroLike, O: SupportsAdd<T, V> + SupportsNeg<T, V> + SupportsScale<T, V> + Operation<T>>
+    TangentSpace<T, V> for LinearTerm<T, V, O>
 {
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
@@ -136,7 +133,7 @@ impl<
         let abstract_value = input_atom.r#type().into_owned();
         let atom = borrow.add_variable(abstract_value);
         borrow.instructions.push(Instruction {
-            operation: O::linear_add_op(),
+            operation: O::add_operation(),
             inputs: vec![lhs.atom, rhs.atom],
             outputs: vec![atom],
         });

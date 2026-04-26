@@ -16,7 +16,7 @@ use crate::{
         jit::{DifferentiableTracer, Tracer},
         linear::{Linearized, jvp_program, jvp_traced},
         operations::{
-            CoreLinearReplayOperation, LinearAddOperation, LinearNegOperation, LinearScaleOperation,
+            CoreLinearReplayOperation, SupportsAdd, SupportsNeg, SupportsScale,
             constants::{OneLike, ZeroLike},
         },
     },
@@ -80,11 +80,7 @@ pub trait Differentiable<T: Type>: Traceable<T> {
     type Tangent<LinearOperation>: TangentSpace<T, Self>
     where
         T: Display,
-        LinearOperation: Clone
-            + Operation<T>
-            + LinearAddOperation<T, Self>
-            + LinearNegOperation<T, Self>
-            + LinearScaleOperation<T, Self>;
+        LinearOperation: Clone + Operation<T> + SupportsAdd<T, Self> + SupportsNeg<T, Self> + SupportsScale<T, Self>;
 }
 
 /// Convenience alias for the primitive-level tangent representation associated with engine `E`.
@@ -100,11 +96,7 @@ where
     type Tangent<LinearOperation>
         = crate::tracing_v2::LinearTerm<T, V, LinearOperation>
     where
-        LinearOperation: Clone
-            + Operation<T>
-            + LinearAddOperation<T, Self>
-            + LinearNegOperation<T, Self>
-            + LinearScaleOperation<T, Self>;
+        LinearOperation: Clone + Operation<T> + SupportsAdd<T, Self> + SupportsNeg<T, Self> + SupportsScale<T, Self>;
 }
 
 /// Forward-mode tracer carrying both a primal and a tangent.
@@ -238,9 +230,9 @@ where
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
     V: Differentiable<ArrayType>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>
-        + LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>,
+        + SupportsAdd<ArrayType, V>
+        + SupportsNeg<ArrayType, V>
+        + SupportsScale<ArrayType, V>,
 {
     type FunctionInput<'engine>
         = Input::To<DifferentiableTracer<'engine, E>>

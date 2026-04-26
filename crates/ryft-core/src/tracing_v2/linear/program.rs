@@ -193,7 +193,7 @@ where
     E: Engine<Type = ArrayType, Value = V> + ?Sized,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + Clone,
+    O: CoreLinearProgramOperation<V> + SupportsAdd<ArrayType, V> + Clone,
 {
     transpose_linear_program_with_factories(
         program,
@@ -214,7 +214,7 @@ where
     V: Traceable<ArrayType>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + Clone,
+    O: CoreLinearProgramOperation<V> + SupportsAdd<ArrayType, V> + Clone,
 {
     fn accumulate<V, O>(
         builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
@@ -224,7 +224,7 @@ where
     ) -> Result<(), TracingError>
     where
         V: Traceable<ArrayType>,
-        O: LinearAddOperation<ArrayType, V> + Operation<ArrayType> + Clone,
+        O: SupportsAdd<ArrayType, V> + Operation<ArrayType> + Clone,
     {
         adjoints[atom.index] = Some(match adjoints[atom.index] {
             Some(existing) => {
@@ -232,7 +232,7 @@ where
                 let abstract_value = builder_borrow.atoms[existing.index].r#type().into_owned();
                 let output = builder_borrow.add_variable(abstract_value);
                 builder_borrow.instructions.push(Instruction {
-                    operation: O::linear_add_op(),
+                    operation: O::add_operation(),
                     inputs: vec![existing, contribution],
                     outputs: vec![output],
                 });
@@ -313,7 +313,7 @@ where
     Output: Parameterized<V, ParameterStructure: Clone>,
     F: FnMut(&Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, &ArrayType, usize) -> Result<AtomId, TracingError>,
     G: FnMut(&Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, &ArrayType) -> Result<AtomId, TracingError>,
-    O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + Clone,
+    O: CoreLinearProgramOperation<V> + SupportsAdd<ArrayType, V> + Clone,
 {
     let mut context = FactoryLinearTransposeContext { make_output_cotangent_input, make_missing_input_cotangent };
     transpose_linear_program_with_context(&mut context, program)
@@ -337,7 +337,7 @@ where
     E: Engine<Type = ArrayType, Value = V> + ?Sized,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + Clone,
+    O: CoreLinearProgramOperation<V> + SupportsAdd<ArrayType, V> + Clone,
 {
     let expected_output_count = program.output_ids.len();
     if output_examples.len() != expected_output_count {
@@ -371,7 +371,7 @@ where
     Input: Parameterized<Tracer<'engine, E, TracingOperation>, ParameterStructure: Clone>,
     Output: Parameterized<Tracer<'engine, E, TracingOperation>, ParameterStructure: Clone>,
     O: CoreLinearProgramOperation<Tracer<'engine, E, TracingOperation>>
-        + LinearAddOperation<ArrayType, Tracer<'engine, E, TracingOperation>>
+        + SupportsAdd<ArrayType, Tracer<'engine, E, TracingOperation>>
         + Clone,
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     TracingOperation: Clone + Operation<ArrayType>,

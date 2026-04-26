@@ -19,20 +19,20 @@ use crate::{
 
 use super::{CoreLinearProgramOperation, DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
-/// Hidden staging trait for the `rematerialize` higher-order primitive.
+/// Hidden carrier capability for staging the `rematerialize` higher-order primitive.
 #[doc(hidden)]
-pub trait RematerializeTracingOperation<T: Type, V: Traceable<T>, L: Clone>: Clone + Operation<T> {
+pub trait SupportsRematerialize<T: Type, V: Traceable<T>, L: Clone>: Clone + Operation<T> {
     /// Constructs the carrier-specific representation of the `rematerialize` higher-order primitive
     /// with a captured traced body.
-    fn rematerialize_op(op: RematerializeOperation<T, V, Self, L>) -> Self;
+    fn rematerialize_operation(op: RematerializeOperation<T, V, Self, L>) -> Self;
 }
 
-/// Hidden staging trait for the `rematerialize` higher-order primitive in linear programs.
+/// Hidden carrier capability for staging the `rematerialize` higher-order primitive in linear programs.
 #[doc(hidden)]
-pub trait LinearRematerializeCarrierOperation<T: Type, V: Traceable<T>>: Clone + Operation<T> {
+pub trait SupportsLinearRematerialize<T: Type, V: Traceable<T>>: Clone + Operation<T> {
     /// Constructs the carrier-specific representation of the linear `rematerialize` higher-order
     /// primitive with a captured linear traced body.
-    fn linear_rematerialize_op(op: LinearRematerializeOperation<T, V, Self>) -> Self;
+    fn rematerialize_operation(op: LinearRematerializeOperation<T, V, Self>) -> Self;
 }
 
 /// Erased traced body for a rematerialization boundary.
@@ -175,7 +175,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V> + 'static,
     O: InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E, O>>>,
-    O: RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
+    O: SupportsRematerialize<ArrayType, V, E::LinearOperation>,
     LinearPrimitiveOperation<Tracer<'engine, E, O>>: CoreLinearProgramOperation<Tracer<'engine, E, O>>,
 {
     fn interpret(
@@ -196,7 +196,7 @@ where
             exemplar_primal_input.engine,
             exemplar_primal_input.builder.clone(),
             primal_inputs.as_slice(),
-            O::rematerialize_op(self.clone()),
+            O::rematerialize_operation(self.clone()),
         )?;
         let body_program = self.body().program();
         let tangent_outputs = replay_program_linearized_jit(
@@ -229,7 +229,7 @@ where
     O: DifferentiableOperation<E>,
     O: InterpretableOperation<ArrayType, V>,
     O: for<'engine> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E, O>>>
-        + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
+        + SupportsRematerialize<ArrayType, V, E::LinearOperation>
         + 'static,
     LinearPrimitiveOperation<V>: CoreLinearProgramOperation<V>,
     for<'engine> LinearPrimitiveOperation<Tracer<'engine, E, O>>: CoreLinearProgramOperation<Tracer<'engine, E, O>>,
@@ -275,8 +275,7 @@ impl<
     for RematerializeOperation<ArrayType, V, E::TracingOperation, E::LinearOperation>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    E::TracingOperation:
-        InterpretableOperation<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
+    E::TracingOperation: InterpretableOperation<ArrayType, V> + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         if inputs.is_empty() {
@@ -291,7 +290,7 @@ where
             exemplar_input.engine,
             exemplar_input.builder.clone(),
             inputs,
-            E::TracingOperation::rematerialize_op(self.clone()),
+            E::TracingOperation::rematerialize_operation(self.clone()),
         )
     }
 }
@@ -500,8 +499,7 @@ where
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input, To<V> = Input::To<V>>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output, To<V> = Output::To<V>>,
-    E::TracingOperation:
-        InterpretableOperation<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
+    E::TracingOperation: InterpretableOperation<ArrayType, V> + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
 {
     fn invoke<F>(function: F, input: Input) -> Result<Output, TracingError>
     where
@@ -552,7 +550,7 @@ where
             exemplar_traced_input.engine,
             exemplar_traced_input.builder.clone(),
             traced_inputs.as_slice(),
-            E::TracingOperation::rematerialize_op(RematerializeOperation::new(body)),
+            E::TracingOperation::rematerialize_operation(RematerializeOperation::new(body)),
         )?;
         Output::from_parameters(output_structure, staged_outputs).map_err(TracingError::from)
     }

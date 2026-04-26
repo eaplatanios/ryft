@@ -27,20 +27,20 @@ use crate::{
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, Operation,
-    add::{AddTracingOperation, LinearAddOperation},
-    cos::CosTracingOperation,
-    custom::{CustomPrimitive, CustomTracingOperation, LinearCustomOperation, LinearCustomPrimitive},
-    left_matmul::{LeftMatMulTracingOperation, LinearLeftMatMulOperation},
-    matmul::MatMulTracingOperation,
+    add::SupportsAdd,
+    cos::SupportsCos,
+    custom::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, SupportsLinearCustom},
+    left_matmul::SupportsLeftMatMul,
+    matmul::SupportsMatMul,
     matrix::MatrixTangentSpace,
-    matrix_transpose::{LinearMatrixTransposeOperation, MatrixTransposeTracingOperation},
-    mul::MulTracingOperation,
-    neg::{LinearNegOperation, NegTracingOperation},
-    rematerialize::{LinearRematerializeCarrierOperation, RematerializeTracingOperation},
-    reshape::{LinearReshapeOperation, ReshapeTangentSpace, ReshapeTracingOperation},
-    right_matmul::{LinearRightMatMulOperation, RightMatMulTracingOperation},
-    scale::{LinearScaleOperation, ScaleTracingOperation},
-    sin::SinTracingOperation,
+    matrix_transpose::SupportsMatrixTranspose,
+    mul::SupportsMul,
+    neg::SupportsNeg,
+    rematerialize::{SupportsLinearRematerialize, SupportsRematerialize},
+    reshape::{ReshapeTangentSpace, SupportsReshape},
+    right_matmul::SupportsRightMatMul,
+    scale::SupportsScale,
+    sin::SupportsSin,
 };
 
 /// Closed set of built-in staged operations.
@@ -161,153 +161,153 @@ impl<V: Traceable<ArrayType> + 'static> LinearPrimitiveOperation<V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> AddTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsAdd<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn add_op() -> Self {
+    fn add_operation() -> Self {
         PrimitiveOperation::Add
     }
 }
 
-impl<V: Traceable<ArrayType>> MulTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsMul<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn mul_op() -> Self {
+    fn mul_operation() -> Self {
         PrimitiveOperation::Mul
     }
 }
 
-impl<V: Traceable<ArrayType>> NegTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsNeg<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn neg_op() -> Self {
+    fn neg_operation() -> Self {
         PrimitiveOperation::Neg
     }
 }
 
-impl<V: Traceable<ArrayType>> SinTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsSin<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn sin_op() -> Self {
+    fn sin_operation() -> Self {
         PrimitiveOperation::Sin
     }
 }
 
-impl<V: Traceable<ArrayType>> CosTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsCos<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn cos_op() -> Self {
+    fn cos_operation() -> Self {
         PrimitiveOperation::Cos
     }
 }
 
-impl<V: Traceable<ArrayType>> MatMulTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsMatMul<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn matmul_op() -> Self {
+    fn matmul_operation() -> Self {
         PrimitiveOperation::MatMul
     }
 }
 
-impl<V: Traceable<ArrayType>> MatrixTransposeTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsMatrixTranspose<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn matrix_transpose_op() -> Self {
+    fn matrix_transpose_operation() -> Self {
         PrimitiveOperation::MatrixTranspose
     }
 }
 
-impl<V: Traceable<ArrayType>> ScaleTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsScale<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn scale_op(factor: V) -> Self {
+    fn scale_operation(factor: V) -> Self {
         PrimitiveOperation::Scale { factor }
     }
 }
 
-impl<V: Traceable<ArrayType>> LeftMatMulTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsLeftMatMul<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn left_matmul_op(factor: V) -> Self {
+    fn left_matmul_operation(factor: V) -> Self {
         PrimitiveOperation::LeftMatMul { factor }
     }
 }
 
-impl<V: Traceable<ArrayType>> RightMatMulTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsRightMatMul<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn right_matmul_op(factor: V) -> Self {
+    fn right_matmul_operation(factor: V) -> Self {
         PrimitiveOperation::RightMatMul { factor }
     }
 }
 
-impl<V: Traceable<ArrayType>> ReshapeTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsReshape<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn reshape_op(input_type: ArrayType, output_type: ArrayType) -> Self {
+    fn reshape_operation(input_type: ArrayType, output_type: ArrayType) -> Self {
         PrimitiveOperation::Reshape { input_type, output_type }
     }
 }
 
-impl<V: Traceable<ArrayType>> RematerializeTracingOperation<ArrayType, V, LinearPrimitiveOperation<V>>
+impl<V: Traceable<ArrayType>> SupportsRematerialize<ArrayType, V, LinearPrimitiveOperation<V>>
     for PrimitiveOperation<V>
 {
     #[inline]
-    fn rematerialize_op(
+    fn rematerialize_operation(
         op: crate::tracing_v2::operations::RematerializeOperation<ArrayType, V, Self, LinearPrimitiveOperation<V>>,
     ) -> Self {
         PrimitiveOperation::Rematerialize(Box::new(op))
     }
 }
 
-impl<V: Traceable<ArrayType>> CustomTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsCustom<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn custom_op(primitive: Arc<CustomPrimitive<ArrayType, V>>) -> Self {
+    fn custom_operation(primitive: Arc<CustomPrimitive<ArrayType, V>>) -> Self {
         PrimitiveOperation::Custom(primitive)
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearAddOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsAdd<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_add_op() -> Self {
+    fn add_operation() -> Self {
         LinearPrimitiveOperation::Add
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearNegOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsNeg<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_neg_op() -> Self {
+    fn neg_operation() -> Self {
         LinearPrimitiveOperation::Neg
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearMatrixTransposeOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsMatrixTranspose<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_matrix_transpose_op() -> Self {
+    fn matrix_transpose_operation() -> Self {
         LinearPrimitiveOperation::MatrixTranspose
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearScaleOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsScale<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_scale_op(factor: V) -> Self {
+    fn scale_operation(factor: V) -> Self {
         LinearPrimitiveOperation::Scale { factor }
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearLeftMatMulOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsLeftMatMul<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_left_matmul_op(factor: V) -> Self {
+    fn left_matmul_operation(factor: V) -> Self {
         LinearPrimitiveOperation::LeftMatMul { factor }
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearRightMatMulOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsRightMatMul<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_right_matmul_op(factor: V) -> Self {
+    fn right_matmul_operation(factor: V) -> Self {
         LinearPrimitiveOperation::RightMatMul { factor }
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearReshapeOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsReshape<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_reshape_op(input_type: ArrayType, output_type: ArrayType) -> Self {
+    fn reshape_operation(input_type: ArrayType, output_type: ArrayType) -> Self {
         LinearPrimitiveOperation::Reshape { input_type, output_type }
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearRematerializeCarrierOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> SupportsLinearRematerialize<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_rematerialize_op(
+    fn rematerialize_operation(
         op: crate::tracing_v2::operations::LinearRematerializeOperation<ArrayType, V, Self>,
     ) -> Self {
         LinearPrimitiveOperation::Rematerialize(Box::new(op))
@@ -321,14 +321,14 @@ impl<V: Traceable<ArrayType>> From<ConditionOperation<V, LinearPrimitiveOperatio
     }
 }
 
-impl<V: Traceable<ArrayType> + 'static> LinearCustomOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType> + 'static> SupportsLinearCustom<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_custom_op(primitive: CustomPrimitive<ArrayType, V>) -> Result<Self, TracingError> {
+    fn custom_operation(primitive: CustomPrimitive<ArrayType, V>) -> Result<Self, TracingError> {
         Ok(LinearPrimitiveOperation::Custom(Arc::new(primitive.into_linear()?)))
     }
 
     #[inline]
-    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<ArrayType, V>>) -> Result<Self, TracingError> {
+    fn custom_arc_operation(primitive: Arc<CustomPrimitive<ArrayType, V>>) -> Result<Self, TracingError> {
         Ok(LinearPrimitiveOperation::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
     }
 }

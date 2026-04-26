@@ -15,22 +15,15 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type, TypeError};
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearOperation, LinearScaleOperation,
-    Operation, unary_abstract,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd, SupportsScale,
+    unary_abstract,
 };
 
-/// Hidden staging trait for the negation primitive.
+/// Hidden carrier capability for staging the negation primitive.
 #[doc(hidden)]
-pub trait NegTracingOperation<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsNeg<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the negation primitive.
-    fn neg_op() -> Self;
-}
-
-/// Hidden staging trait for the negation primitive in linear programs.
-#[doc(hidden)]
-pub trait LinearNegOperation<T: Type, V: Traceable<T>>: Clone {
-    /// Constructs the carrier-specific representation of the linear negation primitive.
-    fn linear_neg_op() -> Self;
+    fn neg_operation() -> Self;
 }
 
 /// Elementwise negation primitive.
@@ -84,9 +77,8 @@ impl<E> DifferentiableOperation<E> for NegOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Neg<Output = E::Value> + Differentiable<ArrayType>,
-    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
-        + LinearNegOperation<ArrayType, E::Value>
-        + LinearScaleOperation<ArrayType, E::Value>,
+    E::LinearOperation:
+        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
 {
     fn jvp(
         &self,

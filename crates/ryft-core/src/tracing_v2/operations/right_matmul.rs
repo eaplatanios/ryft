@@ -13,31 +13,23 @@ use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, Operation,
-    add::LinearAddOperation,
-    left_matmul::LinearLeftMatMulOperation,
+    add::SupportsAdd,
+    left_matmul::SupportsLeftMatMul,
     lift_jit_constant,
-    matmul::MatMulTracingOperation,
+    matmul::SupportsMatMul,
     matrix::{MatrixOps, MatrixValue, matmul_abstract},
-    matrix_transpose::{LinearMatrixTransposeOperation, MatrixTransposeTracingOperation},
-    neg::LinearNegOperation,
+    matrix_transpose::SupportsMatrixTranspose,
+    neg::SupportsNeg,
     primitive::LinearPrimitiveOperation,
-    scale::LinearScaleOperation,
+    scale::SupportsScale,
 };
 
-/// Hidden staging trait for the right matrix-multiplication primitive.
+/// Hidden carrier capability for staging the right matrix-multiplication primitive.
 #[doc(hidden)]
-pub trait RightMatMulTracingOperation<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsRightMatMul<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the right matrix-multiplication primitive
     /// with a captured factor.
-    fn right_matmul_op(factor: V) -> Self;
-}
-
-/// Hidden staging trait for the right matrix-multiplication primitive in linear programs.
-#[doc(hidden)]
-pub trait LinearRightMatMulOperation<T: Type, V: Traceable<T>>: Clone {
-    /// Constructs the carrier-specific representation of the linear right matrix-multiplication
-    /// primitive with a captured factor.
-    fn linear_right_matmul_op(factor: V) -> Self;
+    fn right_matmul_operation(factor: V) -> Self;
 }
 
 /// Linear map `tangent -> tangent @ factor`.
@@ -135,16 +127,16 @@ impl<
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     InnerLinearOperation: Clone
         + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, Tracer<'engine, E>>
-        + LinearNegOperation<ArrayType, Tracer<'engine, E>>
-        + LinearScaleOperation<ArrayType, Tracer<'engine, E>>
-        + LinearLeftMatMulOperation<ArrayType, Tracer<'engine, E>>
-        + LinearRightMatMulOperation<ArrayType, Tracer<'engine, E>>
-        + LinearMatrixTransposeOperation<ArrayType, Tracer<'engine, E>>,
+        + SupportsAdd<ArrayType, Tracer<'engine, E>>
+        + SupportsNeg<ArrayType, Tracer<'engine, E>>
+        + SupportsScale<ArrayType, Tracer<'engine, E>>
+        + SupportsLeftMatMul<ArrayType, Tracer<'engine, E>>
+        + SupportsRightMatMul<ArrayType, Tracer<'engine, E>>
+        + SupportsMatrixTranspose<ArrayType, Tracer<'engine, E>>,
 > InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>
     for RightMatMulOperation<V>
 where
-    E::TracingOperation: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V> + 'static,
+    E::TracingOperation: SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V> + 'static,
 {
     fn interpret(
         &self,
@@ -162,8 +154,7 @@ impl<V, E> DifferentiableOperation<E> for RightMatMulOperation<V>
 where
     V: MatrixValue + ZeroLike + Differentiable<ArrayType>,
     E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
-    E::LinearOperation:
-        LinearAddOperation<ArrayType, V> + LinearNegOperation<ArrayType, V> + LinearScaleOperation<ArrayType, V>,
+    E::LinearOperation: SupportsAdd<ArrayType, V> + SupportsNeg<ArrayType, V> + SupportsScale<ArrayType, V>,
     EngineTangent<E>: super::matrix::MatrixTangentSpace<V>,
 {
     fn jvp(

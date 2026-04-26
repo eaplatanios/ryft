@@ -21,8 +21,8 @@ use crate::{
 };
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearOperation,
-    LinearScaleOperation, Operation,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd, SupportsNeg,
+    SupportsScale,
     primitive::{LinearPrimitiveOperation, PrimitiveOperation},
 };
 
@@ -35,21 +35,21 @@ pub enum CustomOperationError {
     MissingRule { op: &'static str, transform: &'static str },
 }
 
-/// Hidden staging trait for the custom-primitive escape hatch.
+/// Hidden carrier capability for staging the custom-primitive escape hatch.
 #[doc(hidden)]
-pub trait CustomTracingOperation<T: Type, V: Traceable<T> + Traceable<ArrayType>>: Clone {
+pub trait SupportsCustom<T: Type, V: Traceable<T> + Traceable<ArrayType>>: Clone {
     /// Constructs the carrier-specific representation of one custom primitive.
-    fn custom_op(primitive: Arc<CustomPrimitive<T, V>>) -> Self;
+    fn custom_operation(primitive: Arc<CustomPrimitive<T, V>>) -> Self;
 }
 
-/// Hidden staging trait for the custom-primitive escape hatch in linear programs.
+/// Hidden carrier capability for staging the custom-primitive escape hatch in linear programs.
 #[doc(hidden)]
-pub trait LinearCustomOperation<T: Type, V: Traceable<T> + Traceable<ArrayType>>: Clone {
+pub trait SupportsLinearCustom<T: Type, V: Traceable<T> + Traceable<ArrayType>>: Clone {
     /// Constructs the carrier-specific representation of one custom primitive in the linear universe.
-    fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self, TracingError>;
+    fn custom_operation(primitive: CustomPrimitive<T, V>) -> Result<Self, TracingError>;
 
     /// Constructs the carrier-specific representation of one shared custom primitive in the linear universe.
-    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TracingError>;
+    fn custom_arc_operation(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TracingError>;
 }
 
 /// Typed extension registry carried by one [`CustomPrimitive`].
@@ -91,9 +91,9 @@ struct LinearizedJitRule<
     V: Traceable<ArrayType> + ZeroLike,
     InnerLinearOperation: Clone
         + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, Tracer<'static, E>>
-        + LinearNegOperation<ArrayType, Tracer<'static, E>>
-        + LinearScaleOperation<ArrayType, Tracer<'static, E>>
+        + SupportsAdd<ArrayType, Tracer<'static, E>>
+        + SupportsNeg<ArrayType, Tracer<'static, E>>
+        + SupportsScale<ArrayType, Tracer<'static, E>>
         + 'static,
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
 >(Arc<dyn InterpretableOperation<ArrayType, Linearized<Tracer<'static, E>, InnerLinearOperation>>>);
@@ -102,9 +102,9 @@ impl<
     V: Traceable<ArrayType> + ZeroLike,
     InnerLinearOperation: Clone
         + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, Tracer<'static, E>>
-        + LinearNegOperation<ArrayType, Tracer<'static, E>>
-        + LinearScaleOperation<ArrayType, Tracer<'static, E>>
+        + SupportsAdd<ArrayType, Tracer<'static, E>>
+        + SupportsNeg<ArrayType, Tracer<'static, E>>
+        + SupportsScale<ArrayType, Tracer<'static, E>>
         + 'static,
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
 > LinearizedJitRule<V, InnerLinearOperation, E>
@@ -219,9 +219,9 @@ impl<T: Type + 'static, V: Traceable<T> + Traceable<ArrayType> + Parameter + 'st
         E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
         InnerLinearOperation: Clone
             + Operation<ArrayType>
-            + LinearAddOperation<ArrayType, Tracer<'static, E>>
-            + LinearNegOperation<ArrayType, Tracer<'static, E>>
-            + LinearScaleOperation<ArrayType, Tracer<'static, E>>
+            + SupportsAdd<ArrayType, Tracer<'static, E>>
+            + SupportsNeg<ArrayType, Tracer<'static, E>>
+            + SupportsScale<ArrayType, Tracer<'static, E>>
             + 'static,
         Rule: InterpretableOperation<ArrayType, Linearized<Tracer<'static, E>, InnerLinearOperation>> + 'static,
         Linearized<Tracer<'static, E>, InnerLinearOperation>: Traceable<ArrayType>,
@@ -411,9 +411,9 @@ impl<
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     InnerLinearOperation: Clone
         + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, Tracer<'static, E>>
-        + LinearNegOperation<ArrayType, Tracer<'static, E>>
-        + LinearScaleOperation<ArrayType, Tracer<'static, E>>
+        + SupportsAdd<ArrayType, Tracer<'static, E>>
+        + SupportsNeg<ArrayType, Tracer<'static, E>>
+        + SupportsScale<ArrayType, Tracer<'static, E>>
         + 'static,
 > InterpretableOperation<ArrayType, Linearized<Tracer<'static, E>, InnerLinearOperation>>
     for CustomPrimitive<ArrayType, V>

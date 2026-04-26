@@ -22,24 +22,16 @@ use crate::{
 };
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, add::LinearAddOperation,
-    neg::LinearNegOperation, scale::LinearScaleOperation,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, add::SupportsAdd, neg::SupportsNeg,
+    scale::SupportsScale,
 };
 
-/// Hidden staging trait for the reshape primitive.
+/// Hidden carrier capability for staging the reshape primitive.
 #[doc(hidden)]
-pub trait ReshapeTracingOperation<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsReshape<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the reshape primitive with explicit input
     /// and output abstract types.
-    fn reshape_op(input_type: T, output_type: T) -> Self;
-}
-
-/// Hidden staging trait for the reshape primitive in linear programs.
-#[doc(hidden)]
-pub trait LinearReshapeOperation<T: Type, V: Traceable<T>>: Clone {
-    /// Constructs the carrier-specific representation of the linear reshape primitive with explicit
-    /// input and output abstract types.
-    fn linear_reshape_op(input_type: T, output_type: T) -> Self;
+    fn reshape_operation(input_type: T, output_type: T) -> Self;
 }
 
 /// Returns `true` when `dimension` is explicitly unsharded in the JAX sense.
@@ -228,10 +220,7 @@ impl<V: ReshapeValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + Zer
 
 impl<
     V: ReshapeValue + ZeroLike + OneLike + MatrixOps,
-    O: LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
-        + LinearReshapeOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>,
+    O: SupportsAdd<ArrayType, V> + SupportsNeg<ArrayType, V> + SupportsReshape<ArrayType, V> + SupportsScale<ArrayType, V>,
 > ReshapeTangentSpace<V> for LinearTerm<ArrayType, V, O>
 where
     O: Operation<ArrayType>,
@@ -243,7 +232,7 @@ where
         Ok(LinearTerm::apply_staged_op(
             tangent.builder.clone(),
             std::slice::from_ref(&tangent),
-            O::linear_reshape_op(input_type.clone(), output_type.clone()),
+            O::reshape_operation(input_type.clone(), output_type.clone()),
             1,
         )?
         .into_iter()
@@ -267,7 +256,7 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
 impl<'engine, V: Traceable<ArrayType>, E, O> ReshapeOps for Tracer<'engine, E, O>
 where
     E: Engine<Type = ArrayType, Value = V> + ?Sized,
-    O: Clone + Operation<ArrayType> + ReshapeTracingOperation<ArrayType, V>,
+    O: Clone + Operation<ArrayType> + SupportsReshape<ArrayType, V>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.r#type().into_owned();
@@ -279,7 +268,7 @@ where
             self.engine,
             self.builder.clone(),
             std::slice::from_ref(&self),
-            O::reshape_op(input_type, output_type),
+            O::reshape_operation(input_type, output_type),
         )?
         .into_iter()
         .next()
@@ -446,9 +435,8 @@ impl<E> DifferentiableOperation<E> for ReshapeOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: ReshapeValue + ZeroLike + OneLike + MatrixOps + Differentiable<ArrayType>,
-    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
-        + LinearNegOperation<ArrayType, E::Value>
-        + LinearScaleOperation<ArrayType, E::Value>,
+    E::LinearOperation:
+        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
     EngineTangent<E>: ReshapeTangentSpace<E::Value>,
 {
     fn jvp(

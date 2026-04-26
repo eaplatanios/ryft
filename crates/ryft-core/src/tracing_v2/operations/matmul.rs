@@ -12,16 +12,15 @@ use crate::{
 };
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearScaleOperation,
-    Operation,
+    DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsNeg, SupportsScale,
     matrix::{MatrixOps, MatrixValue, matmul_abstract},
 };
 
-/// Hidden staging trait for the matrix multiplication primitive.
+/// Hidden carrier capability for staging the matrix multiplication primitive.
 #[doc(hidden)]
-pub trait MatMulTracingOperation<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsMatMul<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the matrix multiplication primitive.
-    fn matmul_op() -> Self;
+    fn matmul_operation() -> Self;
 }
 
 /// Primitive representing matrix multiplication.
@@ -68,9 +67,8 @@ impl<E> DifferentiableOperation<E> for MatMulOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: MatrixValue + Differentiable<ArrayType>,
-    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
-        + LinearNegOperation<ArrayType, E::Value>
-        + LinearScaleOperation<ArrayType, E::Value>,
+    E::LinearOperation:
+        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
     EngineTangent<E>: super::matrix::MatrixTangentSpace<E::Value>,
 {
     fn jvp(

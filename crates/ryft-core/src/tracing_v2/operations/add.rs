@@ -18,27 +18,17 @@ use crate::{
     },
 };
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, LinearNegOperation, LinearOperation, LinearScaleOperation,
-    Operation,
-};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsNeg, SupportsScale};
 
-/// Hidden staging trait for the addition primitive.
+/// Hidden carrier capability for staging the addition primitive.
 ///
 /// Backend-owned closed op carriers (such as [`PrimitiveOperation`](super::PrimitiveOperation) and the XLA backend's
 /// `XlaPrimitiveOperation`) implement this trait so that generic transform code can stage `AddOperation` without
 /// knowing which carrier is in use.
 #[doc(hidden)]
-pub trait AddTracingOperation<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsAdd<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the addition primitive.
-    fn add_op() -> Self;
-}
-
-/// Hidden staging trait for the addition primitive in linear programs.
-#[doc(hidden)]
-pub trait LinearAddOperation<T: Type, V: Traceable<T>>: Clone {
-    /// Constructs the carrier-specific representation of the linear addition primitive.
-    fn linear_add_op() -> Self;
+    fn add_operation() -> Self;
 }
 
 /// Elementwise addition primitive.
@@ -127,9 +117,8 @@ impl<E> DifferentiableOperation<E> for AddOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Add<Output = E::Value> + Differentiable<ArrayType>,
-    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
-        + LinearNegOperation<ArrayType, E::Value>
-        + LinearScaleOperation<ArrayType, E::Value>,
+    E::LinearOperation:
+        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
 {
     fn jvp(
         &self,

@@ -15,16 +15,13 @@ use crate::{
     },
 };
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearScaleOperation,
-    Operation,
-};
+use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsNeg, SupportsScale};
 
-/// Hidden staging trait for the multiplication primitive.
+/// Hidden carrier capability for staging the multiplication primitive.
 #[doc(hidden)]
-pub trait MulTracingOperation<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsMul<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the multiplication primitive.
-    fn mul_op() -> Self;
+    fn mul_operation() -> Self;
 }
 
 /// Elementwise multiplication primitive.
@@ -101,9 +98,8 @@ impl<E> DifferentiableOperation<E> for MulOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Mul<Output = E::Value> + Differentiable<ArrayType>,
-    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
-        + LinearNegOperation<ArrayType, E::Value>
-        + LinearScaleOperation<ArrayType, E::Value>,
+    E::LinearOperation:
+        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
 {
     fn jvp(
         &self,

@@ -14,8 +14,8 @@ use crate::{
         forward::{JvpTracer, TangentSpace},
         jit::{DifferentiableTracer, Tracer, interpret_and_trace_with_operation},
         operations::{
-            CoreLinearProgramOperation, CoreLinearReplayOperation, DifferentiableOperation, LinearAddOperation,
-            LinearNegOperation, LinearScaleOperation, LinearTransposeContext, RematerializeTracingOperation,
+            CoreLinearProgramOperation, CoreLinearReplayOperation, DifferentiableOperation, LinearTransposeContext,
+            SupportsAdd, SupportsNeg, SupportsRematerialize, SupportsScale,
             constants::{OneLike, ZeroLike},
             rematerialize::{FlatTracedRematerialize, RematerializeOperation},
         },
@@ -280,8 +280,8 @@ mod tests {
         }
     }
 
-    impl crate::tracing_v2::operations::AddTracingOperation<ArrayType, f64> for OrdinaryAddOperation {
-        fn add_op() -> Self {
+    impl crate::tracing_v2::operations::SupportsAdd<ArrayType, f64> for OrdinaryAddOperation {
+        fn add_operation() -> Self {
             Self
         }
     }
@@ -311,8 +311,8 @@ mod tests {
         }
     }
 
-    impl crate::tracing_v2::operations::AddTracingOperation<ArrayType, f64> for DifferentiableAddOperation {
-        fn add_op() -> Self {
+    impl crate::tracing_v2::operations::SupportsAdd<ArrayType, f64> for DifferentiableAddOperation {
+        fn add_operation() -> Self {
             Self
         }
     }

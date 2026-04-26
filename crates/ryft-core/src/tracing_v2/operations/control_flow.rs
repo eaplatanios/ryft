@@ -16,7 +16,7 @@ use crate::{
 };
 
 use super::{
-    CoreLinearProgramOperation, DifferentiableOperation, LinearAddOperation, LinearOperation, LinearTransposeContext,
+    CoreLinearProgramOperation, DifferentiableOperation, LinearOperation, LinearTransposeContext, SupportsAdd,
 };
 
 /// Flat nested program shape used by control-flow operations.
@@ -394,7 +394,7 @@ where
 impl<V, O> LinearOperation<ArrayType, V, O> for ConditionOperation<V, O>
 where
     V: Traceable<ArrayType>,
-    O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + From<ConditionOperation<V, O>>,
+    O: CoreLinearProgramOperation<V> + SupportsAdd<ArrayType, V> + From<ConditionOperation<V, O>>,
 {
     fn transpose(
         &self,
@@ -656,7 +656,7 @@ mod tests {
         tracing_v2::{
             LinearPrimitiveOperation,
             engines::{ArrayScalarEngine, Engine},
-            operations::{LinearAddOperation, LinearNegOperation, LinearScaleOperation},
+            operations::{SupportsAdd, SupportsNeg, SupportsScale},
         },
         types::DataType,
     };
@@ -886,20 +886,20 @@ mod tests {
         }
     }
 
-    impl LinearAddOperation<ArrayType, TestValue> for TestLinearOperation {
-        fn linear_add_op() -> Self {
+    impl SupportsAdd<ArrayType, TestValue> for TestLinearOperation {
+        fn add_operation() -> Self {
             Self::Add
         }
     }
 
-    impl LinearNegOperation<ArrayType, TestValue> for TestLinearOperation {
-        fn linear_neg_op() -> Self {
+    impl SupportsNeg<ArrayType, TestValue> for TestLinearOperation {
+        fn neg_operation() -> Self {
             Self::Neg
         }
     }
 
-    impl LinearScaleOperation<ArrayType, TestValue> for TestLinearOperation {
-        fn linear_scale_op(factor: TestValue) -> Self {
+    impl SupportsScale<ArrayType, TestValue> for TestLinearOperation {
+        fn scale_operation(factor: TestValue) -> Self {
             Self::Scale { factor }
         }
     }

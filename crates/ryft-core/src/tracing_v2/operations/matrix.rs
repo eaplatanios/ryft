@@ -16,9 +16,8 @@ use crate::{
 };
 
 use super::{
-    LinearAddOperation, LinearLeftMatMulOperation, LinearMatrixTransposeOperation, LinearNegOperation,
-    LinearRightMatMulOperation, LinearScaleOperation, MatMulTracingOperation, MatrixTransposeTracingOperation,
-    Operation,
+    Operation, SupportsAdd, SupportsLeftMatMul, SupportsMatMul, SupportsMatrixTranspose, SupportsNeg,
+    SupportsRightMatMul, SupportsScale,
 };
 
 /// Matrix operations required by the tracing prototype.
@@ -215,14 +214,11 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
 impl<'engine, V: Traceable<ArrayType>, E, O> MatrixOps for Tracer<'engine, E, O>
 where
     E: crate::tracing_v2::Engine<Type = ArrayType, Value = V> + ?Sized,
-    O: Clone
-        + Operation<ArrayType>
-        + MatMulTracingOperation<ArrayType, V>
-        + MatrixTransposeTracingOperation<ArrayType, V>,
+    O: Clone + Operation<ArrayType> + SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
 {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
-        self.binary(rhs, O::matmul_op())
+        self.binary(rhs, O::matmul_operation())
     }
 
     #[inline]
@@ -230,34 +226,34 @@ where
         if matrix_transpose_is_identity_type(&self.r#type()) {
             return self;
         }
-        self.unary(O::matrix_transpose_op())
+        self.unary(O::matrix_transpose_operation())
     }
 }
 
 impl<
     V: MatrixValue + ZeroLike,
-    O: LinearLeftMatMulOperation<ArrayType, V>
-        + LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
+    O: SupportsLeftMatMul<ArrayType, V>
+        + SupportsAdd<ArrayType, V>
+        + SupportsNeg<ArrayType, V>
         + Operation<ArrayType>
-        + LinearRightMatMulOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>
-        + LinearMatrixTransposeOperation<ArrayType, V>,
+        + SupportsRightMatMul<ArrayType, V>
+        + SupportsScale<ArrayType, V>
+        + SupportsMatrixTranspose<ArrayType, V>,
 > MatrixTangentSpace<V> for LinearTerm<ArrayType, V, O>
 {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
-        tangent.apply_linear_op(O::linear_left_matmul_op(factor))
+        tangent.apply_linear_op(O::left_matmul_operation(factor))
     }
 
     #[inline]
     fn matmul_right(tangent: Self, factor: V) -> Self {
-        tangent.apply_linear_op(O::linear_right_matmul_op(factor))
+        tangent.apply_linear_op(O::right_matmul_operation(factor))
     }
 
     #[inline]
     fn transpose_matrix(value: Self) -> Self {
-        value.apply_linear_op(O::linear_matrix_transpose_op())
+        value.apply_linear_op(O::matrix_transpose_operation())
     }
 }
 
