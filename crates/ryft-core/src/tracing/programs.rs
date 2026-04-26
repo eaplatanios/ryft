@@ -687,12 +687,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         }
     }
 
-    /// Adds a new input atom retaining only its abstract type.
-    ///
-    /// Intended for program transforms that rebuild structure without needing intermediate values
-    /// (for example [`Program::simplified`]). Callers that later need a representative value for
-    /// this atom should synthesize it from the retained input type through an
-    /// [`Engine`](crate::tracing_v2::Engine).
+    /// Adds an input [`Atom`] to the [`Program`] that is being built with the provided [`Type`].
     #[inline]
     pub fn add_input(&mut self, r#type: T) -> AtomId {
         let id = self.add_variable(r#type);
@@ -700,10 +695,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         id
     }
 
-    /// Adds a constant atom to the program.
-    ///
-    /// Constants are retained verbatim in the final [`Program`] so later replay and lowering can
-    /// recover the literal value.
+    /// Adds the provided value as an [`Atom::Constant`] to the [`Program`] that is being built.
     #[inline]
     pub fn add_constant(&mut self, value: V) -> AtomId {
         let id = AtomId { index: self.atoms.len() };
@@ -711,10 +703,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         id
     }
 
-    /// Adds a non-constant variable atom retaining only its abstract type.
-    ///
-    /// This is the common helper used by input staging and by instruction staging paths that need
-    /// to materialize fresh variable outputs in the atom table.
+    /// Adds an [`Atom::Variable`] to the [`Program`] that is being built with the provided [`Type`].
     #[inline]
     pub fn add_variable(&mut self, r#type: T) -> AtomId {
         let id = AtomId { index: self.atoms.len() };
@@ -722,12 +711,11 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         id
     }
 
-    /// Adds a staged instruction using abstract evaluation.
-    ///
-    /// This validates the input atoms through [`Operation::infer_output_types`] and stages one
-    /// variable-output instruction.
-    pub fn add_instruction(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError> {
-        let input_abstracts = inputs
+    /// Adds an [`Instruction`] to the [`Program`] that is being built, that corresponds to an application of the
+    /// provided [`Operation`] to the provided input [`Atom`]s.
+    #[inline]
+    pub fn add_instruction(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<&[AtomId], TracingError> {
+        let input_types = inputs
             .iter()
             .map(|input| {
                 self.atoms
@@ -736,11 +724,10 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                     .ok_or(TracingError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let output_abstracts = operation.infer_output_types(input_abstracts.as_slice())?;
-
-        let outputs = output_abstracts.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
-        self.instructions.push(Instruction { operation, inputs, outputs: outputs.clone() });
-        Ok(outputs)
+        let output_types = operation.infer_output_types(input_types.as_slice())?;
+        let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
+        self.instructions.push(Instruction { operation, inputs, outputs });
+        Ok(self.instructions.last().unwrap().outputs.as_slice())
     }
 
     /// Retypes this builder to a different final input/output structure.
@@ -762,10 +749,11 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         }
     }
 
-    /// Finalizes the builder into a program with the given output structure.
+    /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided output structure.
+    #[inline]
     pub fn build(
         self,
-        outputs: Vec<AtomId>,
+        output_ids: Vec<AtomId>,
         output_structure: Output::ParameterStructure,
     ) -> Result<Program<T, V, O, Input, Output>, TracingError> {
         if let Some(error) = self.error {
@@ -775,7 +763,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             atoms: self.atoms,
             input_ids: self.input_ids,
             instructions: self.instructions,
-            output_ids: outputs,
+            output_ids,
             input_structure: self.input_structure,
             output_structure,
             marker: PhantomData,
@@ -783,10 +771,13 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>> Default
-    for ProgramBuilder<T, V, O, Input, Output>
-where
-    Input::ParameterStructure: Default,
+impl<
+    T: Type,
+    V: Traceable<T>,
+    O: Clone + Operation<T>,
+    Input: Parameterized<V, ParameterStructure: Default>,
+    Output: Parameterized<V>,
+> Default for ProgramBuilder<T, V, O, Input, Output>
 {
     fn default() -> Self {
         Self::new(Default::default())
