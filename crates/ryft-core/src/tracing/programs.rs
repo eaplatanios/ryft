@@ -464,10 +464,47 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             .into());
         }
 
-        // Flatten the structured input so that we can get the input values aligned to the input atoms of the program.
+        // Flatten the structured input, replay using ordinary interpretation, and reshape the flat outputs
+        // back into the structured `Output` form expected by this program.
         let inputs = input.into_parameters().collect::<Vec<_>>();
+        let outputs = self.interpret_with(
+            inputs,
+            |_, constant| Ok(constant.clone()),
+            |instruction, inputs| instruction.operation.interpret(inputs),
+        )?;
+        Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
+    }
+
+    // TODO(eaplatanios): Review this function.
+    /// Generic replay engine that walks this [`Program`]'s [`Instruction`]s under caller-supplied leaf semantics.
+    ///
+    /// The same atom-walking logic powers ordinary interpretation, batched interpretation, and MLIR lowering;
+    /// transforms specialize the engine by choosing a runtime value type `W`, a constant-lifting closure, and an
+    /// instruction-application closure. Inputs and outputs are flat [`Vec`]s aligned with the program's
+    /// [`Self::input_ids`] and [`Self::output_ids`]; structured-input/output handling stays at the call site so that
+    /// callers can use any parameter family of their choice.
+    ///
+    /// The engine counts each atom's future consumers so that values are moved out at their last use and only
+    /// cloned when a later consumer still needs them.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: Flat input values aligned with [`Self::input_ids`].
+    ///   - `lift_constant`: Lifts an [`Atom::Constant`]'s carried `V` into the runtime leaf type `W`. Receives the
+    ///     constant's [`AtomId`] for callers that surface diagnostics or maintain parallel atom tables. Invoked at
+    ///     most once per live constant atom, in atom-index order.
+    ///   - `apply_op`: Applies one [`Instruction`]'s [`Operation`] to its already-lifted inputs and returns the
+    ///     instruction's outputs. The full [`Instruction`] is provided so that the closure can inspect the
+    ///     operation's expected output [`Atom`] ids when needed (for example, to look up output [`Type`]s).
+    pub fn interpret_with<W, E, F, G>(&self, inputs: Vec<W>, mut lift_constant: F, mut apply_op: G) -> Result<Vec<W>, E>
+    where
+        W: Clone,
+        E: From<TracingError>,
+        F: FnMut(AtomId, &V) -> Result<W, E>,
+        G: FnMut(&Instruction<O>, &[W]) -> Result<Vec<W>, E>,
+    {
         if inputs.len() != self.input_ids.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: inputs.len() });
+            return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: inputs.len() }.into());
         }
 
         // Count every future consumer of each atom, including final program outputs. These counts let us move each
@@ -476,14 +513,14 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         for instruction in self.instructions.iter() {
             for input_id in instruction.inputs.iter().copied() {
                 let Some(remaining_uses) = remaining_uses.get_mut(input_id.index) else {
-                    return Err(TracingError::UnboundAtomId { id: input_id });
+                    return Err(TracingError::UnboundAtomId { id: input_id }.into());
                 };
                 *remaining_uses += 1;
             }
         }
         for output_id in self.output_ids.iter().copied() {
             let Some(remaining_uses) = remaining_uses.get_mut(output_id.index) else {
-                return Err(TracingError::UnboundAtomId { id: output_id });
+                return Err(TracingError::UnboundAtomId { id: output_id }.into());
             };
             *remaining_uses += 1;
         }
@@ -492,7 +529,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         let mut values = vec![None; self.atoms.len()];
         for (input_id, input) in self.input_ids.iter().copied().zip(inputs) {
             let Some(slot) = values.get_mut(input_id.index) else {
-                return Err(TracingError::UnboundAtomId { id: input_id });
+                return Err(TracingError::UnboundAtomId { id: input_id }.into());
             };
             *slot = Some(input);
         }
@@ -504,7 +541,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                 continue;
             }
             if let Atom::Constant(value) = atom {
-                values[atom_index] = Some(value.clone());
+                values[atom_index] = Some(lift_constant(AtomId { index: atom_index }, value)?);
             }
         }
 
@@ -524,18 +561,19 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                 instruction_inputs.push(value);
             }
 
-            // Interpret the operation using concrete values and ensure it produces the expected number of outputs.
-            let outputs = instruction.operation.interpret(instruction_inputs.as_slice())?;
+            // Apply the operation using the supplied dispatcher and ensure it produces the expected number of outputs.
+            let outputs = apply_op(instruction, instruction_inputs.as_slice())?;
             if outputs.len() != instruction.outputs.len() {
                 return Err(TracingError::InvalidOutputCount {
                     expected: instruction.outputs.len(),
                     got: outputs.len(),
-                });
+                }
+                .into());
             }
 
             for (output_id, output) in instruction.outputs.iter().copied().zip(outputs) {
                 let Some(value) = values.get_mut(output_id.index) else {
-                    return Err(TracingError::UnboundAtomId { id: output_id });
+                    return Err(TracingError::UnboundAtomId { id: output_id }.into());
                 };
 
                 // Keep only outputs with a future consumer. Dead instruction results do not need to occupy the table.
@@ -556,8 +594,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             outputs.push(value);
         }
 
-        // Reshape the flat output values into the structured output type that this program is expected to produce.
-        Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
+        Ok(outputs)
     }
 }
 

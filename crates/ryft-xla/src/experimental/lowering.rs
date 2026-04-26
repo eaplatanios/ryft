@@ -10,7 +10,7 @@ use ryft_mlir::{
 
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
-use ryft_core::tracing::{Atom, AtomId, Operation, Program, Traceable};
+use ryft_core::tracing::{AtomId, Instruction, Operation, Program, Traceable, TracingError};
 use ryft_core::tracing_v2::{
     CustomPrimitive, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation,
     operations::{
@@ -83,6 +83,11 @@ pub(crate) enum LoweringError {
     /// Error returned when one custom primitive does not provide StableHLO lowering.
     #[error("custom primitive '{op}' does not provide StableHLO lowering")]
     MissingCustomLowering { op: String },
+
+    /// Underlying tracing error returned while replaying a staged program through the generic
+    /// [`Program::interpret_with`] engine.
+    #[error("{0}")]
+    Tracing(#[from] TracingError),
 }
 
 /// Lowering mode used for plain `tracing_v2` MLIR emission.
@@ -1527,74 +1532,28 @@ where
     V: MlirLowerableValue,
     O: Clone + XlaOperation<V>,
 {
-    if input_values.len() != program.input_ids.len() {
-        return Err(LoweringError::UnsupportedOp {
-            op: format!(
-                "nested program expected {} lowered inputs but got {}",
-                program.input_ids.len(),
-                input_values.len()
-            ),
-        });
-    }
-    let mut atom_values = vec![None; program.atoms.len()];
-    for (atom_id, mlir_value) in program.input_ids.iter().copied().zip(input_values.iter().copied()) {
-        atom_values[atom_id.index] = Some(mlir_value);
-    }
-
-    let mut instruction_by_first_output = vec![None; program.atoms.len()];
-    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
-        if let Some(first_output) = instruction.outputs.first() {
-            instruction_by_first_output[first_output.index] = Some(instruction_index);
-        }
-    }
-    let mut input_atom_flags = vec![false; program.atoms.len()];
-    for input_atom in program.input_ids.iter().copied() {
-        input_atom_flags[input_atom.index] = true;
-    }
-
-    for atom_index in 0..program.atoms.len() {
-        let atom = &program.atoms[atom_index];
-        match atom {
-            Atom::Constant(value) => {
-                atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
-            }
-            Atom::Variable(_) if input_atom_flags[atom_index] => {}
-            Atom::Variable(_) => {
-                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
-                    continue;
-                };
-                let instruction = &program.instructions[instruction_index];
-                let instruction_inputs = instruction
-                    .inputs
-                    .iter()
-                    .map(|input| atom_values[input.index].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let output_types = instruction
-                    .outputs
-                    .iter()
-                    .map(|output| program.atoms[output.index].r#type().into_owned())
-                    .collect::<Vec<_>>();
-                let mut lowerer = PlainMlirLowerer { block: *block, context, location };
-                let lowered_outputs = instruction.operation.lower_to_mlir(
-                    instruction_inputs.as_slice(),
-                    output_types.as_slice(),
-                    PlainMlirLoweringMode::Unpacked,
-                    &mut lowerer,
-                )?;
-                for (output_atom, lowered_output) in
-                    instruction.outputs.iter().copied().zip(lowered_outputs.into_iter())
-                {
-                    atom_values[output_atom.index] = Some(lowered_output);
-                }
-            }
-        }
-    }
-
-    let outputs = program
-        .output_ids
-        .iter()
-        .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
-        .collect::<Result<Vec<_>, _>>()?;
+    let outputs = replay_program_into_block(
+        program,
+        input_values.to_vec(),
+        block,
+        context,
+        location,
+        |_, value, block, context, location| lower_literal_value(value, block, context, location),
+        |instruction, inputs, block, context, location| {
+            let output_types = instruction
+                .outputs
+                .iter()
+                .map(|output| program.atoms[output.index].r#type().into_owned())
+                .collect::<Vec<_>>();
+            let mut lowerer = PlainMlirLowerer { block: *block, context, location };
+            instruction.operation.lower_to_mlir(
+                inputs,
+                output_types.as_slice(),
+                PlainMlirLoweringMode::Unpacked,
+                &mut lowerer,
+            )
+        },
+    )?;
     if outputs.is_empty() || !add_optimization_barrier {
         return Ok(outputs);
     }
@@ -1607,6 +1566,49 @@ where
                 .as_ref()
         })
         .collect::<Vec<_>>())
+}
+
+/// Drives [`Program::interpret_with`] to lower a staged program into MLIR ops appended to `block`.
+///
+/// The two callbacks plug in lowering policies for [`Atom::Constant`]s and [`Instruction`]s respectively while the
+/// generic interpreter handles use-count tracking and atom bookkeeping. Each callback receives a mutable [`BlockRef`]
+/// because [`BlockRef`] is `Copy` and the helper hands each closure its own copy backed by the same MLIR block.
+fn replay_program_into_block<'b, 'c: 'b, 't: 'c, O, V, Input, Output, LiftConstant, ApplyOp>(
+    program: &Program<ArrayType, V, O, Input, Output>,
+    input_values: Vec<ValueRef<'b, 'c, 't>>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+    mut lift_constant: LiftConstant,
+    mut apply_op: ApplyOp,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+where
+    V: Traceable<ArrayType>,
+    O: Clone + Operation<ArrayType>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+    LiftConstant: FnMut(
+        AtomId,
+        &V,
+        &mut BlockRef<'b, 'c, 't>,
+        &'c MlirContext<'t>,
+        LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>,
+    ApplyOp: FnMut(
+        &Instruction<O>,
+        &[ValueRef<'b, 'c, 't>],
+        &mut BlockRef<'b, 'c, 't>,
+        &'c MlirContext<'t>,
+        LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>,
+{
+    let mut block_for_constants = *block;
+    let mut block_for_ops = *block;
+    program.interpret_with(
+        input_values,
+        |atom_id, value| lift_constant(atom_id, value, &mut block_for_constants, context, location),
+        |instruction, inputs| apply_op(instruction, inputs, &mut block_for_ops, context, location),
+    )
 }
 
 /// Inlines a rematerialize body's sub-program and places an optimization barrier on its boundary outputs.
@@ -1639,56 +1641,31 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    let mut atom_values = vec![None; program.atoms.len()];
-    for (input_index, atom_id) in program.input_ids.iter().copied().enumerate() {
-        atom_values[atom_id.index] =
-            Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
-    }
-
-    let mut instruction_by_first_output = vec![None; program.atoms.len()];
-    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
-        if let Some(first_output) = instruction.outputs.first() {
-            instruction_by_first_output[first_output.index] = Some(instruction_index);
-        }
-    }
-    let mut input_atom_flags = vec![false; program.atoms.len()];
-    for input_atom in program.input_ids.iter().copied() {
-        input_atom_flags[input_atom.index] = true;
-    }
-
-    for atom_index in 0..program.atoms.len() {
-        let atom = &program.atoms[atom_index];
-        match atom {
-            Atom::Constant(value) => {
-                atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
-            }
-            Atom::Variable(_) if input_atom_flags[atom_index] => {}
-            Atom::Variable(_) => {
-                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
-                    continue;
-                };
-                let instruction = &program.instructions[instruction_index];
-                let inputs = instruction
-                    .inputs
-                    .iter()
-                    .map(|input| atom_values[input.index].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let lowered_outputs =
-                    lower_plain_instruction(program, instruction_index, inputs.as_slice(), block, context, location)?;
-                for (output_atom, lowered_output) in
-                    instruction.outputs.iter().copied().zip(lowered_outputs.into_iter())
-                {
-                    atom_values[output_atom.index] = Some(lowered_output);
-                }
-            }
-        }
-    }
-
-    program
-        .output_ids
-        .iter()
-        .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
-        .collect::<Result<Vec<_>, _>>()
+    let input_values = (0..program.input_ids.len())
+        .map(|index| block.argument(index).expect("body block arguments should exist").as_ref())
+        .collect::<Vec<_>>();
+    replay_program_into_block(
+        program,
+        input_values,
+        block,
+        context,
+        location,
+        |_, value, block, context, location| lower_literal_value(value, block, context, location),
+        |instruction, inputs, block, context, location| {
+            let output_types = instruction
+                .outputs
+                .iter()
+                .map(|output| program.atoms[output.index].r#type().into_owned())
+                .collect::<Vec<_>>();
+            let mut lowerer = PlainMlirLowerer { block: *block, context, location };
+            instruction.operation.lower_to_mlir(
+                inputs,
+                output_types.as_slice(),
+                PlainMlirLoweringMode::Unpacked,
+                &mut lowerer,
+            )
+        },
+    )
 }
 
 /// Lowers one traced program to values inside a block.
@@ -1702,64 +1679,45 @@ where
     ProgramInput: Parameterized<ShardMapTensor>,
     ProgramOutput: Parameterized<ShardMapTensor>,
 {
+    // Mirror table of every lowered atom value. Shard-map operations look up captured global primals by `AtomId`,
+    // so we keep a parallel table alongside [`Program::interpret_with`]'s use-count-tracked one. [`ValueRef`] is
+    // `Copy`, so this mirror is cheap.
     let mut atom_values = vec![None; program.atoms.len()];
-    for (input_index, atom_id) in program.input_ids.iter().copied().enumerate() {
-        atom_values[atom_id.index] =
-            Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
-    }
-
-    let mut instruction_by_first_output = vec![None; program.atoms.len()];
-    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
-        if let Some(first_output) = instruction.outputs.first() {
-            instruction_by_first_output[first_output.index] = Some(instruction_index);
-        }
-    }
-    let mut input_atom_flags = vec![false; program.atoms.len()];
-    for input_atom in program.input_ids.iter().copied() {
-        input_atom_flags[input_atom.index] = true;
-    }
-
-    for atom_index in 0..program.atoms.len() {
-        let atom_id = AtomId { index: atom_index };
-        let atom = &program.atoms[atom_index];
-        match atom {
-            Atom::Constant(value) => {
-                atom_values[atom_index] = Some(lower_constant(atom_id, value, block, context, location)?);
-            }
-            Atom::Variable(_) if input_atom_flags[atom_index] => {}
-            Atom::Variable(_) => {
-                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
-                    continue;
-                };
-                let instruction = &program.instructions[instruction_index];
-                let inputs = instruction
-                    .inputs
-                    .iter()
-                    .map(|input| atom_values[input.index].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let lowered_outputs = lower_instruction(
-                    program,
-                    instruction_index,
-                    atom_values.as_slice(),
-                    inputs.as_slice(),
-                    block,
-                    context,
-                    location,
-                )?;
-                for (output_atom, lowered_output) in
-                    instruction.outputs.iter().copied().zip(lowered_outputs.into_iter())
-                {
-                    atom_values[output_atom.index] = Some(lowered_output);
-                }
-            }
-        }
-    }
-
-    program
-        .output_ids
+    let input_values = program
+        .input_ids
         .iter()
-        .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
-        .collect::<Result<Vec<_>, _>>()
+        .copied()
+        .enumerate()
+        .map(|(index, atom_id)| {
+            let value = block.argument(index).expect("body block arguments should exist").as_ref();
+            atom_values[atom_id.index] = Some(value);
+            value
+        })
+        .collect::<Vec<_>>();
+    let atom_values = std::cell::RefCell::new(atom_values);
+    replay_program_into_block(
+        program,
+        input_values,
+        block,
+        context,
+        location,
+        |atom_id, value, block, context, location| {
+            let lowered = lower_constant(atom_id, value, block, context, location)?;
+            atom_values.borrow_mut()[atom_id.index] = Some(lowered);
+            Ok(lowered)
+        },
+        |instruction, inputs, block, context, location| {
+            let mut table = atom_values.borrow_mut();
+            let lowered_outputs =
+                lower_instruction(program, instruction, table.as_slice(), inputs, block, context, location)?;
+            for (output_atom, lowered_output) in
+                instruction.outputs.iter().copied().zip(lowered_outputs.iter().copied())
+            {
+                table[output_atom.index] = Some(lowered_output);
+            }
+            Ok(lowered_outputs)
+        },
+    )
 }
 
 /// Lowers one `sdy.manual_computation` operation, including its nested body program.
@@ -2117,42 +2075,10 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
     }
 }
 
-/// Lowers one traced instruction from a plain `tracing_v2` program.
-#[cfg(any(test, feature = "benchmarking"))]
-#[allow(dead_code)]
-fn lower_plain_instruction<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-    program: &Program<ArrayType, V, O, Input, Output>,
-    instruction_index: usize,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    V: MlirLowerableValue,
-    O: Clone + XlaOperation<V>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
-    let instruction = &program.instructions[instruction_index];
-    let output_types = instruction
-        .outputs
-        .iter()
-        .map(|output| program.atoms[output.index].r#type().into_owned())
-        .collect::<Vec<_>>();
-    let mut lowerer = PlainMlirLowerer { block: *block, context, location };
-    instruction.operation.lower_to_mlir(
-        input_values,
-        output_types.as_slice(),
-        PlainMlirLoweringMode::Unpacked,
-        &mut lowerer,
-    )
-}
-
 /// Lowers one traced instruction to the corresponding StableHLO operation and returns its result value.
 fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ProgramInput, ProgramOutput>,
-    instruction_index: usize,
+    instruction: &Instruction<XlaPrimitiveOperation>,
     atom_values: &[Option<ValueRef<'b, 'c, 't>>],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2163,7 +2089,6 @@ where
     ProgramInput: Parameterized<ShardMapTensor>,
     ProgramOutput: Parameterized<ShardMapTensor>,
 {
-    let instruction = &program.instructions[instruction_index];
     let output_types = instruction
         .outputs
         .iter()
@@ -2600,17 +2525,17 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @kernel(%arg0: tensor<4x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) -> (tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {}]>] out_shardings=[<@mesh, [{"x"}, {}]>] manual_axes={"x"} (%arg1: tensor<2x4xf32>) {
-                      %1 = stablehlo.transpose %arg1, dims = [1, 0] : (tensor<2x4xf32>) -> tensor<4x2xf32>
-                      %2 = stablehlo.dot_general %1, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<4x2xf32>, tensor<2x4xf32>) -> tensor<4x4xf32>
-                      %3 = stablehlo.negate %2 : tensor<4x4xf32>
-                      %4 = stablehlo.cosine %3 : tensor<4x4xf32>
-                      %5 = stablehlo.sine %4 : tensor<4x4xf32>
                       %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                      %6 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
-                      %7 = stablehlo.multiply %5, %6 : tensor<4x4xf32>
+                      %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
                       %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                      %8 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
-                      %9 = stablehlo.add %7, %8 : tensor<4x4xf32>
+                      %2 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
+                      %3 = stablehlo.transpose %arg1, dims = [1, 0] : (tensor<2x4xf32>) -> tensor<4x2xf32>
+                      %4 = stablehlo.dot_general %3, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<4x2xf32>, tensor<2x4xf32>) -> tensor<4x4xf32>
+                      %5 = stablehlo.negate %4 : tensor<4x4xf32>
+                      %6 = stablehlo.cosine %5 : tensor<4x4xf32>
+                      %7 = stablehlo.sine %6 : tensor<4x4xf32>
+                      %8 = stablehlo.multiply %7, %1 : tensor<4x4xf32>
+                      %9 = stablehlo.add %8, %2 : tensor<4x4xf32>
                       sdy.return %9 : tensor<4x4xf32>
                     } : (tensor<4x4xf32>) -> tensor<8x4xf32>
                     return %0 : tensor<8x4xf32>

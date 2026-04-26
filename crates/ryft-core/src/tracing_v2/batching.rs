@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily},
-    tracing::{Atom, InterpretableOperation, Operation, Program, Traceable, TracingError, Value},
+    tracing::{InterpretableOperation, Operation, Program, Traceable, TracingError, Value},
     tracing_v2::{
         ControlFlowError, ControlFlowValue, Cos, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation, Sin, Tracer,
         jit::trace,
@@ -396,107 +396,11 @@ where
         .into());
     }
 
-    let input_values = input.into_parameters().collect::<Vec<_>>();
-    if input_values.len() != program.input_ids.len() {
-        return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_values.len() });
-    }
-
-    let mut remaining_uses = vec![0usize; program.atoms.len()];
-    for instruction in program.instructions.iter() {
-        for input in instruction.inputs.iter().copied() {
-            let Some(use_count) = remaining_uses.get_mut(input.index) else {
-                return Err(TracingError::UnboundAtomId { id: input });
-            };
-            *use_count += 1;
-        }
-    }
-    for output in program.output_ids.iter().copied() {
-        let Some(use_count) = remaining_uses.get_mut(output.index) else {
-            return Err(TracingError::UnboundAtomId { id: output });
-        };
-        *use_count += 1;
-    }
-
-    let mut values = vec![None; program.atoms.len()];
-    for (atom, value) in program.input_ids.iter().copied().zip(input_values) {
-        let expected_type = program.atoms[atom.index].r#type().into_owned();
-        let got_type = value.logical_type()?;
-        ensure_compatible_array_type(&expected_type, &got_type)?;
-        values[atom.index] = Some(value);
-    }
-
-    for (atom_index, atom) in program.atoms.iter().enumerate() {
-        if remaining_uses[atom_index] == 0 {
-            continue;
-        }
-        if let Atom::Constant(value) = atom {
-            values[atom_index] = Some(ArrayBatch::unbatched(value.clone()));
-        }
-    }
-
-    let max_input_count = program.instructions.iter().map(|instruction| instruction.inputs.len()).max().unwrap_or(0);
-    let mut instruction_inputs = Vec::with_capacity(max_input_count);
-    for instruction in program.instructions.iter() {
-        instruction_inputs.clear();
-        for input in instruction.inputs.iter().copied() {
-            let Some(use_count) = remaining_uses.get_mut(input.index) else {
-                return Err(TracingError::UnboundAtomId { id: input });
-            };
-            if *use_count == 0 {
-                return Err(TracingError::MalformedProgram(
-                    "instruction consumed an already-exhausted atom".to_string(),
-                ));
-            }
-            *use_count -= 1;
-
-            let Some(slot) = values.get_mut(input.index) else {
-                return Err(TracingError::UnboundAtomId { id: input });
-            };
-            let value = if *use_count == 0 {
-                slot.take().ok_or(TracingError::UnboundAtomId { id: input })?
-            } else {
-                slot.as_ref().ok_or(TracingError::UnboundAtomId { id: input })?.clone()
-            };
-            instruction_inputs.push(value);
-        }
-
-        let outputs = instruction.operation.batch(instruction_inputs.as_slice())?;
-        if outputs.len() != instruction.outputs.len() {
-            return Err(TracingError::InvalidOutputCount { expected: instruction.outputs.len(), got: outputs.len() });
-        }
-        for (atom, value) in instruction.outputs.iter().copied().zip(outputs) {
-            let expected_type = program.atoms[atom.index].r#type().into_owned();
-            let got_type = value.logical_type()?;
-            ensure_compatible_array_type(&expected_type, &got_type)?;
-            if remaining_uses[atom.index] != 0 {
-                values[atom.index] = Some(value);
-            }
-        }
-    }
-
-    let mut outputs = Vec::with_capacity(program.output_ids.len());
-    for output in program.output_ids.iter().copied() {
-        let Some(use_count) = remaining_uses.get_mut(output.index) else {
-            return Err(TracingError::UnboundAtomId { id: output });
-        };
-        if *use_count == 0 {
-            return Err(TracingError::MalformedProgram(
-                "program output consumed an already-exhausted atom".to_string(),
-            ));
-        }
-        *use_count -= 1;
-
-        let Some(slot) = values.get_mut(output.index) else {
-            return Err(TracingError::UnboundAtomId { id: output });
-        };
-        let value = if *use_count == 0 {
-            slot.take().ok_or(TracingError::UnboundAtomId { id: output })?
-        } else {
-            slot.as_ref().ok_or(TracingError::UnboundAtomId { id: output })?.clone()
-        };
-        outputs.push(value);
-    }
-
+    let outputs = program.interpret_with(
+        input.into_parameters().collect(),
+        |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
+        |instruction, inputs| instruction.operation.batch(inputs),
+    )?;
     Ok(Output::To::<ArrayBatch<V>>::from_parameters(program.output_structure.clone(), outputs)?)
 }
 
@@ -745,111 +649,20 @@ where
     }
 
     let input_values = input.into_parameters().collect::<Vec<_>>();
-    if input_values.len() != program.input_ids.len() {
-        return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_values.len() });
-    }
     let lane_count = validate_reference_lane_count(input_values.as_slice())?;
 
-    let mut remaining_uses = vec![0usize; program.atoms.len()];
-    for instruction in program.instructions.iter() {
-        for input in instruction.inputs.iter().copied() {
-            let Some(use_count) = remaining_uses.get_mut(input.index) else {
-                return Err(TracingError::UnboundAtomId { id: input });
-            };
-            *use_count += 1;
-        }
-    }
-    for output in program.output_ids.iter().copied() {
-        let Some(use_count) = remaining_uses.get_mut(output.index) else {
-            return Err(TracingError::UnboundAtomId { id: output });
-        };
-        *use_count += 1;
-    }
-
-    let mut values = vec![None; program.atoms.len()];
-    for (atom, value) in program.input_ids.iter().copied().zip(input_values) {
-        let expected_type = program.atoms[atom.index].r#type().into_owned();
-        let got_type = value.r#type().into_owned();
-        ensure_compatible_array_type(&expected_type, &got_type)?;
-        values[atom.index] = Some(value);
-    }
-
-    for (atom_index, atom) in program.atoms.iter().enumerate() {
-        if remaining_uses[atom_index] == 0 {
-            continue;
-        }
-        if let Atom::Constant(value) = atom {
-            values[atom_index] = Some(ReferenceBatch::broadcast(value.clone(), lane_count));
-        }
-    }
-
-    let max_input_count = program.instructions.iter().map(|instruction| instruction.inputs.len()).max().unwrap_or(0);
-    let mut instruction_inputs = Vec::with_capacity(max_input_count);
-    for instruction in program.instructions.iter() {
-        instruction_inputs.clear();
-        for input in instruction.inputs.iter().copied() {
-            let Some(use_count) = remaining_uses.get_mut(input.index) else {
-                return Err(TracingError::UnboundAtomId { id: input });
-            };
-            if *use_count == 0 {
-                return Err(TracingError::MalformedProgram(
-                    "instruction consumed an already-exhausted atom".to_string(),
-                ));
-            }
-            *use_count -= 1;
-
-            let Some(slot) = values.get_mut(input.index) else {
-                return Err(TracingError::UnboundAtomId { id: input });
-            };
-            let value = if *use_count == 0 {
-                slot.take().ok_or(TracingError::UnboundAtomId { id: input })?
-            } else {
-                slot.as_ref().ok_or(TracingError::UnboundAtomId { id: input })?.clone()
-            };
-            instruction_inputs.push(value);
-        }
-
-        let output_types = instruction
-            .outputs
-            .iter()
-            .map(|output| program.atoms[output.index].r#type().into_owned())
-            .collect::<Vec<_>>();
-        let outputs = interpret_reference_instruction(
-            &instruction.operation,
-            instruction_inputs.as_slice(),
-            output_types,
-            lane_count,
-        )?;
-        for (atom, value) in instruction.outputs.iter().copied().zip(outputs) {
-            if remaining_uses[atom.index] != 0 {
-                values[atom.index] = Some(value);
-            }
-        }
-    }
-
-    let mut outputs = Vec::with_capacity(program.output_ids.len());
-    for output in program.output_ids.iter().copied() {
-        let Some(use_count) = remaining_uses.get_mut(output.index) else {
-            return Err(TracingError::UnboundAtomId { id: output });
-        };
-        if *use_count == 0 {
-            return Err(TracingError::MalformedProgram(
-                "program output consumed an already-exhausted atom".to_string(),
-            ));
-        }
-        *use_count -= 1;
-
-        let Some(slot) = values.get_mut(output.index) else {
-            return Err(TracingError::UnboundAtomId { id: output });
-        };
-        let value = if *use_count == 0 {
-            slot.take().ok_or(TracingError::UnboundAtomId { id: output })?
-        } else {
-            slot.as_ref().ok_or(TracingError::UnboundAtomId { id: output })?.clone()
-        };
-        outputs.push(value);
-    }
-
+    let outputs = program.interpret_with(
+        input_values,
+        |_, constant| Ok(ReferenceBatch::broadcast(constant.clone(), lane_count)),
+        |instruction, inputs| {
+            let output_types = instruction
+                .outputs
+                .iter()
+                .map(|output| program.atoms[output.index].r#type().into_owned())
+                .collect::<Vec<_>>();
+            interpret_reference_instruction(&instruction.operation, inputs, output_types, lane_count)
+        },
+    )?;
     Ok(Output::To::<ReferenceBatch<V>>::from_parameters(program.output_structure.clone(), outputs)?)
 }
 
