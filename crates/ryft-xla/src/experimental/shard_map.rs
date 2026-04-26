@@ -533,13 +533,11 @@ where
         }
     }
 
-    let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Input, Output>::new(
-        program.input_structure.clone(),
-    );
+    let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
     builder.atoms = atoms;
     builder.input_ids = program.input_ids.clone();
     builder.instructions = instructions;
-    builder.build(program.output_ids.clone(), program.output_structure.clone())
+    builder.build(program.output_ids.clone(), program.input_structure.clone(), program.output_structure.clone())
 }
 
 pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
@@ -1178,18 +1176,12 @@ impl FlatTracedShardMap {
         let input_count = traced.program.input_ids.len();
         let output_count = traced.program.output_ids.len();
         let Program { atoms, input_ids, output_ids, instructions, .. } = traced.program.clone();
-        let mut builder = ProgramBuilder::<
-            ArrayType,
-            ShardMapTensor,
-            XlaPrimitiveOperation,
-            Vec<ShardMapTensor>,
-            Vec<ShardMapTensor>,
-        >::new(vec![Placeholder; input_count]);
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
         builder.atoms = atoms;
         builder.input_ids = input_ids;
         builder.instructions = instructions;
         let program = builder
-            .build(output_ids, vec![Placeholder; output_count])
+            .build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])
             .expect("retyping a traced shard_map program should preserve valid program metadata");
         Self::from_parts(
             traced.shard_map.clone(),

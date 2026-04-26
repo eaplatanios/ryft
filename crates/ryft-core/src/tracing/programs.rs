@@ -356,7 +356,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             Input: Parameterized<V>,
             Output: Parameterized<V>,
         >(
-            program_builder: &mut ProgramBuilder<T, V, O, Input, Output>,
+            program_builder: &mut ProgramBuilder<T, V, O>,
             atom_id_mapping: &mut HashMap<AtomId, AtomId>,
             atom_id: AtomId,
             program: &Program<T, V, O, Input, Output>,
@@ -417,7 +417,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             mark_atom_as_live(self, output, atom_is_live.as_mut_slice(), parent_instructions.as_slice());
         }
 
-        let mut program_builder = ProgramBuilder::new(self.input_structure.clone());
+        let mut program_builder = ProgramBuilder::new();
         let mut atom_id_mapping = HashMap::new();
         for input_id in self.input_ids.iter().copied() {
             let input = self.atoms.get(input_id.index).ok_or(TracingError::UnboundAtomId { id: input_id })?;
@@ -442,7 +442,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        program_builder.build(output_ids, self.output_structure.clone())
+        program_builder.build(output_ids, self.input_structure.clone(), self.output_structure.clone())
     }
 
     /// Interprets/executes this [`Program`] with the provided input. This is the main replay entry point for staged
@@ -645,13 +645,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
 /// Builder for [`Program`]s that carries for the most part the same information as the [`Program`] that is being built,
 /// but also carries an optional [`TracingError`] that can be used to signal a failure during program construction.
 #[derive(Clone, Debug)]
-pub struct ProgramBuilder<
-    T: Type,
-    V: Typed<T> + Parameter,
-    O: Clone + Operation<T>,
-    Input: Parameterized<V> = Vec<V>,
-    Output: Parameterized<V> = Vec<V>,
-> {
+pub struct ProgramBuilder<T: Type, V: Typed<T> + Parameter, O: Clone + Operation<T>> {
     /// [`Atom`]s contained in the [`Program`] that is being built, in the order in which they will be evaluated.
     pub atoms: Vec<Atom<T, V>>,
 
@@ -661,30 +655,15 @@ pub struct ProgramBuilder<
     /// Ordered sequence of [`Instruction`]s that make up the computational graph of the [`Program`] being built.
     pub instructions: Vec<Instruction<O>>,
 
-    /// [`Parameter`] structure that can be used to map flat lists of inputs to structured `Input` values.
-    pub input_structure: Input::ParameterStructure,
-
     /// Optional [`TracingError`] encountered during program construction that will be propagated via [`Self::build`].
     pub error: Option<TracingError>,
-
-    /// [`PhantomData`] marker that ties this [`ProgramBuilder`] to its structured `Input` and `Output` types.
-    marker: PhantomData<fn(Input) -> Output>,
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
-    ProgramBuilder<T, V, O, Input, Output>
-{
-    /// Creates a new [`ProgramBuilder`] with the provided input type and structure.
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> {
+    /// Creates a new [`ProgramBuilder`].
     #[inline]
-    pub fn new(input_structure: Input::ParameterStructure) -> Self {
-        Self {
-            atoms: Vec::new(),
-            input_ids: Vec::new(),
-            instructions: Vec::new(),
-            input_structure,
-            error: None,
-            marker: PhantomData,
-        }
+    pub fn new() -> Self {
+        Self { atoms: Vec::new(), input_ids: Vec::new(), instructions: Vec::new(), error: None }
     }
 
     /// Adds an input [`Atom`] to the [`Program`] that is being built with the provided [`Type`].
@@ -730,30 +709,12 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         Ok(self.instructions.last().unwrap().outputs.as_slice())
     }
 
-    /// Retypes this builder to a different final input/output structure.
-    ///
-    /// This is useful for tracing scopes whose live tracer values only need access to the flat
-    /// builder state while the final [`Program`] needs richer structured input and output metadata.
+    /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided input and output structures.
     #[inline]
-    pub fn into_typed<TypedInput: Parameterized<V>, TypedOutput: Parameterized<V>>(
-        self,
-        input_structure: TypedInput::ParameterStructure,
-    ) -> ProgramBuilder<T, V, O, TypedInput, TypedOutput> {
-        ProgramBuilder {
-            atoms: self.atoms,
-            input_ids: self.input_ids,
-            instructions: self.instructions,
-            input_structure,
-            error: self.error,
-            marker: PhantomData,
-        }
-    }
-
-    /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided output structure.
-    #[inline]
-    pub fn build(
+    pub fn build<Input: Parameterized<V>, Output: Parameterized<V>>(
         self,
         output_ids: Vec<AtomId>,
+        input_structure: Input::ParameterStructure,
         output_structure: Output::ParameterStructure,
     ) -> Result<Program<T, V, O, Input, Output>, TracingError> {
         if let Some(error) = self.error {
@@ -764,23 +725,16 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             input_ids: self.input_ids,
             instructions: self.instructions,
             output_ids,
-            input_structure: self.input_structure,
+            input_structure,
             output_structure,
             marker: PhantomData,
         })
     }
 }
 
-impl<
-    T: Type,
-    V: Traceable<T>,
-    O: Clone + Operation<T>,
-    Input: Parameterized<V, ParameterStructure: Default>,
-    Output: Parameterized<V>,
-> Default for ProgramBuilder<T, V, O, Input, Output>
-{
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> Default for ProgramBuilder<T, V, O> {
     fn default() -> Self {
-        Self::new(Default::default())
+        Self::new()
     }
 }
 
@@ -845,14 +799,13 @@ mod tests {
 
     #[test]
     fn program_builder_tracks_atom_kinds_and_executes() {
-        let mut builder =
-            ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>, (f64, f64), f64>::new((Placeholder, Placeholder));
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(2.0f64.r#type().into_owned());
         let y = builder.add_input(3.0f64.r#type().into_owned());
         let two = builder.add_constant(2.0f64);
         let scaled_x = builder.add_instruction(PrimitiveOperation::Scale { factor: 2.0 }, vec![x]).unwrap()[0];
         let sum = builder.add_instruction(PrimitiveOperation::Add, vec![scaled_x, y]).unwrap()[0];
-        let program = builder.build(vec![sum], Placeholder).unwrap();
+        let program = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder).unwrap();
 
         assert!(matches!(program.atoms.get(x.index), Some(Atom::Variable(_))));
         assert!(matches!(program.atoms.get(two.index), Some(Atom::Constant(_))));
@@ -872,10 +825,10 @@ mod tests {
 
     #[test]
     fn program_display_keeps_long_metadata_multiline() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, LongMetadataOperation, f64, f64>::new(Placeholder);
+        let mut builder = ProgramBuilder::<ArrayType, f64, LongMetadataOperation>::new();
         let input = builder.add_input(2.0f64.r#type().into_owned());
         let output = builder.add_instruction(LongMetadataOperation, vec![input]).unwrap()[0];
-        let program = builder.build(vec![output], Placeholder).unwrap();
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
         let expected = format!(
             indoc! {"
                 lambda %0:f64[] .
@@ -892,24 +845,25 @@ mod tests {
 
     #[test]
     fn program_interpret_preserves_duplicate_outputs() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>, f64, (f64, f64)>::new(Placeholder);
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(1.0f64.r#type().into_owned());
         let doubled = builder.add_instruction(PrimitiveOperation::Add, vec![x, x]).unwrap()[0];
-        let program = builder.build(vec![doubled, doubled], (Placeholder, Placeholder)).unwrap();
+        let program = builder
+            .build::<f64, (f64, f64)>(vec![doubled, doubled], Placeholder, (Placeholder, Placeholder))
+            .unwrap();
 
         assert_eq!(program.interpret(2.0f64).unwrap(), (4.0f64, 4.0f64));
     }
 
     #[test]
     fn program_reconstructs_structured_input_and_output_atoms() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>, (f64, f64), (f64, f64)>::new((
-            Placeholder,
-            Placeholder,
-        ));
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(1.0f64.r#type().into_owned());
         let y = builder.add_input(2.0f64.r#type().into_owned());
         let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, y]).unwrap()[0];
-        let program = builder.build(vec![x, sum], (Placeholder, Placeholder)).unwrap();
+        let program = builder
+            .build::<(f64, f64), (f64, f64)>(vec![x, sum], (Placeholder, Placeholder), (Placeholder, Placeholder))
+            .unwrap();
 
         let input = program.input().unwrap();
         assert!(matches!(input.0, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
@@ -922,10 +876,9 @@ mod tests {
 
     #[test]
     fn program_interpret_rejects_mismatched_parameter_structures() {
-        let mut builder =
-            ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>, Vec<f64>, f64>::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(1.0f64.r#type().into_owned());
-        let program = builder.build(vec![x], Placeholder).unwrap();
+        let program = builder.build::<Vec<f64>, f64>(vec![x], vec![Placeholder], Placeholder).unwrap();
 
         assert!(matches!(
             program.interpret(vec![1.0f64, 2.0f64]),
@@ -939,11 +892,11 @@ mod tests {
 
     #[test]
     fn program_display_uses_typed_jaxpr_like_rendering() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>::new(Placeholder);
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(1.0f64.r#type().into_owned());
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
-        let program = builder.build(vec![sum], Placeholder).unwrap();
+        let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder).unwrap();
 
         assert_eq!(
             program.to_string(),
@@ -959,7 +912,7 @@ mod tests {
 
     #[test]
     fn program_builder_rejects_unbound_inputs() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new(Vec::new());
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let result = builder.add_instruction(PrimitiveOperation::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
         assert!(matches!(
             result,
@@ -970,18 +923,18 @@ mod tests {
 
     #[test]
     fn program_builder_build_returns_stored_error() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>::new(Placeholder);
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         builder.error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
 
         assert!(matches!(
-            builder.build(Vec::new(), Placeholder),
+            builder.build::<f64, f64>(Vec::new(), Placeholder, Placeholder),
             Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
         ));
     }
 
     #[test]
     fn program_builder_tracks_only_types_for_variable_atoms() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>::new(Placeholder);
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(2.0f64.r#type().into_owned());
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
@@ -992,7 +945,7 @@ mod tests {
         assert!(matches!(builder.atoms.get(three.index), Some(Atom::Constant(value)) if *value == 3.0));
         assert!(matches!(builder.atoms.get(sum.index), Some(Atom::Variable(_))));
 
-        let program = builder.build(vec![sum], Placeholder).unwrap();
+        let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder).unwrap();
         assert!(
             matches!(program.atoms.get(x.index), Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64))
         );

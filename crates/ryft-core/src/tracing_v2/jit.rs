@@ -192,7 +192,8 @@ impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> Tracer<'engine,
         let input_atoms = inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>()?;
         let output_states = match builder.borrow_mut().add_instruction(op, input_atoms) {
             Ok(outputs) => outputs
-                .into_iter()
+                .iter()
+                .copied()
                 .zip(output_types)
                 .map(|(atom, r#type)| TracerState::Live(atom, r#type))
                 .collect::<Vec<_>>(),
@@ -340,7 +341,7 @@ where
     F: FnOnce(Input::To<Tracer<'engine, E, O>>) -> Result<Output::To<Tracer<'engine, E, O>>, TracingError>,
 {
     let input_structure = input_types.parameter_structure();
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, E::Value, O>::new(Vec::new())));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, E::Value, O>::new()));
     let traced_input = Input::To::<Tracer<'engine, E, O>>::from_parameters(
         input_types.parameter_structure(),
         input_types.into_parameters().map(|r#type| {
@@ -369,9 +370,8 @@ where
         Ok(builder) => builder.into_inner(),
         Err(_) => return Err(TracingError::EscapedProgramBuilder),
     };
-    let program = builder
-        .into_typed::<Input::To<E::Value>, Output::To<E::Value>>(input_structure)
-        .build(outputs, output_structure)?;
+    let program =
+        builder.build::<Input::To<E::Value>, Output::To<E::Value>>(outputs, input_structure, output_structure)?;
     Ok((output_types, program))
 }
 
@@ -446,11 +446,11 @@ where
     let output_structure = output_structure
         .expect("interpret_and_trace should record the staged output structure before returning successfully");
     let Program { atoms, input_ids, output_ids, instructions, .. } = flat_program;
-    let mut builder = ProgramBuilder::<E::Type, E::Value, O, Input, Output>::new(input_structure);
+    let mut builder = ProgramBuilder::<E::Type, E::Value, O>::new();
     builder.atoms = atoms;
     builder.input_ids = input_ids;
     builder.instructions = instructions;
-    let program = builder.build(output_ids, output_structure)?;
+    let program = builder.build::<Input, Output>(output_ids, input_structure, output_structure)?;
     let program = program.simplified()?;
     let concrete_input = Input::from_parameters(program.input_structure.clone(), input_values)?;
     Ok((program.interpret(concrete_input)?, program))
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn jit_tracer_zero_like_adds_constant_atoms() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new(Vec::new())));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let atom = builder.borrow_mut().add_input(3.0f64.r#type().into_owned());
         let engine = ArrayScalarEngine::<f64>::new();
         let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_engine(atom, builder, &engine);
@@ -501,13 +501,8 @@ mod tests {
         let zero_atom = zero.state.live_atom().expect("zero-like tracer should remain live");
         assert!(zero_atom > atom);
 
-        let program = zero
-            .builder
-            .borrow()
-            .clone()
-            .into_typed::<f64, f64>(Placeholder)
-            .build(vec![zero_atom], Placeholder)
-            .unwrap();
+        let program =
+            zero.builder.borrow().clone().build::<f64, f64>(vec![zero_atom], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -521,7 +516,7 @@ mod tests {
 
     #[test]
     fn traced_live_tracer_type_borrows_cached_type() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new(Vec::new())));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let input_type = ArrayType::scalar(crate::types::DataType::F64);
         let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = ArrayScalarEngine::<f64>::new();
@@ -534,10 +529,8 @@ mod tests {
 
     #[test]
     fn traced_apply_staged_op_rejects_mismatched_program_builders() {
-        let builder_a =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new(Vec::new())));
-        let builder_b =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new(Vec::new())));
+        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
+        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let atom_a = builder_a.borrow_mut().add_input(1.0f64.r#type().into_owned());
         let atom_b = builder_b.borrow_mut().add_input(2.0f64.r#type().into_owned());
         let engine = TaggedEngine { id: 1 };
@@ -552,7 +545,7 @@ mod tests {
 
     #[test]
     fn traced_apply_staged_op_rejects_mismatched_engines() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new(Vec::new())));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let atom_a = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
         let atom_b = builder.borrow_mut().add_input(2.0f64.r#type().into_owned());
         let engine_a = TaggedEngine { id: 1 };
@@ -568,7 +561,7 @@ mod tests {
 
     #[test]
     fn traced_apply_staged_op_returns_poisoned_tracers_after_builder_failure() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new(Vec::new())));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
         builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
         let engine = TaggedEngine { id: 1 };
@@ -586,7 +579,7 @@ mod tests {
 
     #[test]
     fn traced_apply_staged_op_caches_live_output_types() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new(Vec::new())));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let input_type = ArrayType::scalar(crate::types::DataType::F64);
         let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = TaggedEngine { id: 1 };
@@ -606,7 +599,7 @@ mod tests {
 
     #[test]
     fn poisoned_tracer_atom_id_returns_poisoned_tracer_error() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new(Vec::new())));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let engine = TaggedEngine { id: 1 };
         let tracer = Tracer {
             state: TracerState::Poison(ArrayType::scalar(crate::types::DataType::F64)),

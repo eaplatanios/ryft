@@ -182,10 +182,8 @@ mod tests {
 
     #[test]
     fn linear_term_apply_staged_op_rejects_mismatched_program_builders() {
-        let builder_a =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new(Vec::new())));
-        let builder_b =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new(Vec::new())));
+        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
+        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
         let atom_a = builder_a.borrow_mut().add_input(1.0f64.r#type().into_owned());
         let atom_b = builder_b.borrow_mut().add_input(2.0f64.r#type().into_owned());
         let term_a = LinearTerm::from_staged_parts(atom_a, builder_a.clone());

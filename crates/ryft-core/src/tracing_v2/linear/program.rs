@@ -110,7 +110,7 @@ where
     if input_primals.len() != program.input_ids.len() {
         return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_primals.len() });
     }
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::LinearOperation>::new(Vec::new())));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::LinearOperation>::new()));
     let mut primals: Vec<Option<V>> = vec![None; program.atoms.len()];
     let mut tangents: Vec<Option<LinearTerm<ArrayType, V, E::LinearOperation>>> = vec![None; program.atoms.len()];
     for (input_atom, input_primal) in program.input_ids.iter().copied().zip(input_primals.into_iter()) {
@@ -173,8 +173,7 @@ where
         }
     };
     builder
-        .into_typed::<Input, Output>(program.input_structure.clone())
-        .build(output_tangents, program.output_structure.clone())?
+        .build(output_tangents, program.input_structure.clone(), program.output_structure.clone())?
         .simplified()
 }
 
@@ -217,8 +216,8 @@ where
     Output: Parameterized<V, ParameterStructure: Clone>,
     O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
-    fn accumulate<V, O, BuilderInput, BuilderOutput>(
-        builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O, BuilderInput, BuilderOutput>>>,
+    fn accumulate<V, O>(
+        builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
         adjoints: &mut [Option<AtomId>],
         atom: AtomId,
         contribution: AtomId,
@@ -226,8 +225,6 @@ where
     where
         V: Traceable<ArrayType>,
         O: LinearAddOperation<ArrayType, V> + Operation<ArrayType> + Clone,
-        BuilderInput: Parameterized<V>,
-        BuilderOutput: Parameterized<V>,
     {
         adjoints[atom.index] = Some(match adjoints[atom.index] {
             Some(existing) => {
@@ -246,7 +243,7 @@ where
         Ok(())
     }
 
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, O>::new(Vec::new())));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, O>::new()));
     let mut output_cotangent_inputs = Vec::with_capacity(program.output_ids.len());
     for (output_index, output) in program.output_ids.iter().enumerate() {
         let output_atom = program.atoms.get(output.index).ok_or(TracingError::UnboundAtomId { id: *output })?;
@@ -301,8 +298,7 @@ where
         }
     };
     builder
-        .into_typed::<Output, Input>(program.output_structure.clone())
-        .build(outputs, program.input_structure.clone())?
+        .build(outputs, program.output_structure.clone(), program.input_structure.clone())?
         .simplified()
 }
 

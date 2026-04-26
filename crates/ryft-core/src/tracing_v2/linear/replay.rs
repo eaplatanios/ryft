@@ -126,7 +126,7 @@ where
         ArrayType,
         Tracer<'engine, E, O>,
         LinearPrimitiveOperation<Tracer<'engine, E, O>>,
-    >::new(Vec::new())));
+    >::new()));
     let traced_input = primals
         .into_iter()
         .map(|primal| {
@@ -145,8 +145,7 @@ where
         }
     };
     let program = builder
-        .into_typed::<Vec<Tracer<'engine, E, O>>, Vec<Tracer<'engine, E, O>>>(vec![Placeholder; input_count])
-        .build(tangent_outputs, vec![Placeholder; primal_outputs.len()])?
+        .build(tangent_outputs, vec![Placeholder; input_count], vec![Placeholder; primal_outputs.len()])?
         .simplified()?;
     Ok((primal_outputs.clone(), program))
 }

@@ -26,11 +26,11 @@ pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
 }
 
 pub(crate) fn assert_reference_program_rendering() {
-    let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>::new(Placeholder);
+    let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
     let x = builder.add_input(1.0f64.r#type().into_owned());
     let three = builder.add_constant(3.0f64);
     let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
-    let program = builder.build(vec![sum], Placeholder).unwrap();
+    let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder).unwrap();
 
     assert_eq!(
         program.to_string(),

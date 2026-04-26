@@ -132,7 +132,7 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///   use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, LinearTerm, ProgramBuilder, ScaleOperation};
 ///
 ///   let builder =
-///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new(Vec::new())));
+///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
 ///   let cotangent_atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
@@ -148,7 +148,7 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///   use ryft_core::tracing_v2::{AddOperation, LinearOperation, LinearPrimitiveOperation, LinearTerm, ProgramBuilder};
 ///
 ///   let builder =
-///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new(Vec::new())));
+///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
 ///   let cotangent_atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
@@ -168,9 +168,7 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///   };
 ///
 ///   let builder = Rc::new(RefCell::new(
-///       ProgramBuilder::<ArrayType, ndarray::Array2<f64>, LinearPrimitiveOperation<ndarray::Array2<f64>>>::new(
-///           Vec::new(),
-///       ),
+///       ProgramBuilder::<ArrayType, ndarray::Array2<f64>, LinearPrimitiveOperation<ndarray::Array2<f64>>>::new(),
 ///   ));
 ///   let cotangent_atom = builder.borrow_mut().add_input(arr2(&[[1.0, 2.0], [3.0, 4.0]]).r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());

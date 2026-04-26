@@ -16,7 +16,7 @@ where
     LinearPrimitiveOperation<Tracer<'engine, E, O>>: CoreLinearProgramOperation<Tracer<'engine, E, O>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
-    let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, O>::new(Vec::new())));
+    let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, O>::new()));
     let traced_primals = traced_program
         .input_ids
         .iter()
@@ -44,8 +44,7 @@ where
         }
     };
     traced_primal_builder
-        .into_typed::<Input, Input>(input_structure.clone())
-        .build(gradient_output_atoms, input_structure)?
+        .build(gradient_output_atoms, input_structure.clone(), input_structure)?
         .simplified()
 }
 
@@ -284,7 +283,7 @@ where
 
     // Build the outer program.
     let input_atoms = program.input_ids.as_slice();
-    let mut outer_builder: ProgramBuilder<ArrayType, V, O> = ProgramBuilder::new(Vec::new());
+    let mut outer_builder: ProgramBuilder<ArrayType, V, O> = ProgramBuilder::new();
 
     // Map from original atom IDs to outer-program atom IDs.
     let mut atom_mapping: Vec<Option<AtomId>> = vec![None; program.atoms.len()];
@@ -402,9 +401,11 @@ where
         .map(|&orig_atom| atom_mapping[orig_atom.index].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
         .collect::<Result<_, _>>()?;
 
-    let outer_program = outer_builder
-        .into_typed::<Vec<V>, Vec<V>>(flat_leaf_parameter_structure(input_atoms.len()))
-        .build(outer_outputs, flat_leaf_parameter_structure(program.output_ids.len()))?;
+    let outer_program = outer_builder.build(
+        outer_outputs,
+        flat_leaf_parameter_structure(input_atoms.len()),
+        flat_leaf_parameter_structure(program.output_ids.len()),
+    )?;
     Ok(outer_program)
 }
 
@@ -444,7 +445,7 @@ where
     let body = FlatTracedRematerialize::from_parts(input_types.clone(), output_types.clone(), program.clone());
     let remat_op = RematerializeOperation::new(body);
 
-    let mut outer_builder: ProgramBuilder<ArrayType, V, O> = ProgramBuilder::new(Vec::new());
+    let mut outer_builder: ProgramBuilder<ArrayType, V, O> = ProgramBuilder::new();
     let outer_inputs: Vec<AtomId> =
         input_types.iter().cloned().map(|input_type| outer_builder.add_input(input_type)).collect();
 
@@ -455,9 +456,11 @@ where
         outputs: outer_outputs.clone(),
     });
 
-    let outer_program = outer_builder
-        .into_typed::<Vec<V>, Vec<V>>(flat_leaf_parameter_structure(outer_inputs.len()))
-        .build(outer_outputs, flat_leaf_parameter_structure(program.output_ids.len()))?;
+    let outer_program = outer_builder.build(
+        outer_outputs,
+        flat_leaf_parameter_structure(outer_inputs.len()),
+        flat_leaf_parameter_structure(program.output_ids.len()),
+    )?;
     Ok(outer_program)
 }
 
@@ -472,7 +475,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone + Operation<Array
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
 ) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TracingError> {
-    let mut sub_builder: ProgramBuilder<ArrayType, V, O> = ProgramBuilder::new(Vec::new());
+    let mut sub_builder: ProgramBuilder<ArrayType, V, O> = ProgramBuilder::new();
 
     // Map from original atom IDs to sub-program atom IDs.
     let mut sub_atom_mapping: std::collections::HashMap<AtomId, AtomId> = std::collections::HashMap::new();
@@ -545,9 +548,11 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone + Operation<Array
         })
         .collect::<Result<_, _>>()?;
 
-    let sub_program = sub_builder
-        .into_typed::<Vec<V>, Vec<V>>(flat_leaf_parameter_structure(boundary_input_atoms.len()))
-        .build(sub_outputs, flat_leaf_parameter_structure(boundary_output_atoms.len()))?;
+    let sub_program = sub_builder.build(
+        sub_outputs,
+        flat_leaf_parameter_structure(boundary_input_atoms.len()),
+        flat_leaf_parameter_structure(boundary_output_atoms.len()),
+    )?;
     Ok(sub_program)
 }
 
@@ -562,10 +567,9 @@ mod tests {
     #[test]
     fn test_build_traced_gradient_program_handles_nullary_scalar_programs() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let mut builder =
-            ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>, Vec<f64>, Vec<f64>>::new(Vec::new());
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let output_atom = builder.add_constant(3.0f64);
-        let traced_program = builder.build(vec![output_atom], vec![Placeholder]).unwrap();
+        let traced_program = builder.build(vec![output_atom], Vec::<Placeholder>::new(), vec![Placeholder]).unwrap();
 
         let gradient_program = build_traced_gradient_program(&engine, (), &traced_program).unwrap();
 

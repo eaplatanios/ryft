@@ -110,12 +110,17 @@ where
         crate::tracing_v2::jit::trace_with_operation::<E, O, _, _, _>(engine, function, input_types)?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();
     let Program { atoms, input_ids, output_ids, instructions, .. } = traced_program;
-    let mut builder =
-        ProgramBuilder::<ArrayType, V, O, Vec<V>, Vec<V>>::new(flat_leaf_parameter_structure(input_leaf_count));
+    let mut builder = ProgramBuilder::<ArrayType, V, O>::new();
     builder.atoms = atoms;
     builder.input_ids = input_ids;
     builder.instructions = instructions;
-    let traced_program = builder.build(output_ids, flat_leaf_parameter_structure(output_leaf_count))?.simplified()?;
+    let traced_program = builder
+        .build(
+            output_ids,
+            flat_leaf_parameter_structure(input_leaf_count),
+            flat_leaf_parameter_structure(output_leaf_count),
+        )?
+        .simplified()?;
     Ok((output_types, traced_program))
 }
 
@@ -407,7 +412,7 @@ mod tests {
     fn linearize_program_does_not_replay_the_forward_program_to_recover_representatives() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp)
             .with_jvp_rule::<ArrayScalarEngine<f64>, _>(PanicReplayOp);
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>::new(Placeholder);
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let input = builder.add_input(3.0f64.r#type().into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.instructions.push(Instruction {
@@ -416,7 +421,7 @@ mod tests {
             outputs: vec![output_atom],
         });
         let output = vec![output_atom];
-        let program = builder.build(output, Placeholder).unwrap();
+        let program = builder.build::<f64, f64>(output, Placeholder, Placeholder).unwrap();
 
         let engine = ArrayScalarEngine::<f64>::new();
         let pushforward = linearize_program(&engine, &program, vec![3.0f64]).unwrap();
@@ -429,7 +434,7 @@ mod tests {
             CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_transpose_rule(PanicReplayOp),
         )
         .unwrap();
-        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>, f64, f64>::new(Placeholder);
+        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new();
         let input = builder.add_input(0.0f64.r#type().into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.instructions.push(Instruction {
@@ -438,7 +443,7 @@ mod tests {
             outputs: vec![output_atom],
         });
         let output = vec![output_atom];
-        let program = builder.build(output, Placeholder).unwrap();
+        let program = builder.build::<f64, f64>(output, Placeholder, Placeholder).unwrap();
         let pushforward = program;
 
         let pullback =
@@ -464,10 +469,10 @@ mod tests {
 
     #[test]
     fn transpose_linear_program_propagates_engine_zero_errors() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>, f64, f64>::new(Placeholder);
+        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new();
         builder.add_input(0.0f64.r#type().into_owned());
         let output = builder.add_constant(1.0f64);
-        let program = builder.build(vec![output], Placeholder).unwrap();
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
 
         assert!(matches!(
             super::program::transpose_linear_program(&FailingZeroEngine, &program),

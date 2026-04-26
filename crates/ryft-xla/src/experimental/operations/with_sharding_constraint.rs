@@ -476,7 +476,7 @@ mod tests {
 
         let transpose_builder =
             Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ShardMapTensor>>::new(Vec::new()),
+                ProgramBuilder::<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ShardMapTensor>>::new(),
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
@@ -498,8 +498,7 @@ mod tests {
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
         let transpose_program = transpose_builder
-            .into_typed::<ShardMapTensor, ShardMapTensor>(Placeholder)
-            .build(vec![contribution_atom], Placeholder)
+            .build::<ShardMapTensor, ShardMapTensor>(vec![contribution_atom], Placeholder, Placeholder)
             .unwrap();
         assert_eq!(
             transpose_program.to_string(),
@@ -516,7 +515,7 @@ mod tests {
 
         let transpose_builder =
             Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>::new(Vec::new()),
+                ProgramBuilder::<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>::new(),
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
@@ -538,8 +537,7 @@ mod tests {
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
         let transpose_program = transpose_builder
-            .into_typed::<ShardMapTracer, ShardMapTracer>(Placeholder)
-            .build(vec![contribution_atom], Placeholder)
+            .build::<ShardMapTracer, ShardMapTracer>(vec![contribution_atom], Placeholder, Placeholder)
             .unwrap();
         assert_eq!(
             transpose_program.to_string(),

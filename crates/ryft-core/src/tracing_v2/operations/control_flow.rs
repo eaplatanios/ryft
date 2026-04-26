@@ -1044,68 +1044,68 @@ mod tests {
     }
 
     fn add_one_branch() -> FlatProgram<TestValue, TestOperation> {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let one = builder.add_constant(TestValue::Number(1.0));
         let output = builder.add_instruction(TestOperation::Add, vec![input, one]).unwrap()[0];
-        builder.build(vec![output], vec![Placeholder]).unwrap()
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     fn subtract_one_branch() -> FlatProgram<TestValue, TestOperation> {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let one = builder.add_constant(TestValue::Number(1.0));
         let output = builder.add_instruction(TestOperation::Sub, vec![input, one]).unwrap()[0];
-        builder.build(vec![output], vec![Placeholder]).unwrap()
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     fn identity_primitive_branch() -> FlatProgram<TestValue, PrimitiveOperation<TestValue>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, PrimitiveOperation<TestValue>>::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, PrimitiveOperation<TestValue>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        builder.build(vec![input], vec![Placeholder]).unwrap()
+        builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     fn scalar_scale_branch(factor: f64) -> FlatProgram<f64, PrimitiveOperation<f64>> {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(PrimitiveOperation::Scale { factor }, vec![input]).unwrap()[0];
-        builder.build(vec![output], vec![Placeholder]).unwrap()
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     fn custom_linear_identity_branch() -> FlatProgram<TestValue, TestLinearOperation> {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        builder.build(vec![input], vec![Placeholder]).unwrap()
+        builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     fn custom_scale_branch(factor: f64) -> FlatProgram<TestValue, TestDifferentiableOperation> {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(TestDifferentiableOperation::Scale { factor: TestValue::Number(factor) }, vec![input])
             .unwrap()[0];
-        builder.build(vec![output], vec![Placeholder]).unwrap()
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     fn custom_while_condition_branch() -> FlatProgram<TestValue, TestDifferentiableOperation> {
-        let mut builder =
-            ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new(vec![Placeholder, Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new();
         let counter = builder.add_input(ArrayType::scalar(DataType::F64));
         let _value = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(TestDifferentiableOperation::IsPositive, vec![counter]).unwrap()[0];
-        builder.build(vec![output], vec![Placeholder]).unwrap()
+        builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
     fn custom_while_body_branch() -> FlatProgram<TestValue, TestDifferentiableOperation> {
-        let mut builder =
-            ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new(vec![Placeholder, Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new();
         let counter = builder.add_input(ArrayType::scalar(DataType::F64));
         let value = builder.add_input(ArrayType::scalar(DataType::F64));
         let next_counter = builder.add_instruction(TestDifferentiableOperation::SubtractOne, vec![counter]).unwrap()[0];
         let next_value = builder
             .add_instruction(TestDifferentiableOperation::Scale { factor: TestValue::Number(2.0) }, vec![value])
             .unwrap()[0];
-        builder.build(vec![next_counter, next_value], vec![Placeholder, Placeholder]).unwrap()
+        builder
+            .build(vec![next_counter, next_value], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
+            .unwrap()
     }
 
     #[test]
@@ -1129,17 +1129,15 @@ mod tests {
         let condition =
             ConditionOperation::new(ArrayType::scalar(DataType::Boolean), add_one_branch(), subtract_one_branch())
                 .unwrap();
-        let mut builder =
-            ProgramBuilder::<ArrayType, TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>::new(vec![
-                Placeholder,
-                Placeholder,
-            ]);
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(TestOperation::Condition(Box::new(condition)), vec![predicate, input])
             .unwrap()[0];
-        let program = builder.build(vec![output], vec![Placeholder]).unwrap();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
 
         assert_eq!(
             program.to_string(),
@@ -1178,21 +1176,25 @@ mod tests {
 
     #[test]
     fn test_condition_rejects_branch_output_mismatch() {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(TestOperation::IsPositive, vec![input]).unwrap()[0];
-        let bool_branch = builder.build(vec![output], vec![Placeholder]).unwrap();
+        let bool_branch = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
 
         assert!(ConditionOperation::new(ArrayType::scalar(DataType::Boolean), add_one_branch(), bool_branch).is_err());
     }
 
     #[test]
     fn test_while_interprets_until_condition_is_false() {
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new(vec![Placeholder]);
+        let mut condition_builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let condition_input = condition_builder.add_input(ArrayType::scalar(DataType::F64));
         let condition_output =
             condition_builder.add_instruction(TestOperation::IsPositive, vec![condition_input]).unwrap()[0];
-        let condition = condition_builder.build(vec![condition_output], vec![Placeholder]).unwrap();
+        let condition = condition_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![condition_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
         let while_operation = WhileOperation::new(condition, subtract_one_branch()).unwrap();
 
         assert_eq!(while_operation.interpret(&[TestValue::Number(3.0)]), Ok(vec![TestValue::Number(0.0)]),);
@@ -1200,19 +1202,20 @@ mod tests {
 
     #[test]
     fn test_while_program_rendering_includes_condition_and_body() {
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new(vec![Placeholder]);
+        let mut condition_builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let condition_input = condition_builder.add_input(ArrayType::scalar(DataType::F64));
         let condition_output =
             condition_builder.add_instruction(TestOperation::IsPositive, vec![condition_input]).unwrap()[0];
-        let condition = condition_builder.build(vec![condition_output], vec![Placeholder]).unwrap();
+        let condition = condition_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![condition_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
         let while_operation = WhileOperation::new(condition, subtract_one_branch()).unwrap();
-        let mut builder =
-            ProgramBuilder::<ArrayType, TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>::new(vec![
-                Placeholder,
-            ]);
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(TestOperation::While(Box::new(while_operation)), vec![input]).unwrap()[0];
-        let program = builder.build(vec![output], vec![Placeholder]).unwrap();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
 
         assert_eq!(
             program.to_string(),
@@ -1259,10 +1262,7 @@ mod tests {
             ConditionOperation::with_captured_predicate(true, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
                 .unwrap();
         let engine = ArrayScalarEngine::<f64>::new();
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new(vec![
-                Placeholder,
-            ])));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
         let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let tangent = LinearTerm::from_staged_parts(tangent_input, builder.clone());
         let outputs = condition.jvp(&engine, &[JvpTracer { primal: 4.0, tangent }]).unwrap();
@@ -1271,8 +1271,7 @@ mod tests {
         let tangent_output = outputs[0].tangent.atom;
         drop(outputs);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
-        let tangent_program =
-            builder.into_typed::<f64, f64>(Placeholder).build(vec![tangent_output], Placeholder).unwrap();
+        let tangent_program = builder.build::<f64, f64>(vec![tangent_output], Placeholder, Placeholder).unwrap();
         assert_eq!(tangent_program.interpret(10.0), Ok(20.0));
     }
 
@@ -1281,8 +1280,7 @@ mod tests {
         let condition =
             ConditionOperation::with_captured_predicate(true, custom_scale_branch(2.0), custom_scale_branch(3.0))
                 .unwrap();
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new(vec![Placeholder])));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let tangent = LinearTerm::from_staged_parts(tangent_input, builder.clone());
         let outputs = condition.jvp(&TestEngine, &[JvpTracer { primal: TestValue::Number(4.0), tangent }]).unwrap();
@@ -1291,17 +1289,16 @@ mod tests {
         let tangent_output = outputs[0].tangent.atom;
         drop(outputs);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
-        let tangent_program = builder.build(vec![tangent_output], vec![Placeholder]).unwrap();
+        let tangent_program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![tangent_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
         assert_eq!(tangent_program.interpret(vec![TestValue::Number(10.0)]), Ok(vec![TestValue::Number(20.0)]));
     }
 
     #[test]
     fn test_generic_while_jvp_propagates_tangents_through_iterations() {
         let while_operation = WhileOperation::new(custom_while_condition_branch(), custom_while_body_branch()).unwrap();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new(vec![
-            Placeholder,
-            Placeholder,
-        ])));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let counter_tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let value_tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let counter_tangent = LinearTerm::from_staged_parts(counter_tangent_input, builder.clone());
@@ -1323,7 +1320,13 @@ mod tests {
         let tangent_outputs = outputs.iter().map(|output| output.tangent.atom).collect::<Vec<_>>();
         drop(outputs);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
-        let tangent_program = builder.build(tangent_outputs, vec![Placeholder, Placeholder]).unwrap();
+        let tangent_program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                tangent_outputs,
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
         assert_eq!(
             tangent_program.interpret(vec![TestValue::Number(0.0), TestValue::Number(1.0)]),
             Ok(vec![TestValue::Number(0.0), TestValue::Number(8.0)]),
@@ -1338,8 +1341,7 @@ mod tests {
             custom_linear_identity_branch(),
         )
         .unwrap();
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new(vec![Placeholder])));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let cotangent = LinearTerm::from_staged_parts(cotangent_input, builder);
         let mut context = TestLinearTransposeContext;
@@ -1360,8 +1362,7 @@ mod tests {
             custom_linear_identity_branch(),
         )
         .unwrap();
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new(vec![Placeholder])));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let cotangent = LinearTerm::from_staged_parts(cotangent_input, builder.clone());
         let mut context = TestLinearTransposeContext;

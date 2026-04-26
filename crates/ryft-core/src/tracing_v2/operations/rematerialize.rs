@@ -538,17 +538,14 @@ where
             .collect::<Vec<_>>();
         let output_types = exemplar_output_types.parameters().cloned().collect::<Vec<_>>();
         let Program { atoms, input_ids, output_ids, instructions, .. } = body_program;
-        let mut builder = ProgramBuilder::<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>::new(vec![
-            Placeholder;
-            input_leaf_count
-        ]);
+        let mut builder = ProgramBuilder::<ArrayType, V, E::TracingOperation>::new();
         builder.atoms = atoms;
         builder.input_ids = input_ids;
         builder.instructions = instructions;
         let body = FlatTracedRematerialize::from_parts(
             input_types,
             output_types,
-            builder.build(output_ids, vec![Placeholder; output_leaf_count])?,
+            builder.build(output_ids, vec![Placeholder; input_leaf_count], vec![Placeholder; output_leaf_count])?,
         );
 
         let staged_outputs = Tracer::apply_staged_op(
@@ -638,15 +635,15 @@ mod tests {
     }
 
     fn empty_traced_body() -> FlatTracedRematerialize<ArrayType, f64> {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>, Vec<f64>, Vec<f64>>::new(vec![]);
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let output = builder.add_constant(0.0f64);
-        let program = builder.build(vec![output], vec![Placeholder]).unwrap();
+        let program = builder.build(vec![output], Vec::<Placeholder>::new(), vec![Placeholder]).unwrap();
         FlatTracedRematerialize::from_parts(vec![], vec![scalar_type()], program)
     }
 
     fn empty_linear_body() -> FlatTracedRematerialize<ArrayType, f64, LinearPrimitiveOperation<f64>> {
-        let program = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>, Vec<f64>, Vec<f64>>::new(vec![])
-            .build(vec![], vec![])
+        let program = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()
+            .build(vec![], Vec::<Placeholder>::new(), Vec::<Placeholder>::new())
             .unwrap();
         FlatTracedRematerialize::from_parts(vec![scalar_type()], vec![], program)
     }

@@ -606,21 +606,18 @@ mod tests {
     }
 
     fn unary_rematerialize_body() -> FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaPrimitiveOperation> {
-        let mut builder = ProgramBuilder::<
-            ArrayType,
-            ShardMapTensor,
-            XlaPrimitiveOperation,
-            Vec<ShardMapTensor>,
-            Vec<ShardMapTensor>,
-        >::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
         let input = builder.add_input(scalar_type());
         let output = builder
             .add_instruction(XlaPrimitiveOperation::Sin, vec![input])
             .expect("rematerialize body should stage one sine op")
             .into_iter()
+            .copied()
             .next()
             .expect("sine should produce one output");
-        let program = builder.build(vec![output], vec![Placeholder]).unwrap();
+        let program = builder
+            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
         FlatTracedRematerialize::from_parts(vec![scalar_type()], vec![scalar_type()], program)
     }
 
@@ -643,7 +640,7 @@ mod tests {
         let operation =
             XlaPrimitiveOperation::Rematerialize(Box::new(RematerializeOperation::new(unary_rematerialize_body())));
         let tangent_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaLinearOperation>::new(Vec::new())));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaLinearOperation>::new()));
         let tangent_atom = tangent_builder.borrow_mut().add_input(scalar_type());
         let outputs = operation
             .jvp(
@@ -662,8 +659,7 @@ mod tests {
             .expect("rematerialize jvp builder should not have outstanding linear terms")
             .into_inner();
         let tangent_program = tangent_builder
-            .into_typed::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![Placeholder])
-            .build(output_atoms, vec![Placeholder])
+            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(output_atoms, vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(
             tangent_program.to_string().contains("rematerialize"),
@@ -676,23 +672,20 @@ mod tests {
     fn test_replay_xla_program_with_tracers_uses_custom_replay_extension() {
         let sharding = Sharding::replicated(test_mesh(), 0);
         let custom = WithShardingConstraintOperation::new(sharding).to_tensor_custom_primitive();
-        let mut program_builder = ProgramBuilder::<
-            ArrayType,
-            ShardMapTensor,
-            XlaPrimitiveOperation,
-            Vec<ShardMapTensor>,
-            Vec<ShardMapTensor>,
-        >::new(vec![Placeholder]);
+        let mut program_builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
         let input = program_builder.add_input(scalar_type());
         let output = program_builder
             .add_instruction(XlaPrimitiveOperation::Custom(Arc::new(custom)), vec![input])
             .expect("custom op should stage")
             .into_iter()
+            .copied()
             .next()
             .expect("custom op should produce one output");
-        let program = program_builder.build(vec![output], vec![Placeholder]).unwrap();
+        let program = program_builder
+            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
         let tracing_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(Vec::new())));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new()));
         let traced_input_atom = tracing_builder.borrow_mut().add_input(scalar_type());
         let traced_input =
             Tracer::from_staged_parts(traced_input_atom, scalar_type(), tracing_builder, XlaEngine::token());

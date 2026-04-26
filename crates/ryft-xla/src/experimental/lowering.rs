@@ -2457,18 +2457,18 @@ mod tests {
     fn xla_identity_branch(
         input_type: ArrayType,
     ) -> Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Vec<ShardMapTensor>, Vec<ShardMapTensor>> {
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
         let input = builder.add_input(input_type);
-        builder.build(vec![input], vec![Placeholder]).unwrap()
+        builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     fn xla_neg_branch(
         input_type: ArrayType,
     ) -> Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Vec<ShardMapTensor>, Vec<ShardMapTensor>> {
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder.add_instruction(XlaPrimitiveOperation::Neg, vec![input]).unwrap()[0];
-        builder.build(vec![output], vec![Placeholder]).unwrap()
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     fn lower_traced_module(
@@ -2530,16 +2530,11 @@ mod tests {
         op: XlaPrimitiveOperation,
     ) -> Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ShardMapTensor, ShardMapTensor> {
         let input_type = test_vector_type(4);
-        let mut builder = ProgramBuilder::<
-            ArrayType,
-            ShardMapTensor,
-            crate::experimental::ops::XlaPrimitiveOperation,
-            ShardMapTensor,
-            ShardMapTensor,
-        >::new(Placeholder);
+        let mut builder =
+            ProgramBuilder::<ArrayType, ShardMapTensor, crate::experimental::ops::XlaPrimitiveOperation>::new();
         let input = builder.add_input(input_type.clone());
         let output = builder.add_instruction(op, vec![input]).unwrap()[0];
-        builder.build(vec![output], Placeholder).unwrap()
+        builder.build(vec![output], Placeholder, Placeholder).unwrap()
     }
 
     #[cfg(feature = "ndarray")]
@@ -2635,14 +2630,19 @@ mod tests {
             xla_identity_branch(input_type.clone()),
         )
         .unwrap();
-        let mut builder =
-            ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(vec![Placeholder, Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
         let predicate = builder.add_input(predicate_type);
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(XlaPrimitiveOperation::Condition(Box::new(condition)), vec![predicate, input])
             .unwrap()[0];
-        let program = builder.build(vec![output], vec![Placeholder]).unwrap();
+        let program = builder
+            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
         assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
@@ -2656,12 +2656,14 @@ mod tests {
         let while_operation =
             WhileOperation::new(xla_identity_branch(state_type.clone()), xla_identity_branch(state_type.clone()))
                 .unwrap();
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(vec![Placeholder]);
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
         let state = builder.add_input(state_type);
         let output = builder
             .add_instruction(XlaPrimitiveOperation::While(Box::new(while_operation)), vec![state])
             .unwrap()[0];
-        let program = builder.build(vec![output], vec![Placeholder]).unwrap();
+        let program = builder
+            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
         assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
