@@ -661,7 +661,7 @@ mod tests {
     use crate::tracing::{Program, ProgramBuilder};
     use crate::tracing_v2::{
         DifferentiationError, JvpTracer, LinearPrimitiveOperation, Sin, Tracer,
-        engines::ArrayScalarEngine,
+        engines::ScalarEngine,
         interpret_and_trace,
         linear::{compile_grad, grad, value_and_grad},
         operations::TranspositionContext,
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn test_linear_rematerialize_jvp_requires_tangent_leaves() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let operation = RematerializeOperation::<ArrayType, f64>::new(empty_traced_body());
         let inputs: Vec<JvpTracer<f64, crate::tracing::AtomId>> = Vec::new();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
@@ -720,7 +720,7 @@ mod tests {
     #[test]
     fn test_traced_rematerialize_requires_input_leaves() {
         let operation = RematerializeOperation::<ArrayType, f64>::new(empty_traced_body());
-        let inputs: Vec<Tracer<'_, ArrayScalarEngine<f64>>> = Vec::new();
+        let inputs: Vec<Tracer<'_, ScalarEngine<f64>>> = Vec::new();
 
         assert!(matches!(
             operation.interpret(inputs.as_slice()),
@@ -744,11 +744,11 @@ mod tests {
 
     #[test]
     fn test_rematerialize_invocation_requires_traced_input_leaves() {
-        let input: Vec<Tracer<'_, ArrayScalarEngine<f64>>> = Vec::new();
+        let input: Vec<Tracer<'_, ScalarEngine<f64>>> = Vec::new();
 
-        let result = <Tracer<'_, ArrayScalarEngine<f64>> as RematerializeInvocationLeaf<
-            Vec<Tracer<'_, ArrayScalarEngine<f64>>>,
-            Tracer<'_, ArrayScalarEngine<f64>>,
+        let result = <Tracer<'_, ScalarEngine<f64>> as RematerializeInvocationLeaf<
+            Vec<Tracer<'_, ScalarEngine<f64>>>,
+            Tracer<'_, ScalarEngine<f64>>,
         >>::invoke(|_inputs| panic!("closure should not run without traced inputs"), input);
 
         assert!(matches!(
@@ -760,7 +760,7 @@ mod tests {
     #[test]
     fn test_rematerialize_jit_produces_traced_op() {
         // When used inside jit, rematerialize should produce a "rematerialize" op in the program.
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
             interpret_and_trace(&engine, |x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
@@ -772,7 +772,7 @@ mod tests {
     #[test]
     fn test_rematerialize_jit_program_rendering() {
         // Check the exact rendering of the jit-traced program containing a rematerialize op.
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let (_, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
             interpret_and_trace(&engine, |x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn test_rematerialize_grad_computes_correct_gradient() {
         // grad of rematerialize(sin, x) should be cos(x).
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let gradient: f64 = grad(&engine, |x| rematerialize(|y| y.sin(), x).unwrap(), 2.0f64).unwrap();
 
         approx_eq(gradient, 2.0f64.cos());
@@ -805,7 +805,7 @@ mod tests {
     #[test]
     fn test_rematerialize_value_and_grad_returns_both() {
         // value_and_grad of rematerialize(sin, x) should give (sin(x), cos(x)).
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let (value, gradient): (f64, f64) =
             value_and_grad(&engine, |x| rematerialize(|y| y.sin(), x).unwrap(), 2.0f64).unwrap();
 
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn test_rematerialize_compile_grad_produces_reusable_gradient() {
         // compile_grad with rematerialize should produce a symbolic gradient program.
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let compiled = compile_grad(&engine, |x| rematerialize(|y| y.sin(), x).unwrap(), 2.0f64).unwrap();
 
         // Verify at the original primal point: d/dx sin(x) = cos(x).
@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn test_rematerialize_grad_of_quadratic_plus_sin() {
         // grad of rematerialize(x^2 + sin(x), x) should be 2x + cos(x).
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let gradient: f64 =
             grad(&engine, |x| rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap(), 2.0f64).unwrap();
 
@@ -844,7 +844,7 @@ mod tests {
     #[test]
     fn test_rematerialize_compile_grad_quadratic_plus_sin() {
         // compile_grad with rematerialize wrapping a multi-op body.
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let compiled =
             compile_grad(&engine, |x| rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap(), 2.0f64).unwrap();
 
@@ -860,13 +860,13 @@ mod tests {
     fn test_rematerialize_does_not_affect_forward_result() {
         // The forward result with rematerialize should match the result without it.
         let without: f64 = {
-            let engine = ArrayScalarEngine::<f64>::new();
+            let engine = ScalarEngine::<f64>::new();
             let (output, _): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
                 interpret_and_trace(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 3.0f64).unwrap();
             output
         };
         let with: f64 = {
-            let engine = ArrayScalarEngine::<f64>::new();
+            let engine = ScalarEngine::<f64>::new();
             let (output, _): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = interpret_and_trace(
                 &engine,
                 |x| Ok(rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap()),

@@ -70,23 +70,23 @@ pub trait StagingEngine: Engine {
 
 /// Stateless engine that synthesizes scalar-compatible values from [`ArrayType`] metadata.
 ///
-/// [`ArrayScalarEngine<V>`] is the "minimal backend" used throughout tests and scalar-only
+/// [`ScalarEngine<V>`] is the "minimal backend" used throughout tests and scalar-only
 /// examples. It demonstrates the intended role of an [`Engine`] in the smallest possible form:
 /// there is no device handle, no mesh state, and no backend registry, just the choice of the
 /// built-in primitive carriers plus metadata-driven construction of scalar zeros and ones.
 ///
 /// The engine ignores most of the supplied [`ArrayType`] metadata because scalar leaves have a
 /// single canonical runtime representation. That makes it a good teaching example for the rest of
-/// the tracing stack: if a transform works against [`ArrayScalarEngine`], the same code path can be
+/// the tracing stack: if a transform works against [`ScalarEngine`], the same code path can be
 /// reused by richer engines that need sharding, device, or runtime context.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ArrayScalarEngine<V> {
+pub struct ScalarEngine<V> {
     /// Phantom marker that ties the zero-sized engine to its scalar leaf type.
     marker: PhantomData<fn() -> V>,
 }
 
-impl<V> ArrayScalarEngine<V> {
-    /// Returns a new [`ArrayScalarEngine<V>`].
+impl<V> ScalarEngine<V> {
+    /// Returns a new [`ScalarEngine<V>`].
     ///
     /// This is a no-op at runtime because the engine is zero-sized; the method mainly exists to
     /// give examples and tests an explicit, readable backend token.
@@ -96,9 +96,9 @@ impl<V> ArrayScalarEngine<V> {
     }
 }
 
-macro_rules! impl_engine_for_array_scalar_engine {
+macro_rules! impl_engine_for_scalar_engine {
     ($ty:ty, $zero:expr, $one:expr) => {
-        impl Engine for ArrayScalarEngine<$ty> {
+        impl Engine for ScalarEngine<$ty> {
             type Type = ArrayType;
             type Value = $ty;
 
@@ -113,16 +113,16 @@ macro_rules! impl_engine_for_array_scalar_engine {
             }
         }
 
-        impl StagingEngine for ArrayScalarEngine<$ty> {
+        impl StagingEngine for ScalarEngine<$ty> {
             type Operation = PrimitiveOperation<$ty>;
         }
 
-        impl DifferentiableEngine for ArrayScalarEngine<$ty> {
+        impl DifferentiableEngine for ScalarEngine<$ty> {
             type DifferentiableOperation = PrimitiveOperation<$ty>;
             type LinearOperation = LinearPrimitiveOperation<$ty>;
         }
 
-        impl DifferentiableStagingEngine for ArrayScalarEngine<$ty> {
+        impl DifferentiableStagingEngine for ScalarEngine<$ty> {
             type LinearOperation<'engine>
                 = LinearPrimitiveOperation<Tracer<'engine, Self>>
             where
@@ -131,8 +131,8 @@ macro_rules! impl_engine_for_array_scalar_engine {
     };
 }
 
-impl_engine_for_array_scalar_engine!(f32, 0.0, 1.0);
-impl_engine_for_array_scalar_engine!(f64, 0.0, 1.0);
+impl_engine_for_scalar_engine!(f32, 0.0, 1.0);
+impl_engine_for_scalar_engine!(f64, 0.0, 1.0);
 
 #[cfg(test)]
 mod tests {
@@ -141,13 +141,13 @@ mod tests {
 
     #[test]
     fn test_array_scalar_engine_is_zero_sized() {
-        assert_eq!(size_of::<ArrayScalarEngine<f64>>(), 0);
-        assert_eq!(size_of::<ArrayScalarEngine<f32>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<f64>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<f32>>(), 0);
     }
 
     #[test]
     fn test_array_scalar_engine_produces_canonical_zero_and_one() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let r#type = ArrayType::scalar(DataType::F64);
         assert_eq!(Engine::zero(&engine, &r#type), Ok(0.0));
         assert_eq!(Engine::one(&engine, &r#type), Ok(1.0));

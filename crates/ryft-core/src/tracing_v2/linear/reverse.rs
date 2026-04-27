@@ -440,7 +440,7 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::tracing::{InterpretableOperation, Operation, Traceable, TracingError, Value};
-    use crate::tracing_v2::engines::ArrayScalarEngine;
+    use crate::tracing_v2::engines::ScalarEngine;
     use crate::tracing_v2::operations::add::{AddOperation, SupportsAdd};
     use crate::tracing_v2::operations::constants::{One, OneLike, Zero, ZeroLike};
     use crate::tracing_v2::operations::matrix::ndarray_support::Array2Engine;
@@ -701,11 +701,11 @@ mod tests {
 
     #[test]
     fn test_jvp_traced_requires_input_leaves() {
-        let empty_primals: Vec<Tracer<'_, ArrayScalarEngine<f64>>> = Vec::new();
-        let empty_tangents: Vec<Tracer<'_, ArrayScalarEngine<f64>>> = Vec::new();
+        let empty_primals: Vec<Tracer<'_, ScalarEngine<f64>>> = Vec::new();
+        let empty_tangents: Vec<Tracer<'_, ScalarEngine<f64>>> = Vec::new();
 
         let result =
-            jvp_traced(|inputs: Vec<Tracer<'_, ArrayScalarEngine<f64>>>| Ok(inputs), empty_primals, empty_tangents);
+            jvp_traced(|inputs: Vec<Tracer<'_, ScalarEngine<f64>>>| Ok(inputs), empty_primals, empty_tangents);
 
         assert!(matches!(
             result,
@@ -715,12 +715,12 @@ mod tests {
 
     #[test]
     fn test_traced_value_and_grad_requires_input_leaves() {
-        let engine = ArrayScalarEngine::<f64>::new();
-        let empty_primals: Vec<Tracer<'_, ArrayScalarEngine<f64>>> = Vec::new();
+        let engine = ScalarEngine::<f64>::new();
+        let empty_primals: Vec<Tracer<'_, ScalarEngine<f64>>> = Vec::new();
 
-        let result = <Tracer<'_, ArrayScalarEngine<f64>> as ValueAndGradInvocationLeaf<
-            ArrayScalarEngine<f64>,
-            Vec<Tracer<'_, ArrayScalarEngine<f64>>>,
+        let result = <Tracer<'_, ScalarEngine<f64>> as ValueAndGradInvocationLeaf<
+            ScalarEngine<f64>,
+            Vec<Tracer<'_, ScalarEngine<f64>>>,
         >>::invoke(
             &engine, |_inputs| panic!("closure should not run without traced inputs"), empty_primals
         );
@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn test_value_and_grad_with_aux_ignores_aux_cotangents() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
 
         let ((value, aux), gradient): ((f64, (f64, f64)), (f64, f64)) = value_and_grad_with_aux(
             &engine,
@@ -766,7 +766,7 @@ mod tests {
 
     #[test]
     fn test_grad_with_aux_returns_gradient_and_aux() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
 
         let (gradient, aux): ((f64, f64), f64) =
             grad_with_aux(&engine, |(x, y)| (x.clone() * y.clone(), x + y), (2.0f64, 3.0f64)).unwrap();

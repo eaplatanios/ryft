@@ -608,7 +608,7 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         tracing::{ProgramBuilder, TracingError},
-        tracing_v2::{Engine, PrimitiveOperation, Sin, StagingEngine, engines::ArrayScalarEngine, test_support},
+        tracing_v2::{Engine, PrimitiveOperation, Sin, StagingEngine, engines::ScalarEngine, test_support},
         types::{ArrayType, TypeError},
     };
 
@@ -618,8 +618,8 @@ mod tests {
     fn jit_tracer_zero_like_adds_constant_atoms() {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let atom = builder.borrow_mut().add_input(3.0f64.r#type().into_owned());
-        let engine = ArrayScalarEngine::<f64>::new();
-        let tracer: Tracer<ArrayScalarEngine<f64>> = TracingEngine::new(&engine, builder).tracer_from_atom(atom);
+        let engine = ScalarEngine::<f64>::new();
+        let tracer: Tracer<ScalarEngine<f64>> = TracingEngine::new(&engine, builder).tracer_from_atom(atom);
         let zero = tracer.zero_like();
         assert_eq!(zero.r#type().into_owned(), ArrayType::scalar(crate::types::DataType::F64));
         let zero_atom = zero.state().live_atom().expect("zero-like tracer should remain live");
@@ -647,8 +647,8 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let input_type = ArrayType::scalar(crate::types::DataType::F64);
         let atom = builder.borrow_mut().add_input(input_type.clone());
-        let engine = ArrayScalarEngine::<f64>::new();
-        let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_staged_parts(atom, input_type, builder, &engine);
+        let engine = ScalarEngine::<f64>::new();
+        let tracer: Tracer<ScalarEngine<f64>> = Tracer::from_staged_parts(atom, input_type, builder, &engine);
 
         assert!(
             matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(crate::types::DataType::F64))
@@ -739,10 +739,10 @@ mod tests {
 
     #[test]
     fn staged_program_replays_graphs() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = interpret_and_trace(
             &engine,
-            |x: Tracer<ArrayScalarEngine<f64>>| {
+            |x: Tracer<ScalarEngine<f64>>| {
                 let squared = x.clone() * x.clone();
                 Ok(squared + x.sin())
             },
@@ -1133,10 +1133,10 @@ mod tests {
 
     #[test]
     fn staged_program_display_renders_the_staged_program() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = interpret_and_trace(
             &engine,
-            |x: Tracer<ArrayScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()),
+            |x: Tracer<ScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()),
             2.0f64,
         )
         .unwrap();

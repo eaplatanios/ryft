@@ -304,7 +304,7 @@ mod tests {
     use crate::tracing::ProgramBuilder;
     use crate::tracing_v2::{
         LinearPrimitiveOperation, PrimitiveOperation,
-        engines::ArrayScalarEngine,
+        engines::ScalarEngine,
         jit::TracingEngine,
         operations::{AddOperation, DifferentiableOperation},
         test_support,
@@ -317,7 +317,7 @@ mod tests {
     /// its tangent effect through the context's `LinearOperation` carrier.
     #[test]
     fn tracing_engine_dispatches_add_jvp_with_traced_primals() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let outer_input_a = outer_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
         let outer_input_b = outer_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
@@ -327,8 +327,8 @@ mod tests {
 
         let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
-            Tracer<'_, ArrayScalarEngine<f64>>,
-            LinearPrimitiveOperation<Tracer<'_, ArrayScalarEngine<f64>>>,
+            Tracer<'_, ScalarEngine<f64>>,
+            LinearPrimitiveOperation<Tracer<'_, ScalarEngine<f64>>>,
         >::new()));
         let tangent_a = linear_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
         let tangent_b = linear_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn jvp_rejects_mismatched_parameter_structures() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let result: Result<(f64, f64), TracingError> =
             jvp(&engine, |xs| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
         assert!(matches!(

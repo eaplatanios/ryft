@@ -405,7 +405,7 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         tracing::TracingError,
-        tracing_v2::{DifferentiationError, Sin, engines::ArrayScalarEngine},
+        tracing_v2::{DifferentiationError, Sin, engines::ScalarEngine},
     };
 
     use super::{DenseJacobian, jacfwd, jacrev};
@@ -463,8 +463,8 @@ mod tests {
 
     #[test]
     fn test_jacfwd_batches_basis_tangents() {
-        let engine = ArrayScalarEngine::<f64>::new();
-        let jacobian = jacfwd::<ArrayScalarEngine<f64>, _, (f64, f64), (f64, f64), f64>(
+        let engine = ScalarEngine::<f64>::new();
+        let jacobian = jacfwd::<ScalarEngine<f64>, _, (f64, f64), (f64, f64), f64>(
             &engine,
             |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
             (2.0f64, 3.0f64),
@@ -481,8 +481,8 @@ mod tests {
 
     #[test]
     fn test_jacrev_batches_basis_cotangents() {
-        let engine = ArrayScalarEngine::<f64>::new();
-        let jacobian = jacrev::<ArrayScalarEngine<f64>, _, (f64, f64), (f64, f64), f64>(
+        let engine = ScalarEngine::<f64>::new();
+        let jacobian = jacrev::<ScalarEngine<f64>, _, (f64, f64), (f64, f64), f64>(
             &engine,
             |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
             (2.0f64, 3.0f64),

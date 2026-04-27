@@ -482,7 +482,7 @@ mod tests {
     use crate::tracing::{Program, ProgramBuilder};
     use crate::tracing_v2::{
         LinearPrimitiveOperation, PrimitiveOperation, Tracer,
-        engines::{ArrayScalarEngine, StagingEngine},
+        engines::{ScalarEngine, StagingEngine},
         grad, interpret_and_trace, jvp,
         operations::{TranspositionContext, constants::OneLike},
     };
@@ -549,10 +549,10 @@ mod tests {
         }
     }
 
-    impl DifferentiableOperation<ArrayScalarEngine<f64>> for ShiftOp {
+    impl DifferentiableOperation<ScalarEngine<f64>> for ShiftOp {
         fn jvp(
             &self,
-            _engine: &ArrayScalarEngine<f64>,
+            _engine: &ScalarEngine<f64>,
             _context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearPrimitiveOperation<f64>>,
             inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
@@ -563,17 +563,17 @@ mod tests {
         }
     }
 
-    impl CustomTracedLinearizationRule<f64, ArrayScalarEngine<f64>> for ShiftOp {
+    impl CustomTracedLinearizationRule<f64, ScalarEngine<f64>> for ShiftOp {
         fn jvp_traced_linearization<'engine>(
             &self,
-            _engine: &TracingEngine<'engine, ArrayScalarEngine<f64>>,
+            _engine: &TracingEngine<'engine, ScalarEngine<f64>>,
             _context: &mut crate::tracing_v2::JvpContext<
                 '_,
-                Tracer<'engine, ArrayScalarEngine<f64>>,
-                LinearPrimitiveOperation<Tracer<'engine, ArrayScalarEngine<f64>>>,
+                Tracer<'engine, ScalarEngine<f64>>,
+                LinearPrimitiveOperation<Tracer<'engine, ScalarEngine<f64>>>,
             >,
-            inputs: &[JvpTracer<Tracer<'engine, ArrayScalarEngine<f64>>, crate::tracing::AtomId>],
-        ) -> Result<Vec<JvpTracer<Tracer<'engine, ArrayScalarEngine<f64>>, crate::tracing::AtomId>>, TracingError>
+            inputs: &[JvpTracer<Tracer<'engine, ScalarEngine<f64>>, crate::tracing::AtomId>],
+        ) -> Result<Vec<JvpTracer<Tracer<'engine, ScalarEngine<f64>>, crate::tracing::AtomId>>, TracingError>
         {
             if inputs.len() != 1 {
                 return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_custom_primitive_base_execution_replays_without_optional_rules() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
         let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
             interpret_and_trace(
@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn test_custom_primitive_missing_jvp_rule_reports_targeted_error() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
         let result: Result<(f64, f64), TracingError> = jvp(
             &engine,
@@ -697,15 +697,15 @@ mod tests {
 
     #[test]
     fn test_custom_primitive_missing_traced_linearization_rule_reports_targeted_error() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0))
-            .with_jvp_rule::<ArrayScalarEngine<f64>, _>(ShiftOp::new(2.0));
+            .with_jvp_rule::<ScalarEngine<f64>, _>(ShiftOp::new(2.0));
         let result: Result<(f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>), TracingError> =
             interpret_and_trace(
                 &engine,
                 {
                     let primitive = primitive.clone();
-                    move |x: Tracer<ArrayScalarEngine<f64>>| {
+                    move |x: Tracer<ScalarEngine<f64>>| {
                         let (primal, tangent) = jvp(
                             &engine,
                             {
@@ -732,9 +732,9 @@ mod tests {
 
     #[test]
     fn test_custom_primitive_jvp_rule_participates_in_grad_and_traced_linearization() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0))
-            .with_derivative_rule::<ArrayScalarEngine<f64>, _>(ShiftOp::new(2.0));
+            .with_derivative_rule::<ScalarEngine<f64>, _>(ShiftOp::new(2.0));
 
         assert_eq!(
             grad(
@@ -753,7 +753,7 @@ mod tests {
                 &engine,
                 {
                     let primitive = primitive.clone();
-                    move |x: Tracer<ArrayScalarEngine<f64>>| {
+                    move |x: Tracer<ScalarEngine<f64>>| {
                         let (primal, tangent) = jvp(
                             &engine,
                             {

@@ -148,7 +148,7 @@ mod tests {
     use crate::types::{DataType, Shape, Size};
     use crate::{
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension},
-        tracing_v2::{engines::ArrayScalarEngine, jvp, test_support},
+        tracing_v2::{engines::ScalarEngine, jvp, test_support},
     };
 
     use super::*;
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn test_mul_jvp_matches_the_product_rule() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let (primal, tangent) =
             jvp(&engine, |(left, right)| left * right, (2.0f64, 5.0f64), (3.0f64, -1.0f64)).unwrap();
 

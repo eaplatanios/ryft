@@ -305,14 +305,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::tracing::Program;
-    use crate::tracing_v2::{Sin, engines::ArrayScalarEngine, interpret_and_trace, operations::constants::OneLike};
+    use crate::tracing_v2::{Sin, engines::ScalarEngine, interpret_and_trace, operations::constants::OneLike};
 
     use super::*;
 
     /// Summarizes a small scalar program and verifies the structural metrics.
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<f64>, f64, f64>) =
             interpret_and_trace(
                 &engine,

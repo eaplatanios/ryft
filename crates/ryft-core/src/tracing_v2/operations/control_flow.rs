@@ -725,7 +725,7 @@ mod tests {
         tracing::{ProgramBuilder, Traceable, Value},
         tracing_v2::{
             Differentiable, LinearPrimitiveOperation,
-            engines::{ArrayScalarEngine, Engine},
+            engines::{ScalarEngine, Engine},
             operations::{
                 SupportsAdd, SupportsNeg, SupportsScale,
                 constants::{One, OneLike, Zero},
@@ -1385,7 +1385,7 @@ mod tests {
         let condition =
             ConditionOperation::with_captured_predicate(true, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
                 .unwrap();
-        let engine = ArrayScalarEngine::<f64>::new();
+        let engine = ScalarEngine::<f64>::new();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
         let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let mut context = JvpContext::new(builder.clone());
