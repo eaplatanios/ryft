@@ -83,13 +83,13 @@ pub trait StagingEngine: Engine {
         F: FnOnce(Input::To<Tracer<'engine, Self>>) -> Result<Output::To<Tracer<'engine, Self>>, TracingError>,
         Input: Parameterized<
                 Self::Type,
-                ParameterStructure: Clone,
                 Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Tracer<'engine, Self>>,
+                ParameterStructure: Clone,
             >,
         Output: Parameterized<
                 Self::Type,
-                ParameterStructure: Clone,
                 Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Tracer<'engine, Self>>,
+                ParameterStructure: Clone,
             >,
     >(
         &'engine self,
@@ -109,10 +109,10 @@ pub trait StagingEngine: Engine {
         F: FnOnce(Input::To<Tracer<'engine, Self>>) -> Result<Output::To<Tracer<'engine, Self>>, TracingError>,
         Input: Parameterized<
                 Self::Value,
-                ParameterStructure: Clone + std::fmt::Debug + PartialEq,
                 Family: ParameterizedFamily<Tracer<'engine, Self>>,
+                ParameterStructure: Clone + std::fmt::Debug + PartialEq,
             >,
-        Output: Parameterized<Self::Value, ParameterStructure: Clone, Family: ParameterizedFamily<Tracer<'engine, Self>>>,
+        Output: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<'engine, Self>>, ParameterStructure: Clone>,
     >(
         &'engine self,
         function: F,
