@@ -788,22 +788,25 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> Default for ProgramBuild
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
+    use pretty_assertions::assert_eq;
 
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::tracing::TracingError;
-    use crate::tracing_v2::{PrimitiveOperation, test_support};
-    use crate::types::{ArrayType, DataType, Typed};
+    use crate::tracing_v2::PrimitiveOperation;
+    use crate::types::{ArrayType, DataType, TypeError};
 
     use super::*;
 
-    const LONG_METADATA_VALUE: &str = concat!(
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaa",
-    );
-
     #[derive(Clone, Debug)]
     struct LongMetadataOperation;
+
+    impl LongMetadataOperation {
+        const METADATA_VALUE: &str = concat!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaa",
+        );
+    }
 
     impl Operation<ArrayType> for LongMetadataOperation {
         fn name(&self) -> &'static str {
@@ -819,112 +822,152 @@ mod tests {
 
         fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
             OperationFormatter::new(formatter, indentation, self.name())?
-                .bracketed(|operation| operation.field("value", LONG_METADATA_VALUE))
+                .bracketed(|operation| operation.field("value", Self::METADATA_VALUE))
         }
     }
 
     #[test]
-    fn atom_id_display_uses_percent_prefix() {
-        assert_eq!(AtomId { index: 42 }.to_string(), "%42");
-    }
-
-    #[test]
-    fn atom_as_constant_returns_only_literal_values() {
+    fn test_atom() {
         let constant = Atom::<ArrayType, f64>::Constant(3.0);
         let variable = Atom::<ArrayType, f64>::Variable(ArrayType::scalar(DataType::F64));
 
         assert!(constant.is_constant());
         assert!(!constant.is_variable());
         assert_eq!(constant.as_constant(), Some(&3.0));
+        assert_eq!(constant.r#type().into_owned(), ArrayType::scalar(DataType::F64));
 
-        assert!(!variable.is_constant());
         assert!(variable.is_variable());
         assert_eq!(variable.as_constant(), None);
+        assert_eq!(variable.r#type().into_owned(), ArrayType::scalar(DataType::F64));
     }
 
     #[test]
-    fn program_builder_tracks_atom_kinds_and_executes() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let x = builder.add_input(2.0f64.r#type().into_owned());
-        let y = builder.add_input(3.0f64.r#type().into_owned());
-        let two = builder.add_constant(2.0f64);
-        let scaled_x = builder.add_instruction(PrimitiveOperation::Scale { factor: 2.0 }, vec![x]).unwrap()[0];
-        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![scaled_x, y]).unwrap()[0];
-        let program = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder).unwrap();
+    fn test_atom_id() {
+        assert_eq!(AtomId { index: 42 }.to_string(), "%42");
+    }
 
-        assert!(matches!(program.atoms.get(x.index), Some(Atom::Variable(_))));
-        assert!(matches!(program.atoms.get(two.index), Some(Atom::Constant(_))));
-        assert_eq!(program.interpret((2.0, 3.0)).unwrap(), 7.0);
+    #[test]
+    fn test_program() {
+        // Test simple program with one argument.
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(3.0f64);
+        let o0 = builder.add_instruction(PrimitiveOperation::Add, vec![i0, c0]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
+        let input = program.input().unwrap();
+        let output = program.output().unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const
+                    %2:f64[] = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert!(matches!(input, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(output, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+
+        // Test simple program with two arguments.
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let v0 = builder.add_instruction(PrimitiveOperation::Scale { factor: 2.0 }, vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(PrimitiveOperation::Add, vec![v0, i1]).unwrap()[0];
+        let program = builder.build::<(f64, f64), f64>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
+        let input = program.input().unwrap();
+        let output = program.output().unwrap();
+        assert_eq!(program.interpret((2.0, 3.0)), Ok(7.0));
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = const
-                    %3:f64[] = scale [factor=2] %0
-                    %4:f64[] = add %3 %1
-                in (%4)
+                let %2:f64[] = scale [factor=2] %0
+                    %3:f64[] = add %2 %1
+                in (%3)
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn program_display_keeps_long_metadata_multiline() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, LongMetadataOperation>::new();
-        let input = builder.add_input(2.0f64.r#type().into_owned());
-        let output = builder.add_instruction(LongMetadataOperation, vec![input]).unwrap()[0];
-        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
-        let expected = format!(
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = long_metadata [
-                    value={LONG_METADATA_VALUE},
-                ] %0
-                in (%1)
-            "},
-            LONG_METADATA_VALUE = LONG_METADATA_VALUE,
-        );
-
-        assert_eq!(program.to_string(), expected.trim_end());
-    }
-
-    #[test]
-    fn program_interpret_preserves_duplicate_outputs() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let x = builder.add_input(1.0f64.r#type().into_owned());
-        let doubled = builder.add_instruction(PrimitiveOperation::Add, vec![x, x]).unwrap()[0];
-        let program = builder
-            .build::<f64, (f64, f64)>(vec![doubled, doubled], Placeholder, (Placeholder, Placeholder))
-            .unwrap();
-
-        assert_eq!(program.interpret(2.0f64).unwrap(), (4.0f64, 4.0f64));
-    }
-
-    #[test]
-    fn program_reconstructs_structured_input_and_output_atoms() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let x = builder.add_input(1.0f64.r#type().into_owned());
-        let y = builder.add_input(2.0f64.r#type().into_owned());
-        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, y]).unwrap()[0];
-        let program = builder
-            .build::<(f64, f64), (f64, f64)>(vec![x, sum], (Placeholder, Placeholder), (Placeholder, Placeholder))
-            .unwrap();
-
-        let input = program.input().unwrap();
         assert!(matches!(input.0, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
         assert!(matches!(input.1, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(output, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
 
+        // Test a program that contains an operation with long metadata that should be rendered on multiple lines.
+        let mut builder = ProgramBuilder::<ArrayType, f64, LongMetadataOperation>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let o0 = builder.add_instruction(LongMetadataOperation, vec![i0]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
+        let input = program.input().unwrap();
         let output = program.output().unwrap();
-        assert!(matches!(output.0, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
-        assert!(matches!(output.1, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+        assert_eq!(
+            program.to_string(),
+            format!(
+                indoc! {"
+                    lambda %0:f64[] .
+                    let %1:f64[] = long_metadata [
+                        value={metadata_value},
+                    ] %0
+                    in (%1)
+                "},
+                metadata_value = LongMetadataOperation::METADATA_VALUE,
+            )
+            .trim_end()
+        );
+        assert!(matches!(input, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(output, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+
+        // Test a program with two outputs that are copies of the same value.
+        let mut builder = ProgramBuilder::<ArrayType, f32, PrimitiveOperation<f32>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F32));
+        let o0 = builder.add_instruction(PrimitiveOperation::Add, vec![i0, i0]).unwrap()[0];
+        let program = builder.build::<f32, (f32, f32)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder)).unwrap();
+        let input = program.input().unwrap();
+        let output = program.output().unwrap();
+        assert_eq!(program.interpret(2.0f32), Ok((4.0f32, 4.0f32)));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = add %0 %0
+                in (%1, %1)
+            "}
+            .trim_end(),
+        );
+        assert!(matches!(input, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F32)));
+        assert!(matches!(output.0, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F32)));
+        assert!(matches!(output.1, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F32)));
     }
 
     #[test]
-    fn program_interpret_rejects_mismatched_parameter_structures() {
+    fn test_program_interpret_lifts_live_constants_once() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let x = builder.add_input(1.0f64.r#type().into_owned());
-        let program = builder.build::<Vec<f64>, f64>(vec![x], vec![Placeholder], Placeholder).unwrap();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(7.0f64);
+        let c1 = builder.add_constant(3.0f64);
+        let o0 = builder.add_instruction(PrimitiveOperation::Add, vec![i0, c1]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
+        let mut lifted_constants = Vec::new();
+        assert_eq!(
+            program.interpret_with(
+                vec![2.0f64],
+                |atom_id, value| {
+                    lifted_constants.push((atom_id, *value));
+                    Ok(*value)
+                },
+                |instruction, inputs| instruction.operation.interpret(inputs),
+            ),
+            Ok(vec![5.0f64]),
+        );
+        assert_eq!(lifted_constants, vec![(c1, 3.0f64)]);
+        assert_eq!(c0, AtomId { index: 1 });
+    }
 
+    #[test]
+    fn test_program_interpret_with_mismatched_parameter_structures() {
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<Vec<f64>, f64>(vec![i0], vec![Placeholder], Placeholder).unwrap();
         assert!(matches!(
             program.interpret(vec![1.0f64, 2.0f64]),
             Err(TracingError::Parameter(ParameterError::MismatchedParameterStructures {
@@ -936,38 +979,139 @@ mod tests {
     }
 
     #[test]
-    fn program_display_uses_typed_jaxpr_like_rendering() {
+    fn test_program_interpret_with_wrong_number_of_operation_inputs() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let x = builder.add_input(1.0f64.r#type().into_owned());
-        let three = builder.add_constant(3.0f64);
-        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
-        let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder).unwrap();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<f64, f64>(vec![i0], Placeholder, Placeholder).unwrap();
+        assert!(matches!(
+            program.interpret_with(
+                Vec::<f64>::new(),
+                |_, value| Ok(*value),
+                |instruction, inputs| instruction.operation.interpret(inputs),
+            ),
+            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+        ));
+    }
 
+    #[test]
+    fn test_program_interpret_with_wrong_number_of_operation_outputs() {
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let o0 = builder.add_instruction(PrimitiveOperation::Scale { factor: 2.0 }, vec![i0]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
+        assert!(matches!(
+            program.interpret_with(
+                vec![2.0f64],
+                |_, value| Ok(*value),
+                |_, _| Ok::<Vec<f64>, TracingError>(Vec::new()),
+            ),
+            Err(TracingError::InvalidOutputCount { expected: 1, got: 0 }),
+        ));
+    }
+
+    #[test]
+    fn test_program_simplified() {
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(2.0f64);
+        let c1 = builder.add_constant(3.0f64);
+        let _ = builder.add_instruction(PrimitiveOperation::Add, vec![i0, c0]).unwrap()[0];
+        let v1 = builder.add_instruction(PrimitiveOperation::Add, vec![i0, c1]).unwrap()[0];
+        let program = builder
+            .build::<f64, (f64, f64)>(vec![v1, v1], Placeholder, (Placeholder, Placeholder))
+            .unwrap();
+        let simplified = program.simplified().unwrap();
+
+        assert_eq!(c0, AtomId { index: 1 });
+        assert_eq!(simplified.interpret(2.0f64), Ok((5.0f64, 5.0f64)));
+        assert_eq!(
+            simplified.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const
+                    %2:f64[] = add %0 %1
+                in (%2, %2)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const
-                    %2:f64[] = add %0 %1
-                in (%2)
+                    %2:f64[] = const
+                    %3:f64[] = add %0 %1
+                    %4:f64[] = add %0 %2
+                in (%4, %4)
             "}
             .trim_end(),
         );
     }
 
+    // TODO(eaplatanios): Review this.
     #[test]
-    fn program_builder_rejects_unbound_inputs() {
+    fn test_program_simplified_rejects_variable_output_without_parent_instruction() {
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let orphaned_variable = builder.add_variable(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<f64, f64>(vec![orphaned_variable], Placeholder, Placeholder).unwrap();
+
+        assert!(matches!(
+            program.simplified(),
+            Err(TracingError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
+        ));
+    }
+    
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_program_builder() {
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant = builder.add_constant(2.0f64);
+        let scaled_left = builder.add_instruction(PrimitiveOperation::Scale { factor: 2.0 }, vec![left]).unwrap()[0];
+        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![scaled_left, right]).unwrap()[0];
+
+        assert_eq!(builder.input_ids, vec![left, right]);
+        assert!(matches!(
+            builder.atoms.get(left.index),
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
+        ));
+        assert!(matches!(
+            builder.atoms.get(right.index),
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
+        ));
+        assert!(matches!(builder.atoms.get(constant.index), Some(Atom::Constant(value)) if *value == 2.0));
+        assert!(matches!(
+            builder.atoms.get(scaled_left.index),
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
+        ));
+        assert!(matches!(
+            builder.atoms.get(sum.index),
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
+        ));
+        assert_eq!(builder.instructions.len(), 2);
+        assert_eq!(builder.instructions[0].inputs, vec![left]);
+        assert_eq!(builder.instructions[0].outputs, vec![scaled_left]);
+        assert_eq!(builder.instructions[1].inputs, vec![scaled_left, right]);
+        assert_eq!(builder.instructions[1].outputs, vec![sum]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_program_builder_rejects_unbound_instruction_inputs() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let result = builder.add_instruction(PrimitiveOperation::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
+
         assert!(matches!(
             result,
             Err(TracingError::UnboundAtomId { id }) if id == AtomId { index: 42 }
         ));
-        test_support::assert_reference_program_rendering();
     }
 
+    // TODO(eaplatanios): Review this.
     #[test]
-    fn program_builder_build_returns_stored_error() {
+    fn test_program_builder_build_returns_stored_error() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         builder.error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
 
@@ -977,8 +1121,9 @@ mod tests {
         ));
     }
 
+    // TODO(eaplatanios): Review this.
     #[test]
-    fn program_builder_build_rejects_input_structure_count_mismatch() {
+    fn test_program_builder_build_rejects_input_structure_count_mismatch() {
         let builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
 
         assert!(matches!(
@@ -987,10 +1132,11 @@ mod tests {
         ));
     }
 
+    // TODO(eaplatanios): Review this.
     #[test]
-    fn program_builder_build_rejects_output_structure_count_mismatch() {
+    fn test_program_builder_build_rejects_output_structure_count_mismatch() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        builder.add_input(1.0f64.r#type().into_owned());
+        builder.add_input(ArrayType::scalar(DataType::F64));
 
         assert!(matches!(
             builder.build::<f64, f64>(Vec::new(), Placeholder, Placeholder),
@@ -998,25 +1144,16 @@ mod tests {
         ));
     }
 
+    // TODO(eaplatanios): Review this.
     #[test]
-    fn program_builder_tracks_only_types_for_variable_atoms() {
+    fn test_program_builder_build_succeeds_with_matching_parameter_counts() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let x = builder.add_input(2.0f64.r#type().into_owned());
-        let three = builder.add_constant(3.0f64);
-        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<f64, f64>(vec![input], Placeholder, Placeholder).unwrap();
 
-        assert!(
-            matches!(builder.atoms.get(x.index), Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64))
-        );
-        assert!(matches!(builder.atoms.get(three.index), Some(Atom::Constant(value)) if *value == 3.0));
-        assert!(matches!(builder.atoms.get(sum.index), Some(Atom::Variable(_))));
-
-        let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder).unwrap();
-        assert!(
-            matches!(program.atoms.get(x.index), Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64))
-        );
-        assert!(matches!(program.atoms.get(three.index), Some(Atom::Constant(value)) if *value == 3.0));
-        assert!(matches!(program.atoms.get(sum.index), Some(Atom::Variable(_))));
-        assert_eq!(program.interpret(4.0).unwrap(), 7.0);
+        assert_eq!(program.input_ids, vec![input]);
+        assert_eq!(program.output_ids, vec![input]);
+        assert_eq!(program.instructions.len(), 0);
+        assert_eq!(program.interpret(4.0f64), Ok(4.0f64));
     }
 }
