@@ -1,45 +1,37 @@
-use std::{
-    fmt::{Debug, Display},
-    ops::{Add, Mul, Neg},
-    sync::Arc,
-};
+use std::fmt::{Debug, Display};
+use std::ops::{Add, Mul, Neg};
+use std::sync::Arc;
 
-use crate::{
-    parameters::{Parameter, Parameterized},
-    tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value},
-    tracing_v2::{
-        Cos, DifferentiableEngine, DifferentiableStagingEngine, MatrixOps, Sin,
-        forward::{Differentiable, JvpContext, JvpTracer},
-        jit::Tracer,
-        operations::{
-            AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
-            NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
-            constants::{OneLike, ZeroLike, ZeroOperation},
-            control_flow::{ConditionOperation, ControlFlowValue, WhileOperation},
-            left_matmul::left_matmul_abstract_eval,
-            right_matmul::right_matmul_abstract_eval,
-        },
-    },
-    types::{ArrayType, Shape, TypeError, Typed},
+use crate::parameters::{Parameter, Parameterized};
+use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
+use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::jit::Tracer;
+use crate::tracing_v2::operations::constants::{OneLike, ZeroLike, ZeroOperation};
+use crate::tracing_v2::operations::control_flow::{ConditionOperation, ControlFlowValue, WhileOperation};
+use crate::tracing_v2::operations::left_matmul::left_matmul_abstract_eval;
+use crate::tracing_v2::operations::right_matmul::right_matmul_abstract_eval;
+use crate::tracing_v2::operations::{
+    AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
+    NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
 };
+use crate::tracing_v2::{Cos, DifferentiableEngine, DifferentiableStagingEngine, MatrixOps, Sin};
+use crate::types::{ArrayType, Shape, TypeError, Typed};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation,
-    add::SupportsAdd,
-    constants::SupportsZero,
-    cos::SupportsCos,
-    custom::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, SupportsLinearCustom},
-    left_matmul::SupportsLeftMatMul,
-    matmul::SupportsMatMul,
-    matrix_transpose::SupportsMatrixTranspose,
-    mul::SupportsMul,
-    neg::SupportsNeg,
-    rematerialize::{SupportsLinearRematerialize, SupportsRematerialize},
-    reshape::SupportsReshape,
-    right_matmul::SupportsRightMatMul,
-    scale::SupportsScale,
-    sin::SupportsSin,
-};
+use super::add::SupportsAdd;
+use super::constants::SupportsZero;
+use super::cos::SupportsCos;
+use super::custom::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, SupportsLinearCustom};
+use super::left_matmul::SupportsLeftMatMul;
+use super::matmul::SupportsMatMul;
+use super::matrix_transpose::SupportsMatrixTranspose;
+use super::mul::SupportsMul;
+use super::neg::SupportsNeg;
+use super::rematerialize::{SupportsLinearRematerialize, SupportsRematerialize};
+use super::reshape::SupportsReshape;
+use super::right_matmul::SupportsRightMatMul;
+use super::scale::SupportsScale;
+use super::sin::SupportsSin;
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
 /// Default closed carrier for ordinary staged programs.
 ///

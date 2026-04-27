@@ -1,4 +1,5 @@
-use std::{borrow::Cow, fmt::Display};
+use std::borrow::Cow;
+use std::fmt::Display;
 
 use thiserror::Error;
 

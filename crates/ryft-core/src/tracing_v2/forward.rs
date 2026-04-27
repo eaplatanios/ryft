@@ -1,24 +1,21 @@
-use std::{borrow::Cow, cell::RefCell, fmt::Debug, fmt::Display, rc::Rc};
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::fmt::{Debug, Display};
+use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
-use crate::{
-    parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder},
-    tracing::{
-        AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
-    },
-    tracing_v2::{
-        DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine,
-        engines::{Engine, StagingEngine},
-        jit::Tracer,
-        linear::{jvp_program, jvp_traced},
-        operations::{
-            DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale,
-            constants::{One, Zero},
-        },
-    },
-    types::{ArrayType, Type, Typed},
+use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use crate::tracing::{
+    AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
 };
+use crate::tracing_v2::engines::{Engine, StagingEngine};
+use crate::tracing_v2::jit::Tracer;
+use crate::tracing_v2::linear::{jvp_program, jvp_traced};
+use crate::tracing_v2::operations::constants::{One, Zero};
+use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine};
+use crate::types::{ArrayType, Type, Typed};
 
 /// Concrete state threaded through forward-mode JVP rules.
 ///
@@ -302,13 +299,10 @@ where
 mod tests {
     use crate::parameters::{ParameterError, Parameterized};
     use crate::tracing::ProgramBuilder;
-    use crate::tracing_v2::{
-        LinearPrimitiveOperation, PrimitiveOperation,
-        engines::ScalarEngine,
-        jit::TracingEngine,
-        operations::{AddOperation, DifferentiableOperation},
-        test_support,
-    };
+    use crate::tracing_v2::engines::ScalarEngine;
+    use crate::tracing_v2::jit::TracingEngine;
+    use crate::tracing_v2::operations::{AddOperation, DifferentiableOperation};
+    use crate::tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation, test_support};
 
     use super::*;
 

@@ -3,20 +3,18 @@ use std::fmt::{Debug, Display};
 use half::{bf16, f16};
 use thiserror::Error;
 
-use crate::{
-    parameters::Parameterized,
-    tracing::{
-        Instruction, InterpretableOperation, Operation, OperationFormatter, Program, Traceable, TracingError, Value,
-    },
-    tracing_v2::{
-        DifferentiableEngine, DifferentiableStagingEngine, JvpContext, JvpTracer, PrimitiveOperation, Tracer,
-        engines::StagingEngine,
-        forward::Differentiable,
-        linear::linearize_program,
-        operations::constants::{Zero, ZeroLike},
-    },
-    types::{ArrayType, DataType, TypeError, Typed},
+use crate::parameters::Parameterized;
+use crate::tracing::{
+    Instruction, InterpretableOperation, Operation, OperationFormatter, Program, Traceable, TracingError, Value,
 };
+use crate::tracing_v2::engines::StagingEngine;
+use crate::tracing_v2::forward::Differentiable;
+use crate::tracing_v2::linear::linearize_program;
+use crate::tracing_v2::operations::constants::{Zero, ZeroLike};
+use crate::tracing_v2::{
+    DifferentiableEngine, DifferentiableStagingEngine, JvpContext, JvpTracer, PrimitiveOperation, Tracer,
+};
+use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 use super::{DifferentiableOperation, LinearOperation, SupportsAdd, TracedLinearizationCarrier, TranspositionContext};
 
@@ -699,25 +697,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, cell::RefCell, rc::Rc};
+    use std::borrow::Cow;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::{
-        parameters::{Parameter, Placeholder},
-        tracing::{ProgramBuilder, Traceable, Value},
-        tracing_v2::{
-            Differentiable, LinearPrimitiveOperation,
-            engines::{Engine, ScalarEngine},
-            operations::{
-                SupportsAdd, SupportsNeg, SupportsScale,
-                constants::{One, OneLike, Zero},
-            },
-        },
-        types::DataType,
-    };
+    use crate::parameters::{Parameter, Placeholder};
+    use crate::tracing::{ProgramBuilder, Traceable, Value};
+    use crate::tracing_v2::engines::{Engine, ScalarEngine};
+    use crate::tracing_v2::operations::constants::{One, OneLike, Zero};
+    use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
+    use crate::tracing_v2::{Differentiable, LinearPrimitiveOperation};
+    use crate::types::DataType;
 
     use super::*;
 

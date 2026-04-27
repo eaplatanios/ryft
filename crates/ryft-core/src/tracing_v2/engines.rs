@@ -1,17 +1,15 @@
-use std::{cell::RefCell, marker::PhantomData, rc::Rc};
+use std::cell::RefCell;
+use std::marker::PhantomData;
+use std::rc::Rc;
 
 use half::{bf16, f16};
 
-use crate::{
-    parameters::{Parameter, Parameterized, ParameterizedFamily},
-    tracing::{InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError},
-    tracing_v2::{
-        LinearPrimitiveOperation, PrimitiveOperation,
-        differentiation::{DifferentiableEngine, DifferentiableStagingEngine},
-        jit::{Tracer, TracingEngine},
-    },
-    types::{ArrayType, Type, Typed},
-};
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
+use crate::tracing::{InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError};
+use crate::tracing_v2::differentiation::{DifferentiableEngine, DifferentiableStagingEngine};
+use crate::tracing_v2::jit::{Tracer, TracingEngine};
+use crate::tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation};
+use crate::types::{ArrayType, Type, Typed};
 
 /// Synthesizes concrete leaf values from abstract type metadata.
 ///
@@ -240,7 +238,8 @@ impl_differentiable_engine_for_scalar!(f64);
 
 #[cfg(test)]
 mod tests {
-    use crate::{tracing_v2::jvp, types::DataType};
+    use crate::tracing_v2::jvp;
+    use crate::types::DataType;
 
     use super::*;
 

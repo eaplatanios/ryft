@@ -2,12 +2,10 @@ use std::collections::BTreeSet;
 
 use half::{bf16, f16};
 
-use crate::{
-    sharding::{Sharding, ShardingDimension},
-    tracing::Traceable,
-    tracing_v2::jit::Tracer,
-    types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
-};
+use crate::sharding::{Sharding, ShardingDimension};
+use crate::tracing::Traceable;
+use crate::tracing_v2::jit::Tracer;
+use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 use super::{SupportsMatMul, SupportsMatrixTranspose};
 

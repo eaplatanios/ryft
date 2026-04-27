@@ -1,20 +1,13 @@
 use std::fmt::{Debug, Display};
 
 use crate::macros::check_input_count;
-use crate::tracing::TracingError;
+use crate::tracing::{AtomId, Traceable, TracingError};
+use crate::tracing_v2::DifferentiableEngine;
+use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::types::{ArrayType, Type, TypeError};
-use crate::{
-    tracing::{AtomId, Traceable},
-    tracing_v2::{
-        DifferentiableEngine,
-        forward::{Differentiable, JvpContext, JvpTracer},
-    },
-};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, Operation,
-    matrix::{MatrixOps, MatrixValue, transpose_abstract},
-};
+use super::matrix::{MatrixOps, MatrixValue, transpose_abstract};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, Operation};
 
 /// Hidden carrier capability for staging the matrix transposition primitive.
 #[doc(hidden)]

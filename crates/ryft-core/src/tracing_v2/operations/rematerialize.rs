@@ -1,18 +1,16 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::{
-    parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
-    tracing::{Instruction, OperationFormatter, Program, ProgramBuilder, Traceable, TracingError, Value},
-    tracing_v2::{
-        Differentiable, DifferentiableEngine, DifferentiableStagingEngine, DifferentiationError,
-        LinearPrimitiveOperation, PrimitiveOperation, Tracer,
-        engines::StagingEngine,
-        linear::{linearize_program, transpose_linear_program_with_output_examples},
-        operations::constants::{SupportsZero, Zero, ZeroLike},
-    },
-    types::{ArrayType, Type, TypeError, Typed},
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
+use crate::tracing::{Instruction, OperationFormatter, Program, ProgramBuilder, Traceable, TracingError, Value};
+use crate::tracing_v2::engines::StagingEngine;
+use crate::tracing_v2::linear::{linearize_program, transpose_linear_program_with_output_examples};
+use crate::tracing_v2::operations::constants::{SupportsZero, Zero, ZeroLike};
+use crate::tracing_v2::{
+    Differentiable, DifferentiableEngine, DifferentiableStagingEngine, DifferentiationError, LinearPrimitiveOperation,
+    PrimitiveOperation, Tracer,
 };
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, TracedLinearizationCarrier};
 
@@ -653,18 +651,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::tracing::{Program, ProgramBuilder};
-    use crate::tracing_v2::{
-        DifferentiationError, JvpTracer, LinearPrimitiveOperation, Sin, Tracer,
-        engines::{ScalarEngine, StagingEngine},
-        linear::{compile_grad, grad, value_and_grad},
-        operations::TranspositionContext,
-    };
+    use crate::tracing_v2::engines::{ScalarEngine, StagingEngine};
+    use crate::tracing_v2::linear::{compile_grad, grad, value_and_grad};
+    use crate::tracing_v2::operations::TranspositionContext;
+    use crate::tracing_v2::{DifferentiationError, JvpTracer, LinearPrimitiveOperation, Sin, Tracer};
 
     use super::*;
 

@@ -296,7 +296,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::{Block, Context, OneOperand, OneResult, Operation, Type, dialects::func};
+    use crate::dialects::func;
+    use crate::{Block, Context, OneOperand, OneResult, Operation, Type};
 
     use super::*;
 

@@ -1,4 +1,5 @@
-use std::{marker::PhantomData, sync::LazyLock};
+use std::marker::PhantomData;
+use std::sync::LazyLock;
 
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
@@ -6,10 +7,8 @@ use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing_v2::{
-    DifferentiableEngine, DifferentiableStagingEngine, LinearPrimitiveOperation, Tracer,
-    engines::{Engine, StagingEngine},
-};
+use ryft_core::tracing_v2::engines::{Engine, StagingEngine};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableStagingEngine, LinearPrimitiveOperation, Tracer};
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::arrays::{Array, ArrayError};

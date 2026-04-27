@@ -1,9 +1,7 @@
 use super::*;
 
-use crate::tracing_v2::{
-    BatchingError, DifferentiationError,
-    batching::{ReferenceBatch, interpret_reference_batched_program, reference_stack},
-};
+use crate::tracing_v2::batching::{ReferenceBatch, interpret_reference_batched_program, reference_stack};
+use crate::tracing_v2::{BatchingError, DifferentiationError};
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
 ///
@@ -395,11 +393,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        parameters::Placeholder,
-        tracing::TracingError,
-        tracing_v2::{DifferentiationError, Sin, engines::ScalarEngine},
-    };
+    use crate::parameters::Placeholder;
+    use crate::tracing::TracingError;
+    use crate::tracing_v2::engines::ScalarEngine;
+    use crate::tracing_v2::{DifferentiationError, Sin};
 
     use super::{DenseJacobian, jacfwd, jacrev};
 

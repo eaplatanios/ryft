@@ -2,18 +2,14 @@ use std::fmt::{Debug, Display};
 
 use half::{bf16, f16};
 
-use crate::{
-    macros::check_input_count,
-    sharding::{Sharding, ShardingDimension},
-    tracing::{AtomId, OperationFormatter, Traceable, TracingError},
-    tracing_v2::{
-        DifferentiableEngine, LinearPrimitiveOperation,
-        engines::StagingEngine,
-        forward::{Differentiable, JvpContext, JvpTracer},
-        jit::Tracer,
-    },
-    types::{ArrayType, Shape, Size, Type, TypeError, Typed},
-};
+use crate::macros::check_input_count;
+use crate::sharding::{Sharding, ShardingDimension};
+use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError};
+use crate::tracing_v2::engines::StagingEngine;
+use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::jit::Tracer;
+use crate::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation};
+use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
@@ -375,10 +371,8 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::{
-        sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
-        types::{DataType, Shape},
-    };
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+    use crate::types::{DataType, Shape};
 
     use super::*;
 

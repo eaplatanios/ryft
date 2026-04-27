@@ -1,27 +1,19 @@
-use std::{
-    any::{Any, TypeId},
-    collections::HashMap,
-    fmt::{Debug, Display},
-    sync::Arc,
-};
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::fmt::{Debug, Display};
+use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::{
-    parameters::Parameter,
-    tracing::{Traceable, TracingError, Value},
-    tracing_v2::{
-        DifferentiableEngine, DifferentiableStagingEngine, TracingEngine,
-        forward::{Differentiable, JvpTracer},
-        jit::Tracer,
-    },
-    types::{ArrayType, Type, TypeError, Typed},
-};
+use crate::parameters::Parameter;
+use crate::tracing::{Traceable, TracingError, Value};
+use crate::tracing_v2::forward::{Differentiable, JvpTracer};
+use crate::tracing_v2::jit::Tracer;
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableStagingEngine, TracingEngine};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation,
-    primitive::{LinearPrimitiveOperation, PrimitiveOperation},
-};
+use super::primitive::{LinearPrimitiveOperation, PrimitiveOperation};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
 /// Error type for rule-based custom staged operations.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -474,18 +466,18 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearCustomPrim
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc, sync::Arc};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
 
     use super::*;
     use crate::tracing::{Program, ProgramBuilder};
-    use crate::tracing_v2::{
-        LinearPrimitiveOperation, PrimitiveOperation, Tracer,
-        engines::{ScalarEngine, StagingEngine},
-        grad, jvp,
-        operations::{TranspositionContext, constants::OneLike},
-    };
+    use crate::tracing_v2::engines::{ScalarEngine, StagingEngine};
+    use crate::tracing_v2::operations::TranspositionContext;
+    use crate::tracing_v2::operations::constants::OneLike;
+    use crate::tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation, Tracer, grad, jvp};
     use crate::types::{ArrayType, DataType, Shape};
 
     /// Simple unary custom op used to exercise the rule-based custom primitive API.

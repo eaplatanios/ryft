@@ -65,8 +65,7 @@ fn array_error_to_tracing_error(error: crate::arrays::ArrayError) -> TracingErro
 mod tests {
     use ndarray::{arr1, arr2};
     use pretty_assertions::assert_eq;
-    use ryft_core::tracing::Operation;
-    use ryft_core::tracing::TracingError;
+    use ryft_core::tracing::{Operation, TracingError};
     use ryft_core::tracing_v2::{DifferentiationError, Engine, MatrixOps, Sin, StagingEngine, compile_grad, grad, jvp};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 

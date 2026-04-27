@@ -2,12 +2,11 @@ use std::ops::{Add, Mul, Neg};
 
 use indoc::indoc;
 
-use crate::{
-    parameters::Placeholder,
-    tracing::{Program, ProgramBuilder},
-    tracing_v2::{engines::ScalarEngine, *},
-    types::{ArrayType, Typed},
-};
+use crate::parameters::Placeholder;
+use crate::tracing::{Program, ProgramBuilder};
+use crate::tracing_v2::engines::ScalarEngine;
+use crate::tracing_v2::*;
+use crate::types::{ArrayType, Typed};
 
 pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
     let engine = ScalarEngine::<f64>::new();

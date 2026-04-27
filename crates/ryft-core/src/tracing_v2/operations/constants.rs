@@ -2,11 +2,9 @@ use std::fmt::{Debug, Display};
 
 use half::{bf16, f16};
 
-use crate::{
-    tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value},
-    tracing_v2::operations::primitive::LinearPrimitiveOperation,
-    types::{ArrayType, Type, TypeError, Typed},
-};
+use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
+use crate::tracing_v2::operations::primitive::LinearPrimitiveOperation;
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{InterpretableOperation, LinearOperation, Operation, TranspositionContext};
 
@@ -227,12 +225,9 @@ impl_scalar_value_traits!(f64, 0.0f64, 1.0f64);
 mod tests {
     use half::{bf16, f16};
 
-    use crate::{
-        tracing::Value,
-        tracing_v2::{Cos, Sin, test_support},
-        types::ArrayType,
-        types::{DataType, Typed},
-    };
+    use crate::tracing::Value;
+    use crate::tracing_v2::{Cos, Sin, test_support};
+    use crate::types::{ArrayType, DataType, Typed};
 
     use super::{OneLike, ZeroLike};
 

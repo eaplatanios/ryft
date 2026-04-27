@@ -9,7 +9,8 @@ use thiserror::Error;
 
 #[cfg(test)]
 use ryft_mlir::Block;
-use ryft_mlir::{Location, dialects::shardy::DetachedMeshOperation};
+use ryft_mlir::Location;
+use ryft_mlir::dialects::shardy::DetachedMeshOperation;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, Client, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
 

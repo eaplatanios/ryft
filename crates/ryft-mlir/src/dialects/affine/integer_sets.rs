@@ -8,7 +8,8 @@ use ryft_xla_sys::bindings::{
     mlirIntegerSetReplaceGet,
 };
 
-use crate::{AffineExpression, AffineExpressionRef, Context, support::write_to_formatter_callback};
+use crate::support::write_to_formatter_callback;
+use crate::{AffineExpression, AffineExpressionRef, Context};
 
 /// Constraint for an [`IntegerSet`].
 pub struct IntegerSetConstraint<'c, 't> {

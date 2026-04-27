@@ -1,26 +1,18 @@
-use std::{
-    borrow::Cow,
-    cell::RefCell,
-    fmt::Display,
-    ops::{Add, Mul, Neg},
-    rc::Rc,
-};
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::fmt::Display;
+use std::ops::{Add, Mul, Neg};
+use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
-use crate::{
-    parameters::{Parameter, Parameterized, ParameterizedFamily},
-    tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError},
-    tracing_v2::{
-        Differentiable, DifferentiableEngine, DifferentiableStagingEngine,
-        engines::{Engine, StagingEngine},
-        operations::{
-            SupportsAdd, SupportsMul, SupportsNeg, TracedLinearizationCarrier,
-            constants::{One, OneLike, ZeroLike},
-        },
-    },
-    types::{Type, Typed},
-};
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
+use crate::tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError};
+use crate::tracing_v2::engines::{Engine, StagingEngine};
+use crate::tracing_v2::operations::constants::{One, OneLike, ZeroLike};
+use crate::tracing_v2::operations::{SupportsAdd, SupportsMul, SupportsNeg, TracedLinearizationCarrier};
+use crate::tracing_v2::{Differentiable, DifferentiableEngine, DifferentiableStagingEngine};
+use crate::types::{Type, Typed};
 
 /// Execution state carried by a [`Tracer`] leaf.
 ///
@@ -530,16 +522,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, cell::RefCell, rc::Rc};
+    use std::borrow::Cow;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     use indoc::indoc;
 
-    use crate::{
-        parameters::Placeholder,
-        tracing::{ProgramBuilder, TracingError},
-        tracing_v2::{Engine, PrimitiveOperation, Sin, StagingEngine, engines::ScalarEngine, test_support},
-        types::{ArrayType, TypeError},
-    };
+    use crate::parameters::Placeholder;
+    use crate::tracing::{ProgramBuilder, TracingError};
+    use crate::tracing_v2::engines::ScalarEngine;
+    use crate::tracing_v2::{Engine, PrimitiveOperation, Sin, StagingEngine, test_support};
+    use crate::types::{ArrayType, TypeError};
 
     use super::*;
 
@@ -905,18 +898,12 @@ mod tests {
     fn jit_returns_abstract_eval_errors_instead_of_panicking() {
         use ryft_macros::Parameter;
 
-        use crate::{
-            tracing::TracingError,
-            tracing_v2::{
-                Cos, MatrixOps, Sin,
-                operations::{
-                    ControlFlowError, ControlFlowValue,
-                    constants::{OneLike, ZeroLike},
-                    reshape::ReshapeOps,
-                },
-            },
-            types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
-        };
+        use crate::tracing::TracingError;
+        use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
+        use crate::tracing_v2::operations::reshape::ReshapeOps;
+        use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
+        use crate::tracing_v2::{Cos, MatrixOps, Sin};
+        use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
         #[derive(Clone, Debug, Parameter)]
         struct TestAbstractValue {

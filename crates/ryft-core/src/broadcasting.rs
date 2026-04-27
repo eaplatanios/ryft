@@ -2,12 +2,10 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
-use crate::{
-    parameters::{ParameterError, Parameterized},
-    sharding::{Sharding, ShardingDimension, ShardingError},
-    types::data_types::DataTypeError,
-    types::{ArrayType, DataType, Shape, Size},
-};
+use crate::parameters::{ParameterError, Parameterized};
+use crate::sharding::{Sharding, ShardingDimension, ShardingError};
+use crate::types::data_types::DataTypeError;
+use crate::types::{ArrayType, DataType, Shape, Size};
 
 /// Represents broadcasting-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]

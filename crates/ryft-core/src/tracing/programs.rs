@@ -789,12 +789,10 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> Default for ProgramBuild
 mod tests {
     use indoc::indoc;
 
-    use crate::{
-        parameters::{ParameterError, Parameterized, Placeholder},
-        tracing::TracingError,
-        tracing_v2::{PrimitiveOperation, test_support},
-        types::{ArrayType, DataType, Typed},
-    };
+    use crate::parameters::{ParameterError, Parameterized, Placeholder};
+    use crate::tracing::TracingError;
+    use crate::tracing_v2::{PrimitiveOperation, test_support};
+    use crate::types::{ArrayType, DataType, Typed};
 
     use super::*;
 

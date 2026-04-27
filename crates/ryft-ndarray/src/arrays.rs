@@ -6,12 +6,9 @@ use ndarray::{Array2, ArrayD, Ix2, IxDyn, Zip};
 use thiserror::Error;
 
 use ryft_core::parameters::Parameter;
-use ryft_core::tracing::TracingError;
-use ryft_core::tracing::{Traceable, Value};
-use ryft_core::tracing_v2::operations::{
-    ControlFlowError, ControlFlowValue,
-    constants::{One, OneLike, Zero, ZeroLike},
-};
+use ryft_core::tracing::{Traceable, TracingError, Value};
+use ryft_core::tracing_v2::operations::constants::{One, OneLike, Zero, ZeroLike};
+use ryft_core::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use ryft_core::tracing_v2::{CoordinateValue, Cos, Differentiable, DifferentiationError, MatrixOps, ReshapeOps, Sin};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
@@ -469,18 +466,15 @@ fn array_error_to_tracing_error(error: ArrayError) -> TracingError {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     use ndarray::{arr0, arr1, arr2};
     use pretty_assertions::assert_eq;
     use ryft_core::parameters::Placeholder;
     use ryft_core::tracing::ProgramBuilder;
-    use ryft_core::tracing_v2::operations::ControlFlowValue;
-    use ryft_core::tracing_v2::{
-        LinearOperation, LinearPrimitiveOperation, StagingEngine,
-        operations::{ReshapeOperation, TranspositionContext},
-    };
-    use ryft_core::tracing_v2::{MatrixOps, ReshapeOps};
+    use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation, TranspositionContext};
+    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, MatrixOps, ReshapeOps, StagingEngine};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
     use crate::NdArrayEngine;

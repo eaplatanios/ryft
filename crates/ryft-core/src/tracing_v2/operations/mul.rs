@@ -1,19 +1,13 @@
-use std::{
-    collections::BTreeSet,
-    fmt::{Debug, Display},
-    ops::Mul,
-};
+use std::collections::BTreeSet;
+use std::fmt::{Debug, Display};
+use std::ops::Mul;
 
 use crate::broadcasting::Broadcastable;
+use crate::macros::check_input_count;
+use crate::tracing::{AtomId, Traceable, TracingError};
+use crate::tracing_v2::DifferentiableEngine;
+use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::types::{ArrayType, Type, TypeError, Typed};
-use crate::{
-    macros::check_input_count,
-    tracing::{AtomId, Traceable, TracingError},
-    tracing_v2::{
-        DifferentiableEngine,
-        forward::{Differentiable, JvpContext, JvpTracer},
-    },
-};
 
 use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsScale};
 
@@ -145,11 +139,10 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::tracing_v2::engines::ScalarEngine;
+    use crate::tracing_v2::{jvp, test_support};
     use crate::types::{DataType, Shape, Size};
-    use crate::{
-        sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension},
-        tracing_v2::{engines::ScalarEngine, jvp, test_support},
-    };
 
     use super::*;
 

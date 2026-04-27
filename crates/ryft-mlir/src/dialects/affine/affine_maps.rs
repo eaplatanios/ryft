@@ -11,7 +11,8 @@ use ryft_xla_sys::bindings::{
     mlirAffineMapZeroResultGet,
 };
 
-use crate::{Context, support::write_to_formatter_callback};
+use crate::Context;
+use crate::support::write_to_formatter_callback;
 
 use super::affine_expressions::{AffineExpression, AffineExpressionRef};
 

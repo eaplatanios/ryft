@@ -20,7 +20,8 @@ impl<S: Clone, InputStructure, OutputStructure> DenseJacobianNdArrayExt<S>
 mod tests {
     use ndarray::arr2;
     use pretty_assertions::assert_eq;
-    use ryft_core::tracing_v2::{Sin, engines::ScalarEngine, jacfwd};
+    use ryft_core::tracing_v2::engines::ScalarEngine;
+    use ryft_core::tracing_v2::{Sin, jacfwd};
 
     use super::DenseJacobianNdArrayExt;
 

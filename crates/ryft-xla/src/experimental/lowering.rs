@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use ryft_mlir::dialects::{func, shardy, stable_hlo, stable_hlo::Accuracy, stable_hlo::Precision};
+use ryft_mlir::dialects::stable_hlo::{Accuracy, Precision};
+use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef,
     Operation as MlirOperation, Region, Size as MlirSize, Type, TypeAndAttributes, TypeRef, Value, ValueRef,
@@ -11,15 +12,13 @@ use ryft_ndarray::Array as NdArrayValue;
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing::{AtomId, Instruction, Operation, Program, Traceable, TracingError};
-use ryft_core::tracing_v2::{
-    CustomPrimitive, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation,
-    operations::{
-        AddOperation, CosOperation, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation,
-        MatrixTransposeOperation, MulOperation, NegOperation, RematerializeOperation, ReshapeOperation,
-        RightMatMulOperation, ScaleOperation, SinOperation,
-        control_flow::{ConditionOperation, ConditionPredicate, WhileOperation},
-    },
+use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
+use ryft_core::tracing_v2::operations::{
+    AddOperation, CosOperation, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation,
+    MatrixTransposeOperation, MulOperation, NegOperation, RematerializeOperation, ReshapeOperation,
+    RightMatMulOperation, ScaleOperation, SinOperation,
 };
+use ryft_core::tracing_v2::{CustomPrimitive, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
 
 use crate::experimental::operations::{
@@ -2319,10 +2318,8 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError};
-    use ryft_core::tracing_v2::{
-        Cos, CustomPrimitive, MatrixOps, Sin, StagingEngine,
-        operations::constants::{OneLike, ZeroLike},
-    };
+    use ryft_core::tracing_v2::operations::constants::{OneLike, ZeroLike};
+    use ryft_core::tracing_v2::{Cos, CustomPrimitive, MatrixOps, Sin, StagingEngine};
     use ryft_core::types::{Shape, TypeError};
     #[cfg(feature = "ndarray")]
     use ryft_ndarray::{Array as NdArrayValue, NdArrayEngine};

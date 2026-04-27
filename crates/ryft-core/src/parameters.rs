@@ -2275,9 +2275,8 @@ mod tests {
     pub mod ryft {
         pub use ryft_macros::Parameterized;
 
-        pub use crate::parameters::ParameterError;
         pub use crate::parameters::{
-            Parameter, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
+            Parameter, ParameterError, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
             PathPrefixedParameterIterator, Placeholder,
         };
     }

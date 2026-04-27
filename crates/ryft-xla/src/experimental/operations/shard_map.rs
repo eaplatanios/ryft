@@ -1,34 +1,31 @@
-use std::{
-    cell::RefCell,
-    fmt::{Debug, Display},
-    marker::PhantomData,
-    rc::Rc,
-    sync::Arc,
-};
+use std::cell::RefCell;
+use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::sync::Arc;
 
-use ryft_core::{
-    parameters::{Parameterized, ParameterizedFamily},
-    sharding::{LogicalMesh, MeshAxisType, Sharding},
-    tracing::{
-        Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
-    },
-    tracing_v2::{
-        CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearCustomPrimitive,
-        LinearOperation, LinearPrimitiveOperation, TracingEngine,
-        forward::{Differentiable, JvpTracer},
-        linear::{linearize_traced_program, transpose_traced_linear_program},
-    },
-    types::{ArrayType, TypeError, Typed},
+use ryft_core::parameters::{Parameterized, ParameterizedFamily};
+use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
+use ryft_core::tracing::{
+    Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
 };
+use ryft_core::tracing_v2::forward::{Differentiable, JvpTracer};
+use ryft_core::tracing_v2::linear::{linearize_traced_program, transpose_traced_linear_program};
+use ryft_core::tracing_v2::{
+    CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearCustomPrimitive, LinearOperation,
+    LinearPrimitiveOperation, TracingEngine,
+};
+use ryft_core::types::{ArrayType, TypeError, Typed};
 
+use crate::experimental::engines::XlaEngine;
 use crate::experimental::lowering::{
     LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
 };
+use crate::experimental::ops::XlaPrimitiveOperation;
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
     ShardMapTensor, ShardMapTraceError, ShardMapTracer, TracedShardMap, fold_xla_program_constants,
 };
-use crate::experimental::{engines::XlaEngine, ops::XlaPrimitiveOperation};
 
 /// Shared program type used by erased shard-map bodies.
 type FlatShardMapProgram =
@@ -1636,18 +1633,16 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
-    use ryft_core::{
-        parameters::Placeholder,
-        sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
-        tracing::{Atom, AtomId, ProgramBuilder, Traceable},
-        tracing_v2::{
-            DifferentiableOperation, JvpContext, LinearPrimitiveOperation, forward::JvpTracer,
-            operations::TranspositionContext,
-        },
-        types::{ArrayType, DataType, Typed},
-    };
+    use ryft_core::parameters::Placeholder;
+    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+    use ryft_core::tracing::{Atom, AtomId, ProgramBuilder, Traceable};
+    use ryft_core::tracing_v2::forward::JvpTracer;
+    use ryft_core::tracing_v2::operations::TranspositionContext;
+    use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext, LinearPrimitiveOperation};
+    use ryft_core::types::{ArrayType, DataType, Typed};
 
     use crate::experimental::ops::XlaPrimitiveOperation;
     use crate::experimental::shard_map::{

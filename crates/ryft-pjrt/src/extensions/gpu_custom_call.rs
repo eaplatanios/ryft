@@ -427,9 +427,9 @@ mod tests {
 
     use indoc::indoc;
 
+    use crate::extensions::ffi::ffi::{XLA_FFI_CallFrame, XLA_FFI_Error};
     use crate::extensions::ffi::{
         FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiInput, FfiOutput, FfiTypeId,
-        ffi::XLA_FFI_CallFrame, ffi::XLA_FFI_Error,
     };
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use crate::tests::{TestPlatform, test_for_each_platform};

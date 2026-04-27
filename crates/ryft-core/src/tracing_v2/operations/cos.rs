@@ -1,23 +1,18 @@
-use std::{
-    fmt::{Debug, Display},
-    ops::Neg,
-};
+use std::fmt::{Debug, Display};
+use std::ops::Neg;
 
 use half::{bf16, f16};
 
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::{
-    DifferentiableEngine,
-    engines::StagingEngine,
-    forward::{Differentiable, JvpContext, JvpTracer},
-    jit::Tracer,
-};
+use crate::tracing_v2::DifferentiableEngine;
+use crate::tracing_v2::engines::StagingEngine;
+use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::jit::Tracer;
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, Operation, SupportsNeg, SupportsScale, sin::Sin, unary_abstract,
-};
+use super::sin::Sin;
+use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsNeg, SupportsScale, unary_abstract};
 
 /// Hidden carrier capability for staging the cosine primitive.
 #[doc(hidden)]

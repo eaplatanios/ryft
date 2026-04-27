@@ -1,25 +1,23 @@
-use std::{cell::RefCell, fmt::Debug, rc::Rc};
+use std::cell::RefCell;
+use std::fmt::Debug;
+use std::rc::Rc;
 
-use crate::{
-    parameters::{Parameterized, ParameterizedFamily, Placeholder},
-    tracing::{
-        Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
-        Value,
-    },
-    tracing_v2::{
-        Differentiable, DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine,
-        DifferentiationError, LinearOperation,
-        engines::{Engine, StagingEngine},
-        forward::JvpTracer,
-        jit::{Tracer, TracingEngine},
-        operations::{
-            DifferentiableOperation, SupportsAdd, SupportsRematerialize,
-            constants::{One, OneLike, SupportsZero, Zero, ZeroLike},
-            rematerialize::{FlatTracedRematerialize, RematerializeOperation},
-        },
-    },
-    types::{ArrayType, Type, Typed},
+use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
+use crate::tracing::{
+    Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
+    Value,
 };
+use crate::tracing_v2::engines::{Engine, StagingEngine};
+use crate::tracing_v2::forward::JvpTracer;
+use crate::tracing_v2::jit::{Tracer, TracingEngine};
+use crate::tracing_v2::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
+use crate::tracing_v2::operations::rematerialize::{FlatTracedRematerialize, RematerializeOperation};
+use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsRematerialize};
+use crate::tracing_v2::{
+    Differentiable, DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine,
+    DifferentiationError, LinearOperation,
+};
+use crate::types::{ArrayType, Type, Typed};
 
 /// Dense Jacobian and Hessian materialization helpers.
 mod dense;
@@ -35,8 +33,7 @@ mod reverse;
 pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
 #[doc(hidden)]
 pub use program::linearize_program;
-pub use program::transpose_linear_program_with_output_examples;
-pub use program::transpose_traced_linear_program;
+pub use program::{transpose_linear_program_with_output_examples, transpose_traced_linear_program};
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
 #[doc(hidden)]
 pub use replay::TracedLinearizableOperation;
@@ -169,21 +166,19 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::{Debug, Display};
     use std::ops::{Add, Mul, Neg};
-    use std::{
-        fmt::{Debug, Display},
-        sync::Arc,
-    };
+    use std::sync::Arc;
 
-    use crate::{
-        parameters::Placeholder,
-        tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError},
-        tracing_v2::{
-            CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearOperation, LinearPrimitiveOperation,
-            PrimitiveOperation, Sin, engines::ScalarEngine, operations::TranspositionContext, test_support,
-        },
-        types::{ArrayType, DataType, TypeError},
+    use crate::parameters::Placeholder;
+    use crate::tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError};
+    use crate::tracing_v2::engines::ScalarEngine;
+    use crate::tracing_v2::operations::TranspositionContext;
+    use crate::tracing_v2::{
+        CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearOperation, LinearPrimitiveOperation,
+        PrimitiveOperation, Sin, test_support,
     };
+    use crate::types::{ArrayType, DataType, TypeError};
     use indoc::indoc;
 
     use super::*;

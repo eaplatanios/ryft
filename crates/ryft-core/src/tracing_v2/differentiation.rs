@@ -1,15 +1,11 @@
 use thiserror::Error;
 
-use crate::{
-    tracing::{InterpretableOperation, TracingError},
-    tracing_v2::{
-        LinearOperation as LinearOperationTrait,
-        engines::{Engine, StagingEngine},
-        jit::Tracer,
-        operations::{SupportsAdd, SupportsNeg, SupportsScale, SupportsZero},
-    },
-    types::ArrayType,
-};
+use crate::tracing::{InterpretableOperation, TracingError};
+use crate::tracing_v2::LinearOperation as LinearOperationTrait;
+use crate::tracing_v2::engines::{Engine, StagingEngine};
+use crate::tracing_v2::jit::Tracer;
+use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale, SupportsZero};
+use crate::types::ArrayType;
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]

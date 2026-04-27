@@ -4,15 +4,14 @@ use half::{bf16, f16};
 
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::{
-    DifferentiableEngine,
-    engines::StagingEngine,
-    forward::{Differentiable, JvpContext, JvpTracer},
-    jit::Tracer,
-};
+use crate::tracing_v2::DifferentiableEngine;
+use crate::tracing_v2::engines::StagingEngine;
+use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::jit::Tracer;
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsScale, cos::Cos, unary_abstract};
+use super::cos::Cos;
+use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsScale, unary_abstract};
 
 /// Hidden carrier capability for staging the sine primitive.
 #[doc(hidden)]

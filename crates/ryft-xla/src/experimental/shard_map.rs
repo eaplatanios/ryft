@@ -1,9 +1,7 @@
-use std::{
-    borrow::Cow,
-    collections::{BTreeSet, HashSet},
-    fmt::{Debug, Display},
-    ops::{Add, Mul, Neg},
-};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashSet};
+use std::fmt::{Debug, Display};
+use std::ops::{Add, Mul, Neg};
 
 use ryft_macros::Parameter;
 #[cfg(test)]
@@ -20,9 +18,9 @@ use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension
 use ryft_core::tracing::{
     Atom, AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
 };
+use ryft_core::tracing_v2::operations::constants::{One, OneLike, ZeroLike};
 use ryft_core::tracing_v2::operations::{
     AddOperation, ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
-    constants::{One, OneLike, ZeroLike},
 };
 use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin, StagingEngine, Tracer};
 
@@ -32,7 +30,8 @@ use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
-use super::{engines::XlaEngine, lowering::LoweringError};
+use super::engines::XlaEngine;
+use super::lowering::LoweringError;
 
 /// Error type for internal shard-map metadata validation and Shardy rendering.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -1896,7 +1895,8 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{Sin, grad, operations::constants::OneLike};
+    use ryft_core::tracing_v2::operations::constants::OneLike;
+    use ryft_core::tracing_v2::{Sin, grad};
     use ryft_core::types::data_types::DataType;
 
     use crate::mlir::ToMlir;

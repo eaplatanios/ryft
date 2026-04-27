@@ -1,19 +1,15 @@
-use std::{
-    fmt::{Debug, Display},
-    ops::Mul,
-};
+use std::fmt::{Debug, Display};
+use std::ops::Mul;
 
 #[cfg(test)]
 use indoc::indoc;
 
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
-use crate::tracing_v2::{
-    DifferentiableEngine, DifferentiableStagingEngine, LinearPrimitiveOperation,
-    forward::{Differentiable, JvpContext, JvpTracer},
-    jit::Tracer,
-    operations::constants::ZeroLike,
-};
+use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::jit::Tracer;
+use crate::tracing_v2::operations::constants::ZeroLike;
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableStagingEngine, LinearPrimitiveOperation};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{
@@ -204,15 +200,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     use pretty_assertions::assert_eq;
 
-    use crate::{
-        parameters::Placeholder,
-        tracing::ProgramBuilder,
-        tracing_v2::{LinearPrimitiveOperation, operations::TranspositionContext},
-    };
+    use crate::parameters::Placeholder;
+    use crate::tracing::ProgramBuilder;
+    use crate::tracing_v2::LinearPrimitiveOperation;
+    use crate::tracing_v2::operations::TranspositionContext;
 
     use super::*;
 

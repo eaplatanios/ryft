@@ -2,19 +2,15 @@ use std::fmt::{Debug, Display};
 
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
-use crate::tracing_v2::{
-    DifferentiableEngine, DifferentiableStagingEngine,
-    forward::{Differentiable, JvpContext, JvpTracer},
-    jit::Tracer,
-    operations::constants::ZeroLike,
-};
+use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::jit::Tracer;
+use crate::tracing_v2::operations::constants::ZeroLike;
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableStagingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, TracedLinearizationCarrier,
-    matrix::{MatrixOps, MatrixValue, matmul_abstract},
-    primitive::LinearPrimitiveOperation,
-};
+use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
+use super::primitive::LinearPrimitiveOperation;
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, TracedLinearizationCarrier};
 
 /// Hidden carrier capability for staging the right matrix-multiplication primitive.
 #[doc(hidden)]

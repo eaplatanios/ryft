@@ -1,36 +1,30 @@
-use std::{
-    fmt::{Debug, Display},
-    sync::Arc,
-};
+use std::fmt::{Debug, Display};
+use std::sync::Arc;
 
-use ryft_core::{
-    tracing::AtomId,
-    tracing::{InterpretableOperation, Operation, TracingError},
-    tracing_v2::{
-        CustomOperationError, CustomPrimitive, DifferentiableEngine, DifferentiableOperation, DifferentiationError,
-        JvpContext, LinearPrimitiveOperation, TracingEngine,
-        forward::{Differentiable, JvpTracer},
-        linear::{TracedLinearizableOperation, linearize_program, transpose_linear_program_with_output_examples},
-        operations::{
-            AddOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation,
-            FlatTracedRematerialize, LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation,
-            MulOperation, NegOperation, RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation,
-            SupportsAdd, SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsMul,
-            SupportsNeg, SupportsRematerialize, SupportsReshape, SupportsScale, SupportsSin, WhileOperation,
-            lift_jit_constant,
-        },
-    },
-    types::{ArrayType, Shape, TypeError},
+use ryft_core::tracing::{AtomId, InterpretableOperation, Operation, TracingError};
+use ryft_core::tracing_v2::forward::{Differentiable, JvpTracer};
+use ryft_core::tracing_v2::linear::{
+    TracedLinearizableOperation, linearize_program, transpose_linear_program_with_output_examples,
 };
+use ryft_core::tracing_v2::operations::{
+    AddOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation, FlatTracedRematerialize,
+    LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
+    RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation, SupportsAdd, SupportsCos, SupportsCustom,
+    SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg, SupportsRematerialize, SupportsReshape,
+    SupportsScale, SupportsSin, WhileOperation, lift_jit_constant,
+};
+use ryft_core::tracing_v2::{
+    CustomOperationError, CustomPrimitive, DifferentiableEngine, DifferentiableOperation, DifferentiationError,
+    JvpContext, LinearPrimitiveOperation, TracingEngine,
+};
+use ryft_core::types::{ArrayType, Shape, TypeError};
 
-use crate::experimental::{
-    engines::XlaEngine,
-    operations::{
-        LinearShardMapOperation, ShardMapCustomReplayExtension, ShardMapOperation, ShardMapReplayContext,
-        WithShardingConstraintOperation,
-    },
-    shard_map::{ShardMapTensor, ShardMapTracer},
+use crate::experimental::engines::XlaEngine;
+use crate::experimental::operations::{
+    LinearShardMapOperation, ShardMapCustomReplayExtension, ShardMapOperation, ShardMapReplayContext,
+    WithShardingConstraintOperation,
 };
+use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 
 type XlaLinearOperation = LinearPrimitiveOperation<ShardMapTensor>;
 
@@ -528,7 +522,9 @@ impl SupportsReshape<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc, sync::Arc};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
 

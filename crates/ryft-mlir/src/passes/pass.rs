@@ -238,7 +238,8 @@ impl<'c, 't: 'c, F: Clone + FnMut(OperationRef<'_, 'c, 't>) -> LogicalResult> Ex
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     use pretty_assertions::assert_eq;
 

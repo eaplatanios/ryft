@@ -1,24 +1,18 @@
-use std::{
-    borrow::Cow,
-    fmt::{Debug, Display},
-    ops::{Add, Mul, Neg},
-};
+use std::borrow::Cow;
+use std::fmt::{Debug, Display};
+use std::ops::{Add, Mul, Neg};
 
 use ryft_macros::Parameter;
 use thiserror::Error;
 
-use crate::{
-    parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily},
-    tracing::{InterpretableOperation, Operation, Program, Traceable, TracingError, Value},
-    tracing_v2::{
-        ControlFlowError, ControlFlowValue, Cos, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation, Sin, Tracer,
-        operations::{
-            constants::{OneLike, ZeroLike},
-            reshape::ReshapeOps,
-        },
-    },
-    types::{ArrayType, Size, Type, Typed},
+use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
+use crate::tracing::{InterpretableOperation, Operation, Program, Traceable, TracingError, Value};
+use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
+use crate::tracing_v2::operations::reshape::ReshapeOps;
+use crate::tracing_v2::{
+    ControlFlowError, ControlFlowValue, Cos, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation, Sin, Tracer,
 };
+use crate::types::{ArrayType, Size, Type, Typed};
 
 /// Errors emitted by explicit batching and `vmap` helpers.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
@@ -661,23 +655,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fmt::Display,
-        ops::{Add, Mul, Neg},
-        sync::Arc,
-    };
+    use std::fmt::Display;
+    use std::ops::{Add, Mul, Neg};
+    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::{
-        broadcasting::Broadcastable,
-        tracing_v2::{
-            DifferentiableEngine, Engine, StagingEngine,
-            operations::{ControlFlowError, ControlFlowValue, CustomPrimitive},
-        },
-        types::{DataType, Shape},
-    };
+    use crate::broadcasting::Broadcastable;
+    use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue, CustomPrimitive};
+    use crate::tracing_v2::{DifferentiableEngine, Engine, StagingEngine};
+    use crate::types::{DataType, Shape};
 
     #[derive(Clone, Debug, PartialEq)]
     struct TestArray {
