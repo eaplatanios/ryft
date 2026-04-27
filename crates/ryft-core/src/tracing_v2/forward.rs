@@ -9,7 +9,8 @@ use crate::{
     },
     tracing_v2::{
         engines::{
-            DifferentiableEngine, DifferentiableStagingEngine, DifferentiationStagingEngine, Engine, StagingEngine,
+            DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine, Engine,
+            StagingEngine,
         },
         jit::Tracer,
         linear::{jvp_program, jvp_traced},
@@ -186,8 +187,8 @@ impl<
 > JvpInvocationLeaf<E, Input, Output> for V
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiationStagingEngine<E>>>,
-    Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiationStagingEngine<E>>>,
+    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+    Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>
         + SupportsAdd<ArrayType, V>
@@ -195,11 +196,11 @@ where
         + SupportsScale<ArrayType, V>,
 {
     type FunctionInput<'engine>
-        = Input::To<Tracer<'engine, DifferentiationStagingEngine<E>>>
+        = Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>
     where
         E: 'engine;
     type FunctionOutput<'engine>
-        = Output::To<Tracer<'engine, DifferentiationStagingEngine<E>>>
+        = Output::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>
     where
         E: 'engine;
 

@@ -94,7 +94,7 @@ pub trait DifferentiableStagingEngine: StagingEngine {
 /// [`vjp`](crate::tracing_v2::vjp) require this trait so non-differentiable backends do not need to
 /// define fake tangent carriers.
 ///
-/// Differentiated closures are traced through [`DifferentiationStagingEngine`], whose
+/// Differentiated closures are traced through [`DifferentiableOperationStagingEngine`], whose
 /// [`StagingEngine::Operation`] is [`DifferentiableEngine::DifferentiableOperation`]. That keeps
 /// ordinary tracing free to use a wider operation carrier while making differentiation reject
 /// unsupported operations at type-check time when the differentiation carrier omits them.
@@ -113,44 +113,58 @@ pub trait DifferentiableEngine: Engine {
         + SupportsScale<Self::Type, Self::Value>;
 }
 
-/// Active tracing view used while staging differentiable primal programs.
+/// Transparent staging view used while tracing differentiable primal programs.
 ///
-/// This transparent view selects [`DifferentiableEngine::DifferentiableOperation`] as the active
-/// staged operation carrier for an existing [`DifferentiableEngine`]. It does not store its own
-/// reference or state: [`DifferentiationStagingEngine::new`] reborrows an engine as this view, so a
-/// [`TracingEngine`](crate::tracing_v2::jit::TracingEngine) can keep using ordinary engine references
-/// without allocating or owning a wrapper.
+/// Automatic-differentiation transforms need to stage the user's primal closure with
+/// [`DifferentiableEngine::DifferentiableOperation`] rather than the ordinary
+/// [`StagingEngine::Operation`] selected by the backend. Those carriers may intentionally differ:
+/// an engine can support a broad ordinary tracing universe while exposing a narrower
+/// differentiable carrier whose variants all have differentiation rules. This adapter is the small
+/// bridge between those two contracts.
+///
+/// [`DifferentiableOperationStagingEngine::new`] reborrows an `E: DifferentiableEngine` as a
+/// [`StagingEngine`] without allocation or ownership. AD entry points construct this view at trace
+/// boundaries such as [`jvp_program`](crate::tracing_v2::jvp_program),
+/// [`vjp`](crate::tracing_v2::vjp), and [`grad`](crate::tracing_v2::grad), pass it immediately to
+/// ordinary tracing helpers, and keep backend implementations centered on their real engine type.
+/// User-facing ordinary tracing should keep using the backend's own [`StagingEngine`]
+/// implementation; traced tangent and cotangent programs are selected separately through
+/// [`DifferentiableStagingEngine`].
+///
+/// This type is public today because the public AD closure bounds still mention
+/// `Tracer<'engine, DifferentiableOperationStagingEngine<E>>`. Once those APIs hide the concrete
+/// active tracer carrier, this adapter can become a `pub(crate)` implementation detail.
 #[repr(transparent)]
-pub struct DifferentiationStagingEngine<E: DifferentiableEngine + ?Sized> {
-    /// Engine viewed through the differentiation tracing carrier.
+pub struct DifferentiableOperationStagingEngine<E: DifferentiableEngine + ?Sized> {
+    /// Engine viewed through its differentiable operation carrier.
     engine: E,
 }
 
-impl<E: DifferentiableEngine + ?Sized> DifferentiationStagingEngine<E> {
-    /// Reborrows `engine` as a differentiation tracing view.
+impl<E: DifferentiableEngine + ?Sized> DifferentiableOperationStagingEngine<E> {
+    /// Reborrows `engine` as a differentiable operation staging view.
     #[inline]
     pub const fn new(engine: &E) -> &Self {
-        // SAFETY: `DifferentiationStagingEngine<E>` is `repr(transparent)` over `E` and adds no
+        // SAFETY: `DifferentiableOperationStagingEngine<E>` is `repr(transparent)` over `E` and adds no
         // fields, so references to `E` and references to this view have identical layout.
         unsafe { &*(std::ptr::from_ref(engine) as *const Self) }
     }
 
-    /// Returns the wrapped differentiation engine.
+    /// Returns the wrapped engine.
     #[inline]
     pub const fn inner(&self) -> &E {
-        // SAFETY: `DifferentiationStagingEngine<E>` is `repr(transparent)` over `E` and adds no
+        // SAFETY: `DifferentiableOperationStagingEngine<E>` is `repr(transparent)` over `E` and adds no
         // fields, so references to this view and references to `E` have identical layout.
         unsafe { &*(std::ptr::from_ref(self) as *const E) }
     }
 }
 
-impl<E: DifferentiableEngine + ?Sized> std::fmt::Debug for DifferentiationStagingEngine<E> {
+impl<E: DifferentiableEngine + ?Sized> std::fmt::Debug for DifferentiableOperationStagingEngine<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("DifferentiationStagingEngine").finish_non_exhaustive()
+        formatter.debug_struct("DifferentiableOperationStagingEngine").finish_non_exhaustive()
     }
 }
 
-impl<E: DifferentiableEngine + ?Sized> Engine for DifferentiationStagingEngine<E> {
+impl<E: DifferentiableEngine + ?Sized> Engine for DifferentiableOperationStagingEngine<E> {
     type Type = E::Type;
     type Value = E::Value;
 
@@ -165,11 +179,11 @@ impl<E: DifferentiableEngine + ?Sized> Engine for DifferentiationStagingEngine<E
     }
 }
 
-impl<E: DifferentiableEngine + ?Sized> StagingEngine for DifferentiationStagingEngine<E> {
+impl<E: DifferentiableEngine + ?Sized> StagingEngine for DifferentiableOperationStagingEngine<E> {
     type Operation = E::DifferentiableOperation;
 }
 
-impl<E: DifferentiableEngine + ?Sized> DifferentiableEngine for DifferentiationStagingEngine<E> {
+impl<E: DifferentiableEngine + ?Sized> DifferentiableEngine for DifferentiableOperationStagingEngine<E> {
     type DifferentiableOperation = E::DifferentiableOperation;
     type LinearOperation = E::LinearOperation;
 }

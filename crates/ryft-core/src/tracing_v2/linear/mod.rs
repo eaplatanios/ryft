@@ -9,7 +9,8 @@ use crate::{
     tracing_v2::{
         Differentiable, DifferentiationError, LinearOperation,
         engines::{
-            DifferentiableEngine, DifferentiableStagingEngine, DifferentiationStagingEngine, Engine, StagingEngine,
+            DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine, Engine,
+            StagingEngine,
         },
         forward::JvpTracer,
         jit::{Tracer, TracingEngine, interpret_and_trace},
@@ -387,15 +388,15 @@ mod tests {
                 .unwrap();
         assert_eq!(traced_program.instructions[0].operation.name(), "ordinary_add");
 
-        let differentiation_engine = DifferentiationStagingEngine::new(&engine);
-        let (_, differentiation_program): (f64, Program<ArrayType, f64, DifferentiableAddOperation, f64, f64>) =
+        let differentiable_staging_engine = DifferentiableOperationStagingEngine::new(&engine);
+        let (_, differentiable_program): (f64, Program<ArrayType, f64, DifferentiableAddOperation, f64, f64>) =
             interpret_and_trace(
-                differentiation_engine,
-                |x: Tracer<'_, DifferentiationStagingEngine<SplitCarrierEngine>>| Ok(x.clone() + x),
+                differentiable_staging_engine,
+                |x: Tracer<'_, DifferentiableOperationStagingEngine<SplitCarrierEngine>>| Ok(x.clone() + x),
                 2.0f64,
             )
             .unwrap();
-        assert_eq!(differentiation_program.instructions[0].operation.name(), "differentiable_add");
+        assert_eq!(differentiable_program.instructions[0].operation.name(), "differentiable_add");
 
         let (primal, pushforward) = jvp_program(&engine, |x| Ok(x.clone() + x), 2.0f64).unwrap();
 
