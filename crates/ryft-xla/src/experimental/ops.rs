@@ -13,15 +13,14 @@ use ryft_core::{
         linear::{TracedLinearizableOperation, linearize_program, transpose_linear_program_with_output_examples},
         operations::{
             AddOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation,
-            FlatTracedRematerialize, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation,
-            MatrixTransposeOperation, MulOperation, NegOperation, RematerializeOperation, ReshapeOperation,
-            RightMatMulOperation, ScaleOperation, SinOperation, SupportsAdd, SupportsCos, SupportsCustom,
-            SupportsLeftMatMul, SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg,
-            SupportsRematerialize, SupportsReshape, SupportsRightMatMul, SupportsScale, SupportsSin, WhileOperation,
-            left_matmul::left_matmul_abstract_eval, lift_jit_constant, right_matmul::right_matmul_abstract_eval,
+            FlatTracedRematerialize, LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation,
+            MulOperation, NegOperation, RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation,
+            SupportsAdd, SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsMul,
+            SupportsNeg, SupportsRematerialize, SupportsReshape, SupportsScale, SupportsSin, WhileOperation,
+            lift_jit_constant,
         },
     },
-    types::{ArrayType, TypeError, Typed},
+    types::{ArrayType, Shape, TypeError},
 };
 
 use crate::experimental::{
@@ -154,22 +153,16 @@ pub enum XlaPrimitiveOperation {
     Cos,
 
     /// Matrix multiplication.
-    MatMul,
+    MatrixMultiply,
 
     /// Matrix transpose.
-    MatrixTranspose,
+    Transpose,
 
     /// Scaling by one captured factor.
     Scale { factor: ShardMapTensor },
 
-    /// Left matrix multiplication by one captured factor.
-    LeftMatMul { factor: ShardMapTensor },
-
-    /// Right matrix multiplication by one captured factor.
-    RightMatMul { factor: ShardMapTensor },
-
-    /// Reshape.
-    Reshape { input_type: ArrayType, output_type: ArrayType },
+    /// Reshape from one shape to another.
+    Reshape { input_shape: Shape, output_shape: Shape },
 
     /// Higher-order rematerialization.
     Rematerialize(Box<RematerializeOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation, XlaLinearOperation>>),
@@ -201,12 +194,12 @@ impl Debug for XlaPrimitiveOperation {
             Self::Neg => write!(formatter, "Neg"),
             Self::Sin => write!(formatter, "Sin"),
             Self::Cos => write!(formatter, "Cos"),
-            Self::MatMul => write!(formatter, "MatMul"),
-            Self::MatrixTranspose => write!(formatter, "MatrixTranspose"),
+            Self::MatrixMultiply => write!(formatter, "MatrixMultiply"),
+            Self::Transpose => write!(formatter, "Transpose"),
             Self::Scale { .. } => write!(formatter, "Scale"),
-            Self::LeftMatMul { .. } => write!(formatter, "LeftMatMul"),
-            Self::RightMatMul { .. } => write!(formatter, "RightMatMul"),
-            Self::Reshape { input_type, output_type } => write!(formatter, "Reshape({input_type} -> {output_type})"),
+            Self::Reshape { input_shape, output_shape } => {
+                write!(formatter, "Reshape({input_shape} -> {output_shape})")
+            }
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
             Self::Condition(condition) => Debug::fmt(condition, formatter),
             Self::While(while_operation) => Debug::fmt(while_operation, formatter),
@@ -221,7 +214,7 @@ impl Debug for XlaPrimitiveOperation {
 impl Display for XlaPrimitiveOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Reshape { output_type, .. } => write!(formatter, "reshape{}", output_type.shape),
+            Self::Reshape { output_shape, .. } => write!(formatter, "reshape{output_shape}"),
             _ => write!(formatter, "{}", self.name()),
         }
     }
@@ -235,11 +228,9 @@ impl Operation<ArrayType> for XlaPrimitiveOperation {
             Self::Neg => "neg",
             Self::Sin => "sin",
             Self::Cos => "cos",
-            Self::MatMul => "matmul",
-            Self::MatrixTranspose => "matrix_transpose",
+            Self::MatrixMultiply => "matmul",
+            Self::Transpose => "matrix_transpose",
             Self::Scale { .. } => "scale",
-            Self::LeftMatMul { .. } => "left_matmul",
-            Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
             Self::Rematerialize(remat) => remat.name(),
             Self::Condition(condition) => condition.name(),
@@ -258,13 +249,11 @@ impl Operation<ArrayType> for XlaPrimitiveOperation {
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
-            Self::MatMul => MatMulOperation.infer_output_types(input_types),
-            Self::MatrixTranspose => MatrixTransposeOperation.infer_output_types(input_types),
+            Self::MatrixMultiply => MatMulOperation.infer_output_types(input_types),
+            Self::Transpose => MatrixTransposeOperation.infer_output_types(input_types),
             Self::Scale { .. } => ScaleOperation::<ArrayType, ShardMapTensor>::abstract_eval_static(input_types),
-            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::r#type(factor), input_types),
-            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::r#type(factor), input_types),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).infer_output_types(input_types)
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
             }
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
@@ -285,13 +274,11 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
-            Self::MatMul => MatMulOperation.interpret(inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.interpret(inputs),
+            Self::MatrixMultiply => MatMulOperation.interpret(inputs),
+            Self::Transpose => MatrixTransposeOperation.interpret(inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).interpret(inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).interpret(inputs),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
@@ -312,22 +299,14 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaPrimitiveOperation
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
-            Self::MatMul => MatMulOperation.interpret(inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.interpret(inputs),
+            Self::MatrixMultiply => MatMulOperation.interpret(inputs),
+            Self::Transpose => MatrixTransposeOperation.interpret(inputs),
             Self::Scale { factor } => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 ScaleOperation::new(lift_jit_constant(factor, exemplar)).interpret(inputs)
             }
-            Self::LeftMatMul { factor } => {
-                let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                LeftMatMulOperation::new(lift_jit_constant(factor, exemplar)).interpret(inputs)
-            }
-            Self::RightMatMul { factor } => {
-                let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                RightMatMulOperation::new(lift_jit_constant(factor, exemplar)).interpret(inputs)
-            }
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => {
@@ -382,13 +361,11 @@ where
             Self::Neg => NegOperation.jvp(engine, context, inputs),
             Self::Sin => SinOperation.jvp(engine, context, inputs),
             Self::Cos => CosOperation.jvp(engine, context, inputs),
-            Self::MatMul => MatMulOperation.jvp(engine, context, inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.jvp(engine, context, inputs),
+            Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
+            Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, context, inputs)
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(engine, context, inputs)
             }
             Self::Rematerialize(remat) => {
                 let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -437,13 +414,11 @@ impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaPrimitiveOp
             Self::Neg => NegOperation.jvp(engine, context, inputs),
             Self::Sin => SinOperation.jvp(engine, context, inputs),
             Self::Cos => CosOperation.jvp(engine, context, inputs),
-            Self::MatMul => MatMulOperation.jvp(engine, context, inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.jvp(engine, context, inputs),
+            Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
+            Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, context, inputs)
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(engine, context, inputs)
             }
             Self::Rematerialize(remat) => remat.jvp(engine, context, inputs),
             Self::Condition(condition) => condition.jvp(engine, context, inputs),
@@ -515,13 +490,13 @@ impl SupportsCos<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
 
 impl SupportsMatMul<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
     fn matmul_operation() -> Self {
-        XlaPrimitiveOperation::MatMul
+        XlaPrimitiveOperation::MatrixMultiply
     }
 }
 
 impl SupportsMatrixTranspose<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
     fn matrix_transpose_operation() -> Self {
-        XlaPrimitiveOperation::MatrixTranspose
+        XlaPrimitiveOperation::Transpose
     }
 }
 
@@ -545,21 +520,9 @@ impl SupportsScale<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
     }
 }
 
-impl SupportsLeftMatMul<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn left_matmul_operation(factor: ShardMapTensor) -> Self {
-        XlaPrimitiveOperation::LeftMatMul { factor }
-    }
-}
-
-impl SupportsRightMatMul<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn right_matmul_operation(factor: ShardMapTensor) -> Self {
-        XlaPrimitiveOperation::RightMatMul { factor }
-    }
-}
-
 impl SupportsReshape<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
-    fn reshape_operation(input_type: ArrayType, output_type: ArrayType) -> Self {
-        XlaPrimitiveOperation::Reshape { input_type, output_type }
+    fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
+        XlaPrimitiveOperation::Reshape { input_shape, output_shape }
     }
 }
 

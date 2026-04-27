@@ -243,7 +243,7 @@ mod tests {
     use crate::{tracing_v2::jvp, types::DataType};
 
     use super::*;
-    
+
     fn assert_differentiable_engine<E: DifferentiableEngine>() {}
 
     #[test]

@@ -20,7 +20,7 @@ use crate::{
             right_matmul::right_matmul_abstract_eval,
         },
     },
-    types::{ArrayType, TypeError, Typed},
+    types::{ArrayType, Shape, TypeError, Typed},
 };
 
 use super::{
@@ -41,12 +41,13 @@ use super::{
     sin::SupportsSin,
 };
 
-/// Closed set of built-in staged operations.
+/// Default closed carrier for ordinary staged programs.
 ///
-/// [`PrimitiveOperation`] is the default ordinary-program carrier for `ryft-core`. Each variant is a
-/// thin tag around one semantic primitive defined elsewhere in [`super`], and the carrier exists so
-/// tracing entry points can store "one of the built-in operations" without resorting to trait
-/// objects for the common case.
+/// [`PrimitiveOperation`] is the operation enum used by the core scalar and ndarray engines when a
+/// program stages ordinary primal computation. Most variants are thin tags around one semantic
+/// primitive defined elsewhere in [`super`]. The [`Custom`](Self::Custom) variant is the explicit
+/// escape hatch for operations outside that default set, so the carrier remains closed for normal
+/// dispatch while still allowing user- or backend-defined extensions.
 #[derive(Clone)]
 pub enum PrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
     /// Elementwise addition.
@@ -65,22 +66,16 @@ pub enum PrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
     Cos,
 
     /// Matrix multiplication.
-    MatMul,
+    MatrixMultiply,
 
     /// Matrix transposition.
-    MatrixTranspose,
+    Transpose,
 
     /// Scalar or tensor scaling by a captured factor.
     Scale { factor: V },
 
-    /// Left matrix multiplication by a captured factor: `factor @ input`.
-    LeftMatMul { factor: V },
-
-    /// Right matrix multiplication by a captured factor: `input @ factor`.
-    RightMatMul { factor: V },
-
-    /// Reshape between two statically known shapes.
-    Reshape { input_type: ArrayType, output_type: ArrayType },
+    /// Reshape from one shape to another.
+    Reshape { input_shape: Shape, output_shape: Shape },
 
     /// Higher-order rematerialization boundary carrying a compiled body and optional transpose body.
     Rematerialize(
@@ -104,11 +99,12 @@ pub enum PrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
     Custom(Arc<CustomPrimitive<ArrayType, V>>),
 }
 
-/// Closed set of operations that may appear in staged linear programs.
+/// Default closed carrier for staged linear programs.
 ///
-/// [`LinearPrimitiveOperation`] is the linear-program sibling of [`PrimitiveOperation`]. It contains only the
-/// operations that make sense in tangent and cotangent programs plus the linearized higher-order
-/// ops needed by rematerialization.
+/// [`LinearPrimitiveOperation`] is the linear-program sibling of [`PrimitiveOperation`]. It contains
+/// operations that can appear in tangent and cotangent programs, including captured-factor linear
+/// maps such as [`LeftMatMul`](Self::LeftMatMul) and [`RightMatMul`](Self::RightMatMul), and the
+/// linearized higher-order operations needed by rematerialization and control flow.
 #[derive(Clone)]
 pub enum LinearPrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
     /// Elementwise addition.
@@ -118,7 +114,7 @@ pub enum LinearPrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
     Neg,
 
     /// Matrix transposition.
-    MatrixTranspose,
+    Transpose,
 
     /// Scalar or tensor scaling by a captured factor.
     Scale { factor: V },
@@ -129,8 +125,8 @@ pub enum LinearPrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
     /// Right matrix multiplication by a captured factor: `input @ factor`.
     RightMatMul { factor: V },
 
-    /// Reshape between two statically known shapes.
-    Reshape { input_type: ArrayType, output_type: ArrayType },
+    /// Reshape from one shape to another.
+    Reshape { input_shape: Shape, output_shape: Shape },
 
     /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
     ///
@@ -206,14 +202,14 @@ impl<V: Traceable<ArrayType>> SupportsCos<ArrayType, V> for PrimitiveOperation<V
 impl<V: Traceable<ArrayType>> SupportsMatMul<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn matmul_operation() -> Self {
-        PrimitiveOperation::MatMul
+        PrimitiveOperation::MatrixMultiply
     }
 }
 
 impl<V: Traceable<ArrayType>> SupportsMatrixTranspose<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn matrix_transpose_operation() -> Self {
-        PrimitiveOperation::MatrixTranspose
+        PrimitiveOperation::Transpose
     }
 }
 
@@ -224,24 +220,10 @@ impl<V: Traceable<ArrayType>> SupportsScale<ArrayType, V> for PrimitiveOperation
     }
 }
 
-impl<V: Traceable<ArrayType>> SupportsLeftMatMul<ArrayType, V> for PrimitiveOperation<V> {
-    #[inline]
-    fn left_matmul_operation(factor: V) -> Self {
-        PrimitiveOperation::LeftMatMul { factor }
-    }
-}
-
-impl<V: Traceable<ArrayType>> SupportsRightMatMul<ArrayType, V> for PrimitiveOperation<V> {
-    #[inline]
-    fn right_matmul_operation(factor: V) -> Self {
-        PrimitiveOperation::RightMatMul { factor }
-    }
-}
-
 impl<V: Traceable<ArrayType>> SupportsReshape<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn reshape_operation(input_type: ArrayType, output_type: ArrayType) -> Self {
-        PrimitiveOperation::Reshape { input_type, output_type }
+    fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
+        PrimitiveOperation::Reshape { input_shape, output_shape }
     }
 }
 
@@ -295,7 +277,7 @@ impl<V: Traceable<ArrayType>> SupportsNeg<ArrayType, V> for LinearPrimitiveOpera
 impl<V: Traceable<ArrayType>> SupportsMatrixTranspose<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
     fn matrix_transpose_operation() -> Self {
-        LinearPrimitiveOperation::MatrixTranspose
+        LinearPrimitiveOperation::Transpose
     }
 }
 
@@ -322,8 +304,8 @@ impl<V: Traceable<ArrayType>> SupportsRightMatMul<ArrayType, V> for LinearPrimit
 
 impl<V: Traceable<ArrayType>> SupportsReshape<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn reshape_operation(input_type: ArrayType, output_type: ArrayType) -> Self {
-        LinearPrimitiveOperation::Reshape { input_type, output_type }
+    fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
+        LinearPrimitiveOperation::Reshape { input_shape, output_shape }
     }
 }
 
@@ -363,13 +345,11 @@ impl<V: Traceable<ArrayType>> Debug for PrimitiveOperation<V> {
             Self::Neg => write!(formatter, "Neg"),
             Self::Sin => write!(formatter, "Sin"),
             Self::Cos => write!(formatter, "Cos"),
-            Self::MatMul => write!(formatter, "MatMul"),
-            Self::MatrixTranspose => write!(formatter, "MatrixTranspose"),
+            Self::MatrixMultiply => write!(formatter, "MatrixMultiply"),
+            Self::Transpose => write!(formatter, "Transpose"),
             Self::Scale { .. } => write!(formatter, "Scale"),
-            Self::LeftMatMul { .. } => write!(formatter, "LeftMatMul"),
-            Self::RightMatMul { .. } => write!(formatter, "RightMatMul"),
-            Self::Reshape { input_type, output_type } => {
-                write!(formatter, "Reshape({input_type} -> {output_type})")
+            Self::Reshape { input_shape, output_shape } => {
+                write!(formatter, "Reshape({input_shape} -> {output_shape})")
             }
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
             Self::Condition(condition) => Debug::fmt(condition, formatter),
@@ -382,7 +362,7 @@ impl<V: Traceable<ArrayType>> Debug for PrimitiveOperation<V> {
 impl<V: Traceable<ArrayType>> Display for PrimitiveOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Reshape { output_type, .. } => write!(formatter, "reshape{}", output_type.shape),
+            Self::Reshape { output_shape, .. } => write!(formatter, "reshape{output_shape}"),
             _ => write!(formatter, "{}", self.name()),
         }
     }
@@ -393,12 +373,12 @@ impl<V: Traceable<ArrayType>> Debug for LinearPrimitiveOperation<V> {
         match self {
             Self::Add => write!(formatter, "Add"),
             Self::Neg => write!(formatter, "Neg"),
-            Self::MatrixTranspose => write!(formatter, "MatrixTranspose"),
+            Self::Transpose => write!(formatter, "Transpose"),
             Self::Scale { .. } => write!(formatter, "Scale"),
             Self::LeftMatMul { .. } => write!(formatter, "LeftMatMul"),
             Self::RightMatMul { .. } => write!(formatter, "RightMatMul"),
-            Self::Reshape { input_type, output_type } => {
-                write!(formatter, "Reshape({input_type} -> {output_type})")
+            Self::Reshape { input_shape, output_shape } => {
+                write!(formatter, "Reshape({input_shape} -> {output_shape})")
             }
             Self::Zero(zero) => Debug::fmt(zero, formatter),
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
@@ -412,7 +392,7 @@ impl<V: Traceable<ArrayType>> Debug for LinearPrimitiveOperation<V> {
 impl<V: Traceable<ArrayType>> Display for LinearPrimitiveOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Reshape { output_type, .. } => write!(formatter, "reshape{}", output_type.shape),
+            Self::Reshape { output_shape, .. } => write!(formatter, "reshape{output_shape}"),
             _ => write!(formatter, "{}", self.name()),
         }
     }
@@ -428,11 +408,9 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<V> {
             Self::Neg => "neg",
             Self::Sin => "sin",
             Self::Cos => "cos",
-            Self::MatMul => "matmul",
-            Self::MatrixTranspose => "matrix_transpose",
+            Self::MatrixMultiply => "matmul",
+            Self::Transpose => "matrix_transpose",
             Self::Scale { .. } => "scale",
-            Self::LeftMatMul { .. } => "left_matmul",
-            Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
             Self::Rematerialize(remat) => remat.name(),
             Self::Condition(condition) => condition.name(),
@@ -448,14 +426,12 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<V> {
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
-            Self::MatMul => MatMulOperation.infer_output_types(input_types),
-            Self::MatrixTranspose => MatrixTransposeOperation.infer_output_types(input_types),
+            Self::MatrixMultiply => MatMulOperation.infer_output_types(input_types),
+            Self::Transpose => MatrixTransposeOperation.infer_output_types(input_types),
             Self::Scale { .. } => ScaleOperation::<ArrayType, V>::abstract_eval_static(input_types),
-            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::r#type(factor), input_types),
-            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::r#type(factor), input_types),
-            Self::Reshape { input_type, output_type } => {
+            Self::Reshape { input_shape, output_shape } => {
                 <ReshapeOperation as Operation<ArrayType>>::infer_output_types(
-                    &ReshapeOperation::new(input_type.clone(), output_type.clone()),
+                    &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                     input_types,
                 )
             }
@@ -468,15 +444,11 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<V> {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         match self {
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).render(formatter, indentation)
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            Self::LeftMatMul { factor } | Self::RightMatMul { factor } => {
-                OperationFormatter::new(formatter, indentation, self.name())?
-                    .bracketed(|operation| operation.field("factor", factor))
-            }
             Self::Rematerialize(remat) => remat.render(formatter, indentation),
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
@@ -493,7 +465,7 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
         match self {
             Self::Add => "add",
             Self::Neg => "neg",
-            Self::MatrixTranspose => "matrix_transpose",
+            Self::Transpose => "matrix_transpose",
             Self::Scale { .. } => "scale",
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
@@ -510,13 +482,13 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
         match self {
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
-            Self::MatrixTranspose => MatrixTransposeOperation.infer_output_types(input_types),
+            Self::Transpose => MatrixTransposeOperation.infer_output_types(input_types),
             Self::Scale { .. } => ScaleOperation::<ArrayType, V>::abstract_eval_static(input_types),
             Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::r#type(factor), input_types),
             Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::r#type(factor), input_types),
-            Self::Reshape { input_type, output_type } => {
+            Self::Reshape { input_shape, output_shape } => {
                 <ReshapeOperation as Operation<ArrayType>>::infer_output_types(
-                    &ReshapeOperation::new(input_type.clone(), output_type.clone()),
+                    &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                     input_types,
                 )
             }
@@ -530,8 +502,8 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         match self {
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).render(formatter, indentation)
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.name())?
                 .bracketed(|operation| operation.field("factor", factor)),
@@ -578,13 +550,11 @@ where
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
-            Self::MatMul => MatMulOperation.interpret(inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.interpret(inputs),
+            Self::MatrixMultiply => MatMulOperation.interpret(inputs),
+            Self::Transpose => MatrixTransposeOperation.interpret(inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).interpret(inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).interpret(inputs),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
@@ -612,12 +582,12 @@ where
         match self {
             Self::Add => AddOperation.interpret(inputs),
             Self::Neg => NegOperation.interpret(inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.interpret(inputs),
+            Self::Transpose => MatrixTransposeOperation.interpret(inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).interpret(inputs),
             Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).interpret(inputs),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
             Self::Zero(zero) => zero.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
@@ -656,7 +626,7 @@ where
         match self {
             Self::Add => AddOperation.transpose(context, output_cotangents),
             Self::Neg => NegOperation.transpose(context, output_cotangents),
-            Self::MatrixTranspose => MatrixTransposeOperation.transpose(context, output_cotangents),
+            Self::Transpose => MatrixTransposeOperation.transpose(context, output_cotangents),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).transpose(context, output_cotangents),
             Self::LeftMatMul { factor } => {
                 LeftMatMulOperation::new(factor.clone()).transpose(context, output_cotangents)
@@ -664,8 +634,8 @@ where
             Self::RightMatMul { factor } => {
                 RightMatMulOperation::new(factor.clone()).transpose(context, output_cotangents)
             }
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).transpose(context, output_cotangents)
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).transpose(context, output_cotangents)
             }
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::Rematerialize(remat) => remat.transpose(context, output_cotangents),
@@ -724,12 +694,10 @@ where
             Self::Sin => SinOperation.jvp(engine, context, inputs),
             Self::Cos => CosOperation.jvp(engine, context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::MatMul => MatMulOperation.jvp(engine, context, inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.jvp(engine, context, inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, context, inputs)
+            Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
+            Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(engine, context, inputs)
             }
             Self::Rematerialize(remat) => remat.as_ref().jvp(engine, context, inputs),
             Self::Condition(condition) => condition.as_ref().jvp(engine, context, inputs),
@@ -742,12 +710,11 @@ where
 /// Linearization-engine dispatcher for [`PrimitiveOperation`] under the traced-linearization path.
 ///
 /// Forwards each variant to the per-op JVP rule, picking up the
-/// [`TracingEngine`](crate::tracing_v2::TracingEngine)-keyed impls for V-capturing
-/// variants ([`Scale`](Self::Scale), [`LeftMatMul`](Self::LeftMatMul),
-/// [`RightMatMul`](Self::RightMatMul)), the [`Rematerialize`](Self::Rematerialize) impl that
-/// recurses via [`linearize_traced_program`](crate::tracing_v2::linear::linearize_traced_program),
-/// the [`Condition`](Self::Condition) / [`While`](Self::While) stub impls (predicate extraction
-/// does not work at trace time), and the [`Custom`](Self::Custom) bridge to the registered traced
+/// [`TracingEngine`](crate::tracing_v2::TracingEngine)-keyed impl for captured
+/// [`Scale`](Self::Scale), the [`Rematerialize`](Self::Rematerialize) impl that recurses via
+/// [`linearize_traced_program`](crate::tracing_v2::linear::linearize_traced_program), the
+/// [`Condition`](Self::Condition) / [`While`](Self::While) stub impls (predicate extraction does
+/// not work at trace time), and the [`Custom`](Self::Custom) bridge to the registered traced
 /// linearization rule.
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingEngine<'engine, EInner>>
     for PrimitiveOperation<V>
@@ -814,12 +781,10 @@ where
             Self::Sin => SinOperation.jvp(engine, context, inputs),
             Self::Cos => CosOperation.jvp(engine, context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::MatMul => MatMulOperation.jvp(engine, context, inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.jvp(engine, context, inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, context, inputs)
+            Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
+            Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(engine, context, inputs)
             }
             Self::Rematerialize(remat) => remat.as_ref().jvp(engine, context, inputs),
             Self::Condition(condition) => condition.as_ref().jvp(engine, context, inputs),

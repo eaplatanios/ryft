@@ -496,11 +496,9 @@ fn xla_op_supports_constant_folding(op: &XlaPrimitiveOperation) -> bool {
             | XlaPrimitiveOperation::Neg
             | XlaPrimitiveOperation::Sin
             | XlaPrimitiveOperation::Cos
-            | XlaPrimitiveOperation::MatMul
-            | XlaPrimitiveOperation::MatrixTranspose
+            | XlaPrimitiveOperation::MatrixMultiply
+            | XlaPrimitiveOperation::Transpose
             | XlaPrimitiveOperation::Scale { .. }
-            | XlaPrimitiveOperation::LeftMatMul { .. }
-            | XlaPrimitiveOperation::RightMatMul { .. }
             | XlaPrimitiveOperation::Reshape { .. }
     )
 }

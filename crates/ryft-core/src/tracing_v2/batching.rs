@@ -322,10 +322,10 @@ where
             Self::Neg => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::NegOperation, inputs),
             Self::Sin => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::SinOperation, inputs),
             Self::Cos => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::CosOperation, inputs),
-            Self::MatMul => {
+            Self::MatrixMultiply => {
                 batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::MatMulOperation, inputs)
             }
-            Self::MatrixTranspose => batch_by_interpreting_physical_operation(
+            Self::Transpose => batch_by_interpreting_physical_operation(
                 &crate::tracing_v2::operations::MatrixTransposeOperation,
                 inputs,
             ),
@@ -333,16 +333,8 @@ where
                 &crate::tracing_v2::operations::ScaleOperation::new(factor.clone()),
                 inputs,
             ),
-            Self::LeftMatMul { factor } => batch_by_interpreting_physical_operation(
-                &crate::tracing_v2::operations::LeftMatMulOperation::new(factor.clone()),
-                inputs,
-            ),
-            Self::RightMatMul { factor } => batch_by_interpreting_physical_operation(
-                &crate::tracing_v2::operations::RightMatMulOperation::new(factor.clone()),
-                inputs,
-            ),
-            Self::Reshape { input_type, output_type } => batch_by_interpreting_physical_operation(
-                &crate::tracing_v2::operations::ReshapeOperation::new(input_type.clone(), output_type.clone()),
+            Self::Reshape { input_shape, output_shape } => batch_by_interpreting_physical_operation(
+                &crate::tracing_v2::operations::ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                 inputs,
             ),
             Self::Custom(_) | Self::Rematerialize(_) | Self::Condition(_) | Self::While(_) => {

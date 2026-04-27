@@ -411,11 +411,14 @@ impl<V: MlirLowerableValue> XlaOperation<V> for ReshapeOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
+        output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let output_shape = static_dimensions(self.output_type())?;
+        let output_type = output_types
+            .first()
+            .ok_or_else(|| LoweringError::from(TracingError::InvalidOutputCount { expected: 1, got: 0 }))?;
+        let output_shape = static_dimensions(output_type)?;
         let result = lowerer.block.append_operation(stable_hlo::reshape(
             input_values[0],
             output_shape.as_slice(),
@@ -469,14 +472,14 @@ impl XlaOperation<ShardMapTensor> for XlaPrimitiveOperation {
                 mode,
                 lowerer,
             ),
-            Self::MatMul => <MatMulOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+            Self::MatrixMultiply => <MatMulOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
                 &MatMulOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            Self::MatrixTranspose => <MatrixTransposeOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+            Self::Transpose => <MatrixTransposeOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
                 &MatrixTransposeOperation,
                 input_values,
                 output_types,
@@ -492,27 +495,9 @@ impl XlaOperation<ShardMapTensor> for XlaPrimitiveOperation {
                     lowerer,
                 )
             }
-            Self::LeftMatMul { factor } => {
-                <LeftMatMulOperation<ShardMapTensor> as XlaOperation<ShardMapTensor>>::lower_to_mlir(
-                    &LeftMatMulOperation::new(factor.clone()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
-            Self::RightMatMul { factor } => {
-                <RightMatMulOperation<ShardMapTensor> as XlaOperation<ShardMapTensor>>::lower_to_mlir(
-                    &RightMatMulOperation::new(factor.clone()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
-            Self::Reshape { input_type, output_type } => {
+            Self::Reshape { input_shape, output_shape } => {
                 <ReshapeOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
-                    &ReshapeOperation::new(input_type.clone(), output_type.clone()),
+                    &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                     input_values,
                     output_types,
                     mode,
@@ -655,14 +640,14 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for PrimitiveOperation<V
                 mode,
                 lowerer,
             ),
-            PrimitiveOperation::MatrixTranspose => <MatrixTransposeOperation as XlaOperation<V>>::lower_to_mlir(
+            PrimitiveOperation::Transpose => <MatrixTransposeOperation as XlaOperation<V>>::lower_to_mlir(
                 &MatrixTransposeOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            PrimitiveOperation::MatMul => <MatMulOperation as XlaOperation<V>>::lower_to_mlir(
+            PrimitiveOperation::MatrixMultiply => <MatMulOperation as XlaOperation<V>>::lower_to_mlir(
                 &MatMulOperation,
                 input_values,
                 output_types,
@@ -676,23 +661,9 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for PrimitiveOperation<V
                 mode,
                 lowerer,
             ),
-            PrimitiveOperation::LeftMatMul { factor } => <LeftMatMulOperation<V> as XlaOperation<V>>::lower_to_mlir(
-                &LeftMatMulOperation::new(factor.clone()),
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            PrimitiveOperation::RightMatMul { factor } => <RightMatMulOperation<V> as XlaOperation<V>>::lower_to_mlir(
-                &RightMatMulOperation::new(factor.clone()),
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            PrimitiveOperation::Reshape { input_type, output_type } => {
+            PrimitiveOperation::Reshape { input_shape, output_shape } => {
                 <ReshapeOperation as XlaOperation<V>>::lower_to_mlir(
-                    &ReshapeOperation::new(input_type.clone(), output_type.clone()),
+                    &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                     input_values,
                     output_types,
                     mode,
@@ -736,7 +707,7 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for LinearPrimitiveOpera
                 mode,
                 lowerer,
             ),
-            LinearPrimitiveOperation::MatrixTranspose => <MatrixTransposeOperation as XlaOperation<V>>::lower_to_mlir(
+            LinearPrimitiveOperation::Transpose => <MatrixTransposeOperation as XlaOperation<V>>::lower_to_mlir(
                 &MatrixTransposeOperation,
                 input_values,
                 output_types,
@@ -770,9 +741,9 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for LinearPrimitiveOpera
                     lowerer,
                 )
             }
-            LinearPrimitiveOperation::Reshape { input_type, output_type } => {
+            LinearPrimitiveOperation::Reshape { input_shape, output_shape } => {
                 <ReshapeOperation as XlaOperation<V>>::lower_to_mlir(
-                    &ReshapeOperation::new(input_type.clone(), output_type.clone()),
+                    &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                     input_values,
                     output_types,
                     mode,
@@ -1970,7 +1941,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
         }
-        XlaPrimitiveOperation::MatMul => {
+        XlaPrimitiveOperation::MatrixMultiply => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
             let result = lowerer.block.append_operation(stable_hlo::dot_general(
@@ -1984,7 +1955,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
         }
-        XlaPrimitiveOperation::MatrixTranspose => {
+        XlaPrimitiveOperation::Transpose => {
             let result =
                 lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
             Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
@@ -2012,39 +1983,10 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
-        XlaPrimitiveOperation::LeftMatMul { factor } => {
-            let factor_value =
-                lower_constant(AtomId { index: 0 }, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
-            let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-            let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
-            let result = lowerer.block.append_operation(stable_hlo::dot_general(
-                factor_value,
-                input_values[0],
-                dimensions,
-                Some((Precision::Default, Precision::Default)),
-                None,
-                output_tensor_type,
-                lowerer.location,
-            ));
-            Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
-        }
-        XlaPrimitiveOperation::RightMatMul { factor } => {
-            let factor_value =
-                lower_constant(AtomId { index: 0 }, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
-            let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-            let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
-            let result = lowerer.block.append_operation(stable_hlo::dot_general(
-                input_values[0],
-                factor_value,
-                dimensions,
-                Some((Precision::Default, Precision::Default)),
-                None,
-                output_tensor_type,
-                lowerer.location,
-            ));
-            Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
-        }
-        XlaPrimitiveOperation::Reshape { output_type, .. } => {
+        XlaPrimitiveOperation::Reshape { .. } => {
+            let output_type = output_types
+                .first()
+                .ok_or_else(|| LoweringError::from(TracingError::InvalidOutputCount { expected: 1, got: 0 }))?;
             let output_shape = static_dimensions(output_type)?;
             let result = lowerer.block.append_operation(stable_hlo::reshape(
                 input_values[0],
