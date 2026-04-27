@@ -323,30 +323,6 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
-        /// Marks the [`Atom`] that corresponds to the provided `atom_id`, its producing [`Instruction`], and all
-        /// transitive input [`Atom`]s as _live_ in the provided `atom_is_live` array.
-        fn mark_atom_as_live<
-            T: Type,
-            V: Traceable<T>,
-            O: Clone + Operation<T>,
-            Input: Parameterized<V>,
-            Output: Parameterized<V>,
-        >(
-            program: &Program<T, V, O, Input, Output>,
-            atom_id: AtomId,
-            atom_is_live: &mut [bool],
-            parent_instructions: &[Option<usize>],
-        ) {
-            if !atom_is_live[atom_id.index] {
-                atom_is_live[atom_id.index] = true;
-                if let Some(instruction_index) = parent_instructions[atom_id.index] {
-                    for input in program.instructions[instruction_index].inputs.iter().copied() {
-                        mark_atom_as_live(program, input, atom_is_live, parent_instructions);
-                    }
-                }
-            }
-        }
-
         /// Adds the [`Atom`] that corresponds to the provided `atom_id` to the provided `builder`, along with its
         /// transitive producers, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`.
         fn add_atom_to_program_builder<
@@ -366,41 +342,43 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                 return Ok(*mapped_atom);
             }
             let atom = program.atoms.get(atom_id.index).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-            let atom = match atom {
-                Atom::Constant(value) => program_builder.add_constant(value.clone()),
-                Atom::Variable(_) => {
-                    let instruction_index = parent_instructions[atom_id.index]
-                        .ok_or(TracingError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
-                    let instruction = &program.instructions[instruction_index];
-                    let inputs = instruction
-                        .inputs
-                        .iter()
-                        .copied()
-                        .map(|input| {
-                            add_atom_to_program_builder(
-                                program_builder,
-                                atom_id_mapping,
-                                input,
-                                program,
-                                parent_instructions,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let outputs = program_builder.add_instruction(instruction.operation.clone(), inputs)?;
-                    if outputs.len() != instruction.outputs.len() {
-                        return Err(TracingError::InvalidOutputCount {
-                            expected: instruction.outputs.len(),
-                            got: outputs.len(),
+            let atom =
+                match atom {
+                    Atom::Constant(value) => Ok(program_builder.add_constant(value.clone())),
+                    Atom::Variable(_) => {
+                        let instruction_index = parent_instructions.get(atom_id.index).copied().flatten().ok_or(
+                            TracingError::MalformedProgram("variable atom has no owning instruction".to_string()),
+                        )?;
+                        let instruction = &program.instructions[instruction_index];
+                        let inputs = instruction
+                            .inputs
+                            .iter()
+                            .copied()
+                            .map(|input| {
+                                add_atom_to_program_builder(
+                                    program_builder,
+                                    atom_id_mapping,
+                                    input,
+                                    program,
+                                    parent_instructions,
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let outputs = program_builder.add_instruction(instruction.operation.clone(), inputs)?;
+                        if outputs.len() != instruction.outputs.len() {
+                            return Err(TracingError::InvalidOutputCount {
+                                expected: instruction.outputs.len(),
+                                got: outputs.len(),
+                            });
+                        }
+                        instruction.outputs.iter().copied().zip(outputs.iter().copied()).for_each(|(old, new)| {
+                            atom_id_mapping.insert(old, new);
                         });
+                        atom_id_mapping.get(&atom_id).copied().ok_or(TracingError::MalformedProgram(
+                            "remapped instruction output was missing".to_string(),
+                        ))
                     }
-                    instruction.outputs.iter().copied().zip(outputs.iter().copied()).for_each(|(old, new)| {
-                        atom_id_mapping.insert(old, new);
-                    });
-                    *atom_id_mapping
-                        .get(&atom_id)
-                        .expect("remapped instruction outputs should populate the atom mapping")
-                }
-            };
+                }?;
             atom_id_mapping.insert(atom_id, atom);
             Ok(atom)
         }
@@ -408,23 +386,20 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         let mut parent_instructions = vec![None; self.atoms.len()];
         for (instruction_index, instruction) in self.instructions.iter().enumerate() {
             for output in instruction.outputs.iter().copied() {
-                parent_instructions[output.index] = Some(instruction_index);
+                let parent_instruction =
+                    parent_instructions.get_mut(output.index).ok_or(TracingError::UnboundAtomId { id: output })?;
+                *parent_instruction = Some(instruction_index);
             }
         }
 
-        let mut atom_is_live = vec![false; self.atoms.len()];
-        for output in self.output_ids.iter().copied() {
-            mark_atom_as_live(self, output, atom_is_live.as_mut_slice(), parent_instructions.as_slice());
-        }
-
         let mut program_builder = ProgramBuilder::new();
-        let mut atom_id_mapping = HashMap::new();
+        let mut atom_id_mapping = HashMap::with_capacity(self.atoms.len());
         for input_id in self.input_ids.iter().copied() {
             let input = self.atoms.get(input_id.index).ok_or(TracingError::UnboundAtomId { id: input_id })?;
-            let Atom::Variable(r#type) = input else {
+            let Atom::Variable(input_type) = input else {
                 return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
             };
-            atom_id_mapping.insert(input_id, program_builder.add_input(r#type.clone()));
+            atom_id_mapping.insert(input_id, program_builder.add_input(input_type.clone()));
         }
 
         let output_ids = self
@@ -443,6 +418,156 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             .collect::<Result<Vec<_>, _>>()?;
 
         program_builder.build(output_ids, self.input_structure.clone(), self.output_structure.clone())
+    }
+
+    /// Consumes this [`Program`] and returns a simplified version with dead constants and [`Instruction`]s that do not
+    /// contribute to the [`Program`]'s output removed. Unlike [`Self::simplified`], this method moves live [`Atom`]s,
+    /// [`Instruction`]s, and parameter structures into the returned [`Program`] instead of cloning them. This avoids
+    /// copying constants and operations that are discarded during simplification.
+    pub fn into_simplified(self) -> Result<Self, TracingError> {
+        /// Adds the [`Atom`] that corresponds to the provided `atom_id` to the simplified [`Program`] vectors, along
+        /// with its transitive producers, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`.
+        fn add_atom_to_simplified_program<T: Type, V: Traceable<T>, O: Clone + Operation<T>>(
+            atoms: &mut [Option<Atom<T, V>>],
+            instructions: &mut [Option<Instruction<O>>],
+            parent_instructions: &[Option<usize>],
+            atom_id_mapping: &mut HashMap<AtomId, AtomId>,
+            new_atoms: &mut Vec<Atom<T, V>>,
+            new_instructions: &mut Vec<Instruction<O>>,
+            atom_id: AtomId,
+        ) -> Result<AtomId, TracingError> {
+            if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
+                return Ok(*mapped_atom);
+            }
+            let atom = atoms.get_mut(atom_id.index).ok_or(TracingError::UnboundAtomId { id: atom_id })?.take();
+            match atom {
+                None => Err(TracingError::MalformedProgram(format!(
+                    "atom {atom_id} was already moved while simplifying program",
+                ))),
+                Some(Atom::Constant(value)) => {
+                    let new_atom = AtomId { index: new_atoms.len() };
+                    new_atoms.push(Atom::Constant(value));
+                    atom_id_mapping.insert(atom_id, new_atom);
+                    Ok(new_atom)
+                }
+                Some(Atom::Variable(_)) => {
+                    let instruction_index =
+                        parent_instructions.get(atom_id.index).copied().flatten().ok_or(
+                            TracingError::MalformedProgram("variable atom has no owning instruction".to_string()),
+                        )?;
+                    let instruction = instructions[instruction_index]
+                        .take()
+                        .ok_or(TracingError::MalformedProgram("instruction was already moved".to_string()))?;
+                    let inputs = instruction
+                        .inputs
+                        .iter()
+                        .copied()
+                        .map(|input| {
+                            add_atom_to_simplified_program(
+                                atoms,
+                                instructions,
+                                parent_instructions,
+                                atom_id_mapping,
+                                new_atoms,
+                                new_instructions,
+                                input,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut outputs = Vec::with_capacity(instruction.outputs.len());
+                    for output in instruction.outputs.iter().copied() {
+                        let output_atom = atoms
+                            .get_mut(output.index)
+                            .ok_or(TracingError::UnboundAtomId { id: output })?
+                            .take()
+                            .ok_or(TracingError::MalformedProgram(
+                                "instruction output atom was already moved".to_string(),
+                            ))?;
+                        let Atom::Variable(output_type) = output_atom else {
+                            return Err(TracingError::MalformedProgram(
+                                "instruction output atom was not a variable".to_string(),
+                            ));
+                        };
+                        let new_output = AtomId { index: new_atoms.len() };
+                        new_atoms.push(Atom::Variable(output_type));
+                        atom_id_mapping.insert(output, new_output);
+                        outputs.push(new_output);
+                    }
+                    new_instructions.push(Instruction { operation: instruction.operation, inputs, outputs });
+                    atom_id_mapping
+                        .get(&atom_id)
+                        .copied()
+                        .ok_or(TracingError::MalformedProgram("remapped instruction output was missing".to_string()))
+                }
+            }
+        }
+
+        let Program { atoms, input_ids, output_ids, instructions, input_structure, output_structure, marker: _ } = self;
+
+        let expected_input_count = input_structure.parameter_count();
+        if input_ids.len() != expected_input_count {
+            return Err(TracingError::InvalidInputCount { expected: expected_input_count, got: input_ids.len() });
+        }
+
+        let expected_output_count = output_structure.parameter_count();
+        if output_ids.len() != expected_output_count {
+            return Err(TracingError::InvalidOutputCount { expected: expected_output_count, got: output_ids.len() });
+        }
+
+        let mut parent_instructions = vec![None; atoms.len()];
+        for (instruction_index, instruction) in instructions.iter().enumerate() {
+            for output in instruction.outputs.iter().copied() {
+                let parent_instruction =
+                    parent_instructions.get_mut(output.index).ok_or(TracingError::UnboundAtomId { id: output })?;
+                *parent_instruction = Some(instruction_index);
+            }
+        }
+
+        let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
+        let mut instructions = instructions.into_iter().map(Some).collect::<Vec<_>>();
+        let mut new_atoms = Vec::with_capacity(atoms.len());
+        let mut new_input_ids = Vec::with_capacity(input_ids.len());
+        let mut new_instructions = Vec::with_capacity(instructions.len());
+        let mut atom_id_mapping = HashMap::with_capacity(atoms.len());
+        for input_id in input_ids {
+            let input = atoms
+                .get_mut(input_id.index)
+                .ok_or(TracingError::UnboundAtomId { id: input_id })?
+                .take()
+                .ok_or(TracingError::MalformedProgram("program input atom was already moved".to_string()))?;
+            let Atom::Variable(input_type) = input else {
+                return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
+            };
+            let new_input = AtomId { index: new_atoms.len() };
+            new_atoms.push(Atom::Variable(input_type));
+            new_input_ids.push(new_input);
+            atom_id_mapping.insert(input_id, new_input);
+        }
+
+        let output_ids = output_ids
+            .into_iter()
+            .map(|output| {
+                add_atom_to_simplified_program(
+                    atoms.as_mut_slice(),
+                    instructions.as_mut_slice(),
+                    parent_instructions.as_slice(),
+                    &mut atom_id_mapping,
+                    &mut new_atoms,
+                    &mut new_instructions,
+                    output,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            atoms: new_atoms,
+            input_ids: new_input_ids,
+            output_ids,
+            instructions: new_instructions,
+            input_structure,
+            output_structure,
+            marker: PhantomData,
+        })
     }
 
     /// Interprets/executes this [`Program`] with the provided input. This is the main replay entry point for staged
@@ -787,6 +912,11 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> Default for ProgramBuild
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::cell::Cell;
+    use std::fmt::{Debug, Display};
+    use std::rc::Rc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -1017,9 +1147,7 @@ mod tests {
         let c1 = builder.add_constant(3.0f64);
         let _ = builder.add_instruction(PrimitiveOperation::Add, vec![i0, c0]).unwrap()[0];
         let v1 = builder.add_instruction(PrimitiveOperation::Add, vec![i0, c1]).unwrap()[0];
-        let program = builder
-            .build::<f64, (f64, f64)>(vec![v1, v1], Placeholder, (Placeholder, Placeholder))
-            .unwrap();
+        let program = builder.build::<f64, (f64, f64)>(vec![v1, v1], Placeholder, (Placeholder, Placeholder)).unwrap();
         let simplified = program.simplified().unwrap();
 
         assert_eq!(c0, AtomId { index: 1 });
@@ -1050,6 +1178,127 @@ mod tests {
 
     // TODO(eaplatanios): Review this.
     #[test]
+    fn test_program_into_simplified() {
+        struct CloneCountingValue {
+            value: f64,
+            clone_count: Rc<Cell<usize>>,
+        }
+
+        impl CloneCountingValue {
+            fn new(value: f64, clone_count: Rc<Cell<usize>>) -> Self {
+                Self { value, clone_count }
+            }
+        }
+
+        impl Clone for CloneCountingValue {
+            fn clone(&self) -> Self {
+                self.clone_count.set(self.clone_count.get() + 1);
+                Self { value: self.value, clone_count: Rc::clone(&self.clone_count) }
+            }
+        }
+
+        impl Display for CloneCountingValue {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}", self.value)
+            }
+        }
+
+        impl crate::parameters::Parameter for CloneCountingValue {}
+
+        impl crate::types::Typed<ArrayType> for CloneCountingValue {
+            fn r#type(&self) -> Cow<'_, ArrayType> {
+                Cow::Owned(ArrayType::scalar(DataType::F64))
+            }
+        }
+
+        impl Traceable<ArrayType> for CloneCountingValue {}
+
+        struct CloneCountingOperation {
+            clone_count: Rc<Cell<usize>>,
+        }
+
+        impl CloneCountingOperation {
+            fn new(clone_count: Rc<Cell<usize>>) -> Self {
+                Self { clone_count }
+            }
+        }
+
+        impl Clone for CloneCountingOperation {
+            fn clone(&self) -> Self {
+                self.clone_count.set(self.clone_count.get() + 1);
+                Self { clone_count: Rc::clone(&self.clone_count) }
+            }
+        }
+
+        impl Debug for CloneCountingOperation {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.debug_struct("CloneCountingOperation").finish_non_exhaustive()
+            }
+        }
+
+        impl Operation<ArrayType> for CloneCountingOperation {
+            fn name(&self) -> &'static str {
+                "clone_counting"
+            }
+
+            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+                if input_types.len() != 2 {
+                    return Err(TypeError { message: format!("expected 2 input types but got {}", input_types.len()) });
+                }
+                Ok(vec![input_types[0].clone()])
+            }
+        }
+
+        let value_clone_count = Rc::new(Cell::new(0));
+        let operation_clone_count = Rc::new(Cell::new(0));
+        let mut builder = ProgramBuilder::<ArrayType, CloneCountingValue, CloneCountingOperation>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(CloneCountingValue::new(2.0, Rc::clone(&value_clone_count)));
+        let c1 = builder.add_constant(CloneCountingValue::new(3.0, Rc::clone(&value_clone_count)));
+        let v0 = builder
+            .add_instruction(CloneCountingOperation::new(Rc::clone(&operation_clone_count)), vec![i0, c0])
+            .unwrap()[0];
+        let v1 = builder
+            .add_instruction(CloneCountingOperation::new(Rc::clone(&operation_clone_count)), vec![i0, c1])
+            .unwrap()[0];
+        let program = builder
+            .build::<CloneCountingValue, (CloneCountingValue, CloneCountingValue)>(
+                vec![v1, v1],
+                Placeholder,
+                (Placeholder, Placeholder),
+            )
+            .unwrap();
+
+        assert_eq!(v0, AtomId { index: 3 });
+        assert_eq!(v1, AtomId { index: 4 });
+        assert_eq!(value_clone_count.get(), 0);
+        assert_eq!(operation_clone_count.get(), 0);
+
+        let simplified = program.into_simplified().unwrap();
+
+        assert_eq!(value_clone_count.get(), 0);
+        assert_eq!(operation_clone_count.get(), 0);
+        assert_eq!(simplified.input_ids, vec![AtomId { index: 0 }]);
+        assert_eq!(simplified.output_ids, vec![AtomId { index: 2 }, AtomId { index: 2 }]);
+        assert_eq!(simplified.atoms.len(), 3);
+        assert!(matches!(simplified.atoms.get(1), Some(Atom::Constant(value)) if value.value == 3.0));
+        assert_eq!(simplified.instructions.len(), 1);
+        assert_eq!(simplified.instructions[0].inputs, vec![AtomId { index: 0 }, AtomId { index: 1 }]);
+        assert_eq!(simplified.instructions[0].outputs, vec![AtomId { index: 2 }]);
+        assert_eq!(
+            simplified.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const
+                    %2:f64[] = clone_counting %0 %1
+                in (%2, %2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
     fn test_program_simplified_rejects_variable_output_without_parent_instruction() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1061,7 +1310,7 @@ mod tests {
             Err(TracingError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
         ));
     }
-    
+
     // TODO(eaplatanios): Review this.
     #[test]
     fn test_program_builder() {
