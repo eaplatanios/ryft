@@ -2380,7 +2380,7 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError};
     use ryft_core::tracing_v2::{
-        Cos, CustomPrimitive, MatrixOps, Sin,
+        Cos, CustomPrimitive, MatrixOps, Sin, StagingEngine,
         operations::constants::{OneLike, ZeroLike},
     };
     use ryft_core::types::{Shape, TypeError};
@@ -2678,12 +2678,7 @@ mod tests {
                 (f64, f64),
                 f64,
             >,
-        ) = ryft_core::tracing_v2::interpret_and_trace(
-            &engine,
-            |inputs| Ok(scalar_bilinear_sin(inputs)),
-            (2.0f64, 3.0f64),
-        )
-        .unwrap();
+        ) = engine.interpret_and_trace(|inputs| Ok(scalar_bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         assert_eq!(
@@ -2707,12 +2702,9 @@ mod tests {
         let (_, compiled): (
             f64,
             ryft_core::tracing::Program<ArrayType, f64, ryft_core::tracing_v2::PrimitiveOperation<f64>, f64, f64>,
-        ) = ryft_core::tracing_v2::interpret_and_trace(
-            &engine,
-            |x| Ok(ryft_core::tracing_v2::rematerialize(|y| y.sin(), x).unwrap()),
-            2.0f64,
-        )
-        .unwrap();
+        ) = engine
+            .interpret_and_trace(|x| Ok(ryft_core::tracing_v2::rematerialize(|y| y.sin(), x).unwrap()), 2.0f64)
+            .unwrap();
 
         assert_eq!(
             to_mlir_module_for_plain_program(&compiled, "main").unwrap(),
@@ -2734,18 +2726,18 @@ mod tests {
         let (_, compiled): (
             f64,
             ryft_core::tracing::Program<ArrayType, f64, ryft_core::tracing_v2::PrimitiveOperation<f64>, f64, f64>,
-        ) = ryft_core::tracing_v2::interpret_and_trace(
-            &engine,
-            |x| {
-                Ok(ryft_core::tracing_v2::grad(
-                    &ryft_core::tracing_v2::engines::ScalarEngine::<f64>::new(),
-                    scalar_quartic_plus_sin,
-                    x,
-                )?)
-            },
-            2.0f64,
-        )
-        .unwrap();
+        ) = engine
+            .interpret_and_trace(
+                |x| {
+                    Ok(ryft_core::tracing_v2::grad(
+                        &ryft_core::tracing_v2::engines::ScalarEngine::<f64>::new(),
+                        scalar_quartic_plus_sin,
+                        x,
+                    )?)
+                },
+                2.0f64,
+            )
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         println!("=== ryft grad(x^4 + sin(x)) StableHLO ===\n{stablehlo}");
@@ -2803,18 +2795,18 @@ mod tests {
                 (f64, f64),
                 (f64, f64),
             >,
-        ) = ryft_core::tracing_v2::interpret_and_trace(
-            &engine,
-            |inputs| {
-                Ok(ryft_core::tracing_v2::grad(
-                    &ryft_core::tracing_v2::engines::ScalarEngine::<f64>::new(),
-                    scalar_bilinear_sin,
-                    inputs,
-                )?)
-            },
-            (2.0f64, 3.0f64),
-        )
-        .unwrap();
+        ) = engine
+            .interpret_and_trace(
+                |inputs| {
+                    Ok(ryft_core::tracing_v2::grad(
+                        &ryft_core::tracing_v2::engines::ScalarEngine::<f64>::new(),
+                        scalar_bilinear_sin,
+                        inputs,
+                    )?)
+                },
+                (2.0f64, 3.0f64),
+            )
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         println!("=== ryft jit(grad(bilinear_sin)) StableHLO ===\n{stablehlo}");

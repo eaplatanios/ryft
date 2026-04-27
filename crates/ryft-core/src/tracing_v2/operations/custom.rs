@@ -483,7 +483,7 @@ mod tests {
     use crate::tracing_v2::{
         LinearPrimitiveOperation, PrimitiveOperation, Tracer,
         engines::{ScalarEngine, StagingEngine},
-        grad, interpret_and_trace, jvp,
+        grad, jvp,
         operations::{TranspositionContext, constants::OneLike},
     };
     use crate::types::{ArrayType, DataType, Shape};
@@ -573,8 +573,7 @@ mod tests {
                 LinearPrimitiveOperation<Tracer<'engine, ScalarEngine<f64>>>,
             >,
             inputs: &[JvpTracer<Tracer<'engine, ScalarEngine<f64>>, crate::tracing::AtomId>],
-        ) -> Result<Vec<JvpTracer<Tracer<'engine, ScalarEngine<f64>>, crate::tracing::AtomId>>, TracingError>
-        {
+        ) -> Result<Vec<JvpTracer<Tracer<'engine, ScalarEngine<f64>>, crate::tracing::AtomId>>, TracingError> {
             if inputs.len() != 1 {
                 return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
@@ -641,9 +640,8 @@ mod tests {
     fn test_custom_primitive_base_execution_replays_without_optional_rules() {
         let engine = ScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
-            interpret_and_trace(
-                &engine,
+        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+            .interpret_and_trace(
                 {
                     let primitive = primitive.clone();
                     move |x| Ok(stage_custom_traced_unary(x, primitive.clone()))
@@ -700,9 +698,8 @@ mod tests {
         let engine = ScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0))
             .with_jvp_rule::<ScalarEngine<f64>, _>(ShiftOp::new(2.0));
-        let result: Result<(f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>), TracingError> =
-            interpret_and_trace(
-                &engine,
+        let result: Result<(f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>), TracingError> = engine
+            .interpret_and_trace(
                 {
                     let primitive = primitive.clone();
                     move |x: Tracer<ScalarEngine<f64>>| {
@@ -748,9 +745,8 @@ mod tests {
             Ok(1.0f64),
         );
 
-        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
-            interpret_and_trace(
-                &engine,
+        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+            .interpret_and_trace(
                 {
                     let primitive = primitive.clone();
                     move |x: Tracer<ScalarEngine<f64>>| {

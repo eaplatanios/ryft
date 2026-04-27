@@ -211,6 +211,67 @@ impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
         };
         Ok(output_states.into_iter().map(|state| Tracer { state, engine: self.clone() }).collect())
     }
+
+    /// Stages `function` directly from type metadata using this tracing engine's active builder.
+    ///
+    /// This is the builder-backed form used by nested traced transforms that need to trace a fresh
+    /// sibling program while retaining access to the outer engine context.
+    pub fn trace<F, Input, Output>(
+        self,
+        function: F,
+        input_types: Input,
+    ) -> Result<
+        (Output, Program<E::Type, E::Value, E::Operation, Input::To<E::Value>, Output::To<E::Value>>),
+        TracingError,
+    >
+    where
+        Input: Parameterized<
+                E::Type,
+                ParameterStructure: Clone,
+                Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
+            >,
+        Output: Parameterized<
+                E::Type,
+                ParameterStructure: Clone,
+                Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
+            >,
+        F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
+    {
+        let input_structure = input_types.parameter_structure();
+        let builder = self.builder().clone();
+        let traced_input = Input::To::<Tracer<'engine, E>>::from_parameters(
+            input_types.parameter_structure(),
+            input_types.into_parameters().map(|r#type| {
+                let atom = builder.borrow_mut().add_input(r#type.clone());
+                self.tracer_from_staged_parts(atom, r#type)
+            }),
+        )
+        .map_err(TracingError::from)?;
+
+        let (output_structure, output_types, outputs) = {
+            let traced_output = function(traced_input)?;
+            let output_structure = traced_output.parameter_structure();
+            let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
+            let output_types = Output::from_parameters(
+                output_structure.clone(),
+                traced_outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>(),
+            )?;
+            if let Some(tracing_error) = builder.borrow_mut().error.take() {
+                return Err(tracing_error);
+            }
+            let outputs = traced_outputs.into_iter().map(|output| output.atom_id()).collect::<Result<Vec<_>, _>>()?;
+            let output_structure = output_types.parameter_structure();
+            (output_structure, output_types, outputs)
+        };
+        drop(self);
+        let builder = match Rc::try_unwrap(builder) {
+            Ok(builder) => builder.into_inner(),
+            Err(_) => return Err(TracingError::EscapedProgramBuilder),
+        };
+        let program =
+            builder.build::<Input::To<E::Value>, Output::To<E::Value>>(outputs, input_structure, output_structure)?;
+        Ok((output_types, program))
+    }
 }
 
 impl<'engine, E: StagingEngine + ?Sized> Engine for TracingEngine<'engine, E> {
@@ -467,138 +528,6 @@ where
     }
 }
 
-/// Stages `function` directly from type metadata using the ordinary staged op set selected by `engine`.
-///
-/// [`trace`] is the most symbolic entry point in the module: it never needs concrete runtime
-/// inputs, only the parameterized input metadata. The closure is executed once on [`Tracer`] leaves
-/// that stand in for those abstract inputs, and the resulting builder state is finalized into a
-/// [`Program`].
-///
-/// The returned pair contains both the structured output metadata inferred during tracing and the
-/// staged program itself.
-pub fn trace<'engine, E, F, Input, Output>(
-    engine: &'engine E,
-    function: F,
-    input_types: Input,
-) -> Result<(Output, Program<E::Type, E::Value, E::Operation, Input::To<E::Value>, Output::To<E::Value>>), TracingError>
-where
-    E: StagingEngine + ?Sized,
-    Input: Parameterized<
-            E::Type,
-            ParameterStructure: Clone,
-            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
-        >,
-    Output: Parameterized<
-            E::Type,
-            ParameterStructure: Clone,
-            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
-        >,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-{
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, E::Value, E::Operation>::new()));
-    trace_with_engine(TracingEngine::new(engine, builder), function, input_types)
-}
-
-pub(crate) fn trace_with_engine<'engine, E, F, Input, Output>(
-    tracing_engine: TracingEngine<'engine, E>,
-    function: F,
-    input_types: Input,
-) -> Result<(Output, Program<E::Type, E::Value, E::Operation, Input::To<E::Value>, Output::To<E::Value>>), TracingError>
-where
-    E: StagingEngine + ?Sized,
-    Input: Parameterized<
-            E::Type,
-            ParameterStructure: Clone,
-            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
-        >,
-    Output: Parameterized<
-            E::Type,
-            ParameterStructure: Clone,
-            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
-        >,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-{
-    let input_structure = input_types.parameter_structure();
-    let builder = tracing_engine.builder().clone();
-    let traced_input = Input::To::<Tracer<'engine, E>>::from_parameters(
-        input_types.parameter_structure(),
-        input_types.into_parameters().map(|r#type| {
-            let atom = builder.borrow_mut().add_input(r#type.clone());
-            tracing_engine.tracer_from_staged_parts(atom, r#type)
-        }),
-    )
-    .map_err(TracingError::from)?;
-
-    let (output_structure, output_types, outputs) = {
-        let traced_output = function(traced_input)?;
-        let output_structure = traced_output.parameter_structure();
-        let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
-        let output_types = Output::from_parameters(
-            output_structure.clone(),
-            traced_outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>(),
-        )?;
-        if let Some(tracing_error) = builder.borrow_mut().error.take() {
-            return Err(tracing_error);
-        }
-        let outputs = traced_outputs.into_iter().map(|output| output.atom_id()).collect::<Result<Vec<_>, _>>()?;
-        let output_structure = output_types.parameter_structure();
-        (output_structure, output_types, outputs)
-    };
-    drop(tracing_engine);
-    let builder = match Rc::try_unwrap(builder) {
-        Ok(builder) => builder.into_inner(),
-        Err(_) => return Err(TracingError::EscapedProgramBuilder),
-    };
-    let program =
-        builder.build::<Input::To<E::Value>, Output::To<E::Value>>(outputs, input_structure, output_structure)?;
-    Ok((output_types, program))
-}
-
-/// Stages `function` with the ordinary op carrier, interprets it, and returns both results.
-pub fn interpret_and_trace<'engine, E, F, Input, Output>(
-    engine: &'engine E,
-    function: F,
-    input: Input,
-) -> Result<(Output, Program<E::Type, E::Value, E::Operation, Input, Output>), TracingError>
-where
-    E: StagingEngine<Operation: InterpretableOperation<E::Type, E::Value>> + ?Sized,
-    Input: Parameterized<
-            E::Value,
-            ParameterStructure: Clone + std::fmt::Debug + PartialEq,
-            Family: ParameterizedFamily<Tracer<'engine, E>>,
-        >,
-    Output: Parameterized<E::Value, ParameterStructure: Clone, Family: ParameterizedFamily<Tracer<'engine, E>>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-{
-    let input_structure = input.parameter_structure();
-    let input_values = input.into_parameters().collect::<Vec<_>>();
-    let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-    let mut output_structure = None;
-    let (_, flat_program): (Vec<E::Type>, Program<E::Type, E::Value, E::Operation, Vec<E::Value>, Vec<E::Value>>) =
-        trace(
-            engine,
-            |flat_traced_input| {
-                let traced_input =
-                    Input::To::<Tracer<'engine, E>>::from_parameters(input_structure.clone(), flat_traced_input)?;
-                let traced_output = function(traced_input)?;
-                output_structure = Some(traced_output.parameter_structure());
-                Ok(traced_output.into_parameters().collect::<Vec<_>>())
-            },
-            input_types,
-        )?;
-    let output_structure = output_structure
-        .expect("interpret_and_trace should record the staged output structure before returning successfully");
-    let Program { atoms, input_ids, output_ids, instructions, .. } = flat_program;
-    let mut builder = ProgramBuilder::<E::Type, E::Value, E::Operation>::new();
-    builder.atoms = atoms;
-    builder.input_ids = input_ids;
-    builder.instructions = instructions;
-    let program = builder.build::<Input, Output>(output_ids, input_structure, output_structure)?;
-    let program = program.simplified()?;
-    let concrete_input = Input::from_parameters(program.input_structure.clone(), input_values)?;
-    Ok((program.interpret(concrete_input)?, program))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{borrow::Cow, cell::RefCell, rc::Rc};
@@ -740,15 +669,15 @@ mod tests {
     #[test]
     fn staged_program_replays_graphs() {
         let engine = ScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = interpret_and_trace(
-            &engine,
-            |x: Tracer<ScalarEngine<f64>>| {
-                let squared = x.clone() * x.clone();
-                Ok(squared + x.sin())
-            },
-            2.0f64,
-        )
-        .unwrap();
+        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+            .interpret_and_trace(
+                |x: Tracer<ScalarEngine<f64>>| {
+                    let squared = x.clone() * x.clone();
+                    Ok(squared + x.sin())
+                },
+                2.0f64,
+            )
+            .unwrap();
 
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
         assert_eq!(program.interpret(0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
@@ -813,7 +742,7 @@ mod tests {
         let engine = FailingOneEngine;
 
         assert!(matches!(
-            interpret_and_trace::<FailingOneEngine, _, f64, f64>(
+            StagingEngine::interpret_and_trace::<_, f64, f64>(
                 &engine,
                 |x: Tracer<FailingOneEngine>| Ok(x.one_like()),
                 1.0f64,
@@ -952,16 +881,16 @@ mod tests {
 
         let scalar_type = TestType("test_scalar");
         let (output, program): (TestValue, Program<TestType, TestValue, TestAddOp, (TestValue, TestValue), TestValue>) =
-            interpret_and_trace(
-                &TestEngine,
-                |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| {
-                    let sum = inputs.0.clone() + inputs.1;
-                    let stabilized = sum + inputs.0.zero_like();
-                    Ok(stabilized + inputs.0.one_like())
-                },
-                (TestValue::new(scalar_type.clone(), 2), TestValue::new(scalar_type.clone(), 3)),
-            )
-            .unwrap();
+            TestEngine
+                .interpret_and_trace(
+                    |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| {
+                        let sum = inputs.0.clone() + inputs.1;
+                        let stabilized = sum + inputs.0.zero_like();
+                        Ok(stabilized + inputs.0.one_like())
+                    },
+                    (TestValue::new(scalar_type.clone(), 2), TestValue::new(scalar_type.clone(), 3)),
+                )
+                .unwrap();
 
         assert_eq!(output, TestValue::new(scalar_type.clone(), 6));
         assert_eq!(
@@ -1111,8 +1040,7 @@ mod tests {
                 >,
             ),
             TracingError,
-        > = interpret_and_trace(
-            &TestEngine,
+        > = TestEngine.interpret_and_trace(
             |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| Ok(inputs.0 + inputs.1),
             (
                 TestAbstractValue {
@@ -1134,12 +1062,9 @@ mod tests {
     #[test]
     fn staged_program_display_renders_the_staged_program() {
         let engine = ScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = interpret_and_trace(
-            &engine,
-            |x: Tracer<ScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()),
-            2.0f64,
-        )
-        .unwrap();
+        let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+            .interpret_and_trace(|x: Tracer<ScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()), 2.0f64)
+            .unwrap();
 
         assert_eq!(
             compiled.to_string(),

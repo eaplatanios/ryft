@@ -429,7 +429,7 @@ mod tests {
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
         tracing::{Program, ProgramBuilder},
         tracing_v2::{
-            LinearPrimitiveOperation, PrimitiveOperation, interpret_and_trace, operations::TranspositionContext,
+            LinearPrimitiveOperation, PrimitiveOperation, engines::StagingEngine, operations::TranspositionContext,
             operations::matrix::ndarray_support::Array2Engine,
         },
         types::{DataType, Shape},
@@ -675,7 +675,8 @@ mod tests {
                 ndarray::Array2<f64>,
                 ndarray::Array2<f64>,
             >,
-        ) = interpret_and_trace(&engine, |x| x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])), input)
+        ) = engine
+            .interpret_and_trace(|x| x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])), input)
             .unwrap();
 
         assert_eq!(

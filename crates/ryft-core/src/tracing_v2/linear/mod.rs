@@ -11,7 +11,7 @@ use crate::{
         DifferentiationError, LinearOperation,
         engines::{Engine, StagingEngine},
         forward::JvpTracer,
-        jit::{Tracer, TracingEngine, interpret_and_trace},
+        jit::{Tracer, TracingEngine},
         operations::{
             DifferentiableOperation, SupportsAdd, SupportsRematerialize,
             constants::{One, OneLike, SupportsZero, Zero, ZeroLike},
@@ -81,11 +81,7 @@ where
     E: StagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
-    trace_flat_program_from_trace_result::<Input, Output, V, E::Operation>(crate::tracing_v2::jit::trace(
-        engine,
-        function,
-        input_types,
-    )?)
+    trace_flat_program_from_trace_result::<Input, Output, V, E::Operation>(engine.trace(function, input_types)?)
 }
 
 pub(crate) fn trace_flat_program_from_input_engine<'engine, Input, Output, V, E, F>(
@@ -103,11 +99,9 @@ where
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
     let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::Operation>::new()));
-    trace_flat_program_from_trace_result::<Input, Output, V, E::Operation>(crate::tracing_v2::jit::trace_with_engine(
-        tracing_engine.sibling(builder),
-        function,
-        input_types,
-    )?)
+    trace_flat_program_from_trace_result::<Input, Output, V, E::Operation>(
+        tracing_engine.sibling(builder).trace(function, input_types)?,
+    )
 }
 
 fn trace_flat_program_from_trace_result<Input, Output, V, O>(
@@ -382,18 +376,17 @@ mod tests {
     fn test_concrete_ad_uses_differentiation_operation_carrier() {
         let engine = SplitCarrierEngine;
         let (_, traced_program): (f64, Program<ArrayType, f64, OrdinaryAddOperation, f64, f64>) =
-            crate::tracing_v2::interpret_and_trace(&engine, |x: Tracer<SplitCarrierEngine>| Ok(x.clone() + x), 2.0f64)
-                .unwrap();
+            engine.interpret_and_trace(|x: Tracer<SplitCarrierEngine>| Ok(x.clone() + x), 2.0f64).unwrap();
         assert_eq!(traced_program.instructions[0].operation.name(), "ordinary_add");
 
         let differentiable_staging_engine = DifferentiableOperationStagingEngine::new(&engine);
         let (_, differentiable_program): (f64, Program<ArrayType, f64, DifferentiableAddOperation, f64, f64>) =
-            interpret_and_trace(
-                differentiable_staging_engine,
-                |x: Tracer<'_, DifferentiableOperationStagingEngine<SplitCarrierEngine>>| Ok(x.clone() + x),
-                2.0f64,
-            )
-            .unwrap();
+            differentiable_staging_engine
+                .interpret_and_trace(
+                    |x: Tracer<'_, DifferentiableOperationStagingEngine<SplitCarrierEngine>>| Ok(x.clone() + x),
+                    2.0f64,
+                )
+                .unwrap();
         assert_eq!(differentiable_program.instructions[0].operation.name(), "differentiable_add");
 
         let (primal, pushforward) = jvp_program(&engine, |x| Ok(x.clone() + x), 2.0f64).unwrap();
@@ -450,8 +443,8 @@ mod tests {
 
     #[test]
     fn linearize_program_does_not_replay_the_forward_program_to_recover_representatives() {
-        let primitive = CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp)
-            .with_jvp_rule::<ScalarEngine<f64>, _>(PanicReplayOp);
+        let primitive =
+            CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule::<ScalarEngine<f64>, _>(PanicReplayOp);
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let input = builder.add_input(3.0f64.r#type().into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));

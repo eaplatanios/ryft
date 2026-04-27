@@ -24,7 +24,7 @@ use ryft_core::tracing_v2::operations::{
     AddOperation, ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
     constants::{One, OneLike, ZeroLike},
 };
-use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin, Tracer, trace as trace_types};
+use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin, StagingEngine, Tracer};
 
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::XlaPrimitiveOperation;
@@ -1006,7 +1006,7 @@ impl ShardMap {
         context.shardy_manual_axes(self.manual_axes())
     }
 
-    /// Traces a shard-map body over local body tensor types using `tracing_v2::trace`.
+    /// Traces a shard-map body over local body tensor types using [`StagingEngine::trace`].
     ///
     /// # Parameters
     ///
@@ -1373,7 +1373,7 @@ where
             input_types.parameters().cloned().collect::<Vec<_>>(),
         )?;
         {
-            let (output_types, program) = trace_types(engine, |input| Ok(function(input)), cloned_input_types)?;
+            let (output_types, program) = engine.trace(|input| Ok(function(input)), cloned_input_types)?;
             (output_types, fold_xla_program_constants(&program)?.simplified()?)
         }
     };

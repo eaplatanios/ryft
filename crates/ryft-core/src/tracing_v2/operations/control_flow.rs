@@ -725,7 +725,7 @@ mod tests {
         tracing::{ProgramBuilder, Traceable, Value},
         tracing_v2::{
             Differentiable, LinearPrimitiveOperation,
-            engines::{ScalarEngine, Engine},
+            engines::{Engine, ScalarEngine},
             operations::{
                 SupportsAdd, SupportsNeg, SupportsScale,
                 constants::{One, OneLike, Zero},

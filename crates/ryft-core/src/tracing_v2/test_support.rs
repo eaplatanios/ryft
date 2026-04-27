@@ -12,7 +12,7 @@ use crate::{
 pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
     let engine = ScalarEngine::<f64>::new();
     let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
-        interpret_and_trace(&engine, |x| Ok(x.sin()), 2.0f64).unwrap();
+        engine.interpret_and_trace(|x| Ok(x.sin()), 2.0f64).unwrap();
 
     assert_eq!(
         compiled.to_string(),
@@ -81,7 +81,7 @@ pub(crate) fn assert_bilinear_pushforward_rendering() {
 pub(crate) fn assert_bilinear_jit_rendering() {
     let engine = ScalarEngine::<f64>::new();
     let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, (f64, f64), f64>) =
-        interpret_and_trace(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
+        engine.interpret_and_trace(|inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
         compiled.to_string(),

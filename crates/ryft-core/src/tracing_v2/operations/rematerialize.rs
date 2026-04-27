@@ -661,8 +661,7 @@ mod tests {
     use crate::tracing::{Program, ProgramBuilder};
     use crate::tracing_v2::{
         DifferentiationError, JvpTracer, LinearPrimitiveOperation, Sin, Tracer,
-        engines::ScalarEngine,
-        interpret_and_trace,
+        engines::{ScalarEngine, StagingEngine},
         linear::{compile_grad, grad, value_and_grad},
         operations::TranspositionContext,
     };
@@ -762,7 +761,7 @@ mod tests {
         // When used inside jit, rematerialize should produce a "rematerialize" op in the program.
         let engine = ScalarEngine::<f64>::new();
         let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
-            interpret_and_trace(&engine, |x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
+            engine.interpret_and_trace(|x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         approx_eq(output, 2.0f64.sin());
         let ir = program.to_string();
@@ -774,7 +773,7 @@ mod tests {
         // Check the exact rendering of the jit-traced program containing a rematerialize op.
         let engine = ScalarEngine::<f64>::new();
         let (_, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
-            interpret_and_trace(&engine, |x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
+            engine.interpret_and_trace(|x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         assert_eq!(
             program.to_string(),
@@ -862,17 +861,14 @@ mod tests {
         let without: f64 = {
             let engine = ScalarEngine::<f64>::new();
             let (output, _): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
-                interpret_and_trace(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 3.0f64).unwrap();
+                engine.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()), 3.0f64).unwrap();
             output
         };
         let with: f64 = {
             let engine = ScalarEngine::<f64>::new();
-            let (output, _): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = interpret_and_trace(
-                &engine,
-                |x| Ok(rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap()),
-                3.0f64,
-            )
-            .unwrap();
+            let (output, _): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+                .interpret_and_trace(|x| Ok(rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap()), 3.0f64)
+                .unwrap();
             output
         };
 

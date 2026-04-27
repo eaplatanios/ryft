@@ -12,8 +12,8 @@ use crate::tracing_v2::{
 use crate::tracing_v2::{
     Sin, Tracer,
     benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program},
-    engines::ScalarEngine,
-    grad, interpret_and_trace, jvp, jvp_program,
+    engines::{ScalarEngine, StagingEngine},
+    grad, jvp, jvp_program,
     operations::constants::OneLike,
     value_and_grad, vjp,
 };
@@ -151,7 +151,7 @@ fn hessian_style_second_derivative_traced(x: Tracer<ScalarEngine<f64>>) -> Trace
 /// Emits the plain JIT scalar bilinear benchmark.
 fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<f64>, (f64, f64), f64>) =
-        interpret_and_trace(&ScalarEngine::<f64>::new(), |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64))?;
+        ScalarEngine::<f64>::new().interpret_and_trace(|inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jit", "jit", &compiled)?])
 }
 
@@ -176,11 +176,9 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, Ben
 /// Emits the staged scalar reverse-mode gradient benchmark.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<f64>, f64, f64>) =
-        interpret_and_trace(
-            &ScalarEngine::<f64>::new(),
+        ScalarEngine::<f64>::new().interpret_and_trace(
             |x| {
-                let gradient: Tracer<ScalarEngine<f64>> =
-                    grad(&ScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
+                let gradient: Tracer<ScalarEngine<f64>> = grad(&ScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
                 Ok(gradient)
             },
             2.0f64,
@@ -193,8 +191,7 @@ fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord
     let (_, compiled): (
         (f64, f64),
         Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<f64>, f64, (f64, f64)>,
-    ) = interpret_and_trace(
-        &ScalarEngine::<f64>::new(),
+    ) = ScalarEngine::<f64>::new().interpret_and_trace(
         |x| {
             let value_and_gradient: (Tracer<ScalarEngine<f64>>, Tracer<ScalarEngine<f64>>) =
                 value_and_grad(&ScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
@@ -215,11 +212,7 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmar
 /// Emits the staged forward-over-reverse scalar benchmark.
 fn emit_scalar_quartic_plus_sin_hessian_style() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<f64>, f64, f64>) =
-        interpret_and_trace(
-            &ScalarEngine::<f64>::new(),
-            |x| Ok(hessian_style_second_derivative_traced(x)),
-            2.0f64,
-        )?;
+        ScalarEngine::<f64>::new().interpret_and_trace(|x| Ok(hessian_style_second_derivative_traced(x)), 2.0f64)?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_hessian_style", "hessian_style", &compiled)?])
 }
 
@@ -297,7 +290,7 @@ fn emit_matrix_matmul_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
             (Array2<f64>, Array2<f64>),
             Array2<f64>,
         >,
-    ) = interpret_and_trace(&Array2Engine::<f64>::new(), |inputs| Ok(bilinear_matmul(inputs)), matrix_inputs())?;
+    ) = Array2Engine::<f64>::new().interpret_and_trace(|inputs| Ok(bilinear_matmul(inputs)), matrix_inputs())?;
     Ok(vec![tracing_record("matrix_matmul_jit", "jit", &compiled)?])
 }
 
@@ -329,8 +322,7 @@ fn emit_matrix_three_matmul_sine_hessian_style() -> Result<Vec<IrBenchmarkRecord
             (Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>),
             Array2<f64>,
         >,
-    ) = interpret_and_trace(
-        &Array2Engine::<f64>::new(),
+    ) = Array2Engine::<f64>::new().interpret_and_trace(
         |inputs| Ok(matrix_hessian_style_second_derivative(inputs)),
         hessian_style_matrix_inputs(),
     )?;

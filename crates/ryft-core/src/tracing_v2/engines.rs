@@ -1,14 +1,14 @@
-use std::marker::PhantomData;
+use std::{cell::RefCell, marker::PhantomData, rc::Rc};
 
 use crate::{
-    parameters::Parameter,
-    tracing::{Operation, Traceable, TracingError},
+    parameters::{Parameter, Parameterized, ParameterizedFamily},
+    tracing::{InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError},
     tracing_v2::{
         LinearPrimitiveOperation, PrimitiveOperation,
         differentiation::{DifferentiableEngine, DifferentiableStagingEngine},
-        jit::Tracer,
+        jit::{Tracer, TracingEngine},
     },
-    types::{ArrayType, Type},
+    types::{ArrayType, Type, Typed},
 };
 
 /// Synthesizes concrete leaf values from abstract type metadata.
@@ -66,6 +66,88 @@ pub trait Engine {
 pub trait StagingEngine: Engine {
     /// Staged operation type selected by this staging engine.
     type Operation: Clone + Operation<Self::Type>;
+
+    /// Stages `function` directly from type metadata using this engine's ordinary staged op set.
+    ///
+    /// This is the most symbolic tracing entry point: it never needs concrete runtime inputs, only
+    /// the parameterized input metadata. The closure is executed once on [`Tracer`] leaves that
+    /// stand in for those abstract inputs, and the resulting builder state is finalized into a
+    /// [`Program`].
+    ///
+    /// The returned pair contains both the structured output metadata inferred during tracing and
+    /// the staged program itself.
+    fn trace<
+        'engine,
+        F: FnOnce(Input::To<Tracer<'engine, Self>>) -> Result<Output::To<Tracer<'engine, Self>>, TracingError>,
+        Input: Parameterized<
+                Self::Type,
+                ParameterStructure: Clone,
+                Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Tracer<'engine, Self>>,
+            >,
+        Output: Parameterized<
+                Self::Type,
+                ParameterStructure: Clone,
+                Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Tracer<'engine, Self>>,
+            >,
+    >(
+        &'engine self,
+        function: F,
+        input_types: Input,
+    ) -> Result<
+        (Output, Program<Self::Type, Self::Value, Self::Operation, Input::To<Self::Value>, Output::To<Self::Value>>),
+        TracingError,
+    > {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        TracingEngine::new(self, builder).trace(function, input_types)
+    }
+
+    /// Stages `function` with this engine's ordinary op carrier, interprets it, and returns both results.
+    fn interpret_and_trace<
+        'engine,
+        F: FnOnce(Input::To<Tracer<'engine, Self>>) -> Result<Output::To<Tracer<'engine, Self>>, TracingError>,
+        Input: Parameterized<
+                Self::Value,
+                ParameterStructure: Clone + std::fmt::Debug + PartialEq,
+                Family: ParameterizedFamily<Tracer<'engine, Self>>,
+            >,
+        Output: Parameterized<Self::Value, ParameterStructure: Clone, Family: ParameterizedFamily<Tracer<'engine, Self>>>,
+    >(
+        &'engine self,
+        function: F,
+        input: Input,
+    ) -> Result<(Output, Program<Self::Type, Self::Value, Self::Operation, Input, Output>), TracingError>
+    where
+        Self::Operation: InterpretableOperation<Self::Type, Self::Value>,
+    {
+        let input_structure = input.parameter_structure();
+        let input_values = input.into_parameters().collect::<Vec<_>>();
+        let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let mut output_structure = None;
+        let (_, flat_program): (
+            Vec<Self::Type>,
+            Program<Self::Type, Self::Value, Self::Operation, Vec<Self::Value>, Vec<Self::Value>>,
+        ) = self.trace(
+            |flat_traced_input| {
+                let traced_input =
+                    Input::To::<Tracer<'engine, Self>>::from_parameters(input_structure.clone(), flat_traced_input)?;
+                let traced_output = function(traced_input)?;
+                output_structure = Some(traced_output.parameter_structure());
+                Ok(traced_output.into_parameters().collect::<Vec<_>>())
+            },
+            input_types,
+        )?;
+        let output_structure = output_structure
+            .expect("interpret_and_trace should record the staged output structure before returning successfully");
+        let Program { atoms, input_ids, output_ids, instructions, .. } = flat_program;
+        let mut builder = ProgramBuilder::new();
+        builder.atoms = atoms;
+        builder.input_ids = input_ids;
+        builder.instructions = instructions;
+        let program = builder.build::<Input, Output>(output_ids, input_structure, output_structure)?;
+        let program = program.simplified()?;
+        let concrete_input = Input::from_parameters(program.input_structure.clone(), input_values)?;
+        Ok((program.interpret(concrete_input)?, program))
+    }
 }
 
 /// Stateless engine that synthesizes scalar-compatible values from [`ArrayType`] metadata.

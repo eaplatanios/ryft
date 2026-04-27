@@ -12,7 +12,6 @@ use crate::{
     tracing::{InterpretableOperation, Operation, Program, Traceable, TracingError, Value},
     tracing_v2::{
         ControlFlowError, ControlFlowValue, Cos, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation, Sin, Tracer,
-        jit::trace,
         operations::{
             constants::{OneLike, ZeroLike},
             reshape::ReshapeOps,
@@ -466,7 +465,8 @@ where
     }
 
     let input_types = Input::To::<ArrayType>::from_parameters(structure.clone(), logical_types)?;
-    let (_, program) = trace::<E, F, Input::To<ArrayType>, Output::To<ArrayType>>(engine, function, input_types)?;
+    let (_, program): (Output::To<ArrayType>, Program<ArrayType, V, E::Operation, Input, Output>) =
+        engine.trace::<F, Input::To<ArrayType>, Output::To<ArrayType>>(function, input_types)?;
     let batched_input = Input::To::<ArrayBatch<V>>::from_parameters(structure, batched_inputs)?;
     let batched_output = interpret_batched_program(&program, batched_input)?;
     let output_structure = batched_output.parameter_structure();

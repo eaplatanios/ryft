@@ -66,7 +66,7 @@ mod tests {
     use ndarray::{arr1, arr2};
     use pretty_assertions::assert_eq;
     use ryft_core::tracing::Operation;
-    use ryft_core::tracing_v2::{Engine, MatrixOps, Sin, interpret_and_trace, jvp, trace};
+    use ryft_core::tracing_v2::{Engine, MatrixOps, Sin, StagingEngine, jvp};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::Array;
@@ -102,7 +102,7 @@ mod tests {
         let input = Array::from_shape_vec([3], vec![1.0, 2.0, 3.0]).unwrap();
 
         let (output, program): (Array<f64>, _) =
-            interpret_and_trace(&engine, |x| Ok((x.clone() * x).sin()), input.clone()).unwrap();
+            engine.interpret_and_trace(|x| Ok((x.clone() * x).sin()), input.clone()).unwrap();
         let replayed: Array<f64> = program.interpret(input).unwrap();
 
         assert_eq!(output.as_ndarray(), &arr1(&[1.0f64.sin(), 4.0f64.sin(), 9.0f64.sin()]).into_dyn());
@@ -115,7 +115,7 @@ mod tests {
         let engine = NdArrayEngine::<f64>::new();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
 
-        let (output_type, program): (ArrayType, _) = trace(&engine, |x| Ok(x.clone() + x), input_type.clone()).unwrap();
+        let (output_type, program): (ArrayType, _) = engine.trace(|x| Ok(x.clone() + x), input_type.clone()).unwrap();
 
         assert_eq!(output_type, input_type);
         assert_eq!(program.instructions.len(), 1);
@@ -142,7 +142,7 @@ mod tests {
         let right = Array::from_shape_vec([2, 2], vec![5.0, 6.0, 7.0, 8.0]).unwrap();
 
         let (output, _program): (Array<f64>, _) =
-            interpret_and_trace(&engine, |(left, right)| Ok(left.matmul(right)), (left, right)).unwrap();
+            engine.interpret_and_trace(|(left, right)| Ok(left.matmul(right)), (left, right)).unwrap();
 
         assert_eq!(output.as_ndarray(), &arr2(&[[19.0, 22.0], [43.0, 50.0]]).into_dyn());
     }

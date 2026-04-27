@@ -28,7 +28,8 @@ where
     let input_primals: Vec<V> = primals.into_parameters().collect();
     let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
     let differentiable_staging_engine = DifferentiableOperationStagingEngine::new(engine);
-    let (primal_output, program) = interpret_and_trace(differentiable_staging_engine, function, reconstructed_primals)?;
+    let (primal_output, program) =
+        differentiable_staging_engine.interpret_and_trace(function, reconstructed_primals)?;
     Ok((primal_output, linearize_program(engine, &program, input_primals)?))
 }
 
@@ -704,8 +705,7 @@ mod tests {
         let empty_primals: Vec<Tracer<'_, ScalarEngine<f64>>> = Vec::new();
         let empty_tangents: Vec<Tracer<'_, ScalarEngine<f64>>> = Vec::new();
 
-        let result =
-            jvp_traced(|inputs: Vec<Tracer<'_, ScalarEngine<f64>>>| Ok(inputs), empty_primals, empty_tangents);
+        let result = jvp_traced(|inputs: Vec<Tracer<'_, ScalarEngine<f64>>>| Ok(inputs), empty_primals, empty_tangents);
 
         assert!(matches!(
             result,
