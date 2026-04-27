@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Display};
+use std::collections::BTreeMap;
 
 use serde::Serialize;
 use thiserror::Error;
@@ -355,12 +355,6 @@ mod tests {
         assert!(case_ids.contains(&"scalar_quartic_plus_sin_value_and_grad"));
         assert!(case_ids.contains(&"scalar_quartic_plus_sin_linearize_pushforward"));
         assert!(case_ids.contains(&"scalar_quartic_plus_sin_hessian_style"));
-        #[cfg(feature = "ndarray")]
-        assert!(case_ids.contains(&"matrix_matmul_jit"));
-        #[cfg(feature = "ndarray")]
-        assert!(case_ids.contains(&"matrix_matmul_vjp_pullback"));
-        #[cfg(feature = "ndarray")]
-        assert!(case_ids.contains(&"matrix_three_matmul_sine_hessian_style"));
     }
 
     /// Verifies that exact case filtering emits only the requested case.

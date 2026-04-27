@@ -66,7 +66,8 @@ mod tests {
     use ndarray::{arr1, arr2};
     use pretty_assertions::assert_eq;
     use ryft_core::tracing::Operation;
-    use ryft_core::tracing_v2::{Engine, MatrixOps, Sin, StagingEngine, jvp};
+    use ryft_core::tracing::TracingError;
+    use ryft_core::tracing_v2::{DifferentiationError, Engine, MatrixOps, Sin, StagingEngine, compile_grad, grad, jvp};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::Array;
@@ -133,6 +134,34 @@ mod tests {
 
         assert_eq!(primal_output.as_ndarray(), &arr1(&[4.0, 9.0]).into_dyn());
         assert_eq!(tangent_output.as_ndarray(), &arr1(&[20.0, 42.0]).into_dyn());
+    }
+
+    #[test]
+    fn test_grad_rejects_non_scalar_array_output() {
+        let engine = NdArrayEngine::<f64>::new();
+        let input = Array::from_shape_vec([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+
+        let result = grad(&engine, |input| input, input);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::NonScalarGradientOutput { output_type }))
+                if output_type.rank() == 2
+        ));
+    }
+
+    #[test]
+    fn test_compile_grad_rejects_non_scalar_array_output() {
+        let engine = NdArrayEngine::<f64>::new();
+        let input = Array::from_shape_vec([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+
+        let result = compile_grad(&engine, |input| input, input);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::NonScalarGradientOutput { output_type }))
+                if output_type.rank() == 2
+        ));
     }
 
     #[test]

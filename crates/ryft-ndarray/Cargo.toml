@@ -33,7 +33,9 @@ ndarray.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+indoc.workspace = true
 pretty_assertions.workspace = true
 
 [features]
 default = []
+benchmarking = ["ryft-core/benchmarking"]

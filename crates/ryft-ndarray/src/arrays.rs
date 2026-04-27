@@ -12,7 +12,7 @@ use ryft_core::tracing_v2::operations::{
     ControlFlowError, ControlFlowValue,
     constants::{One, OneLike, Zero, ZeroLike},
 };
-use ryft_core::tracing_v2::{CoordinateValue, Cos, Differentiable, MatrixOps, ReshapeOps, Sin};
+use ryft_core::tracing_v2::{CoordinateValue, Cos, Differentiable, DifferentiationError, MatrixOps, ReshapeOps, Sin};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Element type supported by the `ryft-ndarray` backend.
@@ -268,6 +268,9 @@ impl<T: NdArrayElement> Zero<ArrayType> for Array<T> {
 impl<T: NdArrayElement> One<ArrayType> for Array<T> {
     #[inline]
     fn one(array_type: &ArrayType) -> Result<Self, TracingError> {
+        if array_type.rank() != 0 {
+            return Err(DifferentiationError::NonScalarGradientOutput { output_type: array_type.clone() }.into());
+        }
         Array::ones(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
@@ -466,11 +469,21 @@ fn array_error_to_tracing_error(error: ArrayError) -> TracingError {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use ndarray::{arr0, arr1, arr2};
     use pretty_assertions::assert_eq;
+    use ryft_core::parameters::Placeholder;
+    use ryft_core::tracing::ProgramBuilder;
     use ryft_core::tracing_v2::operations::ControlFlowValue;
+    use ryft_core::tracing_v2::{
+        LinearOperation, LinearPrimitiveOperation, StagingEngine,
+        operations::{ReshapeOperation, TranspositionContext},
+    };
     use ryft_core::tracing_v2::{MatrixOps, ReshapeOps};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
+
+    use crate::NdArrayEngine;
 
     use super::Array;
 
@@ -518,6 +531,59 @@ mod tests {
         let reshaped = array.reshape(Shape::new(vec![Size::Static(3), Size::Static(2)])).unwrap();
 
         assert_eq!(reshaped.as_ndarray(), &arr2(&[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]).into_dyn());
+    }
+
+    #[test]
+    fn test_reshape_jit_rendering_includes_target_shape() {
+        let input = Array::from_shape_vec([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let engine = NdArrayEngine::<f64>::new();
+        let (_, compiled): (Array<f64>, _) = engine
+            .interpret_and_trace(|x| x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])), input)
+            .unwrap();
+
+        assert_eq!(
+            compiled.to_string(),
+            indoc::indoc! {"
+                lambda %0:f64[2, 2] .
+                let %1:f64[1, 4] = reshape [input_shape=[2, 2], output_shape=[1, 4]] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_reshape_transpose_restores_the_input_shape() {
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
+        let output_value = Array::from_shape_vec([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let transpose_builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, Array<f64>, LinearPrimitiveOperation<Array<f64>>>::new()));
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(output_value.r#type().into_owned());
+        let mut context = TranspositionContext::new(transpose_builder.clone());
+        let contribution_atom =
+            ReshapeOperation::new(input_type.shape.clone(), Shape::new(vec![Size::Static(1), Size::Static(4)]))
+                .transpose(&mut context, &[Some(output_cotangent_atom)])
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("transpose should return one contribution")
+                .expect("transpose should produce one cotangent contribution");
+        drop(context);
+
+        let transpose_builder = Rc::try_unwrap(transpose_builder)
+            .expect("transpose builder should not have outstanding linear terms")
+            .into_inner();
+        let transpose_program = transpose_builder
+            .build::<Array<f64>, Array<f64>>(vec![contribution_atom], Placeholder, Placeholder)
+            .unwrap();
+        assert_eq!(
+            transpose_program
+                .interpret(Array::from_shape_vec([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap())
+                .unwrap()
+                .as_ndarray(),
+            &arr2(&[[1.0f64, 2.0], [3.0, 4.0]]).into_dyn()
+        );
     }
 
     #[test]

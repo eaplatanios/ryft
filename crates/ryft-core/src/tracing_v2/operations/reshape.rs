@@ -2,9 +2,6 @@ use std::fmt::{Debug, Display};
 
 use half::{bf16, f16};
 
-#[cfg(test)]
-use indoc::indoc;
-
 use crate::{
     macros::check_input_count,
     sharding::{Sharding, ShardingDimension},
@@ -234,59 +231,6 @@ macro_rules! impl_scalar_reshape_ops {
 
 impl_scalar_reshape_ops!(bf16, f16, f32, f64);
 
-#[cfg(any(feature = "ndarray", test))]
-mod ndarray_support {
-    use ndarray::Array2;
-
-    use super::{ReshapeOps, reshape_abstract};
-    use crate::{
-        tracing::TracingError,
-        types::{Shape, Size, TypeError, Typed},
-    };
-
-    impl ReshapeOps for Array2<f32> {
-        fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-            let input_type = self.r#type().into_owned();
-            let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
-            if input_type == output_type {
-                return Ok(self);
-            }
-            let [Size::Static(rows), Size::Static(cols)] = output_type.shape.dimensions.as_slice() else {
-                return Err(TracingError::Type(TypeError {
-                    message: "reshape expected a rank-2 static ndarray target shape".to_string(),
-                }));
-            };
-            let values = self.iter().copied().collect::<Vec<_>>();
-            Array2::from_shape_vec((*rows, *cols), values).map_err(|_| {
-                TracingError::Type(TypeError {
-                    message: "reshape could not realize the requested ndarray target shape".to_string(),
-                })
-            })
-        }
-    }
-
-    impl ReshapeOps for Array2<f64> {
-        fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-            let input_type = self.r#type().into_owned();
-            let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
-            if input_type == output_type {
-                return Ok(self);
-            }
-            let [Size::Static(rows), Size::Static(cols)] = output_type.shape.dimensions.as_slice() else {
-                return Err(TracingError::Type(TypeError {
-                    message: "reshape expected a rank-2 static ndarray target shape".to_string(),
-                }));
-            };
-            let values = self.iter().copied().collect::<Vec<_>>();
-            Array2::from_shape_vec((*rows, *cols), values).map_err(|_| {
-                TracingError::Type(TypeError {
-                    message: "reshape could not realize the requested ndarray target shape".to_string(),
-                })
-            })
-        }
-    }
-}
-
 /// Primitive representing one reshape between two [`Shape`]s.
 #[derive(Clone)]
 pub struct ReshapeOperation {
@@ -429,32 +373,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
-
-    use ndarray::arr2;
     use pretty_assertions::assert_eq;
 
     use crate::{
-        parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
-        tracing::{Program, ProgramBuilder},
-        tracing_v2::{
-            LinearPrimitiveOperation, PrimitiveOperation, engines::StagingEngine, operations::TranspositionContext,
-            operations::matrix::ndarray_support::Array2Engine,
-        },
         types::{DataType, Shape},
     };
 
     use super::*;
-
-    fn test_array_transposition_context(
-        builder: Rc<
-            RefCell<ProgramBuilder<ArrayType, ndarray::Array2<f64>, LinearPrimitiveOperation<ndarray::Array2<f64>>>>,
-        >,
-    ) -> TranspositionContext<'static, ArrayType, ndarray::Array2<f64>, LinearPrimitiveOperation<ndarray::Array2<f64>>>
-    {
-        TranspositionContext::new(builder)
-    }
 
     /// Creates one small manual mesh used by reshape sharding tests.
     fn test_mesh() -> LogicalMesh {
@@ -659,78 +585,6 @@ mod tests {
                 ),
             )
             .unwrap())
-        );
-    }
-
-    #[test]
-    fn test_reshape_eval_reorders_only_shape_metadata() {
-        let input = arr2(&[[1.0f64, 2.0], [3.0, 4.0]]);
-
-        assert_eq!(
-            input.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])).unwrap(),
-            arr2(&[[1.0f64, 2.0, 3.0, 4.0]])
-        );
-    }
-
-    #[test]
-    fn test_reshape_jit_rendering_includes_target_shape() {
-        let input = arr2(&[[1.0f64, 2.0], [3.0, 4.0]]);
-        let engine = Array2Engine::<f64>::new();
-        let (_, compiled): (
-            ndarray::Array2<f64>,
-            Program<
-                ArrayType,
-                ndarray::Array2<f64>,
-                PrimitiveOperation<ndarray::Array2<f64>>,
-                ndarray::Array2<f64>,
-                ndarray::Array2<f64>,
-            >,
-        ) = engine
-            .interpret_and_trace(|x| x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])), input)
-            .unwrap();
-
-        assert_eq!(
-            compiled.to_string(),
-            indoc! {"
-                lambda %0:f64[2, 2] .
-                let %1:f64[1, 4] = reshape [input_shape=[2, 2], output_shape=[1, 4]] %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_reshape_transpose_restores_the_input_shape() {
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
-        let output_value = arr2(&[[1.0f64, 2.0, 3.0, 4.0]]);
-        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
-            ndarray::Array2<f64>,
-            LinearPrimitiveOperation<ndarray::Array2<f64>>,
-        >::new()));
-        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(output_value.r#type().into_owned());
-        let mut context = test_array_transposition_context(transpose_builder.clone());
-        let contribution_atom =
-            ReshapeOperation::new(input_type.shape.clone(), Shape::new(vec![Size::Static(1), Size::Static(4)]))
-                .transpose(&mut context, &[Some(output_cotangent_atom)])
-                .unwrap()
-                .into_iter()
-                .next()
-                .expect("transpose should return one contribution")
-                .expect("transpose should produce one cotangent contribution");
-        drop(context);
-
-        let transpose_builder = Rc::try_unwrap(transpose_builder)
-            .expect("transpose builder should not have outstanding linear terms")
-            .into_inner();
-        let transpose_program = transpose_builder
-            .build::<ndarray::Array2<f64>, ndarray::Array2<f64>>(vec![contribution_atom], Placeholder, Placeholder)
-            .unwrap();
-        assert_eq!(
-            transpose_program.interpret(arr2(&[[1.0f64, 2.0, 3.0, 4.0]])).unwrap(),
-            arr2(&[[1.0f64, 2.0], [3.0, 4.0]])
         );
     }
 }

@@ -817,31 +817,31 @@ pub trait Parameterized<P: Parameter>: Sized {
             }
         }
 
-        if deferred_parameters.is_none() {
-            if let Some((provided_path, parameter)) = next_parameter.take() {
-                // No mismatch occurred during traversal, but additional parameters remain. We need to materialize
-                // the remaining parameters while still applying duplicate overrides for previously matched paths.
-                let mut deferred = HashMap::with_capacity(parameters.size_hint().0 + 1);
-                let matching_path_indices = matching_path_indices.get_or_insert_with(|| {
-                    matching_paths
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .map(|(index, path)| (path, index))
-                        .collect::<HashMap<_, _>>()
-                });
+        if deferred_parameters.is_none()
+            && let Some((provided_path, parameter)) = next_parameter.take()
+        {
+            // No mismatch occurred during traversal, but additional parameters remain. We need to materialize
+            // the remaining parameters while still applying duplicate overrides for previously matched paths.
+            let mut deferred = HashMap::with_capacity(parameters.size_hint().0 + 1);
+            let matching_path_indices = matching_path_indices.get_or_insert_with(|| {
+                matching_paths
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, path)| (path, index))
+                    .collect::<HashMap<_, _>>()
+            });
 
-                let parameters = std::iter::once((provided_path, parameter)).chain(parameters);
-                for (provided_path, parameter) in parameters {
-                    if let Some(index) = matching_path_indices.get(&provided_path).copied() {
-                        values[index] = parameter;
-                    } else {
-                        deferred.insert(provided_path, parameter);
-                    }
+            let parameters = std::iter::once((provided_path, parameter)).chain(parameters);
+            for (provided_path, parameter) in parameters {
+                if let Some(index) = matching_path_indices.get(&provided_path).copied() {
+                    values[index] = parameter;
+                } else {
+                    deferred.insert(provided_path, parameter);
                 }
-
-                deferred_parameters = Some(deferred);
             }
+
+            deferred_parameters = Some(deferred);
         }
 
         if !missing_paths.is_empty() {
@@ -1490,7 +1490,7 @@ macro_rules! tuple_parameterized_impl {
 
                 fn parameter_structure(&self) -> Self::ParameterStructure {
                     let ($([<$T:lower>],)*) = &self;
-                    ($([<$T:lower>].parameter_structure(),)*)
+                    tuple_parameter_structure!($([<$T:lower>].parameter_structure(),)*)
                 }
 
                 fn parameters(&self) -> Self::ParameterIterator<'_, P> {
@@ -1534,6 +1534,16 @@ macro_rules! tuple_parameterized_impl {
                 }
             }
         }
+    };
+}
+
+macro_rules! tuple_parameter_structure {
+    () => {
+        Default::default()
+    };
+
+    ($($structure:expr,)*) => {
+        ($($structure,)*)
     };
 }
 

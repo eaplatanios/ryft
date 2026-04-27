@@ -175,21 +175,16 @@ mod tests {
         sync::Arc,
     };
 
-    use indoc::indoc;
-    use ndarray::arr2;
-
     use crate::{
         parameters::Placeholder,
         tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError},
         tracing_v2::{
             CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearOperation, LinearPrimitiveOperation,
-            PrimitiveOperation, Sin,
-            engines::ScalarEngine,
-            operations::{TranspositionContext, matrix::ndarray_support::Array2Engine},
-            test_support,
+            PrimitiveOperation, Sin, engines::ScalarEngine, operations::TranspositionContext, test_support,
         },
         types::{ArrayType, DataType, TypeError},
     };
+    use indoc::indoc;
 
     use super::*;
 
@@ -554,19 +549,6 @@ mod tests {
                 expected: 1,
                 got: 2
             }))
-        ));
-    }
-
-    #[test]
-    fn test_compile_grad_rejects_non_scalar_array_output() {
-        let engine = Array2Engine::<f64>::new();
-
-        let result = compile_grad(&engine, |input| input, arr2(&[[1.0, 2.0], [3.0, 4.0]]));
-
-        assert!(matches!(
-            result,
-            Err(TracingError::Differentiation(DifferentiationError::NonScalarGradientOutput { output_type }))
-                if output_type.rank() == 2
         ));
     }
 

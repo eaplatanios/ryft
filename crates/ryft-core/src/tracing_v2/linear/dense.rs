@@ -219,13 +219,6 @@ impl<S: Clone, InputStructure, OutputStructure> DenseJacobian<S, InputStructure,
     pub fn get(&self, row: usize, col: usize) -> Option<&S> {
         (row < self.rows && col < self.cols).then(|| &self.values[row * self.cols + col])
     }
-
-    #[cfg(any(feature = "ndarray", test))]
-    /// Converts the dense Jacobian into an `ndarray::Array2`.
-    pub fn to_array2(&self) -> ndarray::Array2<S> {
-        ndarray::Array2::from_shape_vec((self.rows, self.cols), self.values.clone())
-            .expect("dense Jacobian dimensions should match the stored values")
-    }
 }
 
 fn coordinate_counts<V>(parameters: &[V]) -> Vec<usize>

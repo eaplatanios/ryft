@@ -73,22 +73,6 @@ macro_rules! impl_non_predicate_control_flow_value {
 
 impl_non_predicate_control_flow_value!(i8, i16, i32, i64, u8, u16, u32, u64, bf16, f16, f32, f64);
 
-#[cfg(any(feature = "ndarray", test))]
-impl ControlFlowValue for ndarray::Array2<f32> {
-    #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
-        Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
-    }
-}
-
-#[cfg(any(feature = "ndarray", test))]
-impl ControlFlowValue for ndarray::Array2<f64> {
-    #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
-        Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
-    }
-}
-
 impl<V: ControlFlowValue, T: Clone + crate::parameters::Parameter> ControlFlowValue for JvpTracer<V, T> {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {

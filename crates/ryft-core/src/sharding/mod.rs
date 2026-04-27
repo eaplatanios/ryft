@@ -662,9 +662,11 @@ impl Sharding {
                 ShardingDimension::Sharded(axis_names) => {
                     let axis_names = axis_names
                         .iter()
-                        .filter(|axis_name| match self.mesh.axis_type(axis_name) {
-                            Some(MeshAxisType::Explicit | MeshAxisType::Manual) => true,
-                            _ => false,
+                        .filter(|axis_name| {
+                            matches!(
+                                self.mesh.axis_type(axis_name),
+                                Some(MeshAxisType::Explicit | MeshAxisType::Manual)
+                            )
                         })
                         .cloned()
                         .collect::<Vec<_>>();
@@ -679,9 +681,8 @@ impl Sharding {
         let unreduced_axes = self
             .unreduced_axes
             .iter()
-            .filter(|axis_name| match self.mesh.axis_type(axis_name) {
-                Some(MeshAxisType::Explicit | MeshAxisType::Manual) => true,
-                _ => false,
+            .filter(|axis_name| {
+                matches!(self.mesh.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
             })
             .cloned()
             .collect();

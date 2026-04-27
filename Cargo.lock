@@ -1779,7 +1779,6 @@ dependencies = [
  "dyn-clone",
  "half",
  "indoc",
- "ndarray",
  "paste",
  "pretty_assertions",
  "ryft-macros",
@@ -1824,6 +1823,7 @@ dependencies = [
 name = "ryft-ndarray"
 version = "0.0.3"
 dependencies = [
+ "indoc",
  "ndarray",
  "pretty_assertions",
  "ryft-core",
@@ -1857,6 +1857,7 @@ dependencies = [
  "ryft-core",
  "ryft-macros",
  "ryft-mlir",
+ "ryft-ndarray",
  "ryft-pjrt",
  "serde_json",
  "thiserror 2.0.18",

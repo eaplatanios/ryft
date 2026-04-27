@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-#[cfg(feature = "ndarray")]
-use ndarray::Array2;
 use ryft_mlir::dialects::{func, shardy, stable_hlo, stable_hlo::Accuracy, stable_hlo::Precision};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef,
     Operation as MlirOperation, Region, Size as MlirSize, Type, TypeAndAttributes, TypeRef, Value, ValueRef,
 };
+#[cfg(feature = "ndarray")]
+use ryft_ndarray::Array as NdArrayValue;
 
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
@@ -1110,13 +1110,14 @@ impl MlirLowerableValue for f64 {
 }
 
 #[cfg(feature = "ndarray")]
-impl MlirLowerableValue for Array2<f64> {
+impl MlirLowerableValue for NdArrayValue<f64> {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-        let elements = self.iter().copied().collect::<Vec<_>>();
+        let standard_layout = self.as_ndarray().as_standard_layout();
+        let elements = standard_layout.iter().copied().collect::<Vec<_>>();
         context
             .dense_f64_elements_attribute(tensor_type, elements.as_slice())
             .and_then(|attribute| attribute.cast::<DenseElementsAttributeRef>())
@@ -1128,15 +1129,15 @@ impl MlirLowerableValue for Array2<f64> {
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         context: &'c MlirContext<'t>,
     ) -> Result<Option<DenseElementsAttributeRef<'c, 't>>, LoweringError> {
-        if self.shape() == [1, 1] {
-            return Ok(Some(
-                context
-                    .dense_f64_elements_attribute(tensor_type, std::slice::from_ref(&self[(0, 0)]))
-                    .and_then(|attribute| attribute.cast::<DenseElementsAttributeRef>())
-                    .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?,
-            ));
-        }
-        Ok(None)
+        let Some(element) = self.as_ndarray().iter().next().filter(|_| self.as_ndarray().len() == 1) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            context
+                .dense_f64_elements_attribute(tensor_type, std::slice::from_ref(element))
+                .and_then(|attribute| attribute.cast::<DenseElementsAttributeRef>())
+                .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?,
+        ))
     }
 }
 
@@ -2315,9 +2316,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    #[cfg(feature = "ndarray")]
-    use ndarray::{Array2, arr2};
-
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError};
@@ -2326,6 +2324,8 @@ mod tests {
         operations::constants::{OneLike, ZeroLike},
     };
     use ryft_core::types::{Shape, TypeError};
+    #[cfg(feature = "ndarray")]
+    use ryft_ndarray::{Array as NdArrayValue, NdArrayEngine};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use super::*;
@@ -2764,19 +2764,19 @@ mod tests {
     #[cfg(feature = "ndarray")]
     #[test]
     fn test_to_mlir_module_for_plain_program_renders_transposed_matrix_pullback_factors() {
-        let left = arr2(&[[1.0f64, 2.0], [3.0, 4.0]]);
-        let right = arr2(&[[5.0f64, 6.0], [7.0, 8.0]]);
+        let left = NdArrayValue::from_shape_vec([2, 2], vec![1.0f64, 2.0, 3.0, 4.0]).unwrap();
+        let right = NdArrayValue::from_shape_vec([2, 2], vec![5.0f64, 6.0, 7.0, 8.0]).unwrap();
         let (_, pullback): (
-            Array2<f64>,
+            NdArrayValue<f64>,
             ryft_core::tracing::Program<
                 ArrayType,
-                Array2<f64>,
-                ryft_core::tracing_v2::LinearPrimitiveOperation<Array2<f64>>,
-                Array2<f64>,
-                (Array2<f64>, Array2<f64>),
+                NdArrayValue<f64>,
+                ryft_core::tracing_v2::LinearPrimitiveOperation<NdArrayValue<f64>>,
+                NdArrayValue<f64>,
+                (NdArrayValue<f64>, NdArrayValue<f64>),
             >,
         ) = ryft_core::tracing_v2::vjp(
-            &ryft_core::tracing_v2::operations::matrix::ndarray_support::Array2Engine::<f64>::new(),
+            &NdArrayEngine::<f64>::new(),
             |inputs| Ok(bilinear_matmul(inputs)),
             (left, right),
         )

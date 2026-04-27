@@ -437,14 +437,12 @@ mod tests {
     use std::fmt::{self, Display};
     use std::ops::{Add, Neg};
 
-    use ndarray::arr2;
     use ryft_macros::Parameter;
 
     use crate::tracing::{InterpretableOperation, Operation, Traceable, TracingError, Value};
     use crate::tracing_v2::engines::ScalarEngine;
     use crate::tracing_v2::operations::add::{AddOperation, SupportsAdd};
     use crate::tracing_v2::operations::constants::{One, OneLike, Zero, ZeroLike};
-    use crate::tracing_v2::operations::matrix::ndarray_support::Array2Engine;
     use crate::tracing_v2::operations::neg::SupportsNeg;
     use crate::tracing_v2::operations::scale::SupportsScale;
     use crate::tracing_v2::{Differentiable, DifferentiationError, Tracer};
@@ -728,19 +726,6 @@ mod tests {
         assert!(matches!(
             result,
             Err(TracingError::Differentiation(DifferentiationError::MissingTracedReverseModeInputLeaves))
-        ));
-    }
-
-    #[test]
-    fn test_grad_rejects_non_scalar_array_output() {
-        let engine = Array2Engine::<f64>::new();
-
-        let result = grad(&engine, |input| input, arr2(&[[1.0, 2.0], [3.0, 4.0]]));
-
-        assert!(matches!(
-            result,
-            Err(TracingError::Differentiation(DifferentiationError::NonScalarGradientOutput { output_type }))
-                if output_type.rank() == 2
         ));
     }
 

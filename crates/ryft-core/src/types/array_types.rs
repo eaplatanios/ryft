@@ -356,7 +356,7 @@ impl Type for ArrayType {
     #[inline]
     fn is_compatible_with(&self, other: &Self) -> bool {
         // Note that this compatibility relationship is defined here as a "broadcastability" relationship.
-        self.is_broadcastable_to(&other)
+        self.is_broadcastable_to(other)
     }
 }
 

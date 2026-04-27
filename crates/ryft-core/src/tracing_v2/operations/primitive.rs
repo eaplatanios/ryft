@@ -43,7 +43,7 @@ use super::{
 
 /// Default closed carrier for ordinary staged programs.
 ///
-/// [`PrimitiveOperation`] is the operation enum used by the core scalar and ndarray engines when a
+/// [`PrimitiveOperation`] is the default operation enum used by scalar and external backend engines when a
 /// program stages ordinary primal computation. Most variants are thin tags around one semantic
 /// primitive defined elsewhere in [`super`]. The [`Custom`](Self::Custom) variant is the explicit
 /// escape hatch for operations outside that default set, so the carrier remains closed for normal
