@@ -12,8 +12,8 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError},
     tracing_v2::{
-        Differentiable,
-        engines::{DifferentiableEngine, DifferentiableStagingEngine, Engine, StagingEngine},
+        Differentiable, DifferentiableEngine, DifferentiableStagingEngine,
+        engines::{Engine, StagingEngine},
         operations::{
             SupportsAdd, SupportsMul, SupportsNeg, TracedLinearizationCarrier,
             constants::{One, OneLike, ZeroLike},

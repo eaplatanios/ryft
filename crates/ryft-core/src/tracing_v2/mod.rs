@@ -26,10 +26,10 @@ pub mod operations;
 pub(crate) mod test_support;
 
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
-pub use differentiation::DifferentiationError;
-pub use engines::{
-    DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine, Engine, StagingEngine,
+pub use differentiation::{
+    DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine, DifferentiationError,
 };
+pub use engines::{Engine, StagingEngine};
 pub use forward::{Differentiable, JvpContext, JvpTracer, jvp};
 pub use jit::{Tracer, TracerState, TracingEngine, interpret_and_trace, trace};
 pub use linear::{

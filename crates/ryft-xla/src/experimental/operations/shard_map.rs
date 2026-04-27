@@ -13,9 +13,8 @@ use ryft_core::{
         Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
     },
     tracing_v2::{
-        CustomPrimitive, DifferentiableOperation, JvpContext, LinearCustomPrimitive, LinearOperation,
-        LinearPrimitiveOperation, TracingEngine,
-        engines::DifferentiableEngine,
+        CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearCustomPrimitive,
+        LinearOperation, LinearPrimitiveOperation, TracingEngine,
         forward::{Differentiable, JvpTracer},
         linear::{linearize_traced_program, transpose_traced_linear_program},
     },

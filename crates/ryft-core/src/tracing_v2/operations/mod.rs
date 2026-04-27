@@ -3,7 +3,8 @@ use std::{cell::RefCell, rc::Rc};
 use crate::{
     tracing::{AtomId, Instruction, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError},
     tracing_v2::{
-        engines::{DifferentiableEngine, StagingEngine},
+        DifferentiableEngine,
+        engines::StagingEngine,
         forward::{JvpContext, JvpTracer},
         jit::Tracer,
     },

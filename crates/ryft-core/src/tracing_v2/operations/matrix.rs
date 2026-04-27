@@ -181,8 +181,9 @@ pub mod ndarray_support {
         parameters::Parameter,
         tracing::{Traceable, TracingError, Value},
         tracing_v2::{
-            CoordinateValue, Cos, Differentiable, LinearPrimitiveOperation, PrimitiveOperation, Sin, Tracer,
-            engines::{DifferentiableEngine, DifferentiableStagingEngine, Engine, StagingEngine},
+            CoordinateValue, Cos, Differentiable, DifferentiableEngine, DifferentiableStagingEngine,
+            LinearPrimitiveOperation, PrimitiveOperation, Sin, Tracer,
+            engines::{Engine, StagingEngine},
             operations::constants::{One, OneLike, Zero, ZeroLike},
         },
         types::{ArrayType, DataType, TypeError, Typed},

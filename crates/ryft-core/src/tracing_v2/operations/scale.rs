@@ -9,8 +9,7 @@ use indoc::indoc;
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
 use crate::tracing_v2::{
-    LinearPrimitiveOperation,
-    engines::{DifferentiableEngine, DifferentiableStagingEngine},
+    DifferentiableEngine, DifferentiableStagingEngine, LinearPrimitiveOperation,
     forward::{Differentiable, JvpContext, JvpTracer},
     jit::Tracer,
     operations::constants::ZeroLike,

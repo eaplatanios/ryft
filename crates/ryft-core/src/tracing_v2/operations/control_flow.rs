@@ -8,8 +8,8 @@ use crate::{
         Instruction, InterpretableOperation, Operation, OperationFormatter, Program, Traceable, TracingError, Value,
     },
     tracing_v2::{
-        JvpContext, JvpTracer, PrimitiveOperation, Tracer,
-        engines::{DifferentiableEngine, DifferentiableStagingEngine, StagingEngine},
+        DifferentiableEngine, DifferentiableStagingEngine, JvpContext, JvpTracer, PrimitiveOperation, Tracer,
+        engines::StagingEngine,
         forward::Differentiable,
         linear::linearize_program,
         operations::constants::{Zero, ZeroLike},

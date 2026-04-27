@@ -7,9 +7,8 @@ use ryft_core::{
     tracing::AtomId,
     tracing::{InterpretableOperation, Operation, TracingError},
     tracing_v2::{
-        CustomOperationError, CustomPrimitive, DifferentiableOperation, DifferentiationError, JvpContext,
-        LinearPrimitiveOperation, TracingEngine,
-        engines::DifferentiableEngine,
+        CustomOperationError, CustomPrimitive, DifferentiableEngine, DifferentiableOperation, DifferentiationError,
+        JvpContext, LinearPrimitiveOperation, TracingEngine,
         forward::{Differentiable, JvpTracer},
         linear::{TracedLinearizableOperation, linearize_program, transpose_linear_program_with_output_examples},
         operations::{

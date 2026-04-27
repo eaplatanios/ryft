@@ -8,8 +8,8 @@ use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing::{AtomId, OperationFormatter, Traceable, TracingError},
     tracing_v2::{
-        LinearPrimitiveOperation,
-        engines::{DifferentiableEngine, StagingEngine},
+        DifferentiableEngine, LinearPrimitiveOperation,
+        engines::StagingEngine,
         forward::{Differentiable, JvpContext, JvpTracer},
         jit::Tracer,
     },

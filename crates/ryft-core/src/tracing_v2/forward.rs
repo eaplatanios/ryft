@@ -8,10 +8,8 @@ use crate::{
         AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
     },
     tracing_v2::{
-        engines::{
-            DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine, Engine,
-            StagingEngine,
-        },
+        DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine,
+        engines::{Engine, StagingEngine},
         jit::Tracer,
         linear::{jvp_program, jvp_traced},
         operations::{

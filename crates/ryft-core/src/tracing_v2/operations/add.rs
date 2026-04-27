@@ -10,8 +10,7 @@ use crate::{
     macros::check_input_count,
     tracing::{AtomId, Traceable, TracingError},
     tracing_v2::{
-        LinearPrimitiveOperation,
-        engines::DifferentiableEngine,
+        DifferentiableEngine, LinearPrimitiveOperation,
         forward::{Differentiable, JvpContext, JvpTracer},
         operations::constants::ZeroLike,
     },

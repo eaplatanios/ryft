@@ -6,8 +6,7 @@ use std::{
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::{
-    LinearPrimitiveOperation,
-    engines::DifferentiableEngine,
+    DifferentiableEngine, LinearPrimitiveOperation,
     forward::{Differentiable, JvpContext, JvpTracer},
     operations::constants::ZeroLike,
 };

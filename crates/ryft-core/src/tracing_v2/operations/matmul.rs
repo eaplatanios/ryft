@@ -6,7 +6,7 @@ use crate::types::{ArrayType, Type, TypeError};
 use crate::{
     tracing::{AtomId, Traceable},
     tracing_v2::{
-        engines::DifferentiableEngine,
+        DifferentiableEngine,
         forward::{Differentiable, JvpContext, JvpTracer},
     },
 };

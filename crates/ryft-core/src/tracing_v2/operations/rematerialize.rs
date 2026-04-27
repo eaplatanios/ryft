@@ -5,8 +5,9 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing::{Instruction, OperationFormatter, Program, ProgramBuilder, Traceable, TracingError, Value},
     tracing_v2::{
-        Differentiable, DifferentiationError, LinearPrimitiveOperation, PrimitiveOperation, Tracer,
-        engines::{DifferentiableEngine, DifferentiableStagingEngine, StagingEngine},
+        Differentiable, DifferentiableEngine, DifferentiableStagingEngine, DifferentiationError,
+        LinearPrimitiveOperation, PrimitiveOperation, Tracer,
+        engines::StagingEngine,
         linear::{linearize_program, transpose_linear_program_with_output_examples},
         operations::constants::{SupportsZero, Zero, ZeroLike},
     },

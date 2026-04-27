@@ -8,8 +8,7 @@ use crate::{
     parameters::{Parameter, Parameterized},
     tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value},
     tracing_v2::{
-        Cos, MatrixOps, Sin,
-        engines::{DifferentiableEngine, DifferentiableStagingEngine},
+        Cos, DifferentiableEngine, DifferentiableStagingEngine, MatrixOps, Sin,
         forward::{Differentiable, JvpContext, JvpTracer},
         jit::Tracer,
         operations::{

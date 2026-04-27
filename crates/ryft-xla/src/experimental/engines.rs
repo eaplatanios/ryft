@@ -7,8 +7,8 @@ use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing_v2::{
-    LinearPrimitiveOperation, Tracer,
-    engines::{DifferentiableEngine, DifferentiableStagingEngine, Engine, StagingEngine},
+    DifferentiableEngine, DifferentiableStagingEngine, LinearPrimitiveOperation, Tracer,
+    engines::{Engine, StagingEngine},
 };
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
