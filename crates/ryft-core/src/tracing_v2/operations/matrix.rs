@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use half::{bf16, f16};
+
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing::Traceable,
@@ -30,29 +32,25 @@ pub trait MatrixValue: Traceable<ArrayType> + MatrixOps {}
 
 impl<T: Traceable<ArrayType> + MatrixOps> MatrixValue for T {}
 
-impl MatrixOps for f32 {
-    #[inline]
-    fn matmul(self, rhs: Self) -> Self {
-        self * rhs
-    }
+macro_rules! impl_scalar_matrix_ops {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl MatrixOps for $ty {
+                #[inline]
+                fn matmul(self, rhs: Self) -> Self {
+                    self * rhs
+                }
 
-    #[inline]
-    fn transpose_matrix(self) -> Self {
-        self
-    }
+                #[inline]
+                fn transpose_matrix(self) -> Self {
+                    self
+                }
+            }
+        )*
+    };
 }
 
-impl MatrixOps for f64 {
-    #[inline]
-    fn matmul(self, rhs: Self) -> Self {
-        self * rhs
-    }
-
-    #[inline]
-    fn transpose_matrix(self) -> Self {
-        self
-    }
-}
+impl_scalar_matrix_ops!(bf16, f16, f32, f64);
 
 fn matrix_array_type(data_type: DataType, rows: usize, cols: usize, sharding: Option<Sharding>) -> ArrayType {
     ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, sharding)
@@ -60,8 +58,10 @@ fn matrix_array_type(data_type: DataType, rows: usize, cols: usize, sharding: Op
 }
 
 fn matrix_parts(r#type: &ArrayType, op: &'static str) -> Result<(DataType, usize, usize), TypeError> {
-    if !matches!(r#type.data_type, DataType::F32 | DataType::F64) || r#type.rank() != 2 {
-        return Err(TypeError { message: format!("{op} expects rank-2 f32 or f64 matrix inputs") });
+    let is_supported_data_type =
+        matches!(r#type.data_type, DataType::BF16 | DataType::F16 | DataType::F32 | DataType::F64);
+    if !is_supported_data_type || r#type.rank() != 2 {
+        return Err(TypeError { message: format!("{op} expects rank-2 floating-point matrix inputs") });
     }
 
     let Size::Static(rows) = r#type.dimension(0) else {

@@ -1,5 +1,7 @@
 use std::{cell::RefCell, marker::PhantomData, rc::Rc};
 
+use half::{bf16, f16};
+
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing::{InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError},
@@ -178,7 +180,7 @@ impl<V> ScalarEngine<V> {
     }
 }
 
-macro_rules! impl_engine_for_scalar_engine {
+macro_rules! impl_scalar_engine_for_scalar {
     ($ty:ty, $zero:expr, $one:expr) => {
         impl Engine for ScalarEngine<$ty> {
             type Type = ArrayType;
@@ -198,7 +200,11 @@ macro_rules! impl_engine_for_scalar_engine {
         impl StagingEngine for ScalarEngine<$ty> {
             type Operation = PrimitiveOperation<$ty>;
         }
+    };
+}
 
+macro_rules! impl_differentiable_engine_for_scalar {
+    ($ty:ty) => {
         impl DifferentiableEngine for ScalarEngine<$ty> {
             type DifferentiableOperation = PrimitiveOperation<$ty>;
             type LinearOperation = LinearPrimitiveOperation<$ty>;
@@ -213,25 +219,102 @@ macro_rules! impl_engine_for_scalar_engine {
     };
 }
 
-impl_engine_for_scalar_engine!(f32, 0.0, 1.0);
-impl_engine_for_scalar_engine!(f64, 0.0, 1.0);
+impl_scalar_engine_for_scalar!(bool, false, true);
+impl_scalar_engine_for_scalar!(i8, 0i8, 1i8);
+impl_scalar_engine_for_scalar!(i16, 0i16, 1i16);
+impl_scalar_engine_for_scalar!(i32, 0i32, 1i32);
+impl_scalar_engine_for_scalar!(i64, 0i64, 1i64);
+impl_scalar_engine_for_scalar!(u8, 0u8, 1u8);
+impl_scalar_engine_for_scalar!(u16, 0u16, 1u16);
+impl_scalar_engine_for_scalar!(u32, 0u32, 1u32);
+impl_scalar_engine_for_scalar!(u64, 0u64, 1u64);
+impl_scalar_engine_for_scalar!(bf16, bf16::ZERO, bf16::ONE);
+impl_scalar_engine_for_scalar!(f16, f16::ZERO, f16::ONE);
+impl_scalar_engine_for_scalar!(f32, 0.0, 1.0);
+impl_scalar_engine_for_scalar!(f64, 0.0, 1.0);
+
+impl_differentiable_engine_for_scalar!(bf16);
+impl_differentiable_engine_for_scalar!(f16);
+impl_differentiable_engine_for_scalar!(f32);
+impl_differentiable_engine_for_scalar!(f64);
 
 #[cfg(test)]
 mod tests {
+    use crate::{tracing_v2::jvp, types::DataType};
+
     use super::*;
-    use crate::types::DataType;
+    
+    fn assert_differentiable_engine<E: DifferentiableEngine>() {}
 
     #[test]
     fn test_array_scalar_engine_is_zero_sized() {
+        assert_eq!(size_of::<ScalarEngine<bool>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<i8>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<u64>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<bf16>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<f16>>(), 0);
         assert_eq!(size_of::<ScalarEngine<f64>>(), 0);
         assert_eq!(size_of::<ScalarEngine<f32>>(), 0);
     }
 
     #[test]
     fn test_array_scalar_engine_produces_canonical_zero_and_one() {
-        let engine = ScalarEngine::<f64>::new();
-        let r#type = ArrayType::scalar(DataType::F64);
-        assert_eq!(Engine::zero(&engine, &r#type), Ok(0.0));
-        assert_eq!(Engine::one(&engine, &r#type), Ok(1.0));
+        let bool_type = ArrayType::scalar(DataType::Boolean);
+        let bool_engine = ScalarEngine::<bool>::new();
+        assert_eq!(Engine::zero(&bool_engine, &bool_type), Ok(false));
+        assert_eq!(Engine::one(&bool_engine, &bool_type), Ok(true));
+
+        let i32_type = ArrayType::scalar(DataType::I32);
+        let i32_engine = ScalarEngine::<i32>::new();
+        assert_eq!(Engine::zero(&i32_engine, &i32_type), Ok(0i32));
+        assert_eq!(Engine::one(&i32_engine, &i32_type), Ok(1i32));
+
+        let u64_type = ArrayType::scalar(DataType::U64);
+        let u64_engine = ScalarEngine::<u64>::new();
+        assert_eq!(Engine::zero(&u64_engine, &u64_type), Ok(0u64));
+        assert_eq!(Engine::one(&u64_engine, &u64_type), Ok(1u64));
+
+        let bf16_type = ArrayType::scalar(DataType::BF16);
+        let bf16_engine = ScalarEngine::<bf16>::new();
+        assert_eq!(Engine::zero(&bf16_engine, &bf16_type), Ok(bf16::ZERO));
+        assert_eq!(Engine::one(&bf16_engine, &bf16_type), Ok(bf16::ONE));
+
+        let f16_type = ArrayType::scalar(DataType::F16);
+        let f16_engine = ScalarEngine::<f16>::new();
+        assert_eq!(Engine::zero(&f16_engine, &f16_type), Ok(f16::ZERO));
+        assert_eq!(Engine::one(&f16_engine, &f16_type), Ok(f16::ONE));
+
+        let f32_type = ArrayType::scalar(DataType::F32);
+        let f32_engine = ScalarEngine::<f32>::new();
+        assert_eq!(Engine::zero(&f32_engine, &f32_type), Ok(0.0f32));
+        assert_eq!(Engine::one(&f32_engine, &f32_type), Ok(1.0f32));
+
+        let f64_type = ArrayType::scalar(DataType::F64);
+        let f64_engine = ScalarEngine::<f64>::new();
+        assert_eq!(Engine::zero(&f64_engine, &f64_type), Ok(0.0f64));
+        assert_eq!(Engine::one(&f64_engine, &f64_type), Ok(1.0f64));
+    }
+
+    #[test]
+    fn test_half_and_float_scalar_engines_are_differentiable() {
+        assert_differentiable_engine::<ScalarEngine<bf16>>();
+        assert_differentiable_engine::<ScalarEngine<f16>>();
+        assert_differentiable_engine::<ScalarEngine<f32>>();
+        assert_differentiable_engine::<ScalarEngine<f64>>();
+    }
+
+    #[test]
+    fn test_half_scalar_engines_run_jvp() {
+        let bf16_engine = ScalarEngine::<bf16>::new();
+        assert_eq!(
+            jvp(&bf16_engine, |x| x.clone() + x, bf16::from_f32(3.0), bf16::ONE),
+            Ok((bf16::from_f32(6.0), bf16::from_f32(2.0)))
+        );
+
+        let f16_engine = ScalarEngine::<f16>::new();
+        assert_eq!(
+            jvp(&f16_engine, |x| x.clone() + x, f16::from_f32(3.0), f16::ONE),
+            Ok((f16::from_f32(6.0), f16::from_f32(2.0)))
+        );
     }
 }

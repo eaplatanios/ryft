@@ -1,5 +1,7 @@
 use std::fmt::{Debug, Display};
 
+use half::{bf16, f16};
+
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::{
@@ -39,6 +41,20 @@ impl Sin for f64 {
     #[inline]
     fn sin(self) -> Self {
         self.sin()
+    }
+}
+
+impl Sin for bf16 {
+    #[inline]
+    fn sin(self) -> Self {
+        Self::from_f32(self.to_f32().sin())
+    }
+}
+
+impl Sin for f16 {
+    #[inline]
+    fn sin(self) -> Self {
+        Self::from_f32(self.to_f32().sin())
     }
 }
 

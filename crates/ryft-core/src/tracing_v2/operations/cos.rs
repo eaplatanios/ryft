@@ -3,6 +3,8 @@ use std::{
     ops::Neg,
 };
 
+use half::{bf16, f16};
+
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::{
@@ -44,6 +46,20 @@ impl Cos for f64 {
     #[inline]
     fn cos(self) -> Self {
         self.cos()
+    }
+}
+
+impl Cos for bf16 {
+    #[inline]
+    fn cos(self) -> Self {
+        Self::from_f32(self.to_f32().cos())
+    }
+}
+
+impl Cos for f16 {
+    #[inline]
+    fn cos(self) -> Self {
+        Self::from_f32(self.to_f32().cos())
     }
 }
 

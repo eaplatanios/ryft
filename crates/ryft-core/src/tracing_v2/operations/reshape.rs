@@ -1,5 +1,7 @@
 use std::fmt::{Debug, Display};
 
+use half::{bf16, f16};
+
 #[cfg(test)]
 use indoc::indoc;
 
@@ -215,19 +217,20 @@ where
     }
 }
 
-impl ReshapeOps for f32 {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        reshape_abstract(&self.r#type(), &target_shape, "reshape")?;
-        Ok(self)
-    }
+macro_rules! impl_scalar_reshape_ops {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl ReshapeOps for $ty {
+                fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
+                    reshape_abstract(&self.r#type(), &target_shape, "reshape")?;
+                    Ok(self)
+                }
+            }
+        )*
+    };
 }
 
-impl ReshapeOps for f64 {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        reshape_abstract(&self.r#type(), &target_shape, "reshape")?;
-        Ok(self)
-    }
-}
+impl_scalar_reshape_ops!(bf16, f16, f32, f64);
 
 #[cfg(any(feature = "ndarray", test))]
 mod ndarray_support {

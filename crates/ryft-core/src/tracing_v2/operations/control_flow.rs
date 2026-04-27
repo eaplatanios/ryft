@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Display};
 
+use half::{bf16, f16};
 use thiserror::Error;
 
 use crate::{
@@ -70,7 +71,7 @@ macro_rules! impl_non_predicate_control_flow_value {
     };
 }
 
-impl_non_predicate_control_flow_value!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
+impl_non_predicate_control_flow_value!(i8, i16, i32, i64, u8, u16, u32, u64, bf16, f16, f32, f64);
 
 #[cfg(any(feature = "ndarray", test))]
 impl ControlFlowValue for ndarray::Array2<f32> {
