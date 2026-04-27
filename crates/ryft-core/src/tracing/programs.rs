@@ -1173,6 +1173,16 @@ mod tests {
             "}
             .trim_end(),
         );
+        
+        // Test a case where we have an output atom with no parent instruction.
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let o0 = builder.add_variable(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
+        assert!(matches!(
+            program.simplified(),
+            Err(TracingError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
+        ));
     }
 
     #[test]
@@ -1260,20 +1270,6 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    // TODO(eaplatanios): Review this.
-    #[test]
-    fn test_program_simplified_rejects_variable_output_without_parent_instruction() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        builder.add_input(ArrayType::scalar(DataType::F64));
-        let orphaned_variable = builder.add_variable(ArrayType::scalar(DataType::F64));
-        let program = builder.build::<f64, f64>(vec![orphaned_variable], Placeholder, Placeholder).unwrap();
-
-        assert!(matches!(
-            program.simplified(),
-            Err(TracingError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
-        ));
     }
 
     // TODO(eaplatanios): Review this.
