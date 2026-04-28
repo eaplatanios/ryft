@@ -6,9 +6,8 @@ use half::{bf16, f16};
 
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::tracing::{InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{DifferentiableEngine, DifferentiableStagingEngine};
+use crate::tracing_v2::PrimitiveOperation;
 use crate::tracing_v2::jit::{Tracer, TracingEngine};
-use crate::tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation};
 use crate::types::{ArrayType, Type, Typed};
 
 /// Synthesizes concrete leaf values from abstract type metadata.
@@ -201,22 +200,6 @@ macro_rules! impl_scalar_engine_for_scalar {
     };
 }
 
-macro_rules! impl_differentiable_engine_for_scalar {
-    ($ty:ty) => {
-        impl DifferentiableEngine for ScalarEngine<$ty> {
-            type DifferentiableOperation = PrimitiveOperation<$ty>;
-            type LinearOperation = LinearPrimitiveOperation<$ty>;
-        }
-
-        impl DifferentiableStagingEngine for ScalarEngine<$ty> {
-            type LinearOperation<'engine>
-                = LinearPrimitiveOperation<Tracer<'engine, Self>>
-            where
-                Self: 'engine;
-        }
-    };
-}
-
 impl_scalar_engine_for_scalar!(bool, false, true);
 impl_scalar_engine_for_scalar!(i8, 0i8, 1i8);
 impl_scalar_engine_for_scalar!(i16, 0i16, 1i16);
@@ -231,13 +214,9 @@ impl_scalar_engine_for_scalar!(f16, f16::ZERO, f16::ONE);
 impl_scalar_engine_for_scalar!(f32, 0.0, 1.0);
 impl_scalar_engine_for_scalar!(f64, 0.0, 1.0);
 
-impl_differentiable_engine_for_scalar!(bf16);
-impl_differentiable_engine_for_scalar!(f16);
-impl_differentiable_engine_for_scalar!(f32);
-impl_differentiable_engine_for_scalar!(f64);
-
 #[cfg(test)]
 mod tests {
+    use crate::tracing_v2::differentiation::DifferentiableEngine;
     use crate::tracing_v2::jvp;
     use crate::types::DataType;
 

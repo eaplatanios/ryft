@@ -1,10 +1,12 @@
+use half::{bf16, f16};
 use thiserror::Error;
 
 use crate::tracing::{InterpretableOperation, TracingError};
 use crate::tracing_v2::LinearOperation as LinearOperationTrait;
-use crate::tracing_v2::engines::{Engine, StagingEngine};
+use crate::tracing_v2::engines::{Engine, ScalarEngine, StagingEngine};
 use crate::tracing_v2::jit::Tracer;
 use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale, SupportsZero};
+use crate::tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation};
 use crate::types::ArrayType;
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
@@ -174,3 +176,24 @@ impl<E: DifferentiableEngine + ?Sized> DifferentiableEngine for DifferentiableOp
     type DifferentiableOperation = E::DifferentiableOperation;
     type LinearOperation = E::LinearOperation;
 }
+
+macro_rules! impl_differentiable_engine_for_scalar {
+    ($ty:ty) => {
+        impl DifferentiableEngine for ScalarEngine<$ty> {
+            type DifferentiableOperation = PrimitiveOperation<$ty>;
+            type LinearOperation = LinearPrimitiveOperation<$ty>;
+        }
+
+        impl DifferentiableStagingEngine for ScalarEngine<$ty> {
+            type LinearOperation<'engine>
+                = LinearPrimitiveOperation<Tracer<'engine, Self>>
+            where
+                Self: 'engine;
+        }
+    };
+}
+
+impl_differentiable_engine_for_scalar!(bf16);
+impl_differentiable_engine_for_scalar!(f16);
+impl_differentiable_engine_for_scalar!(f32);
+impl_differentiable_engine_for_scalar!(f64);

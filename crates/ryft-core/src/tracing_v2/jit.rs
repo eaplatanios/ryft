@@ -71,18 +71,6 @@ pub struct TracingEngine<'engine, E: StagingEngine + ?Sized> {
     builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>,
 }
 
-impl<'engine, E: StagingEngine + ?Sized> Clone for TracingEngine<'engine, E> {
-    fn clone(&self) -> Self {
-        Self { engine: self.engine, builder: self.builder.clone() }
-    }
-}
-
-impl<'engine, E: StagingEngine + ?Sized> std::fmt::Debug for TracingEngine<'engine, E> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("TracingEngine").finish_non_exhaustive()
-    }
-}
-
 impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
     /// Creates a tracing engine over `engine` and `builder`.
     #[inline]
@@ -263,6 +251,18 @@ impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
         let program =
             builder.build::<Input::To<E::Value>, Output::To<E::Value>>(outputs, input_structure, output_structure)?;
         Ok((output_types, program))
+    }
+}
+
+impl<'engine, E: StagingEngine + ?Sized> Clone for TracingEngine<'engine, E> {
+    fn clone(&self) -> Self {
+        Self { engine: self.engine, builder: self.builder.clone() }
+    }
+}
+
+impl<'engine, E: StagingEngine + ?Sized> std::fmt::Debug for TracingEngine<'engine, E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("TracingEngine").finish_non_exhaustive()
     }
 }
 
