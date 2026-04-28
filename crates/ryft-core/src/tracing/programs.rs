@@ -1314,98 +1314,78 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review this.
     #[test]
     fn test_program_builder() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let left = builder.add_input(ArrayType::scalar(DataType::F64));
-        let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let constant = builder.add_constant(2.0f64);
-        let scaled_left = builder.add_instruction(PrimitiveOperation::Scale { factor: 2.0 }, vec![left]).unwrap()[0];
-        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![scaled_left, right]).unwrap()[0];
-
-        assert_eq!(builder.input_ids, vec![left, right]);
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(2.0f64);
+        let v0 = builder.add_instruction(PrimitiveOperation::Scale { factor: 2.0 }, vec![i0]).unwrap()[0];
+        let v1 = builder.add_instruction(PrimitiveOperation::Add, vec![v0, i1]).unwrap()[0];
+        assert_eq!(builder.input_ids, vec![i0, i1]);
         assert!(matches!(
-            builder.atoms.get(left.index),
+            builder.atoms.get(i0.index),
             Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
         ));
         assert!(matches!(
-            builder.atoms.get(right.index),
+            builder.atoms.get(i1.index),
             Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
         ));
-        assert!(matches!(builder.atoms.get(constant.index), Some(Atom::Constant(value)) if *value == 2.0));
+        assert!(matches!(builder.atoms.get(c0.index), Some(Atom::Constant(value)) if *value == 2.0));
         assert!(matches!(
-            builder.atoms.get(scaled_left.index),
+            builder.atoms.get(v0.index),
             Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
         ));
         assert!(matches!(
-            builder.atoms.get(sum.index),
+            builder.atoms.get(v1.index),
             Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
         ));
         assert_eq!(builder.instructions.len(), 2);
-        assert_eq!(builder.instructions[0].inputs, vec![left]);
-        assert_eq!(builder.instructions[0].outputs, vec![scaled_left]);
-        assert_eq!(builder.instructions[1].inputs, vec![scaled_left, right]);
-        assert_eq!(builder.instructions[1].outputs, vec![sum]);
+        assert_eq!(builder.instructions[0].inputs, vec![i0]);
+        assert_eq!(builder.instructions[0].outputs, vec![v0]);
+        assert_eq!(builder.instructions[1].inputs, vec![v0, i1]);
+        assert_eq!(builder.instructions[1].outputs, vec![v1]);
+
+        let program = builder.build::<(f64, f64), f64>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
+        assert_eq!(program.input_ids, vec![i0, i1]);
+        assert_eq!(program.output_ids, vec![v1]);
+        assert_eq!(program.instructions.len(), 2);
+        assert_eq!(program.interpret((2.0f64, 38.0f64)), Ok(42.0f64));
     }
 
-    // TODO(eaplatanios): Review this.
     #[test]
     fn test_program_builder_rejects_unbound_instruction_inputs() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let result = builder.add_instruction(PrimitiveOperation::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
-
-        assert!(matches!(
-            result,
-            Err(TracingError::UnboundAtomId { id }) if id == AtomId { index: 42 }
-        ));
+        let v0 = builder.add_instruction(PrimitiveOperation::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
+        assert!(matches!(v0, Err(TracingError::UnboundAtomId { id }) if id == AtomId { index: 42 }));
     }
 
-    // TODO(eaplatanios): Review this.
     #[test]
-    fn test_program_builder_build_returns_stored_error() {
+    fn test_program_builder_build_returns_error() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         builder.error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
-
         assert!(matches!(
             builder.build::<f64, f64>(Vec::new(), Placeholder, Placeholder),
             Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
         ));
     }
 
-    // TODO(eaplatanios): Review this.
     #[test]
-    fn test_program_builder_build_rejects_input_structure_count_mismatch() {
+    fn test_program_builder_build_rejects_invalid_input_count() {
         let builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-
         assert!(matches!(
             builder.build::<f64, ()>(Vec::new(), Placeholder, ()),
             Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
         ));
     }
 
-    // TODO(eaplatanios): Review this.
     #[test]
-    fn test_program_builder_build_rejects_output_structure_count_mismatch() {
+    fn test_program_builder_build_rejects_invalid_output_count() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         builder.add_input(ArrayType::scalar(DataType::F64));
-
         assert!(matches!(
             builder.build::<f64, f64>(Vec::new(), Placeholder, Placeholder),
             Err(TracingError::InvalidOutputCount { expected: 1, got: 0 }),
         ));
-    }
-
-    // TODO(eaplatanios): Review this.
-    #[test]
-    fn test_program_builder_build_succeeds_with_matching_parameter_counts() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let program = builder.build::<f64, f64>(vec![input], Placeholder, Placeholder).unwrap();
-
-        assert_eq!(program.input_ids, vec![input]);
-        assert_eq!(program.output_ids, vec![input]);
-        assert_eq!(program.instructions.len(), 0);
-        assert_eq!(program.interpret(4.0f64), Ok(4.0f64));
     }
 }
