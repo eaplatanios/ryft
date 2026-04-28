@@ -6,9 +6,8 @@ use half::{bf16, f16};
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableEngine;
-use crate::tracing_v2::engines::StagingEngine;
+use crate::tracing_v2::engines::{StagingEngine, Tracer};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::jit::Tracer;
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::sin::Sin;

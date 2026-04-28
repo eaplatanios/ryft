@@ -7,8 +7,8 @@ use thiserror::Error;
 
 use crate::parameters::Parameter;
 use crate::tracing::{Traceable, TracingError, Value};
+use crate::tracing_v2::engines::Tracer;
 use crate::tracing_v2::forward::{Differentiable, JvpTracer};
-use crate::tracing_v2::jit::Tracer;
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableStagingEngine, TracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 

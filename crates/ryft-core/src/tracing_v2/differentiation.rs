@@ -3,10 +3,11 @@ use thiserror::Error;
 
 use crate::tracing::{InterpretableOperation, TracingError};
 use crate::tracing_v2::LinearOperation as LinearOperationTrait;
-use crate::tracing_v2::engines::{Engine, ScalarEngine, StagingEngine};
-use crate::tracing_v2::jit::Tracer;
-use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale, SupportsZero};
-use crate::tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation};
+use crate::tracing_v2::engines::{Engine, ScalarEngine, StagingEngine, Tracer, TracingEngine};
+use crate::tracing_v2::operations::{
+    SupportsAdd, SupportsNeg, SupportsScale, SupportsZero, TracedLinearizationCarrier,
+};
+use crate::tracing_v2::{Differentiable, LinearPrimitiveOperation, PrimitiveOperation};
 use crate::types::ArrayType;
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
@@ -175,6 +176,17 @@ impl<E: DifferentiableEngine + ?Sized> StagingEngine for DifferentiableOperation
 impl<E: DifferentiableEngine + ?Sized> DifferentiableEngine for DifferentiableOperationStagingEngine<E> {
     type DifferentiableOperation = E::DifferentiableOperation;
     type LinearOperation = E::LinearOperation;
+}
+
+impl<'engine, E> DifferentiableEngine for TracingEngine<'engine, E>
+where
+    E: DifferentiableStagingEngine + ?Sized,
+    E::Value: Differentiable<E::Type, Tangent = E::Value>,
+    E::Operation: TracedLinearizationCarrier<E::Type, E::Value>,
+    crate::tracing_v2::operations::AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+{
+    type DifferentiableOperation = crate::tracing_v2::operations::AddOperation;
+    type LinearOperation = E::LinearOperation<'engine>;
 }
 
 macro_rules! impl_differentiable_engine_for_scalar {

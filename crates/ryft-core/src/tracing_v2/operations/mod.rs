@@ -3,9 +3,8 @@ use std::rc::Rc;
 
 use crate::tracing::{AtomId, Instruction, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableEngine;
-use crate::tracing_v2::engines::StagingEngine;
+use crate::tracing_v2::engines::{StagingEngine, Tracer};
 use crate::tracing_v2::forward::{JvpContext, JvpTracer};
-use crate::tracing_v2::jit::Tracer;
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 /// Elementwise addition.

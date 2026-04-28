@@ -12,8 +12,6 @@ pub mod differentiation;
 pub mod engines;
 /// Forward-mode automatic differentiation over paired primal/tangent leaves.
 pub mod forward;
-/// Symbolic tracing entry points that capture staged programs from Rust closures.
-pub mod jit;
 /// Linearization, transposition, dense Jacobians, and reverse-mode APIs over staged linear programs.
 pub mod linear;
 /// Semantic operation traits, built-in carriers, and custom-primitive extension points.
@@ -29,9 +27,8 @@ pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batc
 pub use differentiation::{
     DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine, DifferentiationError,
 };
-pub use engines::{Engine, StagingEngine};
+pub use engines::{Engine, StagingEngine, Tracer, TracerState, TracingEngine};
 pub use forward::{Differentiable, JvpContext, JvpTracer, jvp};
-pub use jit::{Tracer, TracerState, TracingEngine};
 pub use linear::{
     CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad,
     grad_with_aux, hessian, jacfwd, jacrev, jvp_program, value_and_grad, value_and_grad_with_aux, vjp,

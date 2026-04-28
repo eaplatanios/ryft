@@ -7,9 +7,8 @@ use crate::tracing::{
     Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
     Value,
 };
-use crate::tracing_v2::engines::{Engine, StagingEngine};
+use crate::tracing_v2::engines::{Engine, StagingEngine, Tracer, TracingEngine};
 use crate::tracing_v2::forward::JvpTracer;
-use crate::tracing_v2::jit::{Tracer, TracingEngine};
 use crate::tracing_v2::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
 use crate::tracing_v2::operations::rematerialize::{FlatTracedRematerialize, RematerializeOperation};
 use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsRematerialize};

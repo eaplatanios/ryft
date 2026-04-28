@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
+use crate::tracing_v2::engines::Tracer;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::jit::Tracer;
 use crate::tracing_v2::operations::constants::{OneLike, ZeroLike, ZeroOperation};
 use crate::tracing_v2::operations::control_flow::{ConditionOperation, ControlFlowValue, WhileOperation};
 use crate::tracing_v2::operations::left_matmul::left_matmul_abstract_eval;

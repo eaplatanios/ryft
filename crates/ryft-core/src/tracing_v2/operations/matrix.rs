@@ -4,7 +4,7 @@ use half::{bf16, f16};
 
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::Traceable;
-use crate::tracing_v2::jit::Tracer;
+use crate::tracing_v2::engines::Tracer;
 use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 use super::{SupportsMatMul, SupportsMatrixTranspose};

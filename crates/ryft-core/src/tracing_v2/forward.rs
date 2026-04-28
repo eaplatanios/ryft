@@ -9,8 +9,7 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::tracing::{
     AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
 };
-use crate::tracing_v2::engines::{Engine, StagingEngine};
-use crate::tracing_v2::jit::Tracer;
+use crate::tracing_v2::engines::{Engine, StagingEngine, Tracer};
 use crate::tracing_v2::linear::{jvp_program, jvp_traced};
 use crate::tracing_v2::operations::constants::Zero;
 use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale};
@@ -301,8 +300,7 @@ where
 mod tests {
     use crate::parameters::{ParameterError, Parameterized};
     use crate::tracing::ProgramBuilder;
-    use crate::tracing_v2::engines::ScalarEngine;
-    use crate::tracing_v2::jit::TracingEngine;
+    use crate::tracing_v2::engines::{ScalarEngine, TracingEngine};
     use crate::tracing_v2::operations::{AddOperation, DifferentiableOperation};
     use crate::tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation, test_support};
 
