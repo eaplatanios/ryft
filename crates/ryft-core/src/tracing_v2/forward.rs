@@ -12,7 +12,7 @@ use crate::tracing::{
 use crate::tracing_v2::engines::{Engine, StagingEngine};
 use crate::tracing_v2::jit::Tracer;
 use crate::tracing_v2::linear::{jvp_program, jvp_traced};
-use crate::tracing_v2::operations::constants::{One, Zero};
+use crate::tracing_v2::operations::constants::Zero;
 use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine};
 use crate::types::{ArrayType, Type, Typed};
@@ -87,11 +87,13 @@ where
 ///
 /// The associated [`Tangent`](Self::Tangent) type makes the tangent representation explicit even
 /// though today's staged linear-program IR still requires `Tangent = Self` at the transform
-/// boundary. The default methods synthesize zero tangents and unit gradient seeds from the
-/// value's abstract type metadata through [`Zero`] and [`One`].
+/// boundary. Code paths that need to synthesize zero tangents or unit gradient seeds from abstract
+/// type metadata add [`Zero`] and [`One`](crate::tracing_v2::operations::constants::One) bounds at
+/// those synthesis sites instead of requiring every tangent representation to support metadata-only
+/// construction.
 pub trait Differentiable<T: Type>: Traceable<T> {
     /// Tangent and cotangent leaf type associated with this primal leaf.
-    type Tangent: Traceable<T> + Zero<T> + One<T>;
+    type Tangent: Traceable<T>;
 }
 
 impl<'engine, E> Differentiable<E::Type> for Tracer<'engine, E>

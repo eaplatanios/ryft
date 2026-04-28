@@ -39,9 +39,9 @@ pub trait OneLike {
 /// order to evaluate at interpretation time, since the op carries only the output type and has no
 /// input values to derive a shape from. Concrete leaf value types implement this trait directly.
 ///
-/// Wrapper types that fundamentally cannot synthesize a zero from metadata alone (notably
-/// [`Tracer`](crate::tracing_v2::Tracer)) implement it as a runtime error. Programs containing
-/// `Zero` ops over those value types must materialize them away before being interpreted.
+/// Wrapper types that fundamentally cannot synthesize a zero from metadata alone should use
+/// exemplar-backed [`ZeroLike`] where possible. Programs containing `Zero` ops over those value
+/// types must materialize them away before being interpreted.
 pub trait Zero<T: Type>: Sized {
     /// Returns a typed zero whose shape and dtype are described by `r#type`.
     fn zero(r#type: &T) -> Result<Self, TracingError>;

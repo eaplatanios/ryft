@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::ops::{Add, Mul, Neg};
 use std::rc::Rc;
 
@@ -9,7 +9,7 @@ use ryft_macros::Parameter;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::engines::{Engine, StagingEngine};
-use crate::tracing_v2::operations::constants::{One, OneLike, ZeroLike};
+use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use crate::tracing_v2::operations::{SupportsAdd, SupportsMul, SupportsNeg, TracedLinearizationCarrier};
 use crate::tracing_v2::{Differentiable, DifferentiableEngine, DifferentiableStagingEngine};
 use crate::types::{Type, Typed};
@@ -48,7 +48,7 @@ impl<T: Type> TracerState<T> {
     }
 }
 
-impl<T: Type> std::fmt::Debug for TracerState<T> {
+impl<T: Type> Debug for TracerState<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Live(atom, _) => formatter.debug_tuple("Live").field(atom).finish(),
@@ -260,7 +260,7 @@ impl<'engine, E: StagingEngine + ?Sized> Clone for TracingEngine<'engine, E> {
     }
 }
 
-impl<'engine, E: StagingEngine + ?Sized> std::fmt::Debug for TracingEngine<'engine, E> {
+impl<'engine, E: StagingEngine + ?Sized> Debug for TracingEngine<'engine, E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("TracingEngine").finish_non_exhaustive()
     }
@@ -322,30 +322,6 @@ pub struct Tracer<'engine, E: StagingEngine + ?Sized> {
 
     /// Tracing engine that owns the shared builder and outer staging engine reference.
     pub engine: TracingEngine<'engine, E>,
-}
-
-impl<'engine, E: StagingEngine + ?Sized> Clone for Tracer<'engine, E> {
-    fn clone(&self) -> Self {
-        Self { state: self.state.clone(), engine: self.engine.clone() }
-    }
-}
-
-impl<'engine, E: StagingEngine + ?Sized> std::fmt::Debug for Tracer<'engine, E> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Tracer").field("state", &self.state).finish_non_exhaustive()
-    }
-}
-
-impl<'engine, E> Display for Tracer<'engine, E>
-where
-    E: StagingEngine + ?Sized,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.state {
-            TracerState::Live(atom, _) => Display::fmt(atom, formatter),
-            TracerState::Poison(r#type) => write!(formatter, "<poison:{type}>"),
-        }
-    }
 }
 
 impl<'engine, E: StagingEngine + ?Sized> Tracer<'engine, E> {
@@ -410,6 +386,30 @@ impl<'engine, E: StagingEngine + ?Sized> Tracer<'engine, E> {
     }
 }
 
+impl<'engine, E: StagingEngine + ?Sized> Clone for Tracer<'engine, E> {
+    fn clone(&self) -> Self {
+        Self { state: self.state.clone(), engine: self.engine.clone() }
+    }
+}
+
+impl<'engine, E: StagingEngine + ?Sized> std::fmt::Debug for Tracer<'engine, E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Tracer").field("state", &self.state).finish_non_exhaustive()
+    }
+}
+
+impl<'engine, E> Display for Tracer<'engine, E>
+where
+    E: StagingEngine + ?Sized,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.state {
+            TracerState::Live(atom, _) => Display::fmt(atom, formatter),
+            TracerState::Poison(r#type) => write!(formatter, "<poison:{type}>"),
+        }
+    }
+}
+
 impl<'engine, E: StagingEngine + ?Sized> Typed<E::Type> for Tracer<'engine, E> {
     #[inline]
     fn r#type(&self) -> Cow<'_, E::Type> {
@@ -434,35 +434,6 @@ impl<'engine, E: StagingEngine + ?Sized> ZeroLike for Tracer<'engine, E> {
         };
         let atom = self.builder().borrow_mut().add_constant(value);
         self.engine.tracer_from_staged_parts(atom, r#type)
-    }
-}
-
-impl<'engine, E: StagingEngine + ?Sized> crate::tracing_v2::operations::constants::Zero<E::Type>
-    for Tracer<'engine, E>
-{
-    /// Tracer cannot synthesize a zero from an [`E::Type`] alone because constructing a tracer
-    /// requires both an engine reference and a builder, neither of which is available here.
-    /// Programs that contain `Zero` ops over tracer values must materialize them away (via the
-    /// outer-trace builder) before being interpreted.
-    #[inline]
-    fn zero(_type: &E::Type) -> Result<Self, TracingError> {
-        Err(crate::types::TypeError {
-            message: "tracer values cannot synthesize zero from type metadata; materialize zero ops first".to_string(),
-        }
-        .into())
-    }
-}
-
-impl<'engine, E: StagingEngine + ?Sized> One<E::Type> for Tracer<'engine, E> {
-    /// Tracer cannot synthesize a one from an [`E::Type`] alone because constructing a tracer
-    /// requires both an engine reference and a builder, neither of which is available here.
-    /// Differentiable tracer seeds must be derived from an existing tracer exemplar instead.
-    #[inline]
-    fn one(_type: &E::Type) -> Result<Self, TracingError> {
-        Err(crate::types::TypeError {
-            message: "tracer values cannot synthesize one from type metadata; use an exemplar-backed seed".to_string(),
-        }
-        .into())
     }
 }
 

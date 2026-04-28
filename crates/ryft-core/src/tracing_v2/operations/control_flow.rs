@@ -375,7 +375,6 @@ impl<V, O> LinearOperation<ArrayType, V, O> for ConditionOperation<V, O>
 where
     V: Traceable<ArrayType>,
     O: Clone
-        + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, O>
         + SupportsAdd<ArrayType, V>
         + crate::tracing_v2::operations::SupportsZero<ArrayType, V>

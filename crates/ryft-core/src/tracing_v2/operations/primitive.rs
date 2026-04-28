@@ -590,6 +590,44 @@ where
     }
 }
 
+impl<'engine, E> InterpretableOperation<ArrayType, Tracer<'engine, E>> for LinearPrimitiveOperation<Tracer<'engine, E>>
+where
+    E: DifferentiableStagingEngine<Type = ArrayType> + ?Sized + 'static,
+    Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
+        + Neg<Output = Tracer<'engine, E>>
+        + Mul<Output = Tracer<'engine, E>>
+        + ZeroLike
+        + MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps
+        + ControlFlowValue,
+    Vec<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+{
+    fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
+        match self {
+            Self::Add => AddOperation.interpret(inputs),
+            Self::Neg => NegOperation.interpret(inputs),
+            Self::Transpose => MatrixTransposeOperation.interpret(inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).interpret(inputs),
+            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).interpret(inputs),
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
+            }
+            Self::Zero(zero) => Err(TypeError {
+                message: format!(
+                    "linear zero operation over tracer values was not materialized before interpretation for {}",
+                    zero.output_type()
+                ),
+            }
+            .into()),
+            Self::Rematerialize(remat) => remat.interpret(inputs),
+            Self::Condition(condition) => condition.interpret(inputs),
+            Self::While(while_operation) => while_operation.interpret(inputs),
+            Self::Custom(op) => op.interpret(inputs),
+        }
+    }
+}
+
 impl<
     V: Traceable<ArrayType>
         + Add<Output = V>
@@ -597,7 +635,6 @@ impl<
         + Mul<Output = V>
         + ZeroLike
         + OneLike
-        + crate::tracing_v2::operations::constants::Zero<ArrayType>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,

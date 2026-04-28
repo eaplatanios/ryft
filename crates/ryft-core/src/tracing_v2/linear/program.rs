@@ -126,7 +126,7 @@ where
     V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    O: Clone + InterpretableOperation<T, V> + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
+    O: Clone + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
 {
     fn accumulate<T, V, O>(
         builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
@@ -219,7 +219,7 @@ impl<T, V, O> TranspositionContext<'_, T, V, O>
 where
     T: Type,
     V: Traceable<T>,
-    O: Clone + InterpretableOperation<T, V> + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
+    O: Clone + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
 {
     /// Transposes one nested linear program into a fresh sibling builder.
     pub(crate) fn transpose_nested_program<Input, Output>(
@@ -256,7 +256,7 @@ where
     V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    O: Clone + InterpretableOperation<T, V> + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
+    O: Clone + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
 {
     let expected_output_count = program.output_ids.len();
     if output_examples.len() != expected_output_count {
@@ -286,7 +286,6 @@ where
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
     O: Clone
-        + InterpretableOperation<ArrayType, Tracer<'engine, E>>
         + LinearOperation<ArrayType, Tracer<'engine, E>, O>
         + SupportsAdd<ArrayType, Tracer<'engine, E>>
         + SupportsZero<ArrayType, Tracer<'engine, E>>,
@@ -315,7 +314,6 @@ where
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
     O: Clone
-        + InterpretableOperation<ArrayType, Tracer<'engine, E>>
         + LinearOperation<ArrayType, Tracer<'engine, E>, O>
         + SupportsAdd<ArrayType, Tracer<'engine, E>>
         + SupportsZero<ArrayType, Tracer<'engine, E>>,
