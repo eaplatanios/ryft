@@ -1775,15 +1775,10 @@ mod tests {
     #[test]
     fn test_project_flat_shard_map_program_rejects_unmapped_variable_atom() {
         let array_type = test_array_type();
-        let atom_id = AtomId { index: 0 };
         let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
-        builder.atoms = vec![Atom::Variable(array_type)];
+        let atom_id = builder.add_input(array_type);
         let program = builder
-            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-                vec![atom_id],
-                Vec::<Placeholder>::new(),
-                vec![Placeholder],
-            )
+            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![atom_id], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         assert!(matches!(
@@ -1804,11 +1799,17 @@ mod tests {
             vec![array_type.clone()],
             {
                 let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
-                builder.atoms = vec![Atom::Variable(array_type.clone()), Atom::Variable(array_type)];
-                builder.input_ids = vec![AtomId { index: 0 }];
+                let input = builder.add_input(array_type);
+                let output = builder
+                    .add_instruction(XlaPrimitiveOperation::Sin, vec![input])
+                    .expect("test body should stage one sine instruction")
+                    .into_iter()
+                    .copied()
+                    .next()
+                    .expect("sine should produce one output");
                 builder
                     .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-                        vec![AtomId { index: 1 }],
+                        vec![output],
                         vec![Placeholder],
                         vec![Placeholder],
                     )
