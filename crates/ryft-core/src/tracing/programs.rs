@@ -891,6 +891,39 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
             return Err(TracingError::InvalidOutputCount { expected: expected_output_count, got: output_ids.len() });
         }
 
+        // Verify that variable dependencies are either inputs or previous instruction outputs.
+        let mut variable_has_provider = vec![false; self.atoms.len()];
+        for input_id in self.input_ids.iter().copied() {
+            let input = self.atoms.get(input_id.index).ok_or(TracingError::UnboundAtomId { id: input_id })?;
+            let Atom::Variable(_) = input else {
+                return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
+            };
+            variable_has_provider[input_id.index] = true;
+        }
+        for instruction in self.instructions.iter() {
+            for input_id in instruction.inputs.iter().copied() {
+                let input = self.atoms.get(input_id.index).ok_or(TracingError::UnboundAtomId { id: input_id })?;
+                if input.is_variable() && !variable_has_provider[input_id.index] {
+                    return Err(TracingError::MalformedProgram("variable atom has no owning instruction".to_string()));
+                }
+            }
+            for output_id in instruction.outputs.iter().copied() {
+                let output = self.atoms.get(output_id.index).ok_or(TracingError::UnboundAtomId { id: output_id })?;
+                let Atom::Variable(_) = output else {
+                    return Err(TracingError::MalformedProgram(
+                        "instruction output atom was not a variable".to_string(),
+                    ));
+                };
+                variable_has_provider[output_id.index] = true;
+            }
+        }
+        for output_id in output_ids.iter().copied() {
+            let output = self.atoms.get(output_id.index).ok_or(TracingError::UnboundAtomId { id: output_id })?;
+            if output.is_variable() && !variable_has_provider[output_id.index] {
+                return Err(TracingError::MalformedProgram("variable atom has no owning instruction".to_string()));
+            }
+        }
+
         Ok(Program {
             atoms: self.atoms,
             input_ids: self.input_ids,
@@ -1066,6 +1099,25 @@ mod tests {
         assert!(matches!(input, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F32)));
         assert!(matches!(output.0, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F32)));
         assert!(matches!(output.1, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F32)));
+
+        // Test a case where we have an output atom with no parent instruction.
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let o0 = builder.add_variable(ArrayType::scalar(DataType::F64));
+        assert!(matches!(
+            builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder),
+            Err(TracingError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
+        ));
+
+        // Test a case where we have an instruction input atom with no parent instruction.
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let v0 = builder.add_variable(ArrayType::scalar(DataType::F64));
+        let o0 = builder.add_instruction(PrimitiveOperation::Add, vec![i0, v0]).unwrap()[0];
+        assert!(matches!(
+            builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder),
+            Err(TracingError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
+        ));
     }
 
     #[test]
@@ -1173,16 +1225,6 @@ mod tests {
             "}
             .trim_end(),
         );
-        
-        // Test a case where we have an output atom with no parent instruction.
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        builder.add_input(ArrayType::scalar(DataType::F64));
-        let o0 = builder.add_variable(ArrayType::scalar(DataType::F64));
-        let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert!(matches!(
-            program.simplified(),
-            Err(TracingError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
-        ));
     }
 
     #[test]
