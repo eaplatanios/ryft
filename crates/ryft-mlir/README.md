@@ -107,9 +107,7 @@ fn main() {
           `EmitCPtrDiffTType`, `EmitCSignedSizeTType`, `EmitCSizeTType`.
         - [ ] Add support for operations.
     - [x] `func`
-    - [ ] `gpu`
-        - [ ] Add support for types: `GPUAsyncTokenType`.
-        - [ ] Add support for operations.
+    - [x] `gpu`
     - [x] `index`
     - [ ] `linalg`
     - [ ] `llvm`
@@ -150,7 +148,17 @@ fn main() {
             - https://openxla.org/stablehlo/spec
             - https://github.com/openxla/stablehlo/blob/4c0d4841519aed22e3689c30b72a0e4228051249/stablehlo/dialect/StablehloOps.cpp
     - [ ] `tensor`
-    - [ ] `triton`
+    - [/] `triton`
+      - [x] `tt`
+      - [ ] `tti`
+      - [ ] `ttg`
+      - [ ] `ttng`
+      - [ ] `nvg`
+      - [ ] `nvws`
+      - [ ] `amdg`
+      - [ ] `gluon`
+      - [ ] `proton`
+      - [ ] `proton_gpu`
     - [ ] `transform`
         - [ ] Add support for types: `TransformAnyOpType`, `TransformAnyParamType`, `TransformAnyValueType`,
           `TransformOperationType`, `TransformParamType`.

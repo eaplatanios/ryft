@@ -286,6 +286,26 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
   struct (e.g., "Refer to the documentation of [`<Ext>Extension::<method>`] for more information.") to
   avoid duplication.
 
+### `ryft-mlir`
+
+- For MLIR dialect operation wrappers, define a special-purpose trait for each operation that exposes the
+  specific attributes, operands, results, and regions supported by that operation. Avoid generic operation-only
+  wrappers when the dialect specification provides more precise semantics.
+- In MLIR dialect operation modules, colocate public operation attribute-name constants directly above the first
+  operation trait or macro-generated operation group that uses them.
+- In MLIR dialect operation modules, inline operation-specific attribute, segment, and async-token access logic
+  in the owning trait or constructor instead of adding module-level helper functions, unless the helper is genuinely
+  shared across dialect modules.
+- Prefix MLIR-dialect-local declarative macros with the dialect or module prefix (for example, `gpu_`) unless they
+  are intentionally shared across dialect modules.
+- For MLIR dialect attribute tests, follow the StableHLO attribute test structure: add construction/accessor, equality,
+  display/debug, and casting tests for each attribute in the same order in which attributes appear in the module.
+- For MLIR dialect type tests, follow the StableHLO type test structure: add construction/accessor, equality,
+  display/debug, parsing, and casting tests for each type in the same order in which types appear in the module.
+- For MLIR dialect operation tests, add source-ordered tests for every operation wrapper. Prefer constructor
+  tests when a constructor exists, and use `OperationBuilder` to exercise accessor behavior for wrappers that only
+  expose typed operation traits.
+
 ### `ryft-xla-sys`
 
 - Preserve the current `build.rs` resolution order: environment-provided artifact -> verified download -> Bazel build.
@@ -305,6 +325,16 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
 - When a user asks you to wait for a specific GitHub Actions run before updating `ryft-xla-sys` release metadata,
   do not report the task as complete until that exact run has reached `completed` and you have refreshed every
   affected published checksum from the finalized release assets.
+- Put custom `ryft-xla-sys` MLIR dialect C++ bindings under
+  `crates/ryft-xla-sys/src/c++/mlir/dialects/<dialect>.h` and the matching `.cc` file instead of placing
+  dialect-specific shims directly under `src/c++`.
+- In custom `ryft-xla-sys` C/C++ and Rust FFI identifiers, use regular UpperCamel acronym casing in function and enum
+  type names, such as `Gpu`, `Mlir`, and `Mma`; reserve all-uppercase acronym spelling for all-caps C constants and
+  upstream symbols that already use it.
+- Prefix custom MLIR C API extension functions and opaque/helper enum types with `mlir` / `Mlir`, matching the upstream
+  MLIR C API style; do not use project-specific prefixes such as `ryftMlir` / `RyftMlir` for those exported symbols.
+- In custom C++ FFI shims, inline tiny nullable handle conversions at the getter call site instead of adding local
+  helpers when the helper only wraps a null check for one or two nearby functions.
 
 ## Convention References / Examples
 
