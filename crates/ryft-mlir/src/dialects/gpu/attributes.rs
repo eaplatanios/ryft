@@ -121,6 +121,7 @@ impl<'c, 't> Attribute<'c, 't> for ObjectAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(ObjectAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
+/// Returns whether printed GPU attribute source uses one of MLIR's spellings for the provided mnemonic.
 fn gpu_attribute_has_mnemonic(source: &str, mnemonic: &str) -> bool {
     source.starts_with(format!("#gpu.{mnemonic}<").as_str())
         || source == format!("#gpu.{mnemonic}")

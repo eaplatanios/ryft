@@ -261,34 +261,228 @@ mod tests {
     }
 
     #[test]
-    fn test_async_token_type_display_and_debug() {
+    fn test_async_token_type_equality() {
         let context = Context::new();
-        test_type_display_and_debug(context.gpu_async_token_type(), "!gpu.async.token");
+
+        // Token types from the same context must be equal because they are "uniqued".
+        let token_type_1 = context.gpu_async_token_type();
+        let token_type_2 = context.gpu_async_token_type();
+        assert_eq!(token_type_1, token_type_2);
+
+        // Token types from different contexts must not be equal.
+        let context = Context::new();
+        let token_type_2 = context.gpu_async_token_type();
+        assert_ne!(token_type_1, token_type_2);
     }
 
     #[test]
-    fn test_async_token_type_parsing_and_casting() {
+    fn test_async_token_type_display_and_debug() {
+        let context = Context::new();
+        let token_type = context.gpu_async_token_type();
+        test_type_display_and_debug(token_type, "!gpu.async.token");
+    }
+
+    #[test]
+    fn test_async_token_type_parsing() {
         let context = Context::new();
         let token_type = context.gpu_async_token_type();
         assert_eq!(context.parse_type("!gpu.async.token").unwrap(), token_type);
+    }
+
+    #[test]
+    fn test_async_token_type_casting() {
+        let context = Context::new();
+        let token_type = context.gpu_async_token_type();
         test_type_casting(token_type);
+    }
+
+    #[test]
+    fn test_mma_matrix_operand() {
+        assert_eq!(MmaMatrixOperand::A.as_str(), "AOp");
+        assert_eq!(MmaMatrixOperand::B.as_str(), "BOp");
+        assert_eq!(MmaMatrixOperand::C.as_str(), "COp");
     }
 
     #[test]
     fn test_mma_matrix_type() {
         let context = Context::new();
         let mma_type = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A);
+        assert_eq!(&context, mma_type.context());
+        assert_eq!(mma_type.dialect().namespace().unwrap(), "gpu");
         assert_eq!(mma_type.shape(), [16, 8]);
         assert_eq!(mma_type.element_type(), context.float32_type());
         assert_eq!(mma_type.operand(), MmaMatrixOperand::A);
+    }
+
+    #[test]
+    fn test_mma_matrix_type_equality() {
+        let context = Context::new();
+
+        // Same types from the same context must be equal because they are "uniqued".
+        let mma_type_1 = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A);
+        let mma_type_2 = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A);
+        assert_eq!(mma_type_1, mma_type_2);
+
+        // Different types from the same context must not be equal.
+        let mma_type_2 = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::B);
+        assert_ne!(mma_type_1, mma_type_2);
+
+        // Same types from different contexts must not be equal.
+        let context = Context::new();
+        let mma_type_2 = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A);
+        assert_ne!(mma_type_1, mma_type_2);
+    }
+
+    #[test]
+    fn test_mma_matrix_type_display_and_debug() {
+        let context = Context::new();
+        let mma_type = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A);
         test_type_display_and_debug(mma_type, "!gpu.mma_matrix<16x8xf32, \"AOp\">");
     }
 
     #[test]
-    fn test_sparse_handle_types() {
+    fn test_mma_matrix_type_parsing() {
         let context = Context::new();
-        test_type_display_and_debug(context.gpu_sparse_dn_tensor_handle_type(), "!gpu.sparse.dntensor_handle");
-        test_type_display_and_debug(context.gpu_sparse_sp_mat_handle_type(), "!gpu.sparse.spmat_handle");
-        test_type_display_and_debug(context.gpu_sparse_sp_gemm_operation_handle_type(), "!gpu.sparse.spgemmop_handle");
+        let mma_type = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A);
+        assert_eq!(context.parse_type("!gpu.mma_matrix<16x8xf32, \"AOp\">").unwrap(), mma_type);
+    }
+
+    #[test]
+    fn test_mma_matrix_type_casting() {
+        let context = Context::new();
+        let mma_type = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A);
+        test_type_casting(mma_type);
+    }
+
+    #[test]
+    fn test_sparse_dn_tensor_handle_type() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_dn_tensor_handle_type();
+        assert_eq!(&context, handle_type.context());
+        assert_eq!(handle_type.dialect().namespace().unwrap(), "gpu");
+    }
+
+    #[test]
+    fn test_sparse_dn_tensor_handle_type_equality() {
+        let context = Context::new();
+
+        // Sparse handle types from the same context must be equal because they are "uniqued".
+        let handle_type_1 = context.gpu_sparse_dn_tensor_handle_type();
+        let handle_type_2 = context.gpu_sparse_dn_tensor_handle_type();
+        assert_eq!(handle_type_1, handle_type_2);
+
+        // Sparse handle types from different contexts must not be equal.
+        let context = Context::new();
+        let handle_type_2 = context.gpu_sparse_dn_tensor_handle_type();
+        assert_ne!(handle_type_1, handle_type_2);
+    }
+
+    #[test]
+    fn test_sparse_dn_tensor_handle_type_display_and_debug() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_dn_tensor_handle_type();
+        test_type_display_and_debug(handle_type, "!gpu.sparse.dntensor_handle");
+    }
+
+    #[test]
+    fn test_sparse_dn_tensor_handle_type_parsing() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_dn_tensor_handle_type();
+        assert_eq!(context.parse_type("!gpu.sparse.dntensor_handle").unwrap(), handle_type);
+    }
+
+    #[test]
+    fn test_sparse_dn_tensor_handle_type_casting() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_dn_tensor_handle_type();
+        test_type_casting(handle_type);
+    }
+
+    #[test]
+    fn test_sparse_sp_mat_handle_type() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_sp_mat_handle_type();
+        assert_eq!(&context, handle_type.context());
+        assert_eq!(handle_type.dialect().namespace().unwrap(), "gpu");
+    }
+
+    #[test]
+    fn test_sparse_sp_mat_handle_type_equality() {
+        let context = Context::new();
+
+        // Sparse handle types from the same context must be equal because they are "uniqued".
+        let handle_type_1 = context.gpu_sparse_sp_mat_handle_type();
+        let handle_type_2 = context.gpu_sparse_sp_mat_handle_type();
+        assert_eq!(handle_type_1, handle_type_2);
+
+        // Sparse handle types from different contexts must not be equal.
+        let context = Context::new();
+        let handle_type_2 = context.gpu_sparse_sp_mat_handle_type();
+        assert_ne!(handle_type_1, handle_type_2);
+    }
+
+    #[test]
+    fn test_sparse_sp_mat_handle_type_display_and_debug() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_sp_mat_handle_type();
+        test_type_display_and_debug(handle_type, "!gpu.sparse.spmat_handle");
+    }
+
+    #[test]
+    fn test_sparse_sp_mat_handle_type_parsing() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_sp_mat_handle_type();
+        assert_eq!(context.parse_type("!gpu.sparse.spmat_handle").unwrap(), handle_type);
+    }
+
+    #[test]
+    fn test_sparse_sp_mat_handle_type_casting() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_sp_mat_handle_type();
+        test_type_casting(handle_type);
+    }
+
+    #[test]
+    fn test_sparse_sp_gemm_operation_handle_type() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_sp_gemm_operation_handle_type();
+        assert_eq!(&context, handle_type.context());
+        assert_eq!(handle_type.dialect().namespace().unwrap(), "gpu");
+    }
+
+    #[test]
+    fn test_sparse_sp_gemm_operation_handle_type_equality() {
+        let context = Context::new();
+
+        // Sparse handle types from the same context must be equal because they are "uniqued".
+        let handle_type_1 = context.gpu_sparse_sp_gemm_operation_handle_type();
+        let handle_type_2 = context.gpu_sparse_sp_gemm_operation_handle_type();
+        assert_eq!(handle_type_1, handle_type_2);
+
+        // Sparse handle types from different contexts must not be equal.
+        let context = Context::new();
+        let handle_type_2 = context.gpu_sparse_sp_gemm_operation_handle_type();
+        assert_ne!(handle_type_1, handle_type_2);
+    }
+
+    #[test]
+    fn test_sparse_sp_gemm_operation_handle_type_display_and_debug() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_sp_gemm_operation_handle_type();
+        test_type_display_and_debug(handle_type, "!gpu.sparse.spgemmop_handle");
+    }
+
+    #[test]
+    fn test_sparse_sp_gemm_operation_handle_type_parsing() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_sp_gemm_operation_handle_type();
+        assert_eq!(context.parse_type("!gpu.sparse.spgemmop_handle").unwrap(), handle_type);
+    }
+
+    #[test]
+    fn test_sparse_sp_gemm_operation_handle_type_casting() {
+        let context = Context::new();
+        let handle_type = context.gpu_sparse_sp_gemm_operation_handle_type();
+        test_type_casting(handle_type);
     }
 }
