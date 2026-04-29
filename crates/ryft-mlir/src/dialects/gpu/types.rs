@@ -65,6 +65,8 @@ pub struct MmaMatrixTypeRef<'c, 't> {
 impl<'c, 't> MmaMatrixTypeRef<'c, 't> {
     /// Returns the two-dimensional matrix shape.
     pub fn shape(&self) -> [usize; 2] {
+        // TODO(eaplatanios): Replace this printed-form parsing with a proper `ryft-xla-sys` C++ binding for
+        //  `gpu::MMAMatrixType` shape accessors.
         let source = self.to_string();
         let payload = source
             .strip_prefix("!gpu.mma_matrix<")
@@ -81,6 +83,8 @@ impl<'c, 't> MmaMatrixTypeRef<'c, 't> {
 
     /// Returns the element [`Type`] of this MMA matrix.
     pub fn element_type(&self) -> TypeRef<'c, 't> {
+        // TODO(eaplatanios): Replace this printed-form parsing with a proper `ryft-xla-sys` C++ binding for
+        //  `gpu::MMAMatrixType` element-type accessors.
         let source = self.to_string();
         let payload = source
             .strip_prefix("!gpu.mma_matrix<")
@@ -93,6 +97,8 @@ impl<'c, 't> MmaMatrixTypeRef<'c, 't> {
 
     /// Returns the MMA operand role of this matrix.
     pub fn operand(&self) -> MmaMatrixOperand {
+        // TODO(eaplatanios): Replace this printed-form parsing with a proper `ryft-xla-sys` C++ binding for
+        //  `gpu::MMAMatrixType` operand accessors.
         let source = self.to_string();
         let payload = source
             .strip_prefix("!gpu.mma_matrix<")
@@ -114,6 +120,8 @@ impl<'c, 't> Type<'c, 't> for MmaMatrixTypeRef<'c, 't> {
             return None;
         }
         let r#type = unsafe { TypeRef::from_c_api(handle, context) }?;
+        // TODO(eaplatanios): Replace this printed-form subtype check with a proper `ryft-xla-sys` C++ binding for
+        //  checking `gpu::MMAMatrixType`.
         if r#type.to_string().starts_with("!gpu.mma_matrix<") { Some(Self { handle, context }) } else { None }
     }
 
@@ -151,6 +159,8 @@ macro_rules! gpu_sparse_handle_type {
                     return None;
                 }
                 let r#type = unsafe { TypeRef::from_c_api(handle, context) }?;
+                // TODO(eaplatanios): Replace this printed-form subtype check with a proper `ryft-xla-sys` C++
+                //  binding for GPU sparse handle types.
                 if r#type.to_string() == concat!("!gpu.", $spelling) {
                     Some(Self { handle, context })
                 } else {
@@ -207,6 +217,8 @@ impl<'t> Context<'t> {
         operand: MmaMatrixOperand,
     ) -> MmaMatrixTypeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
+        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
+        //  constructing `gpu::MMAMatrixType`.
         self.parse_type(format!(
             "!gpu.mma_matrix<{}x{}x{}, \"{}\">",
             shape[0],
@@ -221,6 +233,8 @@ impl<'t> Context<'t> {
     /// Creates a new GPU dense tensor sparse handle type owned by this [`Context`].
     pub fn gpu_sparse_dn_tensor_handle_type<'c>(&'c self) -> SparseDnTensorHandleTypeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
+        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
+        //  constructing `gpu::SparseDnTensorHandleType`.
         self.parse_type("!gpu.sparse.dntensor_handle")
             .and_then(|r#type| r#type.cast())
             .expect("invalid GPU dense tensor sparse handle type")
@@ -229,6 +243,8 @@ impl<'t> Context<'t> {
     /// Creates a new GPU sparse matrix handle type owned by this [`Context`].
     pub fn gpu_sparse_sp_mat_handle_type<'c>(&'c self) -> SparseSpMatHandleTypeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
+        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
+        //  constructing `gpu::SparseSpMatHandleType`.
         self.parse_type("!gpu.sparse.spmat_handle")
             .and_then(|r#type| r#type.cast())
             .expect("invalid GPU sparse matrix handle type")
@@ -237,6 +253,8 @@ impl<'t> Context<'t> {
     /// Creates a new GPU SpGEMM operation handle type owned by this [`Context`].
     pub fn gpu_sparse_sp_gemm_operation_handle_type<'c>(&'c self) -> SparseSpGemmOperationHandleTypeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
+        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
+        //  constructing `gpu::SparseSpGEMMOpHandleType`.
         self.parse_type("!gpu.sparse.spgemmop_handle")
             .and_then(|r#type| r#type.cast())
             .expect("invalid GPU SpGEMM operation handle type")
