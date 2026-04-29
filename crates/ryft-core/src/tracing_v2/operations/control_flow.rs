@@ -358,7 +358,7 @@ impl<V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<V, O>
 where
     V: ControlFlowValue,
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
@@ -451,7 +451,7 @@ where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     <E as DifferentiableEngine>::LinearOperation: Operation<ArrayType>,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(
         &self,
@@ -494,7 +494,7 @@ where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
     EInner::Operation: TracedLinearizationCarrier<ArrayType, V>,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(
         &self,
@@ -584,7 +584,7 @@ impl<V, O> InterpretableOperation<ArrayType, V> for WhileOperation<V, O>
 where
     V: ControlFlowValue,
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
@@ -629,7 +629,7 @@ where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
     EInner::Operation: TracedLinearizationCarrier<ArrayType, V>,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(
         &self,
@@ -651,7 +651,7 @@ where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     <E as DifferentiableEngine>::LinearOperation: Operation<ArrayType>,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(
         &self,

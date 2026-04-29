@@ -307,7 +307,7 @@ impl<
         + ControlFlowValue,
 > BatchableOperation<V> for PrimitiveOperation<V>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         match self {
@@ -350,7 +350,7 @@ impl<
         + ControlFlowValue,
 > BatchableOperation<V> for LinearPrimitiveOperation<V>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         match self {
@@ -370,8 +370,8 @@ pub fn interpret_batched_program<V, O, Input, Output>(
 where
     V: Traceable<ArrayType>,
     O: Clone + BatchableOperation<V>,
-    Input: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq, Family: ParameterizedFamily<ArrayBatch<V>>>,
-    Output: Parameterized<V, ParameterStructure: Clone, Family: ParameterizedFamily<ArrayBatch<V>>>,
+    Input: Parameterized<V, ParameterStructure: Debug + PartialEq, Family: ParameterizedFamily<ArrayBatch<V>>>,
+    Output: Parameterized<V, Family: ParameterizedFamily<ArrayBatch<V>>>,
 {
     let input_structure = input.parameter_structure();
     if input_structure != program.input_structure {
@@ -407,14 +407,13 @@ where
     V: Traceable<ArrayType>,
     Input: Parameterized<
             V,
-            ParameterStructure: Clone + Debug + PartialEq,
+            ParameterStructure: Debug + PartialEq,
             Family: ParameterizedFamily<ArrayType>
                         + ParameterizedFamily<ArrayBatch<V>>
                         + ParameterizedFamily<Tracer<'engine, E>>,
         >,
     Output: Parameterized<
             V,
-            ParameterStructure: Clone,
             Family: ParameterizedFamily<ArrayType>
                         + ParameterizedFamily<ArrayBatch<V>>
                         + ParameterizedFamily<Tracer<'engine, E>>,
@@ -554,7 +553,7 @@ fn validate_reference_lane_count<V: Parameter>(batches: &[ReferenceBatch<V>]) ->
 pub(crate) fn reference_stack<V, Input>(inputs: Vec<Input>) -> Result<Input::To<ReferenceBatch<V>>, TracingError>
 where
     V: Traceable<ArrayType>,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<ReferenceBatch<V>>>,
+    Input: Parameterized<V, ParameterStructure: PartialEq, Family: ParameterizedFamily<ReferenceBatch<V>>>,
 {
     let mut inputs = inputs.into_iter();
     let first = inputs.next().ok_or(BatchingError::EmptyBatch)?;
@@ -622,9 +621,8 @@ pub(crate) fn interpret_reference_batched_program<V, O, Input, Output>(
 where
     V: Traceable<ArrayType>,
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
-    Input:
-        Parameterized<V, ParameterStructure: Clone + Debug + PartialEq, Family: ParameterizedFamily<ReferenceBatch<V>>>,
-    Output: Parameterized<V, ParameterStructure: Clone, Family: ParameterizedFamily<ReferenceBatch<V>>>,
+    Input: Parameterized<V, ParameterStructure: Debug + PartialEq, Family: ParameterizedFamily<ReferenceBatch<V>>>,
+    Output: Parameterized<V, Family: ParameterizedFamily<ReferenceBatch<V>>>,
 {
     let input_structure = input.parameter_structure();
     if input_structure != program.input_structure {

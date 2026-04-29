@@ -248,7 +248,7 @@ where
 
 fn standard_basis<Value, V>(structure: &Value::ParameterStructure, parameters: &[V]) -> Result<Vec<Value>, TracingError>
 where
-    Value: Parameterized<V, ParameterStructure: Clone>,
+    Value: Parameterized<V>,
     V: CoordinateValue,
 {
     let zero_parameters = parameters.iter().map(ZeroLike::zero_like).collect::<Vec<_>>();
@@ -276,8 +276,8 @@ pub fn jacfwd<'engine, E, F, Input, Output, V>(
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Output: Parameterized<V, ParameterStructure: PartialEq>,
     Input::Family: ParameterizedFamily<ReferenceBatch<V>>
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     Output::Family: ParameterizedFamily<ReferenceBatch<V>>
@@ -329,8 +329,8 @@ pub fn jacrev<'engine, E, F, Input, Output, V>(
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Output: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Output: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<ReferenceBatch<V>>
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     Output::Family: ParameterizedFamily<ReferenceBatch<V>>
@@ -379,7 +379,7 @@ pub fn hessian<'engine, E, F, Input, V>(
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<ReferenceBatch<V>>
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     F: FnOnce(

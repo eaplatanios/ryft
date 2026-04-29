@@ -152,7 +152,7 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>, L: Clone> Operati
 impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>, L: Clone> InterpretableOperation<ArrayType, V>
     for RematerializeOperation<ArrayType, V, O, L>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     O: InterpretableOperation<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -184,7 +184,7 @@ where
     EInner::Operation: TracedLinearizationCarrier<ArrayType, V>
         + InterpretableOperation<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, LinearPrimitiveOperation<V>>,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearPrimitiveOperation<V>:
         Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
     EInner::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner>,
@@ -276,7 +276,7 @@ impl<
     O: Clone + Operation<ArrayType>,
 > DifferentiableOperation<E> for RematerializeOperation<ArrayType, V, O, E::LinearOperation>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     O: DifferentiableOperation<E>,
     O: InterpretableOperation<ArrayType, V>,
     O: SupportsRematerialize<ArrayType, V, E::LinearOperation> + 'static,
@@ -319,7 +319,7 @@ impl<
 > InterpretableOperation<ArrayType, Tracer<'engine, E>>
     for RematerializeOperation<ArrayType, V, E::Operation, E::LinearOperation>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     E::Operation: InterpretableOperation<ArrayType, V> + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
@@ -415,7 +415,7 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayTy
 impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> InterpretableOperation<ArrayType, V>
     for LinearRematerializeOperation<ArrayType, V, O>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     O: InterpretableOperation<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -500,7 +500,7 @@ pub(crate) fn make_linear_rematerialize<V, E, O>(
 ) -> Result<LinearRematerializeOperation<ArrayType, V>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType> + 'static,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V> + DifferentiableOperation<E> + 'static,
     LinearPrimitiveOperation<V>:
         Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
@@ -524,10 +524,8 @@ where
 
 /// Dispatch trait used by [`rematerialize`] to handle both concrete values and already traced values.
 #[doc(hidden)]
-pub(crate) trait RematerializeInvocationLeaf<
-    Input: Parameterized<Self, ParameterStructure: Clone>,
-    Output: Parameterized<Self, ParameterStructure: Clone>,
->: Parameter + Sized
+pub(crate) trait RematerializeInvocationLeaf<Input: Parameterized<Self>, Output: Parameterized<Self>>:
+    Parameter + Sized
 {
     /// Invokes [`rematerialize`] for one concrete leaf regime.
     fn invoke<F>(function: F, input: Input) -> Result<Output, TracingError>
@@ -537,11 +535,8 @@ pub(crate) trait RematerializeInvocationLeaf<
 
 /// Concrete-value dispatch for [`rematerialize`]: the rematerialization boundary is a no-op during
 /// eager execution and simply applies the body function directly.
-impl<
-    V: Value<ArrayType>,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-> RematerializeInvocationLeaf<Input, Output> for V
+impl<V: Value<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>> RematerializeInvocationLeaf<Input, Output>
+    for V
 {
     fn invoke<F>(function: F, input: Input) -> Result<Output, TracingError>
     where
@@ -558,8 +553,8 @@ impl<
     'engine,
     E,
     V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Input>,
-    Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Output>,
+    Input: Parameterized<Tracer<'engine, E>, To<Tracer<'engine, E>> = Input>,
+    Output: Parameterized<Tracer<'engine, E>, To<Tracer<'engine, E>> = Output>,
 > RematerializeInvocationLeaf<Input, Output> for Tracer<'engine, E>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + StagingEngine + ?Sized + 'static,
@@ -642,8 +637,8 @@ where
 pub fn rematerialize<F, Input, Output, V>(function: F, input: Input) -> Result<Output, TracingError>
 where
     V: RematerializeInvocationLeaf<Input, Output>,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
     F: FnOnce(Input) -> Output,
 {
     V::invoke(function, input)

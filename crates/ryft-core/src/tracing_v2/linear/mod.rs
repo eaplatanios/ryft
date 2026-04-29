@@ -70,8 +70,8 @@ pub(crate) fn trace_flat_program_from_input_types<'engine, Input, Output, V, E, 
 ) -> Result<(Output, Program<ArrayType, V, E::Operation, Vec<V>, Vec<V>>), TracingError>
 where
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<ArrayType, ParameterStructure: Clone>,
-    Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+    Input: Parameterized<ArrayType>,
+    Output: Parameterized<ArrayType>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     E: StagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
@@ -88,8 +88,8 @@ pub(crate) fn trace_flat_program_from_input_engine<'engine, Input, Output, V, E,
 ) -> Result<(Output, Program<ArrayType, V, E::Operation, Vec<V>, Vec<V>>), TracingError>
 where
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<ArrayType, ParameterStructure: Clone>,
-    Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+    Input: Parameterized<ArrayType>,
+    Output: Parameterized<ArrayType>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     E: StagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
@@ -107,8 +107,8 @@ fn trace_flat_program_from_trace_result<Input, Output, V, O>(
 ) -> Result<(Output, Program<ArrayType, V, O, Vec<V>, Vec<V>>), TracingError>
 where
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<ArrayType, ParameterStructure: Clone>,
-    Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+    Input: Parameterized<ArrayType>,
+    Output: Parameterized<ArrayType>,
     Input::Family: ParameterizedFamily<V>,
     Output::Family: ParameterizedFamily<V>,
     O: Clone + Operation<ArrayType>,

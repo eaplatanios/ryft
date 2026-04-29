@@ -14,7 +14,7 @@ where
     <E as DifferentiableStagingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E>>
         + LinearOperation<ArrayType, Tracer<'engine, E>, <E as DifferentiableStagingEngine>::LinearOperation<'engine>>,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::Operation>::new()));
     let tracing_engine = TracingEngine::new(engine, traced_primal_builder.clone());
@@ -70,7 +70,7 @@ where
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
     V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
@@ -148,7 +148,7 @@ where
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
     V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
@@ -195,7 +195,7 @@ where
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
     V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,

@@ -1644,7 +1644,7 @@ pub fn device_put<'c, P, Input, Device, Src, Donate, MayAlias>(
 ) -> Result<<Input as Parameterized<P>>::To<Array<'c>>, ArrayError>
 where
     P: DevicePutLeaf<'c>,
-    Input: Parameterized<P, ParameterStructure: Clone>,
+    Input: Parameterized<P>,
     Input::Family: ParameterizedFamily<Array<'c>>
         + ParameterizedFamily<DevicePutPlacement>
         + ParameterizedFamily<bool>

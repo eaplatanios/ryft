@@ -16,8 +16,8 @@ pub fn linearize_program<Input, Output, V, E, O>(
 ) -> Result<Program<E::Type, V, E::LinearOperation, Input, Output>, TracingError>
 where
     V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
     E: DifferentiableEngine<Value = V> + ?Sized,
     O: Clone + DifferentiableOperation<E>,
 {
@@ -124,8 +124,8 @@ fn transpose_linear_program_with_context<T, V, Input, Output, O>(
 where
     T: Type,
     V: Traceable<T>,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
     O: Clone + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
 {
     fn accumulate<T, V, O>(
@@ -227,8 +227,8 @@ where
         program: &Program<T, V, O, Input, Output>,
     ) -> Result<Program<T, V, O, Output, Input>, TracingError>
     where
-        Input: Parameterized<V, ParameterStructure: Clone>,
-        Output: Parameterized<V, ParameterStructure: Clone>,
+        Input: Parameterized<V>,
+        Output: Parameterized<V>,
     {
         let parent_builder = self.replace_builder(Rc::new(RefCell::new(ProgramBuilder::new())));
         let result = transpose_linear_program_with_context(self, program);
@@ -254,8 +254,8 @@ pub fn transpose_linear_program_with_output_examples<T, V, Input, Output, O>(
 where
     T: Type,
     V: Traceable<T>,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
     O: Clone + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
 {
     let expected_output_count = program.output_ids.len();
@@ -283,8 +283,8 @@ pub fn transpose_traced_linear_program<'engine, Input, Output, V, O, E>(
 ) -> Result<Program<ArrayType, Tracer<'engine, E>, O, Output, Input>, TracingError>
 where
     V: Traceable<ArrayType>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
-    Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
+    Input: Parameterized<Tracer<'engine, E>>,
+    Output: Parameterized<Tracer<'engine, E>>,
     O: Clone
         + LinearOperation<ArrayType, Tracer<'engine, E>, O>
         + SupportsAdd<ArrayType, Tracer<'engine, E>>
@@ -311,8 +311,8 @@ fn materialize_tracer_zero_ops<'engine, Input, Output, V, O, E>(
 ) -> Result<Program<ArrayType, Tracer<'engine, E>, O, Input, Output>, TracingError>
 where
     V: Traceable<ArrayType>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
-    Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
+    Input: Parameterized<Tracer<'engine, E>>,
+    Output: Parameterized<Tracer<'engine, E>>,
     O: Clone
         + LinearOperation<ArrayType, Tracer<'engine, E>, O>
         + SupportsAdd<ArrayType, Tracer<'engine, E>>

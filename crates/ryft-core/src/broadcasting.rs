@@ -219,7 +219,7 @@ impl Broadcastable for Shape {
     }
 }
 
-impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T {
+impl<T: Parameterized<ArrayType>> Broadcastable for T {
     fn broadcast(&self, other: &Self) -> Result<Self, BroadcastingError> {
         let broadcast_to = |lhs: &Self, rhs: &Self| -> Result<Self, BroadcastingError> {
             let structure = rhs.parameter_structure();

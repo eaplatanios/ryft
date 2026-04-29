@@ -11,9 +11,9 @@ use ryft_macros::Parameter;
 
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
 use crate::tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::Differentiable;
-use crate::tracing_v2::PrimitiveOperation;
+use crate::tracing_v2::forward::Differentiable;
 use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
+use crate::tracing_v2::operations::primitive::PrimitiveOperation;
 use crate::tracing_v2::operations::{SupportsAdd, SupportsMul, SupportsNeg, TracedLinearizationCarrier};
 use crate::types::{ArrayType, Type, Typed};
 
@@ -54,16 +54,8 @@ pub trait StagingEngine: Engine {
     fn trace<
         'engine,
         F: FnOnce(Input::To<Tracer<'engine, Self>>) -> Result<Output::To<Tracer<'engine, Self>>, TracingError>,
-        Input: Parameterized<
-                Self::Type,
-                Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>,
-                ParameterStructure: Clone,
-            >,
-        Output: Parameterized<
-                Self::Type,
-                Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>,
-                ParameterStructure: Clone,
-            >,
+        Input: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>>,
+        Output: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>>,
     >(
         &'engine self,
         function: F,
@@ -87,9 +79,9 @@ pub trait StagingEngine: Engine {
         Input: Parameterized<
                 Self::Value,
                 Family: ParameterFamily<Tracer<'engine, Self>>,
-                ParameterStructure: Clone + Debug + PartialEq,
+                ParameterStructure: Debug + PartialEq,
             >,
-        Output: Parameterized<Self::Value, Family: ParameterFamily<Tracer<'engine, Self>>, ParameterStructure: Clone>,
+        Output: Parameterized<Self::Value, Family: ParameterFamily<Tracer<'engine, Self>>>,
     >(
         &'engine self,
         function: F,
@@ -342,16 +334,8 @@ impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
         TracingError,
     >
     where
-        Input: Parameterized<
-                E::Type,
-                ParameterStructure: Clone,
-                Family: ParameterFamily<E::Value> + ParameterFamily<Tracer<'engine, E>>,
-            >,
-        Output: Parameterized<
-                E::Type,
-                ParameterStructure: Clone,
-                Family: ParameterFamily<E::Value> + ParameterFamily<Tracer<'engine, E>>,
-            >,
+        Input: Parameterized<E::Type, Family: ParameterFamily<E::Value> + ParameterFamily<Tracer<'engine, E>>>,
+        Output: Parameterized<E::Type, Family: ParameterFamily<E::Value> + ParameterFamily<Tracer<'engine, E>>>,
         F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     {
         let input_structure = input_types.parameter_structure();

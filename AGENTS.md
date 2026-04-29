@@ -103,6 +103,8 @@ update this file so that they do not need to remind you again in the future.
   references remain in the `ryft` codebase.
 - Use `r#type`, `r#await`, etc. when a reserved Rust keyword must be used as an identifier.
 - Prefer just `size_of::<T>()` instead of `std::mem::size_of<T>()` and do not `use std::mem::size_of` as it is built in.
+- When changing a core trait contract that is consumed by derive macros, run the corresponding macro integration test
+  crate (e.g., `ryft-macros-tests`) in addition to the macro crate's own unit tests.
 
 ### Error Handling
 
@@ -205,6 +207,9 @@ update this file so that they do not need to remind you again in the future.
   cells across multiple lines instead of leaving oversized single-line blocks.
 - When revising one sentence inside a documentation paragraph, reread and polish the whole paragraph so the final
   wording is coherent as a unit instead of sounding locally patched.
+- When editing rustdoc prose, reflow the surrounding paragraph toward the 120-column limit where the text naturally
+  allows it; avoid leaving documentation lines arbitrarily short unless they are lists, code blocks, tables, links, or
+  readability-driven sentence breaks.
 
 ## Testing Guidelines
 

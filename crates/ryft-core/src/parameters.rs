@@ -477,6 +477,8 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///
 ///   - The type on which it is used must be a struct or an enum. Unions are not supported.
 ///   - There must be exactly one generic type bounded by [`Parameter`].
+///   - The reparameterized structure type, with each nested parameter replaced by [`Placeholder`], must implement
+///     [`Clone`]. Deriving [`Clone`] on the same struct or enum is usually the simplest way to satisfy this.
 ///   - The parameter type must be _owned_ in parameter fields (i.e., parameter references or pointers are not allowed).
 ///   - Nested tuples that mix parameterized and non-parameterized elements are supported inside derived structs and
 ///     enums. However, the same kinds of mixed tuples are not generally supported inside other generic containers
@@ -609,11 +611,12 @@ pub trait Parameterized<P: Parameter>: Sized {
     where
         Self::Family: ParameterizedFamily<T>;
 
-    /// Type that represents a shape-only representation of this [`Parameterized`] type with all nested `P` parameter
-    /// types replaced by [`Placeholder`]. This must always be set to `Self::To<Placeholder>`. The only reason this is
-    /// not done by default is that defaulted associated types are not supported in stable Rust, and this forces us to
-    /// require that all implementations provide an implementation for this associated type as well.
-    type ParameterStructure: Parameterized<Placeholder, Family = Self::Family, To<P> = Self>
+    /// Type that represents a reusable shape-only representation of this [`Parameterized`] type with all nested `P`
+    /// parameter types replaced by [`Placeholder`]. This must always be set to `Self::To<Placeholder>`. The only reason
+    /// this is not done by default is that defaulted associated types are not supported in stable Rust, and this forces
+    /// us to require that all implementations provide an implementation for this associated type as well.
+    type ParameterStructure: Clone
+        + Parameterized<Placeholder, Family = Self::Family, To<P> = Self>
         + SameAs<Self::To<Placeholder>>;
 
     /// Iterator returned by [`Self::parameters`] for a borrow of the underlying [`Parameter`]s with lifetime `'t`.

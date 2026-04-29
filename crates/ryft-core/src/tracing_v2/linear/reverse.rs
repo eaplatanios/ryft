@@ -15,8 +15,8 @@ pub fn jvp_program<'engine, E, F, Input, Output, V>(
 where
     E: DifferentiableEngine<Value = V> + 'static,
     V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Output: Parameterized<V>,
     Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
@@ -46,8 +46,8 @@ pub(crate) fn jvp_traced<'engine, F, Input, Output, V, E>(
 ) -> Result<(Output, Output), TracingError>
 where
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
+    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Output: Parameterized<Tracer<'engine, E>>,
     E: DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
@@ -107,8 +107,8 @@ pub fn vjp<'engine, E, F, Input, Output, V>(
 where
     E: DifferentiableEngine<Value = V> + 'static,
     V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Output: Parameterized<V>,
     Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
@@ -137,7 +137,7 @@ where
 pub trait ValueAndGradInvocationLeaf<E, Input>: Parameter + Sized
 where
     E: Engine<Type = ArrayType>,
-    Input: Parameterized<Self, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<Self, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     /// Primal scalar output value produced for the corresponding input regime.
     type Value;
@@ -171,8 +171,8 @@ impl<
         + Differentiable<ArrayType, Tangent = V>
         + Zero<ArrayType>
         + One<ArrayType>
-        + Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+        + Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 > ValueAndGradInvocationLeaf<E, Input> for V
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
@@ -222,8 +222,8 @@ impl<
     V: Traceable<ArrayType>
         + Differentiable<ArrayType, Tangent = V>
         + One<ArrayType>
-        + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+        + Parameterized<V, ParameterStructure: PartialEq>,
+    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: std::fmt::Debug + PartialEq>,
 > ValueAndGradInvocationLeaf<E, Input> for Tracer<'engine, E>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V>
@@ -290,7 +290,7 @@ pub fn value_and_grad<'engine, E, F, Input, Leaf>(
 where
     E: Engine<Type = ArrayType>,
     Leaf: ValueAndGradInvocationLeaf<E, Input>,
-    Input: Parameterized<Leaf, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<Leaf, ParameterStructure: std::fmt::Debug + PartialEq>,
     F: FnOnce(
         <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionInput<'engine>,
     ) -> <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionOutput<'engine>,
@@ -318,7 +318,7 @@ where
         + Differentiable<ArrayType, Tangent = V>
         + Zero<ArrayType>
         + One<ArrayType>
-        + Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+        + Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     V: Parameterized<
             V,
             To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>> = Tracer<
@@ -326,8 +326,8 @@ where
                 DifferentiableOperationStagingEngine<E>,
             >,
         >,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Aux: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Aux: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     Aux::Family: ParameterizedFamily<
             Tracer<'engine, DifferentiableOperationStagingEngine<E>>,
@@ -372,7 +372,7 @@ pub fn grad<'engine, E, F, Input, Leaf>(engine: &'engine E, function: F, primals
 where
     E: Engine<Type = ArrayType>,
     Leaf: ValueAndGradInvocationLeaf<E, Input>,
-    Input: Parameterized<Leaf, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<Leaf, ParameterStructure: std::fmt::Debug + PartialEq>,
     F: FnOnce(
         <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionInput<'engine>,
     ) -> <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionOutput<'engine>,
@@ -397,7 +397,7 @@ where
         + Differentiable<ArrayType, Tangent = V>
         + Zero<ArrayType>
         + One<ArrayType>
-        + Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+        + Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     V: Parameterized<
             V,
             To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>> = Tracer<
@@ -405,8 +405,8 @@ where
                 DifferentiableOperationStagingEngine<E>,
             >,
         >,
-    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Aux: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Aux: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     Aux::Family: ParameterizedFamily<
             Tracer<'engine, DifferentiableOperationStagingEngine<E>>,

@@ -219,16 +219,8 @@ impl<'c> XlaEngine<'c> {
     ///   - `function_name`: Symbol name to use for the outer `func.func` in the emitted module.
     #[allow(private_bounds, private_interfaces)]
     pub fn lower<
-        Input: Parameterized<
-                ArrayType,
-                ParameterStructure: Clone,
-                Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
-            >,
-        Output: Parameterized<
-                ArrayType,
-                ParameterStructure: Clone,
-                Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
-            >,
+        Input: Parameterized<ArrayType, Family: ParameterizedFamily<super::shard_map::ShardMapTensor>>,
+        Output: Parameterized<ArrayType, Family: ParameterizedFamily<super::shard_map::ShardMapTensor>>,
         S: AsRef<str>,
     >(
         &self,
@@ -320,16 +312,8 @@ impl<'c> XlaEngine<'c> {
     ///   - `output_types`: One [`ArrayType`] per traced program output.
     #[allow(private_bounds, private_interfaces)]
     pub fn run<
-        Input: Parameterized<
-                ArrayType,
-                ParameterStructure: Clone,
-                Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
-            >,
-        Output: Parameterized<
-                ArrayType,
-                ParameterStructure: Clone,
-                Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
-            >,
+        Input: Parameterized<ArrayType, Family: ParameterizedFamily<super::shard_map::ShardMapTensor>>,
+        Output: Parameterized<ArrayType, Family: ParameterizedFamily<super::shard_map::ShardMapTensor>>,
         S: AsRef<str>,
     >(
         &self,

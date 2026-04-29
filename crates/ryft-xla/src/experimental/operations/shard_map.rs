@@ -1456,8 +1456,8 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
 
 fn trace_flat_shard_map<
     F: FnOnce(ShardMapLocalTraceInput<Input>) -> ShardMapLocalTraceOutput<Output>,
-    Input: Parameterized<ArrayType, ParameterStructure: Clone>,
-    Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+    Input: Parameterized<ArrayType>,
+    Output: Parameterized<ArrayType>,
 >(
     function: F,
     global_input_types: Input,
@@ -1496,7 +1496,7 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     Ok(Output::from_parameters(output_structure, staged_outputs)?)
 }
 
-fn global_input_types_from_traced_inputs<Input: Parameterized<ShardMapTracer, ParameterStructure: Clone>>(
+fn global_input_types_from_traced_inputs<Input: Parameterized<ShardMapTracer>>(
     traced_inputs: &Input,
 ) -> Result<Input::To<ArrayType>, ShardMapTraceError>
 where
@@ -1516,10 +1516,7 @@ fn reparameterize_shardings<Source: Parameterized<Sharding>, Target: Parameteriz
 }
 
 impl ShardMapInvocationLeaf for ArrayType {
-    type Return<
-        Input: Parameterized<Self, ParameterStructure: Clone>,
-        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-    >
+    type Return<Input: Parameterized<Self>, Output: Parameterized<ArrayType>>
         = TracedShardMap<Input, Output>
     where
         Input::Family: ParameterizedFamily<ArrayType>
@@ -1539,12 +1536,12 @@ impl ShardMapInvocationLeaf for ArrayType {
         check_vma: bool,
     ) -> Result<Self::Return<Input, Output>, ShardMapTraceError>
     where
-        Input: Parameterized<Self, ParameterStructure: Clone>,
+        Input: Parameterized<Self>,
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
-        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+        Output: Parameterized<ArrayType>,
         Output::Family:
             ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
         F: FnOnce(ShardMapLocalTraceInput<Input::To<ArrayType>>) -> ShardMapLocalTraceOutput<Output>,
@@ -1571,10 +1568,7 @@ impl ShardMapInvocationLeaf for ArrayType {
 }
 
 impl ShardMapInvocationLeaf for ShardMapTracer {
-    type Return<
-        Input: Parameterized<Self, ParameterStructure: Clone>,
-        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-    >
+    type Return<Input: Parameterized<Self>, Output: Parameterized<ArrayType>>
         = Output::To<ShardMapTracer>
     where
         Input::Family: ParameterizedFamily<ArrayType>
@@ -1594,12 +1588,12 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
         check_vma: bool,
     ) -> Result<Self::Return<Input, Output>, ShardMapTraceError>
     where
-        Input: Parameterized<Self, ParameterStructure: Clone>,
+        Input: Parameterized<Self>,
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
-        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+        Output: Parameterized<ArrayType>,
         Output::Family:
             ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
         F: FnOnce(ShardMapLocalTraceInput<Input::To<ArrayType>>) -> ShardMapLocalTraceOutput<Output>,

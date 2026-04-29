@@ -169,10 +169,7 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
 ///
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `traced`: Traced XLA handle to render.
-fn traced_xla_records<
-    Input: Parameterized<ArrayType, ParameterStructure: Clone>,
-    Output: Parameterized<ArrayType, ParameterStructure: Clone>,
->(
+fn traced_xla_records<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>(
     case_id: &'static str,
     traced: &TracedXlaProgram<Input, Output>,
 ) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError>

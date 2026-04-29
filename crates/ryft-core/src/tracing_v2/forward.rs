@@ -146,8 +146,8 @@ impl<Ty: Type, V: Traceable<Ty>, T: Clone + Parameter> Traceable<Ty> for JvpTrac
 pub trait JvpInvocationLeaf<E, Input, Output>: Parameter + Sized
 where
     E: Engine<Type = ArrayType>,
-    Input: Parameterized<Self, ParameterStructure: Clone + Debug + PartialEq>,
-    Output: Parameterized<Self, ParameterStructure: Clone>,
+    Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
+    Output: Parameterized<Self>,
 {
     /// Input type expected by the user-provided function.
     type FunctionInput<'engine>
@@ -177,9 +177,9 @@ impl<
     V: Value<ArrayType>
         + Differentiable<ArrayType, Tangent = V>
         + Zero<ArrayType>
-        + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
+        + Parameterized<V, ParameterStructure: PartialEq>,
+    Input: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    Output: Parameterized<V>,
 > JvpInvocationLeaf<E, Input, Output> for V
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
@@ -233,8 +233,8 @@ impl<
     'engine,
     E,
     V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + Debug + PartialEq, To<Tracer<'engine, E>> = Input>,
-    Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Output>,
+    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Debug + PartialEq, To<Tracer<'engine, E>> = Input>,
+    Output: Parameterized<Tracer<'engine, E>, To<Tracer<'engine, E>> = Output>,
 > JvpInvocationLeaf<E, Input, Output> for Tracer<'engine, E>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V>
@@ -287,8 +287,8 @@ pub fn jvp<'engine, E, F, Input, Output, Leaf>(
 where
     E: Engine<Type = ArrayType>,
     Leaf: JvpInvocationLeaf<E, Input, Output>,
-    Input: Parameterized<Leaf, ParameterStructure: Clone + Debug + PartialEq>,
-    Output: Parameterized<Leaf, ParameterStructure: Clone>,
+    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
+    Output: Parameterized<Leaf>,
     F: FnOnce(
         <Leaf as JvpInvocationLeaf<E, Input, Output>>::FunctionInput<'engine>,
     ) -> <Leaf as JvpInvocationLeaf<E, Input, Output>>::FunctionOutput<'engine>,

@@ -107,12 +107,12 @@ impl CodeGenerator {
     ///     #[automatically_derived]
     ///     impl<P: Parameter> ryft::Parameterized<P> for CustomType<P> {
     ///         type Family = CustomType<ryft::Placeholder>;
-    ///         
+    ///
     ///         type To<__P: ryft::Parameter> =
     ///             <Self::Family as ryft::ParameterizedFamily<__P>>::To
     ///         where
     ///             Self::Family: ryft::ParameterizedFamily<__P>;
-    ///         
+    ///
     ///         type ParameterStructure = Self::To<ryft::Placeholder>;
     ///
     ///         type ParameterIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
@@ -188,7 +188,9 @@ impl CodeGenerator {
         let ryft = &generator.ryft_crate;
         let parameter_type = &generator.parameter_type;
         let ident = generator.data.ident();
-        let (impl_generics, ty_generics, where_clause) = generator.generics.split_for_impl();
+        let mut parameterized_generics = generator.generics.clone();
+        generator.add_parameter_structure_clone_bound(&mut parameterized_generics);
+        let (impl_generics, ty_generics, where_clause) = parameterized_generics.split_for_impl();
         let (assoc_types, additional_types_and_impls) = generator.generate_assoc_types();
         let parameter_count = generator.generate_parameter_count_function();
         let parameter_structure = generator.generate_parameter_structure_function();
@@ -361,10 +363,10 @@ impl CodeGenerator {
         /// # Parameters
         ///
         ///   * `generator` - [`CodeGenerator`] from within which this function is called. We need to pass it as an
-        ///     additional argument because Rust function do not capture the surrounding generator.
+        ///     additional argument because Rust functions do not capture the surrounding generator.
         ///   * `field_index` - Index of the [`Field`] in the container in which it belongs.
-        ///   * `field_ident` - Optional [`syn::Ident`] of the [`Field`]. This must be set to [`None`] for anonymous fields
-        ///     (e.g., the fields/elements of a tuple).
+        ///   * `field_ident` - Optional [`syn::Ident`] of the [`Field`]. This must be set to [`None`] for anonymous
+        ///     fields (e.g., the fields/elements of a tuple).
         ///   * `field_ty` - [`syn::Type`] of the [`Field`].
         ///   * `field_attrs` - Optional [`syn::Attribute`]s attached to the [`Field`].
         fn extract_field(
@@ -622,6 +624,24 @@ impl CodeGenerator {
             }
             _ => {}
         });
+    }
+
+    /// Adds the [`Clone`] bound required by [`Parameterized::ParameterStructure`] to the provided [`syn::Generics`].
+    fn add_parameter_structure_clone_bound(&self, generics: &mut syn::Generics) {
+        let parameter_structure = self.parameterized_family_type();
+        let mut bounds = syn::punctuated::Punctuated::new();
+        bounds.push(syn::TypeParamBound::Trait(syn::TraitBound {
+            paren_token: None,
+            modifier: syn::TraitBoundModifier::None,
+            lifetimes: None,
+            path: syn::Path::from(syn::Ident::new("Clone", Span::call_site())),
+        }));
+        generics.make_where_clause().predicates.push(syn::WherePredicate::Type(syn::PredicateType {
+            lifetimes: None,
+            bounded_ty: parameter_structure,
+            colon_token: <syn::Token![:]>::default(),
+            bounds,
+        }));
     }
 
     /// Generates the associated [`Parameterized::Family`], [`Parameterized::To`],
@@ -1120,30 +1140,10 @@ impl CodeGenerator {
         let to_assoc_parameter = quote!(#macro_parameter_type: #ryft::Parameter);
 
         // Generate the [`ParameterizedFamily`] implementation block first.
-        let family_generics = self.generics.with_renamed_param(parameter_type, macro_parameter_type);
+        let mut family_generics = self.generics.with_renamed_param(parameter_type, macro_parameter_type);
+        self.add_parameter_structure_clone_bound(&mut family_generics);
         let (family_impl_generics, _, family_where_clause) = family_generics.split_for_impl();
-        let family_type = if self.generics.params.is_empty() {
-            quote!(#ident)
-        } else {
-            let family_type_args = self.generics.params.iter().map(|parameter| match parameter {
-                syn::GenericParam::Lifetime(lifetime_param) => {
-                    let lifetime = &lifetime_param.lifetime;
-                    quote!(#lifetime)
-                }
-                syn::GenericParam::Type(type_param) if type_param.ident == *parameter_type => {
-                    quote!(#ryft::Placeholder)
-                }
-                syn::GenericParam::Type(type_param) => {
-                    let ident = &type_param.ident;
-                    quote!(#ident)
-                }
-                syn::GenericParam::Const(const_param) => {
-                    let ident = &const_param.ident;
-                    quote!(#ident)
-                }
-            });
-            quote!(#ident<#(#family_type_args),*>)
-        };
+        let family_type = self.parameterized_family_type();
         let family_impl = quote! {
             #[automatically_derived]
             impl #family_impl_generics #ryft::ParameterizedFamily<#macro_parameter_type>
@@ -1671,6 +1671,36 @@ impl CodeGenerator {
             .flat_map(|parameter| parameter.ident())
             .filter(|ident| !field_types.iter().any(|ty| ty.matches_ident(ident) || ty.references_ident(ident)));
         self.generics.without_params(parameters_to_remove)
+    }
+
+    /// Returns the type used as [`Parameterized::Family`] and [`Parameterized::ParameterStructure`]
+    /// for the container currently being derived.
+    fn parameterized_family_type(&self) -> syn::Type {
+        let ident = self.data.ident();
+        let parameter_type = &self.parameter_type;
+        let ryft = &self.ryft_crate;
+        if self.generics.params.is_empty() {
+            syn::parse_quote!(#ident)
+        } else {
+            let family_type_args = self.generics.params.iter().map(|parameter| match parameter {
+                syn::GenericParam::Lifetime(lifetime_param) => {
+                    let lifetime = &lifetime_param.lifetime;
+                    quote!(#lifetime)
+                }
+                syn::GenericParam::Type(type_param) if type_param.ident == *parameter_type => {
+                    quote!(#ryft::Placeholder)
+                }
+                syn::GenericParam::Type(type_param) => {
+                    let ident = &type_param.ident;
+                    quote!(#ident)
+                }
+                syn::GenericParam::Const(const_param) => {
+                    let ident = &const_param.ident;
+                    quote!(#ident)
+                }
+            });
+            syn::parse_quote!(#ident<#(#family_type_args),*>)
+        }
     }
 }
 
@@ -2280,7 +2310,8 @@ mod tests {
                 impl < __P : Parameter > ryft :: ParameterizedFamily < __P > for Container < ryft :: Placeholder > \
                 where __P : ryft :: Parameterized < __P , ParameterStructure = ryft :: Placeholder > , \
                       __P : ryft :: Parameterized < __P , ParameterStructure = ryft :: Placeholder > , \
-                      usize : Clone { type To = Container < __P > ; }\
+                      usize : Clone , \
+                      Container < ryft :: Placeholder > : Clone { type To = Container < __P > ; }\
             "},
         );
     }

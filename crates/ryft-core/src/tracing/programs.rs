@@ -255,13 +255,8 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O: Operation<T>, Input: Par
     marker: PhantomData<fn(Input) -> Output>,
 }
 
-impl<
-    T: Type,
-    V: Traceable<T>,
-    O: Clone + Operation<T>,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-> Clone for Program<T, V, O, Input, Output>
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>> Clone
+    for Program<T, V, O, Input, Output>
 {
     fn clone(&self) -> Self {
         Self {
@@ -289,7 +284,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
     #[inline]
     pub fn input(&self) -> Result<Input::To<Atom<T, V>>, ParameterError>
     where
-        Input::ParameterStructure: Clone,
         Input::Family: ParameterizedFamily<Atom<T, V>>,
     {
         Input::To::<Atom<T, V>>::from_parameters(self.input_structure.clone(), self.inputs().cloned())
@@ -305,7 +299,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
     #[inline]
     pub fn output(&self) -> Result<Output::To<Atom<T, V>>, ParameterError>
     where
-        Output::ParameterStructure: Clone,
         Output::Family: ParameterizedFamily<Atom<T, V>>,
     {
         Output::To::<Atom<T, V>>::from_parameters(self.output_structure.clone(), self.outputs().cloned())
@@ -316,8 +309,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
     pub fn simplified(&self) -> Result<Self, TracingError>
     where
         O: Clone,
-        Input::ParameterStructure: Clone,
-        Output::ParameterStructure: Clone,
     {
         /// Adds the [`Atom`] that corresponds to the provided `atom_id` to the provided `builder`, along with its
         /// transitive producers, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`.
@@ -576,7 +567,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
     where
         O: InterpretableOperation<T, V>,
         Input::ParameterStructure: Debug + PartialEq,
-        Output::ParameterStructure: Clone,
     {
         // Validate that the caller supplied an input with the expected parameter structure.
         let input_structure = input.parameter_structure();

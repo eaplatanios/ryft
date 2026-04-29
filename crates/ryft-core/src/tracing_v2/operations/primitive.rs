@@ -533,7 +533,7 @@ impl<
         + ControlFlowValue,
 > InterpretableOperation<ArrayType, V> for PrimitiveOperation<V>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
@@ -568,7 +568,7 @@ impl<
         + ControlFlowValue,
 > InterpretableOperation<ArrayType, V> for LinearPrimitiveOperation<V>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
@@ -600,7 +600,7 @@ where
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-    Vec<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Vec<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         match self {
@@ -640,7 +640,7 @@ impl<
         + ControlFlowValue,
 > LinearOperation<ArrayType, V> for LinearPrimitiveOperation<V>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose(
         &self,
@@ -700,8 +700,8 @@ impl<
 > DifferentiableOperation<E> for PrimitiveOperation<V>
 where
     V: Differentiable<ArrayType, Tangent = V>,
-    V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    V::ParameterStructure: std::fmt::Debug + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearPrimitiveOperation<V>: super::SupportsAdd<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
@@ -765,8 +765,8 @@ where
         + 'static,
     EInner:
         DifferentiableStagingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>> + ?Sized + 'static,
-    V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    V::ParameterStructure: std::fmt::Debug + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearPrimitiveOperation<V>: super::SupportsAdd<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
