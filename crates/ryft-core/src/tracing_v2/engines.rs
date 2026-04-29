@@ -100,16 +100,19 @@ pub trait StagingEngine: Engine {
             },
             input_types,
         )?;
-        let output_structure = output_structure.unwrap();
-        let Program { atoms, input_ids, output_ids, instructions, .. } = flat_program;
-        let mut builder = ProgramBuilder::new();
-        builder.atoms = atoms;
-        builder.input_ids = input_ids;
-        builder.instructions = instructions;
-        let program = builder.build::<I, O>(output_ids, input_structure, output_structure)?;
-        let program = program.simplified()?;
-        let concrete_input = I::from_parameters(program.input_structure.clone(), input_values)?;
-        Ok((program.interpret(concrete_input)?, program))
+        let output_structure = output_structure.expect("the function being traced should have been invoked");
+        let flat_program = flat_program.into_simplified()?;
+        let output = O::from_parameters(output_structure.clone(), flat_program.interpret(input_values)?)?;
+        let program = Program {
+            atoms: flat_program.atoms,
+            input_ids: flat_program.input_ids,
+            output_ids: flat_program.output_ids,
+            instructions: flat_program.instructions,
+            input_structure,
+            output_structure,
+            marker: PhantomData,
+        };
+        Ok((output, program))
     }
 }
 
@@ -940,6 +943,32 @@ mod tests {
                     %2:f64[] = sin %0
                     %3:f64[] = add %1 %2
                 in (%3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_interpret_and_trace_prunes_unused_staged_operations() {
+        let engine = ScalarEngine::<f64>::new();
+        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+            .interpret_and_trace(
+                |x: Tracer<ScalarEngine<f64>>| {
+                    let _unused = x.clone().sin();
+                    Ok(x.clone() * x)
+                },
+                2.0f64,
+            )
+            .unwrap();
+
+        assert_eq!(output, 4.0);
+        assert_eq!(program.interpret(0.5f64).unwrap(), 0.25);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                in (%1)
             "}
             .trim_end(),
         );

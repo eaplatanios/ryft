@@ -252,7 +252,7 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O: Operation<T>, Input: Par
     pub output_structure: Output::ParameterStructure,
 
     /// [`PhantomData`] marker that ties this [`Program`] to its structured `Input` and `Output` types.
-    marker: PhantomData<fn(Input) -> Output>,
+    pub marker: PhantomData<fn(Input) -> Output>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>> Clone
