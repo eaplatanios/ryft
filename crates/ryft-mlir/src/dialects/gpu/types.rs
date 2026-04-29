@@ -1,6 +1,11 @@
 use ryft_xla_sys::bindings::{MlirType, mlirGPUAsyncTokenTypeGet};
+use ryft_xla_sys::mlir::dialects::gpu::{
+    MlirGpuSparseHandleType, mlirGpuMmaMatrixTypeGet, mlirGpuMmaMatrixTypeGetDimSize,
+    mlirGpuMmaMatrixTypeGetElementType, mlirGpuMmaMatrixTypeGetNumDims, mlirGpuMmaMatrixTypeGetOperand,
+    mlirGpuSparseHandleTypeGet, mlirTypeIsAGpuMmaMatrixType, mlirTypeIsAGpuSparseHandleType,
+};
 
-use crate::{Context, DialectHandle, Type, TypeRef, mlir_subtype_trait_impls};
+use crate::{Context, DialectHandle, StringRef, Type, TypeRef, mlir_subtype_trait_impls};
 
 /// GPU asynchronous token [`Type`]. GPU async tokens order operations that execute asynchronously on the device.
 /// Operations implementing the GPU `async` operation interface consume zero or more token dependencies and may produce
@@ -48,8 +53,7 @@ impl MmaMatrixOperand {
 }
 
 /// GPU MMA matrix [`Type`]. This type represents a matrix fragment held collectively by a subgroup for matrix
-/// multiply-accumulate (MMA) operations. The current MLIR C API does not expose a direct constructor/checker, so this
-/// wrapper is built through the dialect parser and specialized by checking the printed dialect type spelling.
+/// multiply-accumulate (MMA) operations.
 ///
 /// Refer to the [official MLIR GPU dialect documentation](https://mlir.llvm.org/docs/Dialects/GPU/#gpummamatrix)
 /// for more information.
@@ -65,47 +69,28 @@ pub struct MmaMatrixTypeRef<'c, 't> {
 impl<'c, 't> MmaMatrixTypeRef<'c, 't> {
     /// Returns the two-dimensional matrix shape.
     pub fn shape(&self) -> [usize; 2] {
-        // TODO(eaplatanios): Replace this printed-form parsing with a proper `ryft-xla-sys` C++ binding for
-        //  `gpu::MMAMatrixType` shape accessors.
-        let source = self.to_string();
-        let payload = source
-            .strip_prefix("!gpu.mma_matrix<")
-            .and_then(|source| source.strip_suffix(">"))
-            .expect("invalid `!gpu.mma_matrix` type");
-        let (typed_shape, _) = payload.split_once(", ").expect("invalid `!gpu.mma_matrix` type");
-        let (first_dimension, remaining) = typed_shape.split_once('x').expect("invalid `!gpu.mma_matrix` shape");
-        let (second_dimension, _) = remaining.rsplit_once('x').expect("invalid `!gpu.mma_matrix` element type");
+        let dimension_count = unsafe { mlirGpuMmaMatrixTypeGetNumDims(self.handle) };
+        assert_eq!(dimension_count, 2, "invalid `!gpu.mma_matrix` shape");
         [
-            first_dimension.parse().expect("invalid `!gpu.mma_matrix` first dimension"),
-            second_dimension.parse().expect("invalid `!gpu.mma_matrix` second dimension"),
+            usize::try_from(unsafe { mlirGpuMmaMatrixTypeGetDimSize(self.handle, 0) })
+                .expect("invalid `!gpu.mma_matrix` first dimension"),
+            usize::try_from(unsafe { mlirGpuMmaMatrixTypeGetDimSize(self.handle, 1) })
+                .expect("invalid `!gpu.mma_matrix` second dimension"),
         ]
     }
 
     /// Returns the element [`Type`] of this MMA matrix.
     pub fn element_type(&self) -> TypeRef<'c, 't> {
-        // TODO(eaplatanios): Replace this printed-form parsing with a proper `ryft-xla-sys` C++ binding for
-        //  `gpu::MMAMatrixType` element-type accessors.
-        let source = self.to_string();
-        let payload = source
-            .strip_prefix("!gpu.mma_matrix<")
-            .and_then(|source| source.strip_suffix(">"))
-            .expect("invalid `!gpu.mma_matrix` type");
-        let (typed_shape, _) = payload.split_once(", ").expect("invalid `!gpu.mma_matrix` type");
-        let (_, element_type) = typed_shape.rsplit_once('x').expect("invalid `!gpu.mma_matrix` element type");
-        self.context().parse_type(element_type).expect("invalid `!gpu.mma_matrix` element type")
+        unsafe {
+            TypeRef::from_c_api(mlirGpuMmaMatrixTypeGetElementType(self.handle), self.context)
+                .expect("invalid `!gpu.mma_matrix` element type")
+        }
     }
 
     /// Returns the MMA operand role of this matrix.
     pub fn operand(&self) -> MmaMatrixOperand {
-        // TODO(eaplatanios): Replace this printed-form parsing with a proper `ryft-xla-sys` C++ binding for
-        //  `gpu::MMAMatrixType` operand accessors.
-        let source = self.to_string();
-        let payload = source
-            .strip_prefix("!gpu.mma_matrix<")
-            .and_then(|source| source.strip_suffix(">"))
-            .expect("invalid `!gpu.mma_matrix` type");
-        let (_, operand) = payload.split_once(", ").expect("invalid `!gpu.mma_matrix` operand");
-        match operand.trim_matches('"') {
+        let operand = unsafe { StringRef::from_c_api(mlirGpuMmaMatrixTypeGetOperand(self.handle)) };
+        match operand.as_str().expect("invalid `!gpu.mma_matrix` operand") {
             "AOp" => MmaMatrixOperand::A,
             "BOp" => MmaMatrixOperand::B,
             "COp" => MmaMatrixOperand::C,
@@ -119,10 +104,7 @@ impl<'c, 't> Type<'c, 't> for MmaMatrixTypeRef<'c, 't> {
         if handle.ptr.is_null() {
             return None;
         }
-        let r#type = unsafe { TypeRef::from_c_api(handle, context) }?;
-        // TODO(eaplatanios): Replace this printed-form subtype check with a proper `ryft-xla-sys` C++ binding for
-        //  checking `gpu::MMAMatrixType`.
-        if r#type.to_string().starts_with("!gpu.mma_matrix<") { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirTypeIsAGpuMmaMatrixType(handle) } { Some(Self { handle, context }) } else { None }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -137,13 +119,10 @@ impl<'c, 't> Type<'c, 't> for MmaMatrixTypeRef<'c, 't> {
 mlir_subtype_trait_impls!(MmaMatrixTypeRef<'c, 't> as Type, mlir_type = Type);
 
 macro_rules! gpu_sparse_handle_type {
-    ($name:ident, $context_method:ident, $spelling:literal, $description:literal $(,)*) => {
+    ($name:ident, $context_method:ident, $kind:path, $description:literal $(,)*) => {
         #[doc = "GPU sparse "]
         #[doc = $description]
         #[doc = " handle [`Type`]."]
-        ///
-        /// The current MLIR C API does not expose a direct constructor/checker for this type, so this wrapper is built
-        /// through the dialect parser and specialized by checking the printed dialect type spelling.
         #[derive(Copy, Clone)]
         pub struct $name<'c, 't> {
             /// Handle that represents this [`Type`] in the MLIR C API.
@@ -158,10 +137,7 @@ macro_rules! gpu_sparse_handle_type {
                 if handle.ptr.is_null() {
                     return None;
                 }
-                let r#type = unsafe { TypeRef::from_c_api(handle, context) }?;
-                // TODO(eaplatanios): Replace this printed-form subtype check with a proper `ryft-xla-sys` C++
-                //  binding for GPU sparse handle types.
-                if r#type.to_string() == concat!("!gpu.", $spelling) {
+                if unsafe { mlirTypeIsAGpuSparseHandleType(handle, $kind) } {
                     Some(Self { handle, context })
                 } else {
                     None
@@ -184,21 +160,21 @@ macro_rules! gpu_sparse_handle_type {
 gpu_sparse_handle_type!(
     SparseDnTensorHandleTypeRef,
     gpu_sparse_dn_tensor_handle_type,
-    "sparse.dntensor_handle",
+    MlirGpuSparseHandleType::RYFT_MLIR_GPU_SPARSE_DN_TENSOR_HANDLE_TYPE,
     "dense tensor",
 );
 
 gpu_sparse_handle_type!(
     SparseSpMatHandleTypeRef,
     gpu_sparse_sp_mat_handle_type,
-    "sparse.spmat_handle",
+    MlirGpuSparseHandleType::RYFT_MLIR_GPU_SPARSE_SP_MAT_HANDLE_TYPE,
     "sparse matrix",
 );
 
 gpu_sparse_handle_type!(
     SparseSpGemmOperationHandleTypeRef,
     gpu_sparse_sp_gemm_operation_handle_type,
-    "sparse.spgemmop_handle",
+    MlirGpuSparseHandleType::RYFT_MLIR_GPU_SPARSE_SP_GEMM_OPERATION_HANDLE_TYPE,
     "SpGEMM operation",
 );
 
@@ -217,47 +193,68 @@ impl<'t> Context<'t> {
         operand: MmaMatrixOperand,
     ) -> MmaMatrixTypeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
-        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
-        //  constructing `gpu::MMAMatrixType`.
-        self.parse_type(format!(
-            "!gpu.mma_matrix<{}x{}x{}, \"{}\">",
-            shape[0],
-            shape[1],
-            element_type,
-            operand.as_str(),
-        ))
-        .and_then(|r#type| r#type.cast())
-        .expect("invalid arguments to `Context::gpu_mma_matrix_type`")
+        unsafe {
+            let shape = [
+                i64::try_from(shape[0]).expect("invalid `!gpu.mma_matrix` first dimension"),
+                i64::try_from(shape[1]).expect("invalid `!gpu.mma_matrix` second dimension"),
+            ];
+            let operand = StringRef::from(operand.as_str());
+            MmaMatrixTypeRef::from_c_api(
+                mlirGpuMmaMatrixTypeGet(
+                    element_type.to_c_api(),
+                    shape.as_ptr(),
+                    shape.len().cast_signed(),
+                    operand.to_c_api(),
+                ),
+                self,
+            )
+            .expect("invalid arguments to `Context::gpu_mma_matrix_type`")
+        }
     }
 
     /// Creates a new GPU dense tensor sparse handle type owned by this [`Context`].
     pub fn gpu_sparse_dn_tensor_handle_type<'c>(&'c self) -> SparseDnTensorHandleTypeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
-        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
-        //  constructing `gpu::SparseDnTensorHandleType`.
-        self.parse_type("!gpu.sparse.dntensor_handle")
-            .and_then(|r#type| r#type.cast())
+        unsafe {
+            SparseDnTensorHandleTypeRef::from_c_api(
+                mlirGpuSparseHandleTypeGet(
+                    *self.handle.borrow_mut(),
+                    MlirGpuSparseHandleType::RYFT_MLIR_GPU_SPARSE_DN_TENSOR_HANDLE_TYPE,
+                ),
+                self,
+            )
             .expect("invalid GPU dense tensor sparse handle type")
+        }
     }
 
     /// Creates a new GPU sparse matrix handle type owned by this [`Context`].
     pub fn gpu_sparse_sp_mat_handle_type<'c>(&'c self) -> SparseSpMatHandleTypeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
-        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
-        //  constructing `gpu::SparseSpMatHandleType`.
-        self.parse_type("!gpu.sparse.spmat_handle")
-            .and_then(|r#type| r#type.cast())
+        unsafe {
+            SparseSpMatHandleTypeRef::from_c_api(
+                mlirGpuSparseHandleTypeGet(
+                    *self.handle.borrow_mut(),
+                    MlirGpuSparseHandleType::RYFT_MLIR_GPU_SPARSE_SP_MAT_HANDLE_TYPE,
+                ),
+                self,
+            )
             .expect("invalid GPU sparse matrix handle type")
+        }
     }
 
     /// Creates a new GPU SpGEMM operation handle type owned by this [`Context`].
     pub fn gpu_sparse_sp_gemm_operation_handle_type<'c>(&'c self) -> SparseSpGemmOperationHandleTypeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
-        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
-        //  constructing `gpu::SparseSpGEMMOpHandleType`.
-        self.parse_type("!gpu.sparse.spgemmop_handle")
-            .and_then(|r#type| r#type.cast())
+        unsafe {
+            SparseSpGemmOperationHandleTypeRef::from_c_api(
+                mlirGpuSparseHandleTypeGet(
+                    *self.handle.borrow_mut(),
+                    MlirGpuSparseHandleType::RYFT_MLIR_GPU_SPARSE_SP_GEMM_OPERATION_HANDLE_TYPE,
+                ),
+                self,
+            )
             .expect("invalid GPU SpGEMM operation handle type")
+        }
     }
 }
 

@@ -40,4 +40,5 @@ pub fn pjrt_metal_plugin_path() -> PathBuf {
 
 pub mod bindings;
 pub mod distributed;
+pub mod mlir;
 pub mod protos;

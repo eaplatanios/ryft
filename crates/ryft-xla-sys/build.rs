@@ -698,6 +698,11 @@ impl BuildConfiguration {
             PathBuf::from("pjrt_plugin.def"),
             PathBuf::from("pjrt_plugin_exported_symbols.txt"),
             PathBuf::from("pjrt_plugin_version_script.lds"),
+            PathBuf::from("src").join("c++").join("common.h"),
+            PathBuf::from("src").join("c++").join("distributed.cc"),
+            PathBuf::from("src").join("c++").join("distributed.h"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.cc"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.h"),
             PathBuf::from("WORKSPACE"),
         ];
 

@@ -4,10 +4,20 @@ use ryft_xla_sys::bindings::{
     mlirGPUObjectAttrGetTarget, mlirGPUObjectAttrGetWithKernels, mlirGPUObjectAttrHasKernels,
     mlirGPUObjectAttrHasProperties,
 };
+use ryft_xla_sys::mlir::dialects::gpu::{
+    MlirGpuEnumAttribute, MlirGpuMappingAttribute, mlirAttributeIsAGpuEnumAttr, mlirAttributeIsAGpuKernelMetadataAttr,
+    mlirAttributeIsAGpuKernelTableAttr, mlirAttributeIsAGpuMappingAttr, mlirAttributeIsAGpuMappingMaskAttr,
+    mlirAttributeIsAGpuMemorySpaceMappingAttr, mlirAttributeIsAGpuParallelLoopDimMappingAttr,
+    mlirAttributeIsAGpuSelectObjectAttr, mlirGpuEnumAttrGet, mlirGpuEnumAttrGetValue, mlirGpuKernelMetadataAttrGet,
+    mlirGpuKernelTableAttrGet, mlirGpuMappingAttrGet, mlirGpuMappingAttrGetValue, mlirGpuMappingMaskAttrGet,
+    mlirGpuMappingMaskAttrGetMask, mlirGpuMemorySpaceMappingAttrGet, mlirGpuMemorySpaceMappingAttrGetAddressSpace,
+    mlirGpuParallelLoopDimMappingAttrGet, mlirGpuParallelLoopDimMappingAttrGetBound,
+    mlirGpuParallelLoopDimMappingAttrGetMap, mlirGpuParallelLoopDimMappingAttrGetProcessor, mlirGpuSelectObjectAttrGet,
+};
 
 use crate::{
-    AffineMap, AffineMapAttributeRef, ArrayAttributeRef, Attribute, AttributeRef, Context, DialectHandle,
-    DictionaryAttributeRef, FromWithContext, FunctionTypeRef, StringRef, mlir_subtype_trait_impls,
+    AffineMap, ArrayAttributeRef, Attribute, AttributeRef, Context, DialectHandle, DictionaryAttributeRef,
+    FromWithContext, FunctionTypeRef, StringRef, Type, mlir_subtype_trait_impls,
 };
 
 /// GPU compilation object format.
@@ -121,58 +131,7 @@ impl<'c, 't> Attribute<'c, 't> for ObjectAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(ObjectAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
-/// Extracts the payload from printed GPU attribute source if it uses the provided mnemonic.
-fn gpu_attribute_payload<'a>(source: &'a str, mnemonic: &str) -> Option<&'a str> {
-    let prefixed_prefix = format!("#gpu.{mnemonic}<");
-    let dialect_prefix = format!("#gpu<{mnemonic} ");
-    source
-        .strip_prefix(prefixed_prefix.as_str())
-        .and_then(|source| source.strip_suffix(">"))
-        .or_else(|| source.strip_prefix(dialect_prefix.as_str()).and_then(|source| source.strip_suffix(">")))
-}
-
-/// Returns whether printed GPU attribute source uses one of MLIR's spellings for the provided mnemonic.
-fn gpu_attribute_has_mnemonic(source: &str, mnemonic: &str) -> bool {
-    gpu_attribute_payload(source, mnemonic).is_some() || source == format!("#gpu.{mnemonic}")
-}
-
-/// Extracts a named field from the printed source of a GPU struct-like attribute.
-fn gpu_struct_attribute_field(source: &str, mnemonic: &str, field_name: &str) -> Option<String> {
-    let payload = gpu_attribute_payload(source, mnemonic)?;
-    let mut start = 0;
-    let mut angle_depth = 0usize;
-    let mut brace_depth = 0usize;
-    let mut bracket_depth = 0usize;
-    let mut parenthesis_depth = 0usize;
-    let field_prefix = format!("{field_name} = ");
-
-    for (index, character) in payload.char_indices() {
-        match character {
-            '<' => angle_depth += 1,
-            '>' => angle_depth = angle_depth.saturating_sub(1),
-            '{' => brace_depth += 1,
-            '}' => brace_depth = brace_depth.saturating_sub(1),
-            '[' => bracket_depth += 1,
-            ']' => bracket_depth = bracket_depth.saturating_sub(1),
-            '(' => parenthesis_depth += 1,
-            ')' => parenthesis_depth = parenthesis_depth.saturating_sub(1),
-            ',' if angle_depth == 0 && brace_depth == 0 && bracket_depth == 0 && parenthesis_depth == 0 => {
-                let field = payload[start..index].trim();
-                if let Some(value) = field.strip_prefix(field_prefix.as_str()) {
-                    return Some(value.trim().to_owned());
-                }
-                start = index + character.len_utf8();
-            }
-            _ => {}
-        }
-    }
-
-    payload[start..].trim().strip_prefix(field_prefix.as_str()).map(|value| value.trim().to_owned())
-}
-
-/// GPU [`Attribute`] for storing metadata related to a compiled kernel. The current MLIR C API does not expose direct
-/// field accessors for this attribute, so this wrapper is specialized by checking the printed dialect attribute
-/// spelling and constructed through the MLIR parser.
+/// GPU [`Attribute`] for storing metadata related to a compiled kernel.
 ///
 /// Refer to the [MLIR docs] for more information.
 ///
@@ -191,14 +150,7 @@ impl<'c, 't> Attribute<'c, 't> for KernelMetadataAttributeRef<'c, 't> {
         if handle.ptr.is_null() {
             return None;
         }
-        let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-        // TODO(eaplatanios): Replace this printed-form subtype check with a proper `ryft-xla-sys` C++ binding for
-        // GPU kernel metadata attributes.
-        if gpu_attribute_has_mnemonic(attribute.to_string().as_str(), "kernel_metadata") {
-            Some(Self { handle, context })
-        } else {
-            None
-        }
+        if unsafe { mlirAttributeIsAGpuKernelMetadataAttr(handle) } { Some(Self { handle, context }) } else { None }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -213,9 +165,6 @@ impl<'c, 't> Attribute<'c, 't> for KernelMetadataAttributeRef<'c, 't> {
 mlir_subtype_trait_impls!(KernelMetadataAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
 /// GPU [`Attribute`] representing a table of [`KernelMetadataAttributeRef`] values.
-///
-/// The current MLIR C API does not expose direct field accessors for this attribute, so this wrapper is specialized by
-/// checking the printed dialect attribute spelling and constructed through the MLIR parser.
 ///
 /// Refer to the [official MLIR GPU dialect documentation](https://mlir.llvm.org/docs/Dialects/GPU/#gpukerneltableattr)
 /// for more information.
@@ -233,14 +182,7 @@ impl<'c, 't> Attribute<'c, 't> for KernelTableAttributeRef<'c, 't> {
         if handle.ptr.is_null() {
             return None;
         }
-        let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-        // TODO(eaplatanios): Replace this printed-form subtype check with a proper `ryft-xla-sys` C++ binding for
-        // GPU kernel table attributes.
-        if gpu_attribute_has_mnemonic(attribute.to_string().as_str(), "kernel_table") {
-            Some(Self { handle, context })
-        } else {
-            None
-        }
+        if unsafe { mlirAttributeIsAGpuKernelTableAttr(handle) } { Some(Self { handle, context }) } else { None }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -272,14 +214,7 @@ impl<'c, 't> Attribute<'c, 't> for SelectObjectAttributeRef<'c, 't> {
         if handle.ptr.is_null() {
             return None;
         }
-        let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-        // TODO(eaplatanios): Replace this printed-form subtype check with a proper `ryft-xla-sys` C++ binding for
-        // GPU select-object attributes.
-        if gpu_attribute_has_mnemonic(attribute.to_string().as_str(), "select_object") {
-            Some(Self { handle, context })
-        } else {
-            None
-        }
+        if unsafe { mlirAttributeIsAGpuSelectObjectAttr(handle) } { Some(Self { handle, context }) } else { None }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -293,32 +228,13 @@ impl<'c, 't> Attribute<'c, 't> for SelectObjectAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(SelectObjectAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
-/// Extracts the enum value payload from a textual GPU enum attribute if it uses the expected mnemonic.
-fn gpu_enum_attribute_value(source: &str, mnemonic: &str) -> Option<String> {
-    let plain_prefix = format!("#gpu.{mnemonic} ");
-    gpu_attribute_payload(source, mnemonic)
-        .or_else(|| source.strip_prefix(plain_prefix.as_str()))
-        .map(|source| source.trim_matches('"'))
-        .map(str::to_owned)
-}
-
-/// Builds the textual MLIR source for a GPU enum attribute using its mnemonic and MLIR-spelled value.
-fn gpu_enum_attribute_source(mnemonic: &str, value: &str, uses_prefixed_format: bool) -> String {
-    if uses_prefixed_format { format!("#gpu.{mnemonic}<\"{value}\">") } else { format!("#gpu<{mnemonic} \"{value}\">") }
-}
-
-/// Builds the textual MLIR source for a GPU single-parameter attribute.
-fn gpu_single_parameter_attribute_source(mnemonic: &str, value: &str) -> String {
-    format!("#gpu.{mnemonic}<{value}>")
-}
-
 macro_rules! gpu_enum_attribute {
     (
         enum_name = $enum_name:ident,
         attribute_name = $attribute_name:ident,
         context_method = $context_method:ident,
+        ffi_kind = $ffi_kind:path,
         mnemonic = $mnemonic:literal,
-        uses_prefixed_format = $uses_prefixed_format:literal,
         description = $description:literal,
         variants = { $($variant:ident => $value:literal),+ $(,)* } $(,)*
     ) => {
@@ -362,10 +278,11 @@ macro_rules! gpu_enum_attribute {
         impl<'c, 't> $attribute_name<'c, 't> {
             /// Returns the enum value stored in this attribute.
             pub fn value(&self) -> $enum_name {
-                // TODO(eaplatanios): Replace this printed-form value extraction with a proper `ryft-xla-sys` C++
-                // binding for this GPU enum attribute.
-                gpu_enum_attribute_value(self.to_string().as_str(), $mnemonic)
-                    .and_then(|value| $enum_name::from_str(value.as_str()))
+                let value = unsafe { StringRef::from_c_api(mlirGpuEnumAttrGetValue(self.handle, $ffi_kind)) };
+                value
+                    .as_str()
+                    .ok()
+                    .and_then($enum_name::from_str)
                     .expect(concat!("invalid `#gpu.", $mnemonic, "` attribute"))
             }
         }
@@ -375,13 +292,7 @@ macro_rules! gpu_enum_attribute {
                 if handle.ptr.is_null() {
                     return None;
                 }
-                let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-                // TODO(eaplatanios): Replace this printed-form subtype and value check with a proper
-                // `ryft-xla-sys` C++ binding for this GPU enum attribute.
-                if gpu_enum_attribute_value(attribute.to_string().as_str(), $mnemonic)
-                    .and_then(|value| $enum_name::from_str(value.as_str()))
-                    .is_some()
-                {
+                if unsafe { mlirAttributeIsAGpuEnumAttr(handle, $ffi_kind) } {
                     Some(Self { handle, context })
                 } else {
                     None
@@ -411,13 +322,14 @@ macro_rules! gpu_enum_attribute {
             #[doc = " attribute owned by this [`Context`]."]
             pub fn $context_method<'c>(&'c self, value: $enum_name) -> $attribute_name<'c, 't> {
                 self.load_dialect(DialectHandle::gpu());
-                // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++
-                // binding for this GPU enum attribute.
-                self.parse_attribute(
-                    gpu_enum_attribute_source($mnemonic, value.as_str(), $uses_prefixed_format).as_str(),
-                )
-                    .and_then(|attribute| attribute.cast())
+                let value = StringRef::from(value.as_str());
+                unsafe {
+                    $attribute_name::from_c_api(
+                        mlirGpuEnumAttrGet(*self.handle.borrow_mut(), $ffi_kind, value.to_c_api()),
+                        self,
+                    )
                     .expect(concat!("invalid arguments to `Context::", stringify!($context_method), "`"))
+                }
             }
         }
     };
@@ -427,8 +339,8 @@ gpu_enum_attribute!(
     enum_name = AddressSpace,
     attribute_name = AddressSpaceAttributeRef,
     context_method = gpu_address_space_attribute,
+    ffi_kind = MlirGpuEnumAttribute::RYFT_MLIR_GPU_ENUM_ATTRIBUTE_ADDRESS_SPACE,
     mnemonic = "address_space",
-    uses_prefixed_format = true,
     description = "address space",
     variants = {
         Global => "global",
@@ -442,8 +354,8 @@ gpu_enum_attribute!(
     enum_name = Dimension,
     attribute_name = DimensionAttributeRef,
     context_method = gpu_dimension_attribute,
+    ffi_kind = MlirGpuEnumAttribute::RYFT_MLIR_GPU_ENUM_ATTRIBUTE_DIMENSION,
     mnemonic = "dim",
-    uses_prefixed_format = false,
     description = "dimension",
     variants = {
         X => "x",
@@ -456,8 +368,8 @@ gpu_enum_attribute!(
     enum_name = AllReduceOperationKind,
     attribute_name = AllReduceOperationKindAttributeRef,
     context_method = gpu_all_reduce_operation_kind_attribute,
+    ffi_kind = MlirGpuEnumAttribute::RYFT_MLIR_GPU_ENUM_ATTRIBUTE_ALL_REDUCE_OPERATION_KIND,
     mnemonic = "all_reduce_op",
-    uses_prefixed_format = false,
     description = "all-reduce operation kind",
     variants = {
         Add => "add",
@@ -480,8 +392,8 @@ gpu_enum_attribute!(
     enum_name = ShuffleMode,
     attribute_name = ShuffleModeAttributeRef,
     context_method = gpu_shuffle_mode_attribute,
+    ffi_kind = MlirGpuEnumAttribute::RYFT_MLIR_GPU_ENUM_ATTRIBUTE_SHUFFLE_MODE,
     mnemonic = "shuffle_mode",
-    uses_prefixed_format = false,
     description = "shuffle mode",
     variants = {
         Xor => "xor",
@@ -495,8 +407,8 @@ gpu_enum_attribute!(
     enum_name = MmaElementwiseOperation,
     attribute_name = MmaElementwiseOperationAttributeRef,
     context_method = gpu_mma_elementwise_operation_attribute,
+    ffi_kind = MlirGpuEnumAttribute::RYFT_MLIR_GPU_ENUM_ATTRIBUTE_MMA_ELEMENTWISE_OPERATION,
     mnemonic = "mma_element_wise",
-    uses_prefixed_format = false,
     description = "MMA elementwise operation",
     variants = {
         AddFloat => "addf",
@@ -521,8 +433,8 @@ gpu_enum_attribute!(
     enum_name = Prune2To4SparseMatrixFlag,
     attribute_name = Prune2To4SparseMatrixFlagAttributeRef,
     context_method = gpu_prune_2_to_4_sparse_matrix_flag_attribute,
+    ffi_kind = MlirGpuEnumAttribute::RYFT_MLIR_GPU_ENUM_ATTRIBUTE_PRUNE_2_TO_4_SPARSE_MATRIX_FLAG,
     mnemonic = "prune_2to4_spmat_flag",
-    uses_prefixed_format = false,
     description = "2-to-4 sparse matrix pruning flag",
     variants = {
         None => "NONE",
@@ -535,8 +447,8 @@ gpu_enum_attribute!(
     enum_name = MatrixTransposeMode,
     attribute_name = MatrixTransposeModeAttributeRef,
     context_method = gpu_matrix_transpose_mode_attribute,
+    ffi_kind = MlirGpuEnumAttribute::RYFT_MLIR_GPU_ENUM_ATTRIBUTE_MATRIX_TRANSPOSE_MODE,
     mnemonic = "mat_transpose_mode",
-    uses_prefixed_format = false,
     description = "matrix transpose mode",
     variants = {
         NonTranspose => "NON_TRANSPOSE",
@@ -549,8 +461,8 @@ gpu_enum_attribute!(
     enum_name = SpGemmWorkKind,
     attribute_name = SpGemmWorkKindAttributeRef,
     context_method = gpu_sp_gemm_work_kind_attribute,
+    ffi_kind = MlirGpuEnumAttribute::RYFT_MLIR_GPU_ENUM_ATTRIBUTE_SP_GEMM_WORK_KIND,
     mnemonic = "spgemm_work_estimation_or_compute_kind",
-    uses_prefixed_format = false,
     description = "SpGEMM work kind",
     variants = {
         WorkEstimation => "WORK_ESTIMATION",
@@ -562,8 +474,8 @@ gpu_enum_attribute!(
     enum_name = BroadcastType,
     attribute_name = BroadcastTypeAttributeRef,
     context_method = gpu_broadcast_type_attribute,
+    ffi_kind = MlirGpuEnumAttribute::RYFT_MLIR_GPU_ENUM_ATTRIBUTE_BROADCAST_TYPE,
     mnemonic = "broadcast",
-    uses_prefixed_format = false,
     description = "subgroup broadcast type",
     variants = {
         FirstActiveLane => "first_active_lane",
@@ -656,13 +568,10 @@ impl MappingId {
 }
 
 macro_rules! gpu_mapping_id_attribute {
-    ($attribute_name:ident, $context_method:ident, $mnemonic:literal, $description:literal $(,)*) => {
+    ($attribute_name:ident, $context_method:ident, $ffi_kind:path, $mnemonic:literal, $description:literal $(,)*) => {
         #[doc = "GPU "]
         #[doc = $description]
         #[doc = " device mapping [`Attribute`]."]
-        ///
-        /// The current MLIR C API does not expose direct field accessors for this attribute, so this wrapper is
-        /// specialized by checking the printed dialect attribute spelling and constructed through the MLIR parser.
         #[derive(Copy, Clone)]
         pub struct $attribute_name<'c, 't> {
             /// Handle that represents this [`Attribute`] in the MLIR C API.
@@ -675,10 +584,11 @@ macro_rules! gpu_mapping_id_attribute {
         impl<'c, 't> $attribute_name<'c, 't> {
             /// Returns the mapping identifier stored in this attribute.
             pub fn value(&self) -> MappingId {
-                // TODO(eaplatanios): Replace this printed-form value extraction with a proper `ryft-xla-sys` C++
-                // binding for this GPU mapping attribute.
-                gpu_enum_attribute_value(self.to_string().as_str(), $mnemonic)
-                    .and_then(|value| MappingId::from_str(value.as_str()))
+                let value = unsafe { StringRef::from_c_api(mlirGpuMappingAttrGetValue(self.handle, $ffi_kind)) };
+                value
+                    .as_str()
+                    .ok()
+                    .and_then(MappingId::from_str)
                     .expect(concat!("invalid `#gpu.", $mnemonic, "` attribute"))
             }
         }
@@ -688,13 +598,7 @@ macro_rules! gpu_mapping_id_attribute {
                 if handle.ptr.is_null() {
                     return None;
                 }
-                let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-                // TODO(eaplatanios): Replace this printed-form subtype check with a proper `ryft-xla-sys` C++
-                //  binding for this GPU mapping attribute.
-                if gpu_enum_attribute_value(attribute.to_string().as_str(), $mnemonic)
-                    .and_then(|value| MappingId::from_str(value.as_str()))
-                    .is_some()
-                {
+                if unsafe { mlirAttributeIsAGpuMappingAttr(handle, $ffi_kind) } {
                     Some(Self { handle, context })
                 } else {
                     None
@@ -724,21 +628,58 @@ macro_rules! gpu_mapping_id_attribute {
             #[doc = " device mapping attribute owned by this [`Context`]."]
             pub fn $context_method<'c>(&'c self, value: MappingId) -> $attribute_name<'c, 't> {
                 self.load_dialect(DialectHandle::gpu());
-                // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++
-                //  binding for this GPU mapping attribute.
-                self.parse_attribute(gpu_single_parameter_attribute_source($mnemonic, value.as_str()).as_str())
-                    .and_then(|attribute| attribute.cast())
+                let value = StringRef::from(value.as_str());
+                unsafe {
+                    $attribute_name::from_c_api(
+                        mlirGpuMappingAttrGet(*self.handle.borrow_mut(), $ffi_kind, value.to_c_api()),
+                        self,
+                    )
                     .expect(concat!("invalid arguments to `Context::", stringify!($context_method), "`"))
+                }
             }
         }
     };
 }
 
-gpu_mapping_id_attribute!(BlockMappingAttributeRef, gpu_block_mapping_attribute, "block", "block");
-gpu_mapping_id_attribute!(WarpgroupMappingAttributeRef, gpu_warpgroup_mapping_attribute, "warpgroup", "warpgroup");
-gpu_mapping_id_attribute!(WarpMappingAttributeRef, gpu_warp_mapping_attribute, "warp", "warp");
-gpu_mapping_id_attribute!(ThreadMappingAttributeRef, gpu_thread_mapping_attribute, "thread", "thread");
-gpu_mapping_id_attribute!(LaneMappingAttributeRef, gpu_lane_mapping_attribute, "lane", "lane");
+gpu_mapping_id_attribute!(
+    BlockMappingAttributeRef,
+    gpu_block_mapping_attribute,
+    MlirGpuMappingAttribute::RYFT_MLIR_GPU_MAPPING_ATTRIBUTE_BLOCK,
+    "block",
+    "block",
+);
+
+gpu_mapping_id_attribute!(
+    WarpgroupMappingAttributeRef,
+    gpu_warpgroup_mapping_attribute,
+    MlirGpuMappingAttribute::RYFT_MLIR_GPU_MAPPING_ATTRIBUTE_WARPGROUP,
+    "warpgroup",
+    "warpgroup",
+);
+
+gpu_mapping_id_attribute!(
+    WarpMappingAttributeRef,
+    gpu_warp_mapping_attribute,
+    MlirGpuMappingAttribute::RYFT_MLIR_GPU_MAPPING_ATTRIBUTE_WARP,
+    "warp",
+    "warp",
+);
+
+gpu_mapping_id_attribute!(
+    ThreadMappingAttributeRef,
+    gpu_thread_mapping_attribute,
+    MlirGpuMappingAttribute::RYFT_MLIR_GPU_MAPPING_ATTRIBUTE_THREAD,
+    "thread",
+    "thread",
+);
+
+gpu_mapping_id_attribute!(
+    LaneMappingAttributeRef,
+    gpu_lane_mapping_attribute,
+    MlirGpuMappingAttribute::RYFT_MLIR_GPU_MAPPING_ATTRIBUTE_LANE,
+    "lane",
+    "lane",
+);
 
 /// GPU mapping mask [`Attribute`].
 #[derive(Copy, Clone)]
@@ -753,11 +694,7 @@ pub struct MappingMaskAttributeRef<'c, 't> {
 impl<'c, 't> MappingMaskAttributeRef<'c, 't> {
     /// Returns the active processing-unit bit mask.
     pub fn mask(&self) -> u64 {
-        // TODO(eaplatanios): Replace this printed-form value extraction with a proper `ryft-xla-sys` C++ binding for
-        // GPU mapping mask attributes.
-        gpu_enum_attribute_value(self.to_string().as_str(), "mask")
-            .and_then(|value| value.parse().ok())
-            .expect("invalid `#gpu.mask` attribute")
+        unsafe { mlirGpuMappingMaskAttrGetMask(self.handle) }
     }
 }
 
@@ -766,17 +703,7 @@ impl<'c, 't> Attribute<'c, 't> for MappingMaskAttributeRef<'c, 't> {
         if handle.ptr.is_null() {
             return None;
         }
-        let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-        // TODO(eaplatanios): Replace this printed-form subtype check with a proper `ryft-xla-sys` C++ binding for
-        //  GPU mapping mask attributes.
-        if gpu_enum_attribute_value(attribute.to_string().as_str(), "mask")
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some()
-        {
-            Some(Self { handle, context })
-        } else {
-            None
-        }
+        if unsafe { mlirAttributeIsAGpuMappingMaskAttr(handle) } { Some(Self { handle, context }) } else { None }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -809,11 +736,8 @@ pub struct MemorySpaceMappingAttributeRef<'c, 't> {
 impl<'c, 't> MemorySpaceMappingAttributeRef<'c, 't> {
     /// Returns the memory space stored in this mapping attribute.
     pub fn address_space(&self) -> AddressSpace {
-        // TODO(eaplatanios): Replace this printed-form value extraction with a proper `ryft-xla-sys` C++ binding for
-        // GPU memory-space mapping attributes.
-        gpu_enum_attribute_value(self.to_string().as_str(), "memory_space")
-            .and_then(|value| AddressSpace::from_str(value.as_str()))
-            .expect("invalid `#gpu.memory_space` attribute")
+        let value = unsafe { StringRef::from_c_api(mlirGpuMemorySpaceMappingAttrGetAddressSpace(self.handle)) };
+        value.as_str().ok().and_then(AddressSpace::from_str).expect("invalid `#gpu.memory_space` attribute")
     }
 }
 
@@ -822,17 +746,7 @@ impl<'c, 't> Attribute<'c, 't> for MemorySpaceMappingAttributeRef<'c, 't> {
         if handle.ptr.is_null() {
             return None;
         }
-        let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-        // TODO(eaplatanios): Replace this printed-form subtype check with a proper `ryft-xla-sys` C++ binding for
-        //  GPU memory-space mapping attributes.
-        if gpu_enum_attribute_value(attribute.to_string().as_str(), "memory_space")
-            .and_then(|value| AddressSpace::from_str(value.as_str()))
-            .is_some()
-        {
-            Some(Self { handle, context })
-        } else {
-            None
-        }
+        if unsafe { mlirAttributeIsAGpuMemorySpaceMappingAttr(handle) } { Some(Self { handle, context }) } else { None }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -919,35 +833,28 @@ pub struct ParallelLoopDimMappingAttributeRef<'c, 't> {
 impl<'c, 't> ParallelLoopDimMappingAttributeRef<'c, 't> {
     /// Returns the processor mapped to this loop dimension.
     pub fn processor(&self) -> Processor {
-        // TODO(eaplatanios): Replace this printed-form field extraction with a proper `ryft-xla-sys` C++ binding for
-        // GPU parallel-loop dimension mapping attributes.
-        gpu_struct_attribute_field(self.to_string().as_str(), "loop_dim_map", "processor")
-            .and_then(|value| Processor::from_str(value.as_str()))
+        let processor = unsafe { StringRef::from_c_api(mlirGpuParallelLoopDimMappingAttrGetProcessor(self.handle)) };
+        processor
+            .as_str()
+            .ok()
+            .and_then(Processor::from_str)
             .expect("invalid `processor` field in `#gpu.loop_dim_map` attribute")
     }
 
     /// Returns the affine map used to preprocess processor identifiers.
     pub fn map(&self) -> AffineMap<'c, 't> {
-        self.affine_map_field("map")
+        unsafe {
+            AffineMap::from_c_api(mlirGpuParallelLoopDimMappingAttrGetMap(self.handle), self.context)
+                .expect("invalid `map` field in `#gpu.loop_dim_map` attribute")
+        }
     }
 
     /// Returns the affine map used to compute the processor identifier bound.
     pub fn bound(&self) -> AffineMap<'c, 't> {
-        self.affine_map_field("bound")
-    }
-
-    /// Returns the affine map stored in `field_name`.
-    fn affine_map_field(&self, field_name: &str) -> AffineMap<'c, 't> {
-        // TODO(eaplatanios): Replace this printed-form field extraction with a proper `ryft-xla-sys` C++ binding for
-        // GPU parallel-loop dimension mapping attributes.
-        let source = gpu_struct_attribute_field(self.to_string().as_str(), "loop_dim_map", field_name)
-            .unwrap_or_else(|| panic!("invalid `{field_name}` field in `#gpu.loop_dim_map` attribute"));
-        let source = if source.starts_with("affine_map<") { source } else { format!("affine_map<{source}>") };
-        self.context
-            .parse_attribute(source.as_str())
-            .and_then(|attribute| attribute.cast::<AffineMapAttributeRef>())
-            .map(|attribute| attribute.affine_map())
-            .unwrap_or_else(|| panic!("invalid `{field_name}` field in `#gpu.loop_dim_map` attribute"))
+        unsafe {
+            AffineMap::from_c_api(mlirGpuParallelLoopDimMappingAttrGetBound(self.handle), self.context)
+                .expect("invalid `bound` field in `#gpu.loop_dim_map` attribute")
+        }
     }
 }
 
@@ -956,21 +863,11 @@ impl<'c, 't> Attribute<'c, 't> for ParallelLoopDimMappingAttributeRef<'c, 't> {
         if handle.ptr.is_null() {
             return None;
         }
-        let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-        let source = attribute.to_string();
-        let processor = gpu_struct_attribute_field(source.as_str(), "loop_dim_map", "processor")
-            .and_then(|value| Processor::from_str(value.as_str()));
-        let map = gpu_struct_attribute_field(source.as_str(), "loop_dim_map", "map")
-            .map(|value| if value.starts_with("affine_map<") { value } else { format!("affine_map<{value}>") })
-            .and_then(|value| context.parse_attribute(value.as_str()))
-            .and_then(|attribute| attribute.cast::<AffineMapAttributeRef>());
-        let bound = gpu_struct_attribute_field(source.as_str(), "loop_dim_map", "bound")
-            .map(|value| if value.starts_with("affine_map<") { value } else { format!("affine_map<{value}>") })
-            .and_then(|value| context.parse_attribute(value.as_str()))
-            .and_then(|attribute| attribute.cast::<AffineMapAttributeRef>());
-        // TODO(eaplatanios): Replace these printed-form subtype and field checks with a proper `ryft-xla-sys` C++
-        //  binding for GPU parallel-loop dimension mapping attributes.
-        if processor.is_some() && map.is_some() && bound.is_some() { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAGpuParallelLoopDimMappingAttr(handle) } {
+            Some(Self { handle, context })
+        } else {
+            None
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -988,11 +885,10 @@ impl<'t> Context<'t> {
     /// Creates a GPU [`MappingMaskAttributeRef`] owned by this [`Context`].
     pub fn gpu_mapping_mask_attribute<'c>(&'c self, mask: u64) -> MappingMaskAttributeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
-        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
-        //  GPU mapping mask attributes.
-        self.parse_attribute(gpu_single_parameter_attribute_source("mask", mask.to_string().as_str()).as_str())
-            .and_then(|attribute| attribute.cast())
-            .expect("invalid arguments to `Context::gpu_mapping_mask_attribute`")
+        unsafe {
+            MappingMaskAttributeRef::from_c_api(mlirGpuMappingMaskAttrGet(*self.handle.borrow_mut(), mask), self)
+                .expect("invalid arguments to `Context::gpu_mapping_mask_attribute`")
+        }
     }
 
     /// Creates a GPU [`MemorySpaceMappingAttributeRef`] owned by this [`Context`].
@@ -1001,11 +897,14 @@ impl<'t> Context<'t> {
         address_space: AddressSpace,
     ) -> MemorySpaceMappingAttributeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
-        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
-        //  GPU memory-space mapping attributes.
-        self.parse_attribute(gpu_single_parameter_attribute_source("memory_space", address_space.as_str()).as_str())
-            .and_then(|attribute| attribute.cast())
+        let address_space = StringRef::from(address_space.as_str());
+        unsafe {
+            MemorySpaceMappingAttributeRef::from_c_api(
+                mlirGpuMemorySpaceMappingAttrGet(*self.handle.borrow_mut(), address_space.to_c_api()),
+                self,
+            )
             .expect("invalid arguments to `Context::gpu_memory_space_mapping_attribute`")
+        }
     }
 
     /// Creates a GPU [`ParallelLoopDimMappingAttributeRef`] owned by this [`Context`].
@@ -1022,14 +921,19 @@ impl<'t> Context<'t> {
         bound: AffineMap<'c, 't>,
     ) -> ParallelLoopDimMappingAttributeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
-        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
-        //  GPU parallel-loop dimension mapping attributes.
-        self.parse_attribute(
-            format!("#gpu.loop_dim_map<processor = {}, map = {}, bound = {}>", processor.as_str(), map, bound,)
-                .as_str(),
-        )
-        .and_then(|attribute| attribute.cast())
-        .expect("invalid arguments to `Context::gpu_parallel_loop_dim_mapping_attribute`")
+        let processor = StringRef::from(processor.as_str());
+        unsafe {
+            ParallelLoopDimMappingAttributeRef::from_c_api(
+                mlirGpuParallelLoopDimMappingAttrGet(
+                    *self.handle.borrow_mut(),
+                    processor.to_c_api(),
+                    map.to_c_api(),
+                    bound.to_c_api(),
+                ),
+                self,
+            )
+            .expect("invalid arguments to `Context::gpu_parallel_loop_dim_mapping_attribute`")
+        }
     }
 
     /// Creates the typed array form used by MLIR for GPU parallel-loop mapping attributes.
@@ -1058,25 +962,19 @@ impl<'t> Context<'t> {
         metadata: Option<DictionaryAttributeRef<'c, 't>>,
     ) -> KernelMetadataAttributeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
-        let mut source = format!("#gpu.kernel_metadata<{}, {}", self.string_attribute(name), function_type);
-        match (argument_attributes, metadata) {
-            (Some(argument_attributes), Some(metadata)) => {
-                source.push_str(format!(", arg_attrs = {argument_attributes}, metadata = {metadata}").as_str());
-            }
-            (Some(argument_attributes), None) => {
-                source.push_str(format!(", arg_attrs = {argument_attributes}").as_str());
-            }
-            (None, Some(metadata)) => {
-                source.push_str(format!(", metadata = {metadata}").as_str());
-            }
-            (None, None) => {}
-        }
-        source.push('>');
-        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for
-        // GPU kernel metadata attributes.
-        self.parse_attribute(source.as_str())
-            .and_then(|attribute| attribute.cast())
+        let name = StringRef::from(name);
+        unsafe {
+            let argument_attributes = argument_attributes
+                .map(|attribute| attribute.to_c_api())
+                .unwrap_or_else(|| self.null_attribute().to_c_api());
+            let metadata =
+                metadata.map(|attribute| attribute.to_c_api()).unwrap_or_else(|| self.null_attribute().to_c_api());
+            KernelMetadataAttributeRef::from_c_api(
+                mlirGpuKernelMetadataAttrGet(name.to_c_api(), function_type.to_c_api(), argument_attributes, metadata),
+                self,
+            )
             .expect("invalid arguments to `Context::gpu_kernel_metadata_attribute`")
+        }
     }
 
     /// Creates a GPU [`KernelTableAttributeRef`] owned by this [`Context`].
@@ -1089,17 +987,14 @@ impl<'t> Context<'t> {
         kernels: &[KernelMetadataAttributeRef<'c, 't>],
     ) -> KernelTableAttributeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
-        let source = if kernels.is_empty() {
-            "#gpu.kernel_table<>".to_owned()
-        } else {
-            let kernels = kernels.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
-            format!("#gpu.kernel_table<[{kernels}]>")
-        };
-        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for GPU
-        // kernel table attributes.
-        self.parse_attribute(source.as_str())
-            .and_then(|attribute| attribute.cast())
+        unsafe {
+            let kernels = kernels.iter().map(|kernel| kernel.to_c_api()).collect::<Vec<_>>();
+            KernelTableAttributeRef::from_c_api(
+                mlirGpuKernelTableAttrGet(*self.handle.borrow_mut(), kernels.len().cast_signed(), kernels.as_ptr()),
+                self,
+            )
             .expect("invalid arguments to `Context::gpu_kernel_table_attribute`")
+        }
     }
 
     /// Creates a GPU [`SelectObjectAttributeRef`] owned by this [`Context`].
@@ -1112,13 +1007,14 @@ impl<'t> Context<'t> {
         target: Option<AttributeRef<'c, 't>>,
     ) -> SelectObjectAttributeRef<'c, 't> {
         self.load_dialect(DialectHandle::gpu());
-        let source =
-            target.map_or_else(|| "#gpu.select_object".to_owned(), |target| format!("#gpu.select_object<{target}>"));
-        // TODO(eaplatanios): Replace this textual construction path with a proper `ryft-xla-sys` C++ binding for GPU
-        // select-object attributes.
-        self.parse_attribute(source.as_str())
-            .and_then(|attribute| attribute.cast())
+        unsafe {
+            let target = target.unwrap_or_else(|| self.null_attribute());
+            SelectObjectAttributeRef::from_c_api(
+                mlirGpuSelectObjectAttrGet(*self.handle.borrow_mut(), target.to_c_api()),
+                self,
+            )
             .expect("invalid arguments to `Context::gpu_select_object_attribute`")
+        }
     }
 
     /// Creates a GPU [`ObjectAttributeRef`] owned by this [`Context`].
