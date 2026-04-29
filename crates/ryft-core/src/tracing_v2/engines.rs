@@ -6,9 +6,10 @@ use std::ops::{Add, Mul, Neg};
 use std::rc::Rc;
 
 use half::{bf16, f16};
+
 use ryft_macros::Parameter;
 
-use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
 use crate::tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::Differentiable;
 use crate::tracing_v2::PrimitiveOperation;
@@ -16,43 +17,24 @@ use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use crate::tracing_v2::operations::{SupportsAdd, SupportsMul, SupportsNeg, TracedLinearizationCarrier};
 use crate::types::{ArrayType, Type, Typed};
 
-/// Synthesizes concrete leaf values from abstract type metadata.
-///
-/// [`Engine`] is the backend token threaded through the public `tracing_v2` transforms. It has
-/// one narrow job: synthesize representative zero and one values from abstract metadata when a
-/// transform needs an exemplar but only knows a leaf's type. That responsibility is what lets
-/// higher-order transforms stay generic. Linearization,
-/// reverse-mode transposition, and rematerialization all occasionally need to rebuild a value from
-/// shape/type information alone; [`Engine`] is the narrow seam where backend-specific knowledge
-/// enters the otherwise backend-agnostic transform code.
-///
-/// Per-instruction evaluation stays outside this trait: replay and abstract-eval continue to go
-/// straight through [`crate::tracing::InterpretableOperation`] and [`crate::tracing::Operation`]
-/// so the common fast path never needs an extra dispatch layer.
-///
-/// Engines are passed by shared reference to user-facing transforms. Implementations should be
-/// cheap to clone (the common case is a [`Copy`] zero-sized type) and must return values whose type
-/// metadata agrees with the input descriptor.
+/// [`Engine`]s provide backend-specific functionality related to tracing, just-in-time compilation, automatic
+/// differentiation, and potentially other [`Program`] transforms. They also define the kinds of [`Type`]s and
+/// [`Traceable`] values that each backend supports and they are effectively what lets higher-order transforms
+/// remain backend-invariant.
 pub trait Engine {
-    /// Abstract type metadata interpreted by this engine.
-    ///
-    /// This is the descriptor carried by staged atoms and used during abstract evaluation. For the
-    /// default core pipeline it is usually [`ArrayType`](crate::types::ArrayType), but the trait is
-    /// generic so backends can substitute a richer metadata type if needed.
+    /// [`Type`]s that this [`Engine`] uses to represent the abstract metadata associated with its [`Traceable`] values.
+    /// A commonly used [`Type`] is [`ArrayType`], though richer backends may use richer types.
     type Type: Type + Parameter;
 
-    /// Concrete leaf value produced by this engine.
-    ///
-    /// The value is what program replay and eager transforms actually operate on. In other words,
-    /// [`Engine::Type`] is the abstract description used while staging, while [`Engine::Value`] is
-    /// the runtime leaf that inhabits traced programs once they are executed.
+    /// [`Traceable`] value types supported by this [`Engine`]. Instances of this type are what [`Program`]
+    /// interpretation and eager transforms operate on. [`Engine::Type`] represents abstract staging metadata,
+    /// while [`Engine::Value`] represents the runtime values that inhabit traced [`Program`]s during execution.
     type Value: Traceable<Self::Type>;
 
     /// Returns the additive-identity value corresponding to the provided type metadata.
     ///
-    /// Transforms use this when they need a representative value for a leaf without having a
-    /// concrete witness available, for example when replaying a staged program from retained input
-    /// types or constructing zero cotangents in a transposed linear program.
+    /// Transforms use this when they need a representative value for a leaf without a witness, such as replaying a
+    /// staged program from retained input types or constructing zero cotangents in a transposed linear program.
     fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 
     /// Returns the multiplicative-identity value corresponding to the provided type metadata.
@@ -65,33 +47,30 @@ pub trait Engine {
 /// Engine capability for selecting a staged operation carrier.
 ///
 /// [`StagingEngine`] extends [`Engine`] with the closed operation carrier that the paired
-/// [`ProgramBuilder`](crate::tracing::ProgramBuilder) stores. This keeps carrier selection on the
-/// engine value that is actually threaded through tracers instead of splitting it across a separate
-/// generic parameter.
+/// [`ProgramBuilder`](crate::tracing::ProgramBuilder) stores. This keeps carrier selection on the engine value that is
+/// actually threaded through tracers instead of splitting it across a separate generic parameter.
 pub trait StagingEngine: Engine {
     /// Staged operation type selected by this staging engine.
     type Operation: Clone + Operation<Self::Type>;
 
     /// Stages `function` directly from type metadata using this engine's ordinary staged op set.
     ///
-    /// This is the most symbolic tracing entry point: it never needs concrete runtime inputs, only
-    /// the parameterized input metadata. The closure is executed once on [`Tracer`] leaves that
-    /// stand in for those abstract inputs, and the resulting builder state is finalized into a
-    /// [`Program`].
+    /// This is the most symbolic tracing entry point: it never needs concrete runtime inputs, only the parameterized
+    /// input metadata. The closure is executed once on [`Tracer`] leaves standing in for those abstract inputs, then
+    /// the builder state is finalized into a [`Program`] with the inferred output metadata.
     ///
-    /// The returned pair contains both the structured output metadata inferred during tracing and
-    /// the staged program itself.
+    /// The returned pair contains the structured output metadata inferred during tracing and the staged program itself.
     fn trace<
         'engine,
         F: FnOnce(Input::To<Tracer<'engine, Self>>) -> Result<Output::To<Tracer<'engine, Self>>, TracingError>,
         Input: Parameterized<
                 Self::Type,
-                Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Tracer<'engine, Self>>,
+                Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>,
                 ParameterStructure: Clone,
             >,
         Output: Parameterized<
                 Self::Type,
-                Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Tracer<'engine, Self>>,
+                Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>,
                 ParameterStructure: Clone,
             >,
     >(
@@ -106,16 +85,20 @@ pub trait StagingEngine: Engine {
         TracingEngine::new(self, builder).trace(function, input_types)
     }
 
-    /// Stages `function` with this engine's ordinary op carrier, interprets it, and returns both results.
+    /// Stages `function`, interprets the staged program on `input`, and returns both results.
+    ///
+    /// The concrete `input` supplies both runtime values and the metadata used to trace the function. The closure runs
+    /// once on symbolic [`Tracer`] leaves, then the staged program is simplified and interpreted on the original input
+    /// values. Tests and eager transforms use this entry point when they need both the concrete result and the program.
     fn interpret_and_trace<
         'engine,
         F: FnOnce(Input::To<Tracer<'engine, Self>>) -> Result<Output::To<Tracer<'engine, Self>>, TracingError>,
         Input: Parameterized<
                 Self::Value,
-                Family: ParameterizedFamily<Tracer<'engine, Self>>,
-                ParameterStructure: Clone + std::fmt::Debug + PartialEq,
+                Family: ParameterFamily<Tracer<'engine, Self>>,
+                ParameterStructure: Clone + Debug + PartialEq,
             >,
-        Output: Parameterized<Self::Value, Family: ParameterizedFamily<Tracer<'engine, Self>>, ParameterStructure: Clone>,
+        Output: Parameterized<Self::Value, Family: ParameterFamily<Tracer<'engine, Self>>, ParameterStructure: Clone>,
     >(
         &'engine self,
         function: F,
@@ -157,15 +140,13 @@ pub trait StagingEngine: Engine {
 
 /// Stateless engine that synthesizes scalar-compatible values from [`ArrayType`] metadata.
 ///
-/// [`ScalarEngine<V>`] is the "minimal backend" used throughout tests and scalar-only
-/// examples. It demonstrates the intended role of an [`Engine`] in the smallest possible form:
-/// there is no device handle, no mesh state, and no backend registry, just the choice of the
-/// built-in primitive carriers plus metadata-driven construction of scalar zeros and ones.
+/// [`ScalarEngine<V>`] is the "minimal backend" used throughout tests and scalar-only examples. It demonstrates the
+/// intended role of an [`Engine`] in the smallest possible form: there is no device handle, no mesh state, and no
+/// backend registry, just the built-in primitive carriers plus metadata-driven construction of scalar identity values.
 ///
-/// The engine ignores most of the supplied [`ArrayType`] metadata because scalar leaves have a
-/// single canonical runtime representation. That makes it a good teaching example for the rest of
-/// the tracing stack: if a transform works against [`ScalarEngine`], the same code path can be
-/// reused by richer engines that need sharding, device, or runtime context.
+/// The engine ignores most of the supplied [`ArrayType`] metadata because scalar leaves have one canonical runtime
+/// representation. That makes it a compact teaching example for the tracing stack: if a transform works against
+/// [`ScalarEngine`], the same path can be reused by richer engines with sharding, device, or runtime context.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScalarEngine<V> {
     /// Phantom marker that ties the zero-sized engine to its scalar leaf type.
@@ -175,8 +156,7 @@ pub struct ScalarEngine<V> {
 impl<V> ScalarEngine<V> {
     /// Returns a new [`ScalarEngine<V>`].
     ///
-    /// This is a no-op at runtime because the engine is zero-sized; the method mainly exists to
-    /// give examples and tests an explicit, readable backend token.
+    /// This zero-sized engine is a runtime no-op; it gives examples and tests an explicit backend token.
     #[inline]
     pub const fn new() -> Self {
         Self { marker: PhantomData }
@@ -220,12 +200,11 @@ impl_scalar_engine_for_scalar!(f16, f16::ZERO, f16::ONE);
 impl_scalar_engine_for_scalar!(f32, 0.0, 1.0);
 impl_scalar_engine_for_scalar!(f64, 0.0, 1.0);
 
-/// Active engine used while staging one traced program.
+/// Active engine used while staging one program.
 ///
 /// [`TracingEngine`] bundles the active [`StagingEngine`] reference with the active
-/// [`ProgramBuilder`](crate::tracing::ProgramBuilder). Individual [`Tracer`] leaves carry a clone
-/// of this engine so ordinary Rust operator traits can keep staging without requiring an explicit
-/// engine argument at every call site.
+/// [`ProgramBuilder`](crate::tracing::ProgramBuilder). Individual [`Tracer`] leaves carry a clone of this engine so
+/// ordinary Rust operator traits can keep staging without requiring an explicit engine argument at every call site.
 pub struct TracingEngine<'engine, E: StagingEngine + ?Sized> {
     /// Engine borrowed by this tracing engine for metadata-driven value synthesis and operation selection.
     engine: &'engine E,
@@ -236,6 +215,9 @@ pub struct TracingEngine<'engine, E: StagingEngine + ?Sized> {
 
 impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
     /// Creates a tracing engine over `engine` and `builder`.
+    ///
+    /// The caller owns the tracing scope: all tracers used together must carry a [`TracingEngine`] that refers to the
+    /// same outer engine handle and builder, or staging is rejected before mutation.
     #[inline]
     pub fn new(engine: &'engine E, builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>) -> Self {
         Self { engine, builder }
@@ -261,8 +243,8 @@ impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
 
     /// Lifts a concrete engine value into a [`Tracer`] constant in this tracing engine.
     ///
-    /// Traced JVP rules for value-capturing operations use this to turn captured runtime values
-    /// into symbolic values staged in the outer program.
+    /// Traced JVP rules for value-capturing operations use this to turn captured runtime values into symbolic values
+    /// staged in the outer program, preserving the symbolic dataflow.
     pub fn lift_constant(&self, value: E::Value) -> Tracer<'engine, E> {
         let r#type = <E::Value as Typed<E::Type>>::r#type(&value).into_owned();
         let atom = self.builder.borrow_mut().add_constant(value);
@@ -288,12 +270,13 @@ impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
         Tracer { state: TracerState::Poison(r#type), engine: self.clone() }
     }
 
-    /// Stages one primitive application in this tracing engine and returns tracers for its outputs.
+    /// Stages one operation application in this tracing engine and returns tracers for its outputs.
     ///
-    /// The method validates that all inputs belong to this tracing engine and then delegates normal
-    /// instruction construction to [`ProgramBuilder::add_instruction`]. If the builder has already
-    /// recorded an error, it avoids mutating the partial program and only uses abstract evaluation
-    /// to synthesize poisoned output tracers with the expected types.
+    /// The method validates that all inputs belong to this tracing engine and then delegates normal instruction
+    /// construction to [`ProgramBuilder::add_instruction`]. If the builder has already recorded an error, it avoids
+    /// mutating the partial program and only uses abstract evaluation to synthesize poisoned output tracers with the
+    /// expected types. If abstract evaluation also fails after an earlier builder error, a non-empty input list still
+    /// produces one poisoned tracer using the first input type so later staging can continue to short-circuit.
     pub fn apply_staged_op(
         &self,
         inputs: &[Tracer<'engine, E>],
@@ -357,8 +340,8 @@ impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
 
     /// Stages `function` directly from type metadata using this tracing engine's active builder.
     ///
-    /// This is the builder-backed form used by nested traced transforms that need to trace a fresh
-    /// sibling program while retaining access to the outer engine context.
+    /// This builder-backed form lets nested traced transforms trace a fresh sibling program while retaining access to
+    /// the outer engine context that supplies values and operation carriers.
     pub fn trace<F, Input, Output>(
         self,
         function: F,
@@ -371,12 +354,12 @@ impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
         Input: Parameterized<
                 E::Type,
                 ParameterStructure: Clone,
-                Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
+                Family: ParameterFamily<E::Value> + ParameterFamily<Tracer<'engine, E>>,
             >,
         Output: Parameterized<
                 E::Type,
                 ParameterStructure: Clone,
-                Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
+                Family: ParameterFamily<E::Value> + ParameterFamily<Tracer<'engine, E>>,
             >,
         F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     {
@@ -460,10 +443,10 @@ where
 
 /// Execution state carried by a [`Tracer`] leaf.
 ///
-/// Live tracers point at a concrete staged atom in the shared program builder. Poisoned tracers
-/// arise only after the active tracing engine has already recorded an error and can no longer
-/// stage new instructions safely. They still retain the inferred abstract output type so later
-/// type queries and best-effort short-circuiting can continue without manufacturing a dummy atom.
+/// Live tracers point at a concrete staged atom in the shared program builder. Poisoned tracers arise only after the
+/// active tracing engine has already recorded an error and can no longer stage new instructions safely. They still
+/// retain the inferred abstract output type so type queries and best-effort short-circuiting can continue without
+/// manufacturing dummy atoms for a program that can no longer be finalized successfully.
 #[derive(Clone, PartialEq, Eq)]
 pub enum TracerState<T: Type> {
     /// Normal traced leaf backed by a concrete atom in the staged program.
@@ -503,13 +486,11 @@ impl<T: Type> Debug for TracerState<T> {
 
 /// Symbolic leaf used while staging ordinary traced programs.
 ///
-/// A [`Tracer`] is the value-level facade for one staged traced leaf. Primitive trait impls on
-/// [`Tracer`] do not compute numerically; instead, they add instructions to a shared
-/// [`ProgramBuilder`](crate::tracing::ProgramBuilder) and return new tracers for the staged
-/// outputs. When tracing has already failed, later operations return poisoned tracers that retain
-/// only abstract type metadata rather than manufacturing dummy atoms. This makes [`Tracer`] the
-/// central "big picture" type for symbolic execution in `tracing_v2`: if a closure is being
-/// traced rather than eagerly evaluated, its leaves are almost always instances of this type.
+/// A [`Tracer`] is the value-level facade for one staged traced leaf. Primitive trait impls on [`Tracer`] stage
+/// instructions in a shared [`ProgramBuilder`](crate::tracing::ProgramBuilder) instead of doing numerical work, and
+/// return new tracers for the staged outputs. When tracing has already failed, later operations return poisoned tracers
+/// that retain only abstract type metadata rather than manufacturing dummy atoms. This makes [`Tracer`] the symbolic
+/// leaf used when `tracing_v2` executes a closure symbolically instead of eagerly.
 #[derive(Parameter)]
 pub struct Tracer<'engine, E: StagingEngine + ?Sized> {
     /// Execution state for this traced leaf.
@@ -522,8 +503,8 @@ pub struct Tracer<'engine, E: StagingEngine + ?Sized> {
 impl<'engine, E: StagingEngine + ?Sized> Tracer<'engine, E> {
     /// Constructs a traced leaf from staged tracing parts.
     ///
-    /// Callers that already know the staged atom's abstract type should prefer this constructor so
-    /// the resulting tracer can answer future type queries without re-borrowing the shared builder.
+    /// Callers that already know the staged atom's abstract type should prefer this constructor so future type queries
+    /// can use cached metadata without re-borrowing the shared builder.
     #[inline]
     pub fn from_staged_parts(
         atom: AtomId,
@@ -557,7 +538,9 @@ impl<'engine, E: StagingEngine + ?Sized> Tracer<'engine, E> {
         self.state.live_atom().ok_or(TracingError::PoisonedTracer)
     }
 
-    /// Stages a single-input primitive application and returns its unique output.
+    /// Stages a single-input operation application and returns its unique output.
+    ///
+    /// Convenience wrapper for operator trait implementations whose staged operation should produce one output.
     pub fn unary(self, op: E::Operation) -> Self {
         let engine = self.engine.clone();
         engine
@@ -568,7 +551,9 @@ impl<'engine, E: StagingEngine + ?Sized> Tracer<'engine, E> {
             .expect("unary traced staging should produce one output")
     }
 
-    /// Stages a two-input primitive application and returns its unique output.
+    /// Stages a two-input operation application and returns its unique output.
+    ///
+    /// Convenience wrapper for operator trait implementations whose staged operation should produce one output.
     pub fn binary(self, rhs: Self, op: E::Operation) -> Self {
         debug_assert!(Rc::ptr_eq(self.builder(), rhs.builder()));
         let engine = self.engine.clone();
@@ -692,15 +677,49 @@ mod tests {
     use std::rc::Rc;
 
     use indoc::indoc;
+    use pretty_assertions::assert_eq;
 
     use crate::parameters::Placeholder;
     use crate::tracing_v2::differentiation::DifferentiableEngine;
     use crate::tracing_v2::{Sin, jvp, test_support};
-    use crate::types::{DataType, TypeError};
+    use crate::types::{DataType, Shape, Size, TypeError};
 
     use super::*;
 
+    type F64ProgramBuilder = ProgramBuilder<ArrayType, f64, PrimitiveOperation<f64>>;
+
     fn assert_differentiable_engine<E: DifferentiableEngine>() {}
+
+    fn new_f64_builder() -> Rc<RefCell<F64ProgramBuilder>> {
+        Rc::new(RefCell::new(ProgramBuilder::new()))
+    }
+
+    fn scalar_f64_type() -> ArrayType {
+        ArrayType::scalar(DataType::F64)
+    }
+
+    struct TaggedEngine {
+        id: u8,
+    }
+
+    impl Engine for TaggedEngine {
+        type Type = ArrayType;
+        type Value = f64;
+
+        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            let _ = self.id;
+            Ok(0.0)
+        }
+
+        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            let _ = self.id;
+            Ok(1.0)
+        }
+    }
+
+    impl StagingEngine for TaggedEngine {
+        type Operation = PrimitiveOperation<f64>;
+    }
 
     #[test]
     fn test_array_scalar_engine_is_zero_sized() {
@@ -775,13 +794,52 @@ mod tests {
     }
 
     #[test]
-    fn jit_tracer_zero_like_adds_constant_atoms() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
+    fn test_tracing_engine_zero_and_one_lift_constant_atoms() {
+        let builder = new_f64_builder();
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_engine = TracingEngine::new(&engine, builder.clone());
+        let r#type = scalar_f64_type();
+
+        let zero = Engine::zero(&tracing_engine, &r#type).unwrap();
+        let one = Engine::one(&tracing_engine, &r#type).unwrap();
+
+        assert_eq!(zero.r#type().into_owned(), r#type);
+        assert_eq!(one.r#type().into_owned(), scalar_f64_type());
+        let zero_atom = zero.atom_id().expect("zero tracer should remain live");
+        let one_atom = one.atom_id().expect("one tracer should remain live");
+        assert_eq!(zero_atom.index, 0);
+        assert_eq!(one_atom.index, 1);
+
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<Vec<f64>, Vec<f64>>(
+                vec![zero_atom, one_atom],
+                Vec::<Placeholder>::new(),
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.interpret(Vec::new()).unwrap(), vec![0.0, 1.0]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f64[] = const
+                    %1:f64[] = const
+                in (%0, %1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracer_zero_like_adds_constant_atoms() {
+        let builder = new_f64_builder();
         let atom = builder.borrow_mut().add_input(3.0f64.r#type().into_owned());
         let engine = ScalarEngine::<f64>::new();
         let tracer: Tracer<ScalarEngine<f64>> = TracingEngine::new(&engine, builder).tracer_from_atom(atom);
         let zero = tracer.zero_like();
-        assert_eq!(zero.r#type().into_owned(), ArrayType::scalar(crate::types::DataType::F64));
+        assert_eq!(zero.r#type().into_owned(), scalar_f64_type());
         let zero_atom = zero.state().live_atom().expect("zero-like tracer should remain live");
         assert!(zero_atom > atom);
 
@@ -803,22 +861,20 @@ mod tests {
     }
 
     #[test]
-    fn traced_live_tracer_type_borrows_cached_type() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
-        let input_type = ArrayType::scalar(crate::types::DataType::F64);
+    fn test_live_tracer_type_borrows_cached_type() {
+        let builder = new_f64_builder();
+        let input_type = scalar_f64_type();
         let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = ScalarEngine::<f64>::new();
         let tracer: Tracer<ScalarEngine<f64>> = Tracer::from_staged_parts(atom, input_type, builder, &engine);
 
-        assert!(
-            matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(crate::types::DataType::F64))
-        );
+        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == scalar_f64_type()));
     }
 
     #[test]
-    fn traced_apply_staged_op_rejects_mismatched_program_builders() {
-        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
-        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
+    fn test_apply_staged_op_rejects_mismatched_program_builders() {
+        let builder_a = new_f64_builder();
+        let builder_b = new_f64_builder();
         let atom_a = builder_a.borrow_mut().add_input(1.0f64.r#type().into_owned());
         let atom_b = builder_b.borrow_mut().add_input(2.0f64.r#type().into_owned());
         let engine = TaggedEngine { id: 1 };
@@ -832,8 +888,8 @@ mod tests {
     }
 
     #[test]
-    fn traced_apply_staged_op_rejects_mismatched_engines() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
+    fn test_apply_staged_op_rejects_mismatched_engines() {
+        let builder = new_f64_builder();
         let atom_a = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
         let atom_b = builder.borrow_mut().add_input(2.0f64.r#type().into_owned());
         let engine_a = TaggedEngine { id: 1 };
@@ -848,8 +904,8 @@ mod tests {
     }
 
     #[test]
-    fn traced_apply_staged_op_returns_poisoned_tracers_after_builder_failure() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
+    fn test_apply_staged_op_returns_poisoned_tracers_after_builder_failure() {
+        let builder = new_f64_builder();
         let atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
         builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
         let engine = TaggedEngine { id: 1 };
@@ -862,14 +918,14 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             outputs[0].state(),
-            TracerState::Poison(output_type) if *output_type == ArrayType::scalar(crate::types::DataType::F64)
+            TracerState::Poison(output_type) if *output_type == scalar_f64_type()
         ));
     }
 
     #[test]
-    fn traced_apply_staged_op_caches_live_output_types() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
-        let input_type = ArrayType::scalar(crate::types::DataType::F64);
+    fn test_apply_staged_op_caches_live_output_types() {
+        let builder = new_f64_builder();
+        let input_type = scalar_f64_type();
         let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = TaggedEngine { id: 1 };
         let tracer = Tracer::from_staged_parts(atom, input_type, builder.clone(), &engine);
@@ -879,26 +935,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(outputs.len(), 1);
-        assert!(
-            matches!(outputs[0].state(), TracerState::Live(_, output_type) if *output_type == ArrayType::scalar(crate::types::DataType::F64))
-        );
-        assert!(
-            matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(crate::types::DataType::F64))
-        );
+        assert!(matches!(outputs[0].state(), TracerState::Live(_, output_type) if *output_type == scalar_f64_type()));
+        assert!(matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == scalar_f64_type()));
     }
 
     #[test]
-    fn poisoned_tracer_atom_id_returns_poisoned_tracer_error() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
+    fn test_poisoned_tracer_atom_id_returns_poisoned_tracer_error() {
+        let builder = new_f64_builder();
         let engine = TaggedEngine { id: 1 };
-        let tracer =
-            TracingEngine::new(&engine, builder).poisoned_tracer(ArrayType::scalar(crate::types::DataType::F64));
+        let tracer = TracingEngine::new(&engine, builder).poisoned_tracer(scalar_f64_type());
 
         assert_eq!(tracer.atom_id(), Err(TracingError::PoisonedTracer));
+        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == scalar_f64_type()));
     }
 
     #[test]
-    fn staged_program_replays_graphs() {
+    fn test_interpret_and_trace_replays_staged_graphs() {
         let engine = ScalarEngine::<f64>::new();
         let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
             .interpret_and_trace(
@@ -926,50 +978,128 @@ mod tests {
         );
     }
 
-    struct TaggedEngine {
-        id: u8,
-    }
+    #[test]
+    fn test_trace_stages_program_from_type_metadata() {
+        let engine = ScalarEngine::<f64>::new();
+        let input_type = scalar_f64_type();
+        let (output_type, program): (ArrayType, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+            .trace(
+                |x: Tracer<ScalarEngine<f64>>| {
+                    let squared = x.clone() * x.clone();
+                    Ok(squared + x.one_like())
+                },
+                input_type.clone(),
+            )
+            .unwrap();
 
-    impl Engine for TaggedEngine {
-        type Type = ArrayType;
-        type Value = f64;
-
-        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            let _ = self.id;
-            Ok(0.0)
-        }
-
-        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            let _ = self.id;
-            Ok(1.0)
-        }
-    }
-
-    impl StagingEngine for TaggedEngine {
-        type Operation = PrimitiveOperation<f64>;
-    }
-
-    struct FailingOneEngine;
-
-    impl Engine for FailingOneEngine {
-        type Type = ArrayType;
-        type Value = f64;
-
-        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(0.0)
-        }
-
-        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Err(TypeError { message: "test engine cannot synthesize one".to_string() }.into())
-        }
-    }
-
-    impl StagingEngine for FailingOneEngine {
-        type Operation = PrimitiveOperation<f64>;
+        assert_eq!(output_type, input_type);
+        assert_eq!(program.interpret(3.0).unwrap(), 10.0);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = const
+                    %3:f64[] = add %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
-    fn tracer_one_like_records_engine_identity_error() {
+    fn test_trace_rejects_escaped_program_builder() {
+        let engine = ScalarEngine::<f64>::new();
+        let escaped_builder = Rc::new(RefCell::new(None));
+        let result: Result<(ArrayType, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>), TracingError> =
+            engine.trace(
+                |x: Tracer<ScalarEngine<f64>>| {
+                    *escaped_builder.borrow_mut() = Some(x.builder().clone());
+                    Ok(x)
+                },
+                scalar_f64_type(),
+            );
+
+        assert!(matches!(result, Err(TracingError::EscapedProgramBuilder)));
+    }
+
+    #[test]
+    fn test_tracer_display_and_debug_render_live_and_poisoned_states() {
+        let builder = new_f64_builder();
+        let atom = builder.borrow_mut().add_input(scalar_f64_type());
+        let engine = ScalarEngine::<f64>::new();
+        let live = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(atom);
+        let poison = TracingEngine::new(&engine, builder).poisoned_tracer(scalar_f64_type());
+
+        assert_eq!(live.to_string(), "%0");
+        assert_eq!(format!("{live:?}"), "Tracer { state: Live(AtomId { index: 0 }), .. }");
+        assert_eq!(poison.to_string(), "<poison:f64[]>");
+        assert_eq!(format!("{poison:?}"), "Tracer { state: Poison(..), .. }");
+        assert_eq!(format!("{:?}", live.engine), "TracingEngine { .. }");
+    }
+
+    #[test]
+    fn test_apply_staged_op_records_abstract_eval_error_and_returns_poisoned_output() {
+        let builder = new_f64_builder();
+        let lhs_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
+        let rhs_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
+        let lhs_atom = builder.borrow_mut().add_input(lhs_type.clone());
+        let rhs_atom = builder.borrow_mut().add_input(rhs_type);
+        let engine = ScalarEngine::<f64>::new();
+        let lhs = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(lhs_atom);
+        let rhs = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(rhs_atom);
+
+        let outputs = TracingEngine::new(&engine, builder.clone())
+            .apply_staged_op(&[lhs, rhs], PrimitiveOperation::Add)
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0].state(), TracerState::Poison(output_type) if *output_type == lhs_type));
+        assert!(matches!(
+            builder.borrow().error.clone(),
+            Some(TracingError::Type(TypeError { message }))
+                if message == "add input types are not broadcast-compatible"
+        ));
+    }
+
+    #[test]
+    fn test_apply_staged_op_uses_input_type_when_poisoned_abstract_eval_fails() {
+        let builder = new_f64_builder();
+        let input_type = scalar_f64_type();
+        let atom = builder.borrow_mut().add_input(input_type.clone());
+        builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
+        let engine = TaggedEngine { id: 1 };
+        let tracer = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(atom);
+
+        let outputs = TracingEngine::new(&engine, builder)
+            .apply_staged_op(std::slice::from_ref(&tracer), PrimitiveOperation::Add)
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0].state(), TracerState::Poison(output_type) if *output_type == input_type));
+    }
+
+    #[test]
+    fn test_tracer_one_like_records_engine_identity_error() {
+        struct FailingOneEngine;
+
+        impl Engine for FailingOneEngine {
+            type Type = ArrayType;
+            type Value = f64;
+
+            fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+                Ok(0.0)
+            }
+
+            fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+                Err(TypeError { message: "test engine cannot synthesize one".to_string() }.into())
+            }
+        }
+
+        impl StagingEngine for FailingOneEngine {
+            type Operation = PrimitiveOperation<f64>;
+        }
+
         let engine = FailingOneEngine;
 
         assert!(matches!(
@@ -987,8 +1117,6 @@ mod tests {
         use std::fmt;
 
         use ryft_macros::Parameter;
-
-        use Type;
 
         #[derive(Clone, Debug, PartialEq, Eq)]
         struct TestType(&'static str);
@@ -1133,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn jit_returns_abstract_eval_errors_instead_of_panicking() {
+    fn test_interpret_and_trace_returns_abstract_eval_errors_instead_of_panicking() {
         use ryft_macros::Parameter;
 
         use crate::tracing::TracingError;
@@ -1285,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_program_display_renders_the_staged_program() {
+    fn test_staged_program_display_renders_the_staged_program() {
         let engine = ScalarEngine::<f64>::new();
         let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
             .interpret_and_trace(|x: Tracer<ScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()), 2.0f64)
