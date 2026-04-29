@@ -33,134 +33,6 @@ impl<'o, 'c: 'o, 't: 'c> Dim3<'o, 'c, 't> {
     }
 }
 
-fn required_attribute<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(
-    operation: &O,
-    attribute_name: &str,
-    operation_name: &str,
-) -> AttributeRef<'c, 't> {
-    operation
-        .attribute(attribute_name)
-        .unwrap_or_else(|| panic!("invalid '{attribute_name}' attribute in `{operation_name}`"))
-}
-
-fn optional_unit_attribute<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(operation: &O, attribute_name: &str) -> bool {
-    operation.attribute(attribute_name).is_some()
-}
-
-fn integer_attribute<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(
-    operation: &O,
-    attribute_name: &str,
-    operation_name: &str,
-) -> IntegerAttributeRef<'c, 't> {
-    required_attribute(operation, attribute_name, operation_name)
-        .cast()
-        .unwrap_or_else(|| panic!("invalid '{attribute_name}' attribute in `{operation_name}`"))
-}
-
-fn optional_integer_attribute<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(
-    operation: &O,
-    attribute_name: &str,
-) -> Option<IntegerAttributeRef<'c, 't>> {
-    operation.attribute(attribute_name).and_then(|attribute| attribute.cast())
-}
-
-fn matrix_transpose_mode<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(
-    operation: &O,
-    attribute_name: &str,
-    operation_name: &str,
-) -> MatrixTransposeMode {
-    required_attribute(operation, attribute_name, operation_name)
-        .cast::<MatrixTransposeModeAttributeRef>()
-        .map(|attribute| attribute.value())
-        .unwrap_or_else(|| panic!("invalid `{attribute_name}` attribute in `{operation_name}`"))
-}
-
-fn type_attribute<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(
-    operation: &O,
-    attribute_name: &str,
-    operation_name: &str,
-) -> TypeRef<'c, 't> {
-    required_attribute(operation, attribute_name, operation_name)
-        .cast::<TypeAttributeRef>()
-        .map(|attribute| attribute.r#type())
-        .unwrap_or_else(|| panic!("invalid `{attribute_name}` attribute in `{operation_name}`"))
-}
-
-fn operand_segment_sizes<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(operation: &O) -> Vec<usize> {
-    operation
-        .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-        .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-        .map(|attribute| attribute.values().map(|value| value as usize).collect())
-        .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", operation.name()))
-}
-
-fn result_segment_sizes<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(operation: &O) -> Vec<usize> {
-    operation
-        .attribute(RESULT_SEGMENT_SIZES_ATTRIBUTE)
-        .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-        .map(|attribute| attribute.values().map(|value| value as usize).collect())
-        .unwrap_or_else(|| panic!("invalid '{RESULT_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", operation.name()))
-}
-
-fn operand_segment<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(
-    operation: &O,
-    segment_index: usize,
-) -> Vec<ValueRef<'o, 'c, 't>> {
-    let segment_sizes = operand_segment_sizes(operation);
-    let start = segment_sizes.iter().take(segment_index).sum::<usize>();
-    operation.operand_values().skip(start).take(segment_sizes[segment_index]).collect()
-}
-
-fn result_segment<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(
-    operation: &O,
-    segment_index: usize,
-) -> Vec<ValueRef<'o, 'c, 't>> {
-    let segment_sizes = result_segment_sizes(operation);
-    let start = segment_sizes.iter().take(segment_index).sum::<usize>();
-    operation
-        .results()
-        .skip(start)
-        .take(segment_sizes[segment_index])
-        .map(|result| result.as_ref())
-        .collect()
-}
-
-fn leading_async_dependency_count<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(operation: &O) -> usize {
-    let token_type = operation.context().gpu_async_token_type().as_ref();
-    operation.operand_values().take_while(|operand| operand.r#type() == token_type).count()
-}
-
-fn leading_async_dependencies<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(
-    operation: &O,
-) -> Vec<ValueRef<'o, 'c, 't>> {
-    operation.operand_values().take(leading_async_dependency_count(operation)).collect()
-}
-
-fn optional_async_token<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(operation: &O) -> Option<ValueRef<'o, 'c, 't>> {
-    operation.result(0).map(|result| result.as_ref())
-}
-
-fn add_optional_async_result<'c, 't: 'c>(
-    builder: OperationBuilder<'c, 't>,
-    is_async: bool,
-) -> OperationBuilder<'c, 't> {
-    if is_async {
-        let async_token_type = builder.context().gpu_async_token_type();
-        builder.add_result(async_token_type)
-    } else {
-        builder
-    }
-}
-
-fn add_operand_segments<'c, 't: 'c>(
-    builder: OperationBuilder<'c, 't>,
-    segment_sizes: &[usize],
-) -> OperationBuilder<'c, 't> {
-    let segment_sizes = segment_sizes.iter().map(|size| *size as i32).collect::<Vec<_>>();
-    let segment_sizes = builder.context().dense_i32_array_attribute(segment_sizes.as_slice()).unwrap();
-    builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
-}
-
 /// Name of the [`Attribute`] that stores a GPU dimension.
 pub const DIMENSION_ATTRIBUTE: &str = "dimension";
 
@@ -177,7 +49,10 @@ macro_rules! gpu_dimension_operation {
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 /// Returns the GPU dimension queried by this operation.
                 fn dimension(&self) -> Dimension {
-                    required_attribute(self, DIMENSION_ATTRIBUTE, $operation_name)
+                    self.attribute(DIMENSION_ATTRIBUTE)
+                        .unwrap_or_else(|| {
+                            panic!("invalid '{DIMENSION_ATTRIBUTE}' attribute in `{}`", $operation_name)
+                        })
                         .cast::<DimensionAttributeRef>()
                         .map(|attribute| attribute.value())
                         .unwrap_or_else(|| panic!("invalid '{DIMENSION_ATTRIBUTE}' attribute in `{}`", $operation_name))
@@ -185,7 +60,7 @@ macro_rules! gpu_dimension_operation {
 
                 /// Returns the optional upper bound associated with this operation.
                 fn upper_bound(&self) -> Option<IntegerAttributeRef<'c, 't>> {
-                    optional_integer_attribute(self, UPPER_BOUND_ATTRIBUTE)
+                    self.attribute(UPPER_BOUND_ATTRIBUTE).and_then(|attribute| attribute.cast())
                 }
             }
 
@@ -235,7 +110,7 @@ macro_rules! gpu_upper_bound_index_operation {
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 /// Returns the optional upper bound associated with this operation.
                 fn upper_bound(&self) -> Option<IntegerAttributeRef<'c, 't>> {
-                    optional_integer_attribute(self, UPPER_BOUND_ATTRIBUTE)
+                    self.attribute(UPPER_BOUND_ATTRIBUTE).and_then(|attribute| attribute.cast())
                 }
             }
 
@@ -388,7 +263,7 @@ pub const WORKGROUP_ATTRIBUTIONS_ATTRIBUTE: &str = "workgroup_attributions";
 pub trait FuncOperation<'o, 'c: 'o, 't: 'c>: Function<'o, 'c, 't> + OneRegion<'o, 'c, 't> {
     /// Returns `true` if this GPU function is a kernel.
     fn is_kernel(&self) -> bool {
-        optional_unit_attribute(self, KERNEL_ATTRIBUTE)
+        self.attribute(KERNEL_ATTRIBUTE).is_some()
     }
 
     /// Returns the optional known block size hint.
@@ -414,7 +289,8 @@ pub trait FuncOperation<'o, 'c: 'o, 't: 'c>: Function<'o, 'c, 't> + OneRegion<'o
 
     /// Returns the number of workgroup attributions.
     fn workgroup_attribution_count(&self) -> usize {
-        optional_integer_attribute(self, WORKGROUP_ATTRIBUTIONS_ATTRIBUTE)
+        self.attribute(WORKGROUP_ATTRIBUTIONS_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
             .unwrap_or(0)
     }
@@ -463,9 +339,6 @@ pub fn dynamic_shared_memory<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         .expect("invalid arguments to `gpu::dynamic_shared_memory`")
 }
 
-/// Name of the MLIR attribute storing operation operand segment sizes.
-pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operand_segment_sizes";
-
 /// Properties used to construct a [`LaunchFuncOperation`].
 #[derive(Clone, Debug)]
 pub struct LaunchFuncProperties<'o, 'c: 'o, 't: 'c> {
@@ -497,56 +370,110 @@ pub struct LaunchFuncProperties<'o, 'c: 'o, 't: 'c> {
     pub is_async: bool,
 }
 
+/// Name of the MLIR attribute storing operation operand segment sizes.
+pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operand_segment_sizes";
+
 /// GPU operation that launches a named GPU kernel function.
 pub trait LaunchFuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 0)
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        self.operand_values().take(segment_sizes[0]).collect()
     }
 
     /// Returns the kernel symbol reference.
     fn kernel(&self) -> crate::SymbolRefAttributeRef<'c, 't> {
-        required_attribute(self, KERNEL_ATTRIBUTE, "gpu.launch_func")
+        self.attribute(KERNEL_ATTRIBUTE)
+            .expect("invalid `kernel` attribute in `gpu.launch_func`")
             .cast()
             .expect("invalid `kernel` attribute in `gpu.launch_func`")
     }
 
     /// Returns the grid size operands.
     fn grid_size(&self) -> Dim3<'o, 'c, 't> {
-        Dim3 { x: operand_segment(self, 1)[0], y: operand_segment(self, 2)[0], z: operand_segment(self, 3)[0] }
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        let x = segment_sizes.iter().take(1).sum::<usize>();
+        let y = segment_sizes.iter().take(2).sum::<usize>();
+        let z = segment_sizes.iter().take(3).sum::<usize>();
+        Dim3 { x: self.operand_value(x).unwrap(), y: self.operand_value(y).unwrap(), z: self.operand_value(z).unwrap() }
     }
 
     /// Returns the block size operands.
     fn block_size(&self) -> Dim3<'o, 'c, 't> {
-        Dim3 { x: operand_segment(self, 4)[0], y: operand_segment(self, 5)[0], z: operand_segment(self, 6)[0] }
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        let x = segment_sizes.iter().take(4).sum::<usize>();
+        let y = segment_sizes.iter().take(5).sum::<usize>();
+        let z = segment_sizes.iter().take(6).sum::<usize>();
+        Dim3 { x: self.operand_value(x).unwrap(), y: self.operand_value(y).unwrap(), z: self.operand_value(z).unwrap() }
     }
 
     /// Returns the optional cluster size operands.
     fn cluster_size(&self) -> Option<Dim3<'o, 'c, 't>> {
-        let x = operand_segment(self, 7);
-        let y = operand_segment(self, 8);
-        let z = operand_segment(self, 9);
-        if x.is_empty() { None } else { Some(Dim3 { x: x[0], y: y[0], z: z[0] }) }
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        if segment_sizes[7] == 0 {
+            None
+        } else {
+            let x = segment_sizes.iter().take(7).sum::<usize>();
+            let y = segment_sizes.iter().take(8).sum::<usize>();
+            let z = segment_sizes.iter().take(9).sum::<usize>();
+            Some(Dim3 {
+                x: self.operand_value(x).unwrap(),
+                y: self.operand_value(y).unwrap(),
+                z: self.operand_value(z).unwrap(),
+            })
+        }
     }
 
     /// Returns the optional dynamic shared-memory size operand.
     fn dynamic_shared_memory_size(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 10).first().copied()
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        if segment_sizes[10] == 0 { None } else { self.operand_value(segment_sizes.iter().take(10).sum::<usize>()) }
     }
 
     /// Returns the kernel argument operands.
     fn kernel_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 11)
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        let start = segment_sizes.iter().take(11).sum::<usize>();
+        self.operand_values().skip(start).take(segment_sizes[11]).collect()
     }
 
     /// Returns the optional async object operand.
     fn async_object(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 12).first().copied()
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        if segment_sizes[12] == 0 { None } else { self.operand_value(segment_sizes.iter().take(12).sum::<usize>()) }
     }
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        optional_async_token(self)
+        self.result(0).map(|result| result.as_ref())
     }
 }
 
@@ -598,7 +525,10 @@ pub fn launch_func<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     if !properties.is_async {
         segment_sizes[12] = usize::from(properties.async_object.is_some());
     }
-    add_operand_segments(builder, segment_sizes.as_slice())
+    let segment_sizes = segment_sizes.iter().map(|size| *size as i32).collect::<Vec<_>>();
+    let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice()).unwrap();
+    builder
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
         .build()
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `gpu::launch_func`")
@@ -645,30 +575,69 @@ pub const FUNCTION_ATTRIBUTE: &str = "function";
 pub trait LaunchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 0)
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        self.operand_values().take(segment_sizes[0]).collect()
     }
 
     /// Returns the grid size operands.
     fn grid_size(&self) -> Dim3<'o, 'c, 't> {
-        Dim3 { x: operand_segment(self, 1)[0], y: operand_segment(self, 2)[0], z: operand_segment(self, 3)[0] }
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        let x = segment_sizes.iter().take(1).sum::<usize>();
+        let y = segment_sizes.iter().take(2).sum::<usize>();
+        let z = segment_sizes.iter().take(3).sum::<usize>();
+        Dim3 { x: self.operand_value(x).unwrap(), y: self.operand_value(y).unwrap(), z: self.operand_value(z).unwrap() }
     }
 
     /// Returns the block size operands.
     fn block_size(&self) -> Dim3<'o, 'c, 't> {
-        Dim3 { x: operand_segment(self, 4)[0], y: operand_segment(self, 5)[0], z: operand_segment(self, 6)[0] }
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        let x = segment_sizes.iter().take(4).sum::<usize>();
+        let y = segment_sizes.iter().take(5).sum::<usize>();
+        let z = segment_sizes.iter().take(6).sum::<usize>();
+        Dim3 { x: self.operand_value(x).unwrap(), y: self.operand_value(y).unwrap(), z: self.operand_value(z).unwrap() }
     }
 
     /// Returns optional cluster size operands.
     fn cluster_size(&self) -> Option<Dim3<'o, 'c, 't>> {
-        let x = operand_segment(self, 7);
-        let y = operand_segment(self, 8);
-        let z = operand_segment(self, 9);
-        if x.is_empty() { None } else { Some(Dim3 { x: x[0], y: y[0], z: z[0] }) }
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        if segment_sizes[7] == 0 {
+            None
+        } else {
+            let x = segment_sizes.iter().take(7).sum::<usize>();
+            let y = segment_sizes.iter().take(8).sum::<usize>();
+            let z = segment_sizes.iter().take(9).sum::<usize>();
+            Some(Dim3 {
+                x: self.operand_value(x).unwrap(),
+                y: self.operand_value(y).unwrap(),
+                z: self.operand_value(z).unwrap(),
+            })
+        }
     }
 
     /// Returns the optional dynamic shared-memory size operand.
     fn dynamic_shared_memory_size(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 10).first().copied()
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        if segment_sizes[10] == 0 { None } else { self.operand_value(segment_sizes.iter().take(10).sum::<usize>()) }
     }
 
     /// Returns the optional module symbol.
@@ -683,7 +652,8 @@ pub trait LaunchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion
 
     /// Returns the number of workgroup attributions.
     fn workgroup_attribution_count(&self) -> usize {
-        optional_integer_attribute(self, WORKGROUP_ATTRIBUTIONS_ATTRIBUTE)
+        self.attribute(WORKGROUP_ATTRIBUTIONS_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
             .unwrap_or(0)
     }
@@ -695,7 +665,7 @@ pub trait LaunchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        optional_async_token(self)
+        self.result(0).map(|result| result.as_ref())
     }
 }
 
@@ -752,7 +722,11 @@ pub fn launch<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     if properties.is_async {
         builder = builder.add_result(context.gpu_async_token_type());
     }
-    add_operand_segments(builder.add_region(body), segment_sizes.as_slice())
+    let segment_sizes = segment_sizes.iter().map(|size| *size as i32).collect::<Vec<_>>();
+    let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice()).unwrap();
+    builder
+        .add_region(body)
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
         .build()
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `gpu::launch`")
@@ -765,7 +739,8 @@ pub const FORMAT_ATTRIBUTE: &str = "format";
 pub trait PrintfOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the printf format string.
     fn format(&self) -> StringRef<'c> {
-        required_attribute(self, FORMAT_ATTRIBUTE, "gpu.printf")
+        self.attribute(FORMAT_ATTRIBUTE)
+            .expect("invalid `format` attribute in `gpu.printf`")
             .cast::<StringAttributeRef>()
             .map(|attribute| attribute.string())
             .expect("invalid `format` attribute in `gpu.printf`")
@@ -894,7 +869,7 @@ pub trait AllReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneReg
 
     /// Returns `true` if the collective is marked uniform.
     fn is_uniform(&self) -> bool {
-        optional_unit_attribute(self, UNIFORM_ATTRIBUTE)
+        self.attribute(UNIFORM_ATTRIBUTE).is_some()
     }
 
     /// Returns the reduction body region.
@@ -950,7 +925,8 @@ pub trait SubgroupReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the built-in reduction operation kind.
     fn operation_kind(&self) -> AllReduceOperationKind {
-        required_attribute(self, OP_ATTRIBUTE, "gpu.subgroup_reduce")
+        self.attribute(OP_ATTRIBUTE)
+            .expect("invalid `op` attribute in `gpu.subgroup_reduce`")
             .cast::<AllReduceOperationKindAttributeRef>()
             .map(|attribute| attribute.value())
             .expect("invalid `op` attribute in `gpu.subgroup_reduce`")
@@ -958,17 +934,20 @@ pub trait SubgroupReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns `true` if the reduction is marked uniform.
     fn is_uniform(&self) -> bool {
-        optional_unit_attribute(self, UNIFORM_ATTRIBUTE)
+        self.attribute(UNIFORM_ATTRIBUTE).is_some()
     }
 
     /// Returns the optional subgroup cluster size.
     fn cluster_size(&self) -> Option<IntegerAttributeRef<'c, 't>> {
-        optional_integer_attribute(self, CLUSTER_SIZE_ATTRIBUTE)
+        self.attribute(CLUSTER_SIZE_ATTRIBUTE).and_then(|attribute| attribute.cast())
     }
 
     /// Returns the subgroup cluster stride.
     fn cluster_stride(&self) -> IntegerAttributeRef<'c, 't> {
-        integer_attribute(self, CLUSTER_STRIDE_ATTRIBUTE, "gpu.subgroup_reduce")
+        self.attribute(CLUSTER_STRIDE_ATTRIBUTE)
+            .expect("invalid 'cluster_stride' attribute in `gpu.subgroup_reduce`")
+            .cast()
+            .expect("invalid 'cluster_stride' attribute in `gpu.subgroup_reduce`")
     }
 }
 
@@ -1034,7 +1013,8 @@ pub trait ShuffleOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the shuffle mode.
     fn mode(&self) -> ShuffleMode {
-        required_attribute(self, MODE_ATTRIBUTE, "gpu.shuffle")
+        self.attribute(MODE_ATTRIBUTE)
+            .expect("invalid `mode` attribute in `gpu.shuffle`")
             .cast::<ShuffleModeAttributeRef>()
             .map(|attribute| attribute.value())
             .expect("invalid `mode` attribute in `gpu.shuffle`")
@@ -1102,12 +1082,18 @@ pub trait RotateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the rotation offset attribute.
     fn offset(&self) -> IntegerAttributeRef<'c, 't> {
-        integer_attribute(self, OFFSET_ATTRIBUTE, "gpu.rotate")
+        self.attribute(OFFSET_ATTRIBUTE)
+            .expect("invalid 'offset' attribute in `gpu.rotate`")
+            .cast()
+            .expect("invalid 'offset' attribute in `gpu.rotate`")
     }
 
     /// Returns the rotation width attribute.
     fn width(&self) -> IntegerAttributeRef<'c, 't> {
-        integer_attribute(self, WIDTH_ATTRIBUTE, "gpu.rotate")
+        self.attribute(WIDTH_ATTRIBUTE)
+            .expect("invalid 'width' attribute in `gpu.rotate`")
+            .cast()
+            .expect("invalid 'width' attribute in `gpu.rotate`")
     }
 
     /// Returns the rotated value result.
@@ -1270,7 +1256,8 @@ pub trait BinaryOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + Symbol<'o
 
     /// Returns the GPU object attribute array.
     fn objects(&self) -> ArrayAttributeRef<'c, 't> {
-        required_attribute(self, OBJECTS_ATTRIBUTE, "gpu.binary")
+        self.attribute(OBJECTS_ATTRIBUTE)
+            .expect("invalid `objects` attribute in `gpu.binary`")
             .cast()
             .expect("invalid `objects` attribute in `gpu.binary`")
     }
@@ -1361,7 +1348,7 @@ pub trait WaitOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        optional_async_token(self)
+        self.result(0).map(|result| result.as_ref())
     }
 }
 
@@ -1377,7 +1364,11 @@ pub fn wait<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> DetachedWaitOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::gpu());
-    add_optional_async_result(OperationBuilder::new("gpu.wait", location).add_operands(async_dependencies), is_async)
+    let mut builder = OperationBuilder::new("gpu.wait", location).add_operands(async_dependencies);
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
         .build()
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `gpu::wait`")
@@ -1390,22 +1381,39 @@ pub const HOST_SHARED_ATTRIBUTE: &str = "hostShared";
 pub trait AllocOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 0)
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        self.operand_values().take(segment_sizes[0]).collect()
     }
 
     /// Returns dynamic size operands.
     fn dynamic_sizes(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 1)
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        let start = segment_sizes.iter().take(1).sum::<usize>();
+        self.operand_values().skip(start).take(segment_sizes[1]).collect()
     }
 
     /// Returns symbol operands.
     fn symbol_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 2)
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        let start = segment_sizes.iter().take(2).sum::<usize>();
+        self.operand_values().skip(start).take(segment_sizes[2]).collect()
     }
 
     /// Returns `true` if the allocation is host shared.
     fn host_shared(&self) -> bool {
-        optional_unit_attribute(self, HOST_SHARED_ATTRIBUTE)
+        self.attribute(HOST_SHARED_ATTRIBUTE).is_some()
     }
 
     /// Returns the allocated memref result.
@@ -1446,7 +1454,13 @@ pub fn alloc<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     if is_async {
         builder = builder.add_result(context.gpu_async_token_type());
     }
-    add_operand_segments(builder, &[async_dependencies.len(), dynamic_sizes.len(), symbol_operands.len()])
+    let segment_sizes = [async_dependencies.len(), dynamic_sizes.len(), symbol_operands.len()]
+        .iter()
+        .map(|size| *size as i32)
+        .collect::<Vec<_>>();
+    let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice()).unwrap();
+    builder
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
         .build()
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `gpu::alloc`")
@@ -1465,19 +1479,25 @@ macro_rules! gpu_async_prefix_operation {
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 /// Returns async token dependencies.
                 fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-                    leading_async_dependencies(self)
+                    let token_type = self.context().gpu_async_token_type().as_ref();
+                    self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
                 }
 
                 $(
                     #[doc = "Returns this operation operand."]
                     fn $method(&self) -> ValueRef<'o, 'c, 't> {
-                        self.operand_value(leading_async_dependency_count(self) + $index).unwrap()
+                        let token_type = self.context().gpu_async_token_type().as_ref();
+                        let async_dependency_count = self
+                            .operand_values()
+                            .take_while(|operand| operand.r#type() == token_type)
+                            .count();
+                        self.operand_value(async_dependency_count + $index).unwrap()
                     }
                 )+
 
                 /// Returns the optional async token result.
                 fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-                    optional_async_token(self)
+                    self.result(0).map(|result| result.as_ref())
                 }
             }
 
@@ -1519,14 +1539,17 @@ pub fn dealloc<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     is_async: bool,
     location: L,
 ) -> DetachedDeallocOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
-    add_optional_async_result(
-        OperationBuilder::new("gpu.dealloc", location).add_operands(async_dependencies).add_operand(memref),
-        is_async,
-    )
-    .build()
-    .and_then(|operation| unsafe { operation.cast() })
-    .expect("invalid arguments to `gpu::dealloc`")
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder =
+        OperationBuilder::new("gpu.dealloc", location).add_operands(async_dependencies).add_operand(memref);
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::dealloc`")
 }
 
 /// Constructs a new detached/owned [`MemcpyOperation`] at the specified [`Location`].
@@ -1537,17 +1560,19 @@ pub fn memcpy<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     is_async: bool,
     location: L,
 ) -> DetachedMemcpyOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
-    add_optional_async_result(
-        OperationBuilder::new("gpu.memcpy", location)
-            .add_operands(async_dependencies)
-            .add_operand(destination)
-            .add_operand(source),
-        is_async,
-    )
-    .build()
-    .and_then(|operation| unsafe { operation.cast() })
-    .expect("invalid arguments to `gpu::memcpy`")
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.memcpy", location)
+        .add_operands(async_dependencies)
+        .add_operand(destination)
+        .add_operand(source);
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::memcpy`")
 }
 
 /// Constructs a new detached/owned [`MemsetOperation`] at the specified [`Location`].
@@ -1558,17 +1583,19 @@ pub fn memset<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     is_async: bool,
     location: L,
 ) -> DetachedMemsetOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
-    add_optional_async_result(
-        OperationBuilder::new("gpu.memset", location)
-            .add_operands(async_dependencies)
-            .add_operand(destination)
-            .add_operand(value),
-        is_async,
-    )
-    .build()
-    .and_then(|operation| unsafe { operation.cast() })
-    .expect("invalid arguments to `gpu::memset`")
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.memset", location)
+        .add_operands(async_dependencies)
+        .add_operand(destination)
+        .add_operand(value);
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::memset`")
 }
 
 /// GPU operation that sets the default device index.
@@ -1616,12 +1643,15 @@ pub trait SubgroupMmaLoadMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 
 
     /// Returns the leading dimension attribute.
     fn lead_dimension(&self) -> IntegerAttributeRef<'c, 't> {
-        integer_attribute(self, LEAD_DIMENSION_ATTRIBUTE, "gpu.subgroup_mma_load_matrix")
+        self.attribute(LEAD_DIMENSION_ATTRIBUTE)
+            .expect("invalid 'leadDimension' attribute in `gpu.subgroup_mma_load_matrix`")
+            .cast()
+            .expect("invalid 'leadDimension' attribute in `gpu.subgroup_mma_load_matrix`")
     }
 
     /// Returns `true` if the load is transposed.
     fn transpose(&self) -> bool {
-        optional_unit_attribute(self, TRANSPOSE_ATTRIBUTE)
+        self.attribute(TRANSPOSE_ATTRIBUTE).is_some()
     }
 
     /// Returns the loaded MMA matrix result.
@@ -1654,12 +1684,15 @@ pub trait SubgroupMmaStoreMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c,
 
     /// Returns the leading dimension attribute.
     fn lead_dimension(&self) -> IntegerAttributeRef<'c, 't> {
-        integer_attribute(self, LEAD_DIMENSION_ATTRIBUTE, "gpu.subgroup_mma_store_matrix")
+        self.attribute(LEAD_DIMENSION_ATTRIBUTE)
+            .expect("invalid 'leadDimension' attribute in `gpu.subgroup_mma_store_matrix`")
+            .cast()
+            .expect("invalid 'leadDimension' attribute in `gpu.subgroup_mma_store_matrix`")
     }
 
     /// Returns `true` if the store is transposed.
     fn transpose(&self) -> bool {
-        optional_unit_attribute(self, TRANSPOSE_ATTRIBUTE)
+        self.attribute(TRANSPOSE_ATTRIBUTE).is_some()
     }
 }
 
@@ -1692,12 +1725,12 @@ pub trait SubgroupMmaComputeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't>
 
     /// Returns `true` if operand A is transposed.
     fn a_transpose(&self) -> bool {
-        optional_unit_attribute(self, A_TRANSPOSE_ATTRIBUTE)
+        self.attribute(A_TRANSPOSE_ATTRIBUTE).is_some()
     }
 
     /// Returns `true` if operand B is transposed.
     fn b_transpose(&self) -> bool {
-        optional_unit_attribute(self, B_TRANSPOSE_ATTRIBUTE)
+        self.attribute(B_TRANSPOSE_ATTRIBUTE).is_some()
     }
 
     /// Returns the result matrix.
@@ -1793,7 +1826,8 @@ pub trait SubgroupMmaElementwiseOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c,
 
     /// Returns the elementwise operation kind.
     fn operation(&self) -> MmaElementwiseOperation {
-        required_attribute(self, OP_TYPE_ATTRIBUTE, "gpu.subgroup_mma_elementwise")
+        self.attribute(OP_TYPE_ATTRIBUTE)
+            .expect("invalid `opType` attribute in `gpu.subgroup_mma_elementwise`")
             .cast::<MmaElementwiseOperationAttributeRef>()
             .map(|attribute| attribute.value())
             .expect("invalid `opType` attribute in `gpu.subgroup_mma_elementwise`")
@@ -1817,13 +1851,19 @@ macro_rules! gpu_sparse_async_operation {
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 /// Returns async token dependencies.
                 fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-                    leading_async_dependencies(self)
+                    let token_type = self.context().gpu_async_token_type().as_ref();
+                    self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
                 }
 
                 $(
                     #[doc = "Returns this operation operand."]
                     fn $method(&self) -> ValueRef<'o, 'c, 't> {
-                        self.operand_value(leading_async_dependency_count(self) + $index).unwrap()
+                        let token_type = self.context().gpu_async_token_type().as_ref();
+                        let async_dependency_count = self
+                            .operand_values()
+                            .take_while(|operand| operand.r#type() == token_type)
+                            .count();
+                        self.operand_value(async_dependency_count + $index).unwrap()
                     }
                 )*
 
@@ -1832,7 +1872,7 @@ macro_rules! gpu_sparse_async_operation {
                     if self.result_count() > 1 {
                         self.result(self.result_count() - 1).map(|result| result.as_ref())
                     } else {
-                        optional_async_token(self)
+                        self.result(0).map(|result| result.as_ref())
                     }
                 }
             }
@@ -1851,13 +1891,19 @@ macro_rules! gpu_sparse_create_sp_mat_operation {
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 /// Returns async token dependencies.
                 fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-                    leading_async_dependencies(self)
+                    let token_type = self.context().gpu_async_token_type().as_ref();
+                    self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
                 }
 
                 $(
                     #[doc = "Returns this operation operand."]
                     fn $method(&self) -> ValueRef<'o, 'c, 't> {
-                        self.operand_value(leading_async_dependency_count(self) + $index).unwrap()
+                        let token_type = self.context().gpu_async_token_type().as_ref();
+                        let async_dependency_count = self
+                            .operand_values()
+                            .take_while(|operand| operand.r#type() == token_type)
+                            .count();
+                        self.operand_value(async_dependency_count + $index).unwrap()
                     }
                 )+
 
@@ -1883,17 +1929,33 @@ macro_rules! gpu_sparse_create_sp_mat_operation {
 pub trait CreateDnTensorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 0)
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        self.operand_values().take(segment_sizes[0]).collect()
     }
 
     /// Returns the dense tensor backing memref.
     fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        operand_segment(self, 1)[0]
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        self.operand_value(segment_sizes.iter().take(1).sum::<usize>()).unwrap()
     }
 
     /// Returns dense tensor dimension operands.
     fn dimensions(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 2)
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        let start = segment_sizes.iter().take(2).sum::<usize>();
+        self.operand_values().skip(start).take(segment_sizes[2]).collect()
     }
 
     /// Returns the dense tensor handle result.
@@ -1963,22 +2025,28 @@ pub const PRUNE_FLAG_ATTRIBUTE: &str = "pruneFlag";
 pub trait Create2To4SpMatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        leading_async_dependencies(self)
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
     }
 
     /// Returns the row count operand.
     fn rows(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self)).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count).unwrap()
     }
 
     /// Returns the column count operand.
     fn columns(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 1).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 1).unwrap()
     }
 
     /// Returns the pruning flag.
     fn prune_flag(&self) -> Prune2To4SparseMatrixFlag {
-        required_attribute(self, PRUNE_FLAG_ATTRIBUTE, "gpu.create_2to4_spmat")
+        self.attribute(PRUNE_FLAG_ATTRIBUTE)
+            .expect("invalid `pruneFlag` attribute in `gpu.create_2to4_spmat`")
             .cast::<Prune2To4SparseMatrixFlagAttributeRef>()
             .map(|attribute| attribute.value())
             .expect("invalid `pruneFlag` attribute in `gpu.create_2to4_spmat`")
@@ -1986,7 +2054,9 @@ pub trait Create2To4SpMatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the dense backing memref.
     fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 2).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 2).unwrap()
     }
 
     /// Returns the sparse matrix result.
@@ -2023,32 +2093,47 @@ pub const COMPUTE_TYPE_ATTRIBUTE: &str = "computeType";
 pub trait SpmvBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        leading_async_dependencies(self)
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
     }
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_A_ATTRIBUTE, "gpu.spmv_buffer_size")
+        self.attribute(MODE_A_ATTRIBUTE)
+            .expect("invalid `modeA` attribute in `gpu.spmv_buffer_size`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeA` attribute in `gpu.spmv_buffer_size`")
     }
 
     /// Returns sparse matrix A.
     fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self)).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count).unwrap()
     }
 
     /// Returns dense tensor X.
     fn dense_tensor_x(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 1).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 1).unwrap()
     }
 
     /// Returns dense tensor Y.
     fn dense_tensor_y(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 2).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 2).unwrap()
     }
 
     /// Returns the compute type attribute.
     fn compute_type(&self) -> TypeRef<'c, 't> {
-        type_attribute(self, COMPUTE_TYPE_ATTRIBUTE, "gpu.spmv_buffer_size")
+        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
+            .expect("invalid `computeType` attribute in `gpu.spmv_buffer_size`")
+            .cast::<TypeAttributeRef>()
+            .map(|attribute| attribute.r#type())
+            .expect("invalid `computeType` attribute in `gpu.spmv_buffer_size`")
     }
 
     /// Returns the buffer-size result.
@@ -2070,42 +2155,59 @@ mlir_op_trait!(SpmvBufferSize, ZeroSuccessors);
 pub trait SpmvOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        leading_async_dependencies(self)
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
     }
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_A_ATTRIBUTE, "gpu.spmv")
+        self.attribute(MODE_A_ATTRIBUTE)
+            .expect("invalid `modeA` attribute in `gpu.spmv`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeA` attribute in `gpu.spmv`")
     }
 
     /// Returns sparse matrix A.
     fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self)).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count).unwrap()
     }
 
     /// Returns dense tensor X.
     fn dense_tensor_x(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 1).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 1).unwrap()
     }
 
     /// Returns dense tensor Y.
     fn dense_tensor_y(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 2).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 2).unwrap()
     }
 
     /// Returns the temporary buffer.
     fn buffer(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 3).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 3).unwrap()
     }
 
     /// Returns the compute type attribute.
     fn compute_type(&self) -> TypeRef<'c, 't> {
-        type_attribute(self, COMPUTE_TYPE_ATTRIBUTE, "gpu.spmv")
+        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
+            .expect("invalid `computeType` attribute in `gpu.spmv`")
+            .cast::<TypeAttributeRef>()
+            .map(|attribute| attribute.r#type())
+            .expect("invalid `computeType` attribute in `gpu.spmv`")
     }
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        optional_async_token(self)
+        self.result(0).map(|result| result.as_ref())
     }
 }
 
@@ -2120,47 +2222,76 @@ pub const RESULT_SEGMENT_SIZES_ATTRIBUTE: &str = "result_segment_sizes";
 pub trait SpmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        leading_async_dependencies(self)
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
     }
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_A_ATTRIBUTE, "gpu.spmm_buffer_size")
+        self.attribute(MODE_A_ATTRIBUTE)
+            .expect("invalid `modeA` attribute in `gpu.spmm_buffer_size`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeA` attribute in `gpu.spmm_buffer_size`")
     }
 
     /// Returns dense matrix B transpose mode.
     fn mode_b(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_B_ATTRIBUTE, "gpu.spmm_buffer_size")
+        self.attribute(MODE_B_ATTRIBUTE)
+            .expect("invalid `modeB` attribute in `gpu.spmm_buffer_size`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeB` attribute in `gpu.spmm_buffer_size`")
     }
 
     /// Returns sparse matrix A.
     fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self)).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count).unwrap()
     }
 
     /// Returns dense matrix B.
     fn dense_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 1).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 1).unwrap()
     }
 
     /// Returns dense matrix C.
     fn dense_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 2).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 2).unwrap()
     }
 
     /// Returns the compute type attribute.
     fn compute_type(&self) -> TypeRef<'c, 't> {
-        type_attribute(self, COMPUTE_TYPE_ATTRIBUTE, "gpu.spmm_buffer_size")
+        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
+            .expect("invalid `computeType` attribute in `gpu.spmm_buffer_size`")
+            .cast::<TypeAttributeRef>()
+            .map(|attribute| attribute.r#type())
+            .expect("invalid `computeType` attribute in `gpu.spmm_buffer_size`")
     }
 
     /// Returns the buffer-size results.
     fn buffer_sizes(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        result_segment(self, 0)
+        let segment_sizes = self
+            .attribute(RESULT_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{RESULT_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        self.results().take(segment_sizes[0]).map(|result| result.as_ref()).collect()
     }
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        result_segment(self, 1).first().copied()
+        let segment_sizes = self
+            .attribute(RESULT_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{RESULT_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        if segment_sizes[1] == 0 { None } else { self.result(segment_sizes[0]).map(|result| result.as_ref()) }
     }
 }
 
@@ -2172,47 +2303,85 @@ mlir_op_trait!(SpmmBufferSize, ZeroSuccessors);
 pub trait SpmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 0)
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        self.operand_values().take(segment_sizes[0]).collect()
     }
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_A_ATTRIBUTE, "gpu.spmm")
+        self.attribute(MODE_A_ATTRIBUTE)
+            .expect("invalid `modeA` attribute in `gpu.spmm`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeA` attribute in `gpu.spmm`")
     }
 
     /// Returns dense matrix B transpose mode.
     fn mode_b(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_B_ATTRIBUTE, "gpu.spmm")
+        self.attribute(MODE_B_ATTRIBUTE)
+            .expect("invalid `modeB` attribute in `gpu.spmm`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeB` attribute in `gpu.spmm`")
     }
 
     /// Returns sparse matrix A.
     fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        operand_segment(self, 1)[0]
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        self.operand_value(segment_sizes.iter().take(1).sum::<usize>()).unwrap()
     }
 
     /// Returns dense matrix B.
     fn dense_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        operand_segment(self, 2)[0]
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        self.operand_value(segment_sizes.iter().take(2).sum::<usize>()).unwrap()
     }
 
     /// Returns dense matrix C.
     fn dense_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        operand_segment(self, 3)[0]
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        self.operand_value(segment_sizes.iter().take(3).sum::<usize>()).unwrap()
     }
 
     /// Returns temporary buffers.
     fn buffers(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        operand_segment(self, 4)
+        let segment_sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
+        let start = segment_sizes.iter().take(4).sum::<usize>();
+        self.operand_values().skip(start).take(segment_sizes[4]).collect()
     }
 
     /// Returns the compute type attribute.
     fn compute_type(&self) -> TypeRef<'c, 't> {
-        type_attribute(self, COMPUTE_TYPE_ATTRIBUTE, "gpu.spmm")
+        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
+            .expect("invalid `computeType` attribute in `gpu.spmm`")
+            .cast::<TypeAttributeRef>()
+            .map(|attribute| attribute.r#type())
+            .expect("invalid `computeType` attribute in `gpu.spmm`")
     }
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        optional_async_token(self)
+        self.result(0).map(|result| result.as_ref())
     }
 }
 
@@ -2224,37 +2393,56 @@ mlir_op_trait!(Spmm, ZeroSuccessors);
 pub trait SddmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        leading_async_dependencies(self)
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
     }
 
     /// Returns dense matrix A transpose mode.
     fn mode_a(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_A_ATTRIBUTE, "gpu.sddmm_buffer_size")
+        self.attribute(MODE_A_ATTRIBUTE)
+            .expect("invalid `modeA` attribute in `gpu.sddmm_buffer_size`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeA` attribute in `gpu.sddmm_buffer_size`")
     }
 
     /// Returns dense matrix B transpose mode.
     fn mode_b(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_B_ATTRIBUTE, "gpu.sddmm_buffer_size")
+        self.attribute(MODE_B_ATTRIBUTE)
+            .expect("invalid `modeB` attribute in `gpu.sddmm_buffer_size`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeB` attribute in `gpu.sddmm_buffer_size`")
     }
 
     /// Returns dense matrix A.
     fn dense_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self)).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count).unwrap()
     }
 
     /// Returns dense matrix B.
     fn dense_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 1).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 1).unwrap()
     }
 
     /// Returns sparse matrix C.
     fn sparse_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 2).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 2).unwrap()
     }
 
     /// Returns the compute type attribute.
     fn compute_type(&self) -> TypeRef<'c, 't> {
-        type_attribute(self, COMPUTE_TYPE_ATTRIBUTE, "gpu.sddmm_buffer_size")
+        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
+            .expect("invalid `computeType` attribute in `gpu.sddmm_buffer_size`")
+            .cast::<TypeAttributeRef>()
+            .map(|attribute| attribute.r#type())
+            .expect("invalid `computeType` attribute in `gpu.sddmm_buffer_size`")
     }
 
     /// Returns the buffer-size result.
@@ -2276,47 +2464,68 @@ mlir_op_trait!(SddmmBufferSize, ZeroSuccessors);
 pub trait SddmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        leading_async_dependencies(self)
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
     }
 
     /// Returns dense matrix A transpose mode.
     fn mode_a(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_A_ATTRIBUTE, "gpu.sddmm")
+        self.attribute(MODE_A_ATTRIBUTE)
+            .expect("invalid `modeA` attribute in `gpu.sddmm`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeA` attribute in `gpu.sddmm`")
     }
 
     /// Returns dense matrix B transpose mode.
     fn mode_b(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_B_ATTRIBUTE, "gpu.sddmm")
+        self.attribute(MODE_B_ATTRIBUTE)
+            .expect("invalid `modeB` attribute in `gpu.sddmm`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeB` attribute in `gpu.sddmm`")
     }
 
     /// Returns dense matrix A.
     fn dense_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self)).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count).unwrap()
     }
 
     /// Returns dense matrix B.
     fn dense_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 1).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 1).unwrap()
     }
 
     /// Returns sparse matrix C.
     fn sparse_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 2).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 2).unwrap()
     }
 
     /// Returns the temporary buffer.
     fn buffer(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 3).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 3).unwrap()
     }
 
     /// Returns the compute type attribute.
     fn compute_type(&self) -> TypeRef<'c, 't> {
-        type_attribute(self, COMPUTE_TYPE_ATTRIBUTE, "gpu.sddmm")
+        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
+            .expect("invalid `computeType` attribute in `gpu.sddmm`")
+            .cast::<TypeAttributeRef>()
+            .map(|attribute| attribute.r#type())
+            .expect("invalid `computeType` attribute in `gpu.sddmm`")
     }
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        optional_async_token(self)
+        self.result(0).map(|result| result.as_ref())
     }
 }
 
@@ -2328,7 +2537,8 @@ mlir_op_trait!(Sddmm, ZeroSuccessors);
 pub trait SpGemmCreateDescrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        leading_async_dependencies(self)
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
     }
 
     /// Returns the SpGEMM descriptor result.
@@ -2359,57 +2569,83 @@ pub const KIND_ATTRIBUTE: &str = "kind";
 pub trait SpGemmWorkEstimationOrComputeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        leading_async_dependencies(self)
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
     }
 
     /// Returns the SpGEMM descriptor operand.
     fn descriptor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self)).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count).unwrap()
     }
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_A_ATTRIBUTE, "gpu.spgemm_work_estimation_or_compute")
+        self.attribute(MODE_A_ATTRIBUTE)
+            .expect("invalid `modeA` attribute in `gpu.spgemm_work_estimation_or_compute`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeA` attribute in `gpu.spgemm_work_estimation_or_compute`")
     }
 
     /// Returns sparse matrix B transpose mode.
     fn mode_b(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_B_ATTRIBUTE, "gpu.spgemm_work_estimation_or_compute")
+        self.attribute(MODE_B_ATTRIBUTE)
+            .expect("invalid `modeB` attribute in `gpu.spgemm_work_estimation_or_compute`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeB` attribute in `gpu.spgemm_work_estimation_or_compute`")
     }
 
     /// Returns the sparse matrix A operand.
     fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 1).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 1).unwrap()
     }
 
     /// Returns the sparse matrix B operand.
     fn sparse_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 2).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 2).unwrap()
     }
 
     /// Returns the sparse matrix C operand.
     fn sparse_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 3).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 3).unwrap()
     }
 
     /// Returns the current buffer-size operand.
     fn buffer_size(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 4).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 4).unwrap()
     }
 
     /// Returns the temporary buffer operand.
     fn buffer(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 5).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 5).unwrap()
     }
 
     /// Returns the compute type attribute.
     fn compute_type(&self) -> TypeRef<'c, 't> {
-        type_attribute(self, COMPUTE_TYPE_ATTRIBUTE, "gpu.spgemm_work_estimation_or_compute")
+        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
+            .expect("invalid `computeType` attribute in `gpu.spgemm_work_estimation_or_compute`")
+            .cast::<TypeAttributeRef>()
+            .map(|attribute| attribute.r#type())
+            .expect("invalid `computeType` attribute in `gpu.spgemm_work_estimation_or_compute`")
     }
 
     /// Returns the SpGEMM work kind.
     fn kind(&self) -> SpGemmWorkKind {
-        required_attribute(self, KIND_ATTRIBUTE, "gpu.spgemm_work_estimation_or_compute")
+        self.attribute(KIND_ATTRIBUTE)
+            .expect("invalid `kind` attribute in `gpu.spgemm_work_estimation_or_compute`")
             .cast::<SpGemmWorkKindAttributeRef>()
             .map(|attribute| attribute.value())
             .expect("invalid `kind` attribute in `gpu.spgemm_work_estimation_or_compute`")
@@ -2434,47 +2670,68 @@ mlir_op_trait!(SpGemmWorkEstimationOrCompute, ZeroSuccessors);
 pub trait SpGemmCopyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        leading_async_dependencies(self)
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
     }
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_A_ATTRIBUTE, "gpu.spgemm_copy")
+        self.attribute(MODE_A_ATTRIBUTE)
+            .expect("invalid `modeA` attribute in `gpu.spgemm_copy`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeA` attribute in `gpu.spgemm_copy`")
     }
 
     /// Returns sparse matrix B transpose mode.
     fn mode_b(&self) -> MatrixTransposeMode {
-        matrix_transpose_mode(self, MODE_B_ATTRIBUTE, "gpu.spgemm_copy")
+        self.attribute(MODE_B_ATTRIBUTE)
+            .expect("invalid `modeB` attribute in `gpu.spgemm_copy`")
+            .cast::<MatrixTransposeModeAttributeRef>()
+            .map(|attribute| attribute.value())
+            .expect("invalid `modeB` attribute in `gpu.spgemm_copy`")
     }
 
     /// Returns the SpGEMM descriptor operand.
     fn descriptor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self)).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count).unwrap()
     }
 
     /// Returns the sparse matrix A operand.
     fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 1).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 1).unwrap()
     }
 
     /// Returns the sparse matrix B operand.
     fn sparse_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 2).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 2).unwrap()
     }
 
     /// Returns the sparse matrix C operand.
     fn sparse_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self) + 3).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count + 3).unwrap()
     }
 
     /// Returns the compute type attribute.
     fn compute_type(&self) -> TypeRef<'c, 't> {
-        type_attribute(self, COMPUTE_TYPE_ATTRIBUTE, "gpu.spgemm_copy")
+        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
+            .expect("invalid `computeType` attribute in `gpu.spgemm_copy`")
+            .cast::<TypeAttributeRef>()
+            .map(|attribute| attribute.r#type())
+            .expect("invalid `computeType` attribute in `gpu.spgemm_copy`")
     }
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        optional_async_token(self)
+        self.result(0).map(|result| result.as_ref())
     }
 }
 
@@ -2486,12 +2743,15 @@ mlir_op_trait!(SpGemmCopy, ZeroSuccessors);
 pub trait SpMatGetSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        leading_async_dependencies(self)
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
     }
 
     /// Returns the sparse matrix operand.
     fn sparse_matrix(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(leading_async_dependency_count(self)).unwrap()
+        let token_type = self.context().gpu_async_token_type().as_ref();
+        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
+        self.operand_value(async_dependency_count).unwrap()
     }
 
     /// Returns the sparse matrix row-count result.
@@ -2537,7 +2797,10 @@ pub trait WarpExecuteOnLane0Operation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't>
 
     /// Returns the warp size attribute.
     fn warp_size(&self) -> IntegerAttributeRef<'c, 't> {
-        integer_attribute(self, WARP_SIZE_ATTRIBUTE, "gpu.warp_execute_on_lane_0")
+        self.attribute(WARP_SIZE_ATTRIBUTE)
+            .expect("invalid 'warp_size' attribute in `gpu.warp_execute_on_lane_0`")
+            .cast()
+            .expect("invalid 'warp_size' attribute in `gpu.warp_execute_on_lane_0`")
     }
 
     /// Returns operands passed into the lane-0 region.
@@ -2578,7 +2841,8 @@ pub trait SubgroupBroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> 
 
     /// Returns the broadcast type.
     fn broadcast_type(&self) -> BroadcastType {
-        required_attribute(self, BROADCAST_TYPE_ATTRIBUTE, "gpu.subgroup_broadcast")
+        self.attribute(BROADCAST_TYPE_ATTRIBUTE)
+            .expect("invalid `broadcast_type` attribute in `gpu.subgroup_broadcast`")
             .cast::<BroadcastTypeAttributeRef>()
             .map(|attribute| attribute.value())
             .expect("invalid `broadcast_type` attribute in `gpu.subgroup_broadcast`")
@@ -3407,16 +3671,17 @@ mod tests {
         let memref = block.argument(1).unwrap();
         let dimension = block.argument(2).unwrap();
         let stride = block.argument(3).unwrap();
-        let operation: DetachedCreateDnTensorOperation<'_, '_> = build_detached_operation(add_operand_segments(
+        let segment_sizes = context.dense_i32_array_attribute(&[1, 1, 2]).unwrap();
+        let operation: DetachedCreateDnTensorOperation<'_, '_> = build_detached_operation(
             OperationBuilder::new("gpu.create_dn_tensor", location)
                 .add_operand(token)
                 .add_operand(memref)
                 .add_operand(dimension)
                 .add_operand(stride)
+                .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
                 .add_result(context.gpu_sparse_dn_tensor_handle_type())
                 .add_result(context.gpu_async_token_type()),
-            &[1, 1, 2],
-        ));
+        );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.create_dn_tensor"));
         assert_eq!(operation.async_dependencies(), vec![token]);
@@ -3707,7 +3972,8 @@ mod tests {
         let dense_matrix_c = block.argument(3).unwrap();
         let buffer_0 = block.argument(4).unwrap();
         let buffer_1 = block.argument(5).unwrap();
-        let operation: DetachedSpmmOperation<'_, '_> = build_detached_operation(add_operand_segments(
+        let segment_sizes = context.dense_i32_array_attribute(&[1, 1, 1, 1, 2]).unwrap();
+        let operation: DetachedSpmmOperation<'_, '_> = build_detached_operation(
             OperationBuilder::new("gpu.spmm", location)
                 .add_operand(token)
                 .add_operand(sparse_matrix_a)
@@ -3723,10 +3989,10 @@ mod tests {
                     MODE_B_ATTRIBUTE,
                     context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::Transpose),
                 )
+                .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
                 .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(context.float32_type()))
                 .add_result(context.gpu_async_token_type()),
-            &[1, 1, 1, 1, 2],
-        ));
+        );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spmm"));
         assert_eq!(operation.async_dependencies(), vec![token]);
