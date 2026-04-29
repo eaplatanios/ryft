@@ -44,49 +44,43 @@ pub trait StagingEngine: Engine {
     /// Staged [`Operation`] type supported by this [`StagingEngine`].
     type Operation: Operation<Self::Type>;
 
-    /// Stages `function` directly from type metadata using this engine's ordinary staged op set.
-    ///
-    /// This is the most symbolic tracing entry point: it never needs concrete runtime inputs, only the parameterized
-    /// input metadata. The closure is executed once on [`Tracer`] leaves standing in for those abstract inputs, then
-    /// the builder state is finalized into a [`Program`] with the inferred output metadata.
-    ///
-    /// The returned pair contains the structured output metadata inferred during tracing and the staged program itself.
+    /// Traces the provided `function` into a [`Program`] for the provided input types, returning the output types of
+    /// the traced [`Program`] along with that traced [`Program`] itself. This is the most symbolic tracing entry
+    /// point in that it does not require concrete runtime input values but rather it only requires their types. The
+    /// provided closure is executed once on [`Tracer`] values standing in for those input types to trace the function,
+    /// and relies on [`Operation::infer_output_types`] for inferring output types.
+    #[inline]
     fn trace<
-        'engine,
-        F: FnOnce(Input::To<Tracer<'engine, Self>>) -> Result<Output::To<Tracer<'engine, Self>>, TracingError>,
-        Input: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>>,
-        Output: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>>,
+        'e,
+        F: FnOnce(I::To<Tracer<'e, Self>>) -> Result<O::To<Tracer<'e, Self>>, TracingError>,
+        I: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'e, Self>>>,
+        O: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'e, Self>>>,
     >(
-        &'engine self,
+        &'e self,
         function: F,
-        input_types: Input,
+        input_types: I,
     ) -> Result<
-        (Output, Program<Self::Type, Self::Value, Self::Operation, Input::To<Self::Value>, Output::To<Self::Value>>),
+        (O, Program<Self::Type, Self::Value, Self::Operation, I::To<Self::Value>, O::To<Self::Value>>),
         TracingError,
     > {
         let program_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         TracingEngine::new(self, program_builder).trace(function, input_types)
     }
 
-    /// Stages `function`, interprets the staged program on `input`, and returns both results.
-    ///
-    /// The concrete `input` supplies both runtime values and the metadata used to trace the function. The closure runs
-    /// once on symbolic [`Tracer`] leaves, then the staged program is simplified and interpreted on the original input
-    /// values. Tests and eager transforms use this entry point when they need both the concrete result and the program.
+    /// Traces the provided `function` into a [`Program`] using the provided input values and also interprets it using
+    /// those same input values, returning the output values along with the traced [`Program`]. This function should be
+    /// used instead of [`StagingEngine::trace`] when the caller wants to both trace a computation and execute it at the
+    /// same time.
     fn interpret_and_trace<
-        'engine,
-        F: FnOnce(Input::To<Tracer<'engine, Self>>) -> Result<Output::To<Tracer<'engine, Self>>, TracingError>,
-        Input: Parameterized<
-                Self::Value,
-                Family: ParameterFamily<Tracer<'engine, Self>>,
-                ParameterStructure: Debug + PartialEq,
-            >,
-        Output: Parameterized<Self::Value, Family: ParameterFamily<Tracer<'engine, Self>>>,
+        'e,
+        F: FnOnce(I::To<Tracer<'e, Self>>) -> Result<O::To<Tracer<'e, Self>>, TracingError>,
+        I: Parameterized<Self::Value, Family: ParameterFamily<Tracer<'e, Self>>, ParameterStructure: Debug + PartialEq>,
+        O: Parameterized<Self::Value, Family: ParameterFamily<Tracer<'e, Self>>>,
     >(
-        &'engine self,
+        &'e self,
         function: F,
-        input: Input,
-    ) -> Result<(Output, Program<Self::Type, Self::Value, Self::Operation, Input, Output>), TracingError>
+        input: I,
+    ) -> Result<(O, Program<Self::Type, Self::Value, Self::Operation, I, O>), TracingError>
     where
         Self::Operation: Clone + InterpretableOperation<Self::Type, Self::Value>,
     {
@@ -98,25 +92,23 @@ pub trait StagingEngine: Engine {
             Vec<Self::Type>,
             Program<Self::Type, Self::Value, Self::Operation, Vec<Self::Value>, Vec<Self::Value>>,
         ) = self.trace(
-            |flat_traced_input| {
-                let traced_input =
-                    Input::To::<Tracer<'engine, Self>>::from_parameters(input_structure.clone(), flat_traced_input)?;
-                let traced_output = function(traced_input)?;
-                output_structure = Some(traced_output.parameter_structure());
-                Ok(traced_output.into_parameters().collect::<Vec<_>>())
+            |flat_input| {
+                let input = I::To::<Tracer<'e, Self>>::from_parameters(input_structure.clone(), flat_input)?;
+                let output = function(input)?;
+                output_structure = Some(output.parameter_structure());
+                Ok(output.into_parameters().collect::<Vec<_>>())
             },
             input_types,
         )?;
-        let output_structure = output_structure
-            .expect("interpret_and_trace should record the staged output structure before returning successfully");
+        let output_structure = output_structure.unwrap();
         let Program { atoms, input_ids, output_ids, instructions, .. } = flat_program;
         let mut builder = ProgramBuilder::new();
         builder.atoms = atoms;
         builder.input_ids = input_ids;
         builder.instructions = instructions;
-        let program = builder.build::<Input, Output>(output_ids, input_structure, output_structure)?;
+        let program = builder.build::<I, O>(output_ids, input_structure, output_structure)?;
         let program = program.simplified()?;
-        let concrete_input = Input::from_parameters(program.input_structure.clone(), input_values)?;
+        let concrete_input = I::from_parameters(program.input_structure.clone(), input_values)?;
         Ok((program.interpret(concrete_input)?, program))
     }
 }
