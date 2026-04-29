@@ -71,7 +71,7 @@ impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
 /// Unique identifier for an [`Atom`] within a [`Program`]. [`AtomId`]s are stable indexes into a [`Program`]'s atom
 /// table. [`Instruction`]s refer to their inputs and outputs by these IDs, which keeps the intermediate representation
 /// compact and easy to clone.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Parameter)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Parameter)]
 pub struct AtomId {
     /// Zero-based index of the corresponding [`Atom`] inside the owning [`Program`]'s atom table.
     pub index: usize,

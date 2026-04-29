@@ -125,7 +125,7 @@ pub trait StagingEngine: Engine {
 /// The engine ignores most of the supplied [`ArrayType`] metadata because scalar leaves have one canonical runtime
 /// representation. That makes it a compact teaching example for the tracing stack: if a transform works against
 /// [`ScalarEngine`], the same path can be reused by richer engines with sharding, device, or runtime context.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct ScalarEngine<V> {
     /// Phantom marker that ties the zero-sized engine to its scalar leaf type.
     marker: PhantomData<fn() -> V>,

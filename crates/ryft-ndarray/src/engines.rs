@@ -14,7 +14,7 @@ use crate::arrays::{Array, NdArrayElement};
 /// [`NdArrayEngine`] selects [`ArrayType`] as its abstract metadata, [`Array<T>`] as its concrete
 /// value, and the default `ryft-core` primitive operation carriers. It has no device or runtime
 /// state because all execution happens eagerly on host CPU buffers.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct NdArrayEngine<T = f64> {
     /// Phantom marker tying the zero-sized engine to its element type.
     marker: PhantomData<fn() -> T>,

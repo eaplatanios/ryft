@@ -239,7 +239,7 @@ fn build_upper_bound_query_operation<'c, 't: 'c, L: Location<'c, 't>, O: Detache
 }
 
 /// Explicit launch dimensions for GPU launch operations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LaunchDimensions<'o, 'c: 'o, 't: 'c> {
     /// Grid dimensions (`x`, `y`, `z`).
     pub grid_size: [ValueRef<'o, 'c, 't>; 3],

@@ -374,7 +374,7 @@ pub(crate) mod ffi {
     pub const PJRT_API_GPU_EXTENSION_VERSION: usize = 2;
 
     #[repr(C)]
-    #[derive(Debug, Copy, Clone)]
+    #[derive(Copy, Clone, Debug)]
     pub struct PJRT_Gpu_Register_Custom_Call_Args {
         pub struct_size: usize,
         pub function_name: *const std::ffi::c_char,

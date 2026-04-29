@@ -242,7 +242,7 @@ impl From<ShardMapError> for ShardMapTraceError {
 }
 
 /// Constant class preserved for abstract shard-map tensors.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ShardMapConstantKind {
     /// All elements are exactly zero.
     Zero,

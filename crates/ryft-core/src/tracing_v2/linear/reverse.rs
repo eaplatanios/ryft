@@ -659,7 +659,7 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Copy, Clone, Debug)]
     struct TestEngine;
 
     impl Engine for TestEngine {

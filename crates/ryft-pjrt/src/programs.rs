@@ -553,7 +553,7 @@ impl Drop for SerializedCompilationOptions {
 ///
 /// The total host memory required to run that same [`Executable`] can be computed similarly using the host-specific
 /// fields of [`ExecutableMemoryStatistics`].
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExecutableMemoryStatistics {
     /// Number of bytes used for storing the generated code in device memory.
     pub device_generated_code_size_in_bytes: usize,

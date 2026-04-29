@@ -154,7 +154,7 @@ impl HasDefaultMemory for Memory<'_> {
 }
 
 /// Statistics about a [`Memory`].
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemoryStatistics {
     /// Number of bytes in use.
     pub bytes_in_use: u64,

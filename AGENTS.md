@@ -103,6 +103,8 @@ update this file so that they do not need to remind you again in the future.
   references remain in the `ryft` codebase.
 - Use `r#type`, `r#await`, etc. when a reserved Rust keyword must be used as an identifier.
 - Prefer just `size_of::<T>()` instead of `std::mem::size_of<T>()` and do not `use std::mem::size_of` as it is built in.
+- In derive lists that include both `Copy` and `Clone`, list `Copy` before `Clone` and keep those two traits before
+  any other derived traits.
 - When changing a core trait contract that is consumed by derive macros, run the corresponding macro integration test
   crate (e.g., `ryft-macros-tests`) in addition to the macro crate's own unit tests.
 

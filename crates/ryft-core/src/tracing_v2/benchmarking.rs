@@ -105,7 +105,7 @@ pub struct IrBenchmarkRecord {
 }
 
 /// Descriptor for one benchmark case.
-#[derive(Clone, Copy)]
+#[derive(Copy, Clone)]
 pub struct BenchmarkCase {
     /// Stable case identifier.
     pub case_id: &'static str,
