@@ -89,6 +89,7 @@ XLA_DEPENDENCIES = [
     "@stablehlo//:stablehlo_capi",
     "@stablehlo//:stablehlo_dialect_capi",
     "@stablehlo//:vhlo_capi",
+    "@triton//:TritonDialects",
     "@xla//xla/ffi/api:c_api",
     "@xla//xla/mlir_hlo:CAPI",
     "@xla//xla/pjrt/distributed",
@@ -117,10 +118,12 @@ cc_library(
         "src/c++/common.h",
         "src/c++/distributed.h",
         "src/c++/mlir/dialects/gpu.h",
+        "src/c++/mlir/dialects/triton.h",
     ],
     srcs = [
         "src/c++/distributed.cc",
         "src/c++/mlir/dialects/gpu.cc",
+        "src/c++/mlir/dialects/triton.cc",
     ],
     copts = tsl_copts(),
     deps = RYFT_PJRT_SYS_DEPENDENCIES,
@@ -187,6 +190,7 @@ filegroup(
         "@stablehlo//:chlo_ops_td_files",
         "@stablehlo//:stablehlo_ops_td_files",
         "@stablehlo//:vhlo_ops_td_files",
+        "@triton//:td_files",
         "@xla//xla/mlir_hlo:hlo_ops_td_files",
     ],
 )
