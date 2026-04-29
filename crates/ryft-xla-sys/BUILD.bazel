@@ -81,6 +81,7 @@ XLA_DEPENDENCIES = [
     "@llvm-project//mlir:CAPIQuant",
     "@llvm-project//mlir:CAPIVector",
     "@llvm-project//mlir:FuncDialect",
+    "@llvm-project//mlir:GPUDialect",
     "@llvm-project//mlir:IR",
     "@llvm-project//mlir:Support",
     "@shardy//shardy/integrations/c:sdy_capi",
@@ -115,9 +116,11 @@ cc_library(
     hdrs = [
         "src/c++/common.h",
         "src/c++/distributed.h",
+        "src/c++/mlir/dialects/gpu.h",
     ],
     srcs = [
         "src/c++/distributed.cc",
+        "src/c++/mlir/dialects/gpu.cc",
     ],
     copts = tsl_copts(),
     deps = RYFT_PJRT_SYS_DEPENDENCIES,
