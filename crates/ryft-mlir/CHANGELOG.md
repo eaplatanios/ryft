@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Added support for the MLIR `gpu` dialect.
+- Added support for the `gpu` dialect.
 
 ### Changed
 
