@@ -31,26 +31,17 @@ pub trait Engine {
     /// while [`Engine::Value`] represents the runtime values that inhabit traced [`Program`]s during execution.
     type Value: Traceable<Self::Type>;
 
-    /// Returns the additive-identity value corresponding to the provided type metadata.
-    ///
-    /// Transforms use this when they need a representative value for a leaf without a witness, such as replaying a
-    /// staged program from retained input types or constructing zero cotangents in a transposed linear program.
+    /// Returns the additive-identity value (i.e., the _zero_ value) that corresponds to the provided type.
     fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 
-    /// Returns the multiplicative-identity value corresponding to the provided type metadata.
-    ///
-    /// This is used less frequently than [`Engine::zero`] but plays the same architectural role:
-    /// it lets traced code materialize identity seeds without depending on an existing exemplar.
+    /// Returns the multiplicative-identity value (i.e., the _one_ value) that corresponds to the provided type.
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 }
 
-/// Engine capability for selecting a staged operation carrier.
-///
-/// [`StagingEngine`] extends [`Engine`] with the closed operation carrier that the paired
-/// [`ProgramBuilder`](crate::tracing::ProgramBuilder) stores. This keeps carrier selection on the engine value that is
-/// actually threaded through tracers instead of splitting it across a separate generic parameter.
+/// [`StagingEngine`] extends [`Engine`] with a closed [`Operation`] carrier type that can be used to trace
+/// and interpret [`Program`]s.
 pub trait StagingEngine: Engine {
-    /// Staged operation type selected by this staging engine.
+    /// Staged [`Operation`] type supported by this [`StagingEngine`].
     type Operation: Operation<Self::Type>;
 
     /// Stages `function` directly from type metadata using this engine's ordinary staged op set.
@@ -81,8 +72,8 @@ pub trait StagingEngine: Engine {
         (Output, Program<Self::Type, Self::Value, Self::Operation, Input::To<Self::Value>, Output::To<Self::Value>>),
         TracingError,
     > {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        TracingEngine::new(self, builder).trace(function, input_types)
+        let program_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        TracingEngine::new(self, program_builder).trace(function, input_types)
     }
 
     /// Stages `function`, interprets the staged program on `input`, and returns both results.
