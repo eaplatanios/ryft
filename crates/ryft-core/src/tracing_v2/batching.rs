@@ -424,7 +424,7 @@ where
     Output::To<ArrayType>:
         Parameterized<ArrayType, To<V> = Output, To<Tracer<'engine, E>> = Output::To<Tracer<'engine, E>>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::Operation: BatchableOperation<V>,
+    E::Operation: Clone + BatchableOperation<V>,
 {
     let structure = input.parameter_structure();
     let input_values = input.into_parameters().collect::<Vec<_>>();

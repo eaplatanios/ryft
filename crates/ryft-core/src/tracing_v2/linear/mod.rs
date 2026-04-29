@@ -75,6 +75,7 @@ where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     E: StagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    E::Operation: Clone,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
     trace_flat_program_from_trace_result::<Input, Output, V, E::Operation>(engine.trace(function, input_types)?)
@@ -92,6 +93,7 @@ where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     E: StagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    E::Operation: Clone,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
     let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::Operation>::new()));

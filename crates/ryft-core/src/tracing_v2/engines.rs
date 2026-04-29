@@ -51,7 +51,7 @@ pub trait Engine {
 /// actually threaded through tracers instead of splitting it across a separate generic parameter.
 pub trait StagingEngine: Engine {
     /// Staged operation type selected by this staging engine.
-    type Operation: Clone + Operation<Self::Type>;
+    type Operation: Operation<Self::Type>;
 
     /// Stages `function` directly from type metadata using this engine's ordinary staged op set.
     ///
@@ -105,7 +105,7 @@ pub trait StagingEngine: Engine {
         input: Input,
     ) -> Result<(Output, Program<Self::Type, Self::Value, Self::Operation, Input, Output>), TracingError>
     where
-        Self::Operation: InterpretableOperation<Self::Type, Self::Value>,
+        Self::Operation: Clone + InterpretableOperation<Self::Type, Self::Value>,
     {
         let input_structure = input.parameter_structure();
         let input_values = input.into_parameters().collect::<Vec<_>>();
