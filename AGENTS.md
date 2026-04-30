@@ -285,6 +285,9 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
 - For MLIR dialect operation wrappers, define a special-purpose trait for each operation that exposes the
   specific attributes, operands, results, and regions supported by that operation. Avoid generic operation-only
   wrappers when the dialect specification provides more precise semantics.
+- When adding MLIR dialect operation wrappers, audit the pinned TableGen operation definitions for arguments, results,
+  regions, segment-size traits, and builders; do not stop at empty marker traits unless the operation definition itself
+  has no named API surface.
 - In MLIR dialect operation modules, colocate public operation attribute-name constants directly above the first
   operation trait or macro-generated operation group that uses them.
 - In MLIR dialect operation modules, inline operation-specific attribute, segment, and async-token access logic
