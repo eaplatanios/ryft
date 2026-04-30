@@ -9,9 +9,6 @@ use super::attributes::{
     OobFillModeAttributeRef, TiledLayoutAttributeRef, TmaReductionAttributeRef, WgStridedFragLayoutAttributeRef,
 };
 
-/// Name of the [`Attribute`] that stores Mosaic GPU operand segment sizes.
-pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operand_segment_sizes";
-
 /// Name of the [`Attribute`] that stores an arrival count.
 pub const ARRIVAL_COUNT_ATTRIBUTE: &str = "arrival_count";
 
@@ -20,17 +17,6 @@ pub const NUM_BARRIERS_ATTRIBUTE: &str = "num_barriers";
 
 /// Name of the [`Attribute`] that indicates whether a barrier orders tensor-core operations.
 pub const ORDERS_TENSOR_CORE_ATTRIBUTE: &str = "orders_tensor_core";
-
-/// Name of the [`Attribute`] that stores the expected byte-transfer count.
-pub const EXPECT_TX_ATTRIBUTE: &str = "expect_tx";
-
-fn operand_segment_sizes<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(operation: &O) -> Vec<i32> {
-    operation
-        .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-        .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-        .map(|attribute| attribute.values().collect())
-        .unwrap_or_default()
-}
 
 /// Mosaic GPU [`Operation`] that initializes barrier objects at a shared-memory location.
 pub trait InitializeBarrierOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -99,6 +85,9 @@ pub trait ArriveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(Arrive);
 mlir_op_trait!(Arrive, ZeroRegions);
 mlir_op_trait!(Arrive, ZeroSuccessors);
+
+/// Name of the [`Attribute`] that stores the expected byte-transfer count.
+pub const EXPECT_TX_ATTRIBUTE: &str = "expect_tx";
 
 /// Mosaic GPU [`Operation`] that arrives at a barrier and sets an expected transfer count.
 pub trait ArriveExpectTxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -191,6 +180,9 @@ mlir_op!(QueryClusterCancel);
 mlir_op_trait!(QueryClusterCancel, ZeroRegions);
 mlir_op_trait!(QueryClusterCancel, ZeroSuccessors);
 
+/// Name of the [`Attribute`] that stores Mosaic GPU operand segment sizes.
+pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operand_segment_sizes";
+
 /// Name of the [`Attribute`] that stores Mosaic GPU slice lengths.
 pub const SLICE_LENGTHS_ATTRIBUTE: &str = "slice_lengths";
 
@@ -202,12 +194,6 @@ pub const LEADER_TRACKED_ATTRIBUTE: &str = "leader_tracked";
 
 /// Name of the [`Attribute`] that stores the out-of-bounds fill mode.
 pub const OOB_FILL_MODE_ATTRIBUTE: &str = "oob_fill_mode";
-
-/// Name of the [`Attribute`] that stores an optional TMA reduction operation.
-pub const REDUCTION_OP_ATTRIBUTE: &str = "reduction_op";
-
-/// Name of the [`Attribute`] that stores whether an async store commits its group.
-pub const COMMIT_GROUP_ATTRIBUTE: &str = "commit_group";
 
 /// Mosaic GPU [`Operation`] that schedules an asynchronous global-to-shared memory load.
 pub trait AsyncLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -228,14 +214,22 @@ pub trait AsyncLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the index operands.
     fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let sizes = operand_segment_sizes(self);
+        let sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<_>>())
+            .unwrap_or_default();
         let count = sizes.get(3).copied().unwrap_or(0).max(0) as usize;
         (0..count).map(|index| self.operand_value(3 + index).unwrap()).collect()
     }
 
     /// Returns the predicate operand.
     fn predicate(&self) -> ValueRef<'o, 'c, 't> {
-        let sizes = operand_segment_sizes(self);
+        let sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<_>>())
+            .unwrap_or_default();
         let index_count = sizes.get(3).copied().unwrap_or(0).max(0) as usize;
         self.operand_value(3 + index_count).unwrap()
     }
@@ -283,14 +277,22 @@ pub trait AsyncPrefetchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the index operands.
     fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let sizes = operand_segment_sizes(self);
+        let sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<_>>())
+            .unwrap_or_default();
         let count = sizes.get(1).copied().unwrap_or(0).max(0) as usize;
         (0..count).map(|index| self.operand_value(1 + index).unwrap()).collect()
     }
 
     /// Returns the predicate operand.
     fn predicate(&self) -> ValueRef<'o, 'c, 't> {
-        let sizes = operand_segment_sizes(self);
+        let sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<_>>())
+            .unwrap_or_default();
         let index_count = sizes.get(1).copied().unwrap_or(0).max(0) as usize;
         self.operand_value(1 + index_count).unwrap()
     }
@@ -316,6 +318,12 @@ mlir_op!(AsyncPrefetch);
 mlir_op_trait!(AsyncPrefetch, ZeroRegions);
 mlir_op_trait!(AsyncPrefetch, ZeroSuccessors);
 
+/// Name of the [`Attribute`] that stores an optional TMA reduction operation.
+pub const REDUCTION_OP_ATTRIBUTE: &str = "reduction_op";
+
+/// Name of the [`Attribute`] that stores whether an async store commits its group.
+pub const COMMIT_GROUP_ATTRIBUTE: &str = "commit_group";
+
 /// Mosaic GPU [`Operation`] that schedules an asynchronous shared-to-global memory store.
 pub trait AsyncStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source memref.
@@ -330,14 +338,22 @@ pub trait AsyncStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the index operands.
     fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let sizes = operand_segment_sizes(self);
+        let sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<_>>())
+            .unwrap_or_default();
         let count = sizes.get(2).copied().unwrap_or(0).max(0) as usize;
         (0..count).map(|index| self.operand_value(2 + index).unwrap()).collect()
     }
 
     /// Returns the predicate operand.
     fn predicate(&self) -> ValueRef<'o, 'c, 't> {
-        let sizes = operand_segment_sizes(self);
+        let sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<_>>())
+            .unwrap_or_default();
         let index_count = sizes.get(2).copied().unwrap_or(0).max(0) as usize;
         self.operand_value(2 + index_count).unwrap()
     }
@@ -667,20 +683,32 @@ pub trait TcGen05MmaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the optional `a` scale memref.
     fn a_scale(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let sizes = operand_segment_sizes(self);
+        let sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<_>>())
+            .unwrap_or_default();
         if sizes.get(4).copied().unwrap_or(0) > 0 { self.operand_value(4) } else { None }
     }
 
     /// Returns the optional `b` scale memref.
     fn b_scale(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let sizes = operand_segment_sizes(self);
+        let sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<_>>())
+            .unwrap_or_default();
         let a_scale_count = sizes.get(4).copied().unwrap_or(0).max(0) as usize;
         if sizes.get(5).copied().unwrap_or(0) > 0 { self.operand_value(4 + a_scale_count) } else { None }
     }
 
     /// Returns the optional sparse metadata memref for the `a` operand.
     fn a_sparse_metadata(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let sizes = operand_segment_sizes(self);
+        let sizes = self
+            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<_>>())
+            .unwrap_or_default();
         let a_scale_count = sizes.get(4).copied().unwrap_or(0).max(0) as usize;
         let b_scale_count = sizes.get(5).copied().unwrap_or(0).max(0) as usize;
         if sizes.get(6).copied().unwrap_or(0) > 0 {
@@ -1164,10 +1192,6 @@ mod tests {
 
     use super::*;
 
-    fn build_detached_operation<'c, 't: 'c, O: DetachedOp<'c, 'c, 't>>(builder: OperationBuilder<'c, 't>) -> O {
-        builder.build().and_then(|operation| unsafe { operation.cast::<O>() }).unwrap()
-    }
-
     macro_rules! operation_casting_test {
         ($test_name:ident, $operation_type:ty, $operation_name:literal $(,)?) => {
             #[test]
@@ -1175,8 +1199,10 @@ mod tests {
                 let context = Context::new();
                 context.load_dialect(DialectHandle::mosaic_gpu());
                 let location = context.unknown_location();
-                let operation: $operation_type =
-                    build_detached_operation(OperationBuilder::new($operation_name, location));
+                let operation: $operation_type = OperationBuilder::new($operation_name, location)
+                    .build()
+                    .and_then(|operation| unsafe { operation.cast() })
+                    .unwrap();
 
                 assert_eq!(operation.name().as_str(), Ok($operation_name));
             }

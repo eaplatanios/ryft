@@ -838,20 +838,10 @@ mod tests {
 
     use super::*;
 
-    fn shape_attribute<'c, 't>(context: &'c Context<'t>, values: &[i64]) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        context.dense_i64_array_attribute(values).unwrap()
-    }
-
-    fn i64_array_attribute<'c, 't>(context: &'c Context<'t>, values: &[i64]) -> ArrayAttributeRef<'c, 't> {
-        let element_type = context.signless_integer_type(64);
-        let elements = values.iter().map(|value| context.integer_attribute(element_type, *value)).collect::<Vec<_>>();
-        context.array_attribute(&elements)
-    }
-
     #[test]
     fn test_wg_strided_frag_layout_attribute() {
         let context = Context::new();
-        let shape = shape_attribute(&context, &[2, 4]);
+        let shape = context.dense_i64_array_attribute(&[2, 4]).unwrap();
         let attribute = context.mosaic_gpu_wg_strided_frag_layout_attribute(shape, 2);
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.shape(), shape);
@@ -862,7 +852,7 @@ mod tests {
     #[test]
     fn test_wg_splat_frag_layout_attribute() {
         let context = Context::new();
-        let shape = shape_attribute(&context, &[2, 4]);
+        let shape = context.dense_i64_array_attribute(&[2, 4]).unwrap();
         let attribute = context.mosaic_gpu_wg_splat_frag_layout_attribute(shape);
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.shape(), shape);
@@ -882,8 +872,13 @@ mod tests {
     fn test_tiled_layout_attribute() {
         let context = Context::new();
         let tiling = context.array_attribute(&[context.mosaic_gpu_replicated_attribute(2).as_ref()]);
-        let warp_dims = i64_array_attribute(&context, &[0, 1]);
-        let lane_dims = i64_array_attribute(&context, &[1, 0]);
+        let element_type = context.signless_integer_type(64);
+        let warp_dim_attributes =
+            [context.integer_attribute(element_type, 0), context.integer_attribute(element_type, 1)];
+        let warp_dims = context.array_attribute(&warp_dim_attributes);
+        let lane_dim_attributes =
+            [context.integer_attribute(element_type, 1), context.integer_attribute(element_type, 0)];
+        let lane_dims = context.array_attribute(&lane_dim_attributes);
         let attribute = context.mosaic_gpu_tiled_layout_attribute(tiling, warp_dims, lane_dims, 1);
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.tiling(), tiling);
