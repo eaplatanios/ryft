@@ -1,0 +1,5 @@
+interface:
+  display_name: "Add MLIR Dialect"
+  short_description: "Adds support for a new MLIR dialect in `ryft-mlir`."
+  icon_small: "./assets/open-xla-logo.png"
+  icon_large: "./assets/open-xla-logo.png"

@@ -43,6 +43,7 @@ platform(
 # ----------------------------------------------------
 
 XLA_DEPENDENCIES = [
+    ":triton_tt_dialect",
     "@com_google_absl//absl/status",
     "@com_google_absl//absl/status:statusor",
     # "@jax//jaxlib/mosaic/gpu:mlir_capi",
@@ -111,18 +112,79 @@ RYFT_PJRT_SYS_DEPENDENCIES = XLA_DEPENDENCIES + select({
     ],
 })
 
+# `@triton//:TritonDialects` also compiles `TritonGPU`, `TritonNvidiaGPU`, and analysis utilities, but the
+# `ryft-mlir` TT wrappers only need the core `tt` IR dialect for type, attribute, operation, and dialect registration
+# helpers. Keeping this target scoped to `lib/Dialect/Triton/IR` avoids pulling unrelated GPU dialect code into the
+# cross-platform `ryft-xla-sys` archive, which is especially important for the Windows CPU artifact build.
+cc_library(
+    name = "triton_tt_dialect",
+    srcs = [
+        "@triton//:lib/Dialect/Triton/IR/Dialect.cpp",
+        "@triton//:lib/Dialect/Triton/IR/DiscardableAttributes.cpp",
+        "@triton//:lib/Dialect/Triton/IR/OpInterfaces.cpp",
+        "@triton//:lib/Dialect/Triton/IR/Ops.cpp",
+        "@triton//:lib/Dialect/Triton/IR/Traits.cpp",
+        "@triton//:lib/Dialect/Triton/IR/Types.cpp",
+        "@triton//:lib/Dialect/Triton/IR/Utility.cpp",
+    ],
+    hdrs = [
+        "@triton//:include/triton/Dialect/Triton/IR/Dialect.h",
+        "@triton//:include/triton/Dialect/Triton/IR/DiscardableAttributes.h",
+        "@triton//:include/triton/Dialect/Triton/IR/Interfaces.h",
+        "@triton//:include/triton/Dialect/Triton/IR/OpInterfaces.h",
+        "@triton//:include/triton/Dialect/Triton/IR/Traits.h",
+        "@triton//:include/triton/Dialect/Triton/IR/Types.h",
+        "@triton//:include/triton/Dialect/Triton/IR/Utility.h",
+    ],
+    copts = [
+        "-Iexternal/triton/include",
+        "-I$(BINDIR)/external/triton/include",
+    ],
+    deps = [
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:ControlFlowDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:FunctionInterfaces",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:InferTypeOpInterface",
+        "@llvm-project//mlir:InliningUtils",
+        "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:MathDialect",
+        "@llvm-project//mlir:SCFDialect",
+        "@llvm-project//mlir:SideEffectInterfaces",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:Transforms",
+        "@llvm-project//mlir:UBDialect",
+        "@triton//:triton_canonicalize_inc_gen",
+        "@triton//:triton_dialect_inc_gen",
+        "@triton//:triton_interfaces_inc_gen",
+        "@triton//:triton_op_interfaces_inc_gen",
+        "@triton//:triton_ops_inc_gen",
+        "@triton//:triton_type_interfaces_inc_gen",
+        "@triton//:triton_types_inc_gen",
+    ],
+    alwayslink = True,
+)
+
 cc_library(
     name = "ryft-xla-sys-library",
     hdrs = [
         "src/c++/common.h",
         "src/c++/distributed.h",
         "src/c++/mlir/dialects/gpu.h",
+        "src/c++/mlir/dialects/triton.h",
     ],
     srcs = [
         "src/c++/distributed.cc",
         "src/c++/mlir/dialects/gpu.cc",
+        "src/c++/mlir/dialects/triton.cc",
     ],
-    copts = tsl_copts(),
+    copts = tsl_copts() + [
+        "-Iexternal/triton/include",
+        "-I$(BINDIR)/external/triton/include",
+    ],
     deps = RYFT_PJRT_SYS_DEPENDENCIES,
     alwayslink = True,
 )
@@ -187,6 +249,7 @@ filegroup(
         "@stablehlo//:chlo_ops_td_files",
         "@stablehlo//:stablehlo_ops_td_files",
         "@stablehlo//:vhlo_ops_td_files",
+        "@triton//:td_files",
         "@xla//xla/mlir_hlo:hlo_ops_td_files",
     ],
 )

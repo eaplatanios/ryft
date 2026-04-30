@@ -6,7 +6,9 @@ description: Upgrades the dependency of `ryft` on XLA by switching to a newer / 
 
 You must look for the latest commit hash in the [OpenXLA GitHub repository](https://github.com/openxla/xla).
 You must make all necessary updates in `ryft` to switch us over to this new commit by following the steps described
-in the `Contribution` section of the `crates/ryft-xla-sys/README.md` file.
+in the `Contribution` section of the `crates/ryft-xla-sys/README.md` file. You must also make sure to verify that if
+the XLA MLIR and Triton dependencies are updated, our bindings for those packages (and things like MLIR dialects) are
+updated accordingly.
 
 Note that you must always start by creating a new branch called `u/eaplatanios/upgrade-xla-<commit>` and pushing a
 change to `crates/ryft-xla-sys/WORKSPACE` updating the XLA commit hash and checksum. Then, you must submit a GitHub
