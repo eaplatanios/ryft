@@ -122,20 +122,14 @@ pub trait StagingEngine: Engine {
 /// `ryft-core`. It demonstrates the intended role of an [`Engine`] in the smallest possible form: there are no device
 /// handles, no mesh states, and no backend registries; just the built-in scalar primitive carriers plus
 /// [`DataType`]-driven construction of scalar values.
-///
-/// This engine intentionally does not carry rank, shape, layout, or sharding metadata. Array backends should use
-/// [`ArrayType`](crate::ArrayType) through their own engine implementations when those properties are semantically
-/// relevant.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ScalarEngine<V> {
-    /// Phantom marker that ties the zero-sized engine to its scalar leaf type.
+    /// Phantom marker that ties this zero-sized [`ScalarEngine`] to its scalar value type.
     marker: PhantomData<fn() -> V>,
 }
 
 impl<V> ScalarEngine<V> {
-    /// Returns a new [`ScalarEngine<V>`].
-    ///
-    /// This zero-sized engine is a runtime no-op; it gives examples and tests an explicit backend token.
+    /// Creates a new [`ScalarEngine`].
     #[inline]
     pub const fn new() -> Self {
         Self { marker: PhantomData }
@@ -152,11 +146,7 @@ macro_rules! impl_scalar_engine_for_scalar {
             fn zero(&self, r#type: &DataType) -> Result<$ty, TracingError> {
                 if *r#type != $data_type {
                     return Err(TypeError {
-                        message: format!(
-                            "scalar engine for {} cannot synthesize zero for {type_}",
-                            $data_type,
-                            type_ = r#type
-                        ),
+                        message: format!("{} scalar engine cannot synthesize zero for type: {}", $data_type, r#type),
                     }
                     .into());
                 }
@@ -167,11 +157,7 @@ macro_rules! impl_scalar_engine_for_scalar {
             fn one(&self, r#type: &DataType) -> Result<$ty, TracingError> {
                 if *r#type != $data_type {
                     return Err(TypeError {
-                        message: format!(
-                            "scalar engine for {} cannot synthesize one for {type_}",
-                            $data_type,
-                            type_ = r#type
-                        ),
+                        message: format!("{} scalar engine cannot synthesize one for type: {}", $data_type, r#type),
                     }
                     .into());
                 }
