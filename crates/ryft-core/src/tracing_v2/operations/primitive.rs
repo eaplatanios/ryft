@@ -1261,7 +1261,7 @@ where
                     return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
                 }
                 let input = &inputs[0];
-                let factor_tracer = engine.lift_constant(factor.clone());
+                let factor_tracer = engine.lift(factor.clone());
                 let tangent = context
                     .apply_operation(
                         &[input.tangent],

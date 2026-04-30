@@ -331,7 +331,7 @@ where
         {
             let zero_value = tracing_engine.engine.zero(zero_type)?;
             let outer_atom = tracing_engine.builder.borrow_mut().add_constant(zero_value);
-            let zero_tracer = tracing_engine.variable_tracer(outer_atom, Some(zero_type.clone()));
+            let zero_tracer = tracing_engine.tracer(outer_atom, Some(zero_type.clone()));
             let constant_atom = builder.add_constant(zero_tracer);
             atom_remapping[instruction.outputs[0].index] = Some(constant_atom);
         } else {

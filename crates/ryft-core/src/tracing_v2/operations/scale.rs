@@ -209,7 +209,7 @@ where
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
         let input = &inputs[0];
-        let factor_tracer = engine.lift_constant(self.factor().clone());
+        let factor_tracer = engine.lift(self.factor().clone());
         let tangent = context
             .apply_operation(
                 &[input.tangent],

@@ -101,7 +101,7 @@ where
     }
     for (atom_index, atom) in program.atoms.iter().enumerate() {
         if let Atom::Constant(value) = atom {
-            primal_values[atom_index] = Some(tracing_engine.lift_constant(value.clone()));
+            primal_values[atom_index] = Some(tracing_engine.lift(value.clone()));
         }
     }
 

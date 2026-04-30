@@ -22,7 +22,7 @@ where
         .map(|input_atom| {
             let input_type = traced_program.atoms[input_atom.index].r#type().into_owned();
             let atom = traced_primal_builder.borrow_mut().add_input(input_type.clone());
-            tracing_engine.variable_tracer(atom, Some(input_type))
+            tracing_engine.tracer(atom, Some(input_type))
         })
         .collect::<Vec<_>>();
     let (_, traced_gradient) =

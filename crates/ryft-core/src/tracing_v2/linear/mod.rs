@@ -163,7 +163,7 @@ where
     let _ = <V as One<E::Type>>::one(&seed_type)?;
     let seed_value = tracing_engine.engine.one(&seed_type)?;
     let seed_atom = tracing_builder.borrow_mut().add_constant(seed_value);
-    let seed = traced_output.engine.variable_tracer(seed_atom, Some(seed_type));
+    let seed = traced_output.engine.tracer(seed_atom, Some(seed_type));
     let traced_gradient = pullback.interpret(vec![seed])?;
     Ok((traced_output, traced_gradient))
 }
