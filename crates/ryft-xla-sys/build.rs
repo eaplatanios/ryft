@@ -840,16 +840,16 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("8411a69bd01e6c492704cb3301fc81f33e96d8b53f88c70971a3eba182c960b6")
+                Some("f9e52f32b3a9916b853c38e1a4e3aae283dd73b15673b8a53a670fc78e1908d6")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::AArch64, Device::Cpu) => {
-                Some("6601ca0ee00b245e839957a3ed8b404ad9a5c99daf532b29b2b08b33c252b9cd")
+                Some("88fa7f53d31cafefe2a604375320474673c0d7584a81442bcfdb1db05136cd1e")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("aa0435607c976bb28fdffb0cbe2ff05255a0f63367d0393ae4970a66131a33c9")
+                Some("15a0341444065aeb3feaa0a63c4e21749c4cfe851ec8c8b12e4c536257c9b067")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("3816e1f90cb66d195423d3a5184f56ffa4dd98cdcddbe2b1eec9b36124376d6b")
+                Some("51b043898ecfbc694c2a110ced0585118e831dd1e29acf873b8048164455935b")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
                 Some("a15eb6df931406cb679dd09c425875c23c03cbe715ca1c604476eda5998ef864")
