@@ -1389,7 +1389,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .cloned()
             .map(|input_type| {
                 let atom = pushforward_compiled_builder.borrow_mut().add_input(input_type.clone());
-                pushforward_compiled_context.tracer_from_staged_parts(atom, input_type)
+                pushforward_compiled_context.variable_tracer(atom, Some(input_type))
             })
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
@@ -1415,7 +1415,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .cloned()
             .map(|input_type| {
                 let atom = pullback_compiled_builder.borrow_mut().add_input(input_type.clone());
-                pullback_compiled_context.tracer_from_staged_parts(atom, input_type)
+                pullback_compiled_context.variable_tracer(atom, Some(input_type))
             })
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();

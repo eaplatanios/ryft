@@ -196,16 +196,10 @@ pub struct TracingEngine<'engine, E: StagingEngine + ?Sized> {
 }
 
 impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
-    /// Creates a new [`TracingEngine`] that borrows the provided [`StagingEngine`] and [`ProgramBuilder`].
+    /// Creates a new [`TracingEngine`] that borrows the provided [`StagingEngine`].
     #[inline]
     pub fn new(engine: &'engine E, builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>) -> Self {
         Self { engine, builder }
-    }
-
-    /// Creates a sibling tracing engine over the same active engine handle and a fresh builder.
-    #[inline]
-    pub(crate) fn sibling(&self, builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>) -> Self {
-        Self { engine: self.engine, builder }
     }
 
     /// Lifts a concrete engine value into a [`Tracer`] constant in this tracing engine.
@@ -215,20 +209,16 @@ impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
     pub fn lift_constant(&self, value: E::Value) -> Tracer<'engine, E> {
         let r#type = <E::Value as Typed<E::Type>>::r#type(&value).into_owned();
         let atom = self.builder.borrow_mut().add_constant(value);
-        self.tracer_from_staged_parts(atom, r#type)
+        self.variable_tracer(atom, Some(r#type))
     }
 
-    /// Constructs a live tracer in this tracing engine from a staged atom and its cached abstract type.
+    /// Constructs a live variable tracer in this tracing engine from a staged atom.
+    ///
+    /// When the optional type is [`None`], the staged atom's abstract type is read from the active builder.
     #[inline]
-    pub fn tracer_from_staged_parts(&self, atom: AtomId, r#type: E::Type) -> Tracer<'engine, E> {
+    pub fn variable_tracer(&self, atom: AtomId, r#type: Option<E::Type>) -> Tracer<'engine, E> {
+        let r#type = r#type.unwrap_or_else(|| self.builder.borrow().atoms[atom.index].r#type().into_owned());
         Tracer { state: TracerState::Live(atom, r#type), engine: self.clone() }
-    }
-
-    /// Constructs a live tracer in this tracing engine by reading the staged atom's abstract type.
-    #[inline]
-    pub fn tracer_from_atom(&self, atom: AtomId) -> Tracer<'engine, E> {
-        let r#type = self.builder.borrow().atoms[atom.index].r#type().into_owned();
-        self.tracer_from_staged_parts(atom, r#type)
     }
 
     /// Constructs a poisoned tracer in this tracing engine.
@@ -328,7 +318,7 @@ impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
             input_types.parameter_structure(),
             input_types.into_parameters().map(|r#type| {
                 let atom = builder.borrow_mut().add_input(r#type.clone());
-                self.tracer_from_staged_parts(atom, r#type)
+                self.variable_tracer(atom, Some(r#type))
             }),
         )
         .map_err(TracingError::from)?;
@@ -379,14 +369,14 @@ impl<'engine, E: StagingEngine + ?Sized> Engine for TracingEngine<'engine, E> {
     fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
         let value = self.engine.zero(r#type)?;
         let atom = self.builder.borrow_mut().add_constant(value);
-        Ok(self.tracer_from_staged_parts(atom, r#type.clone()))
+        Ok(self.variable_tracer(atom, Some(r#type.clone())))
     }
 
     #[inline]
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
         let value = self.engine.one(r#type)?;
         let atom = self.builder.borrow_mut().add_constant(value);
-        Ok(self.tracer_from_staged_parts(atom, r#type.clone()))
+        Ok(self.variable_tracer(atom, Some(r#type.clone())))
     }
 }
 
@@ -471,7 +461,7 @@ impl<'engine, E: StagingEngine + ?Sized> Tracer<'engine, E> {
         builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>,
         engine: &'engine E,
     ) -> Self {
-        TracingEngine::new(engine, builder).tracer_from_staged_parts(atom, r#type)
+        TracingEngine::new(engine, builder).variable_tracer(atom, Some(r#type))
     }
 
     /// Returns this tracer's leaf state.
@@ -572,7 +562,7 @@ impl<'engine, E: StagingEngine + ?Sized> ZeroLike for Tracer<'engine, E> {
             }
         };
         let atom = self.builder().borrow_mut().add_constant(value);
-        self.engine.tracer_from_staged_parts(atom, r#type)
+        self.engine.variable_tracer(atom, Some(r#type))
     }
 }
 
@@ -590,7 +580,7 @@ impl<'engine, E: StagingEngine + ?Sized> OneLike for Tracer<'engine, E> {
             }
         };
         let atom = self.builder().borrow_mut().add_constant(value);
-        self.engine.tracer_from_staged_parts(atom, r#type)
+        self.engine.variable_tracer(atom, Some(r#type))
     }
 }
 
@@ -819,7 +809,7 @@ mod tests {
         let builder = new_f64_builder();
         let atom = builder.borrow_mut().add_input(<f64 as Typed<DataType>>::r#type(&3.0f64).into_owned());
         let engine = ScalarEngine::<f64>::new();
-        let tracer: Tracer<ScalarEngine<f64>> = TracingEngine::new(&engine, builder).tracer_from_atom(atom);
+        let tracer: Tracer<ScalarEngine<f64>> = TracingEngine::new(&engine, builder).variable_tracer(atom, None);
         let zero = tracer.zero_like();
         assert_eq!(zero.r#type().into_owned(), scalar_f64_type());
         let zero_atom = zero.state().live_atom().expect("zero-like tracer should remain live");
@@ -860,8 +850,8 @@ mod tests {
         let atom_a = builder_a.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
         let atom_b = builder_b.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&2.0f64).into_owned());
         let engine = TaggedEngine { id: 1 };
-        let tracer_a = TracingEngine::new(&engine, builder_a.clone()).tracer_from_atom(atom_a);
-        let tracer_b = TracingEngine::new(&engine, builder_b).tracer_from_atom(atom_b);
+        let tracer_a = TracingEngine::new(&engine, builder_a.clone()).variable_tracer(atom_a, None);
+        let tracer_b = TracingEngine::new(&engine, builder_b).variable_tracer(atom_b, None);
 
         assert!(matches!(
             TracingEngine::new(&engine, builder_a).apply_staged_op(&[tracer_a, tracer_b], PrimitiveOperation::Add),
@@ -876,8 +866,8 @@ mod tests {
         let atom_b = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&2.0f64).into_owned());
         let engine_a = TaggedEngine { id: 1 };
         let engine_b = TaggedEngine { id: 2 };
-        let tracer_a = TracingEngine::new(&engine_a, builder.clone()).tracer_from_atom(atom_a);
-        let tracer_b = TracingEngine::new(&engine_b, builder.clone()).tracer_from_atom(atom_b);
+        let tracer_a = TracingEngine::new(&engine_a, builder.clone()).variable_tracer(atom_a, None);
+        let tracer_b = TracingEngine::new(&engine_b, builder.clone()).variable_tracer(atom_b, None);
 
         assert!(matches!(
             TracingEngine::new(&engine_a, builder).apply_staged_op(&[tracer_a, tracer_b], PrimitiveOperation::Add),
@@ -891,7 +881,7 @@ mod tests {
         let atom = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
         builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
         let engine = TaggedEngine { id: 1 };
-        let tracer = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(atom);
+        let tracer = TracingEngine::new(&engine, builder.clone()).variable_tracer(atom, None);
 
         let outputs = TracingEngine::new(&engine, builder)
             .apply_staged_op(std::slice::from_ref(&tracer), PrimitiveOperation::Neg)
@@ -1041,7 +1031,7 @@ mod tests {
         let builder = new_f64_builder();
         let atom = builder.borrow_mut().add_input(scalar_f64_type());
         let engine = ScalarEngine::<f64>::new();
-        let live = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(atom);
+        let live = TracingEngine::new(&engine, builder.clone()).variable_tracer(atom, None);
         let poison = TracingEngine::new(&engine, builder).poisoned_tracer(scalar_f64_type());
 
         assert_eq!(live.to_string(), "%0");
@@ -1059,8 +1049,8 @@ mod tests {
         let lhs_atom = builder.borrow_mut().add_input(lhs_type.clone());
         let rhs_atom = builder.borrow_mut().add_input(rhs_type);
         let engine = TaggedEngine { id: 1 };
-        let lhs = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(lhs_atom);
-        let rhs = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(rhs_atom);
+        let lhs = TracingEngine::new(&engine, builder.clone()).variable_tracer(lhs_atom, None);
+        let rhs = TracingEngine::new(&engine, builder.clone()).variable_tracer(rhs_atom, None);
 
         let outputs = TracingEngine::new(&engine, builder.clone())
             .apply_staged_op(&[lhs, rhs], PrimitiveOperation::Add)
@@ -1082,7 +1072,7 @@ mod tests {
         let atom = builder.borrow_mut().add_input(input_type.clone());
         builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
         let engine = TaggedEngine { id: 1 };
-        let tracer = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(atom);
+        let tracer = TracingEngine::new(&engine, builder.clone()).variable_tracer(atom, None);
 
         let outputs = TracingEngine::new(&engine, builder)
             .apply_staged_op(std::slice::from_ref(&tracer), PrimitiveOperation::Add)

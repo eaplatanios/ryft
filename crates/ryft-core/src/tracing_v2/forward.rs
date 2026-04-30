@@ -323,8 +323,8 @@ mod tests {
         let outer_input_a = outer_builder.borrow_mut().add_input(crate::types::DataType::F64);
         let outer_input_b = outer_builder.borrow_mut().add_input(crate::types::DataType::F64);
         let outer_tracing_engine = TracingEngine::new(&engine, outer_builder.clone());
-        let primal_a = outer_tracing_engine.tracer_from_atom(outer_input_a);
-        let primal_b = outer_tracing_engine.tracer_from_atom(outer_input_b);
+        let primal_a = outer_tracing_engine.variable_tracer(outer_input_a, None);
+        let primal_b = outer_tracing_engine.variable_tracer(outer_input_b, None);
 
         let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
             DataType,

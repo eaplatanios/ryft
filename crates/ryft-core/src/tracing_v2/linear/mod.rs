@@ -100,7 +100,7 @@ where
 {
     let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, V, E::Operation>::new()));
     trace_flat_program_from_trace_result::<E::Type, Input, Output, V, E::Operation>(
-        tracing_engine.sibling(builder).trace(function, input_types)?,
+        TracingEngine::new(tracing_engine.engine, builder).trace(function, input_types)?,
     )
 }
 
@@ -163,7 +163,7 @@ where
     let _ = <V as One<E::Type>>::one(&seed_type)?;
     let seed_value = tracing_engine.engine.one(&seed_type)?;
     let seed_atom = tracing_builder.borrow_mut().add_constant(seed_value);
-    let seed = traced_output.engine.tracer_from_staged_parts(seed_atom, seed_type);
+    let seed = traced_output.engine.variable_tracer(seed_atom, Some(seed_type));
     let traced_gradient = pullback.interpret(vec![seed])?;
     Ok((traced_output, traced_gradient))
 }
