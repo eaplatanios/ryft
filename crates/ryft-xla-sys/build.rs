@@ -44,6 +44,15 @@ static XLA_COMMIT: LazyLock<&'static str> = LazyLock::new(|| {
         .expect("failed to parse `XLA_COMMIT` from `WORKSPACE`")
 });
 
+/// JAX commit currently pinned in [`WORKSPACE`].
+static JAX_COMMIT: LazyLock<&'static str> = LazyLock::new(|| {
+    include_str!("WORKSPACE")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("JAX_COMMIT = \""))
+        .and_then(|line| line.strip_suffix('"'))
+        .expect("failed to parse `JAX_COMMIT` from `WORKSPACE`")
+});
+
 /// URL paired with an expected SHA-256 checksum for verifying downloads.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct UrlWithChecksum {
@@ -486,10 +495,18 @@ impl BuildConfiguration {
     /// any existing extracted directory is replaced to keep the contents up to date. For extracted
     /// `ryft-xla-sys` archives, post-processing (e.g., renaming the static library) is applied.
     fn artifact_directory(&self, artifact: Artifact) -> Result<PathBuf> {
-        // We include the XLA commit in the extracted archive name to ensure that we do not use stale extracted files.
+        // We include the native source pins and the expected checksum in the extracted archive name to avoid reusing
+        // stale extracted files when either the native sources or the published artifact contents change.
         let artifact_name = self.precompiled_artifact_name(artifact);
         let artifact_name = artifact_name.trim_end_matches(".tar.gz").trim_end_matches(".whl");
-        let archive_name = format!("{artifact_name}-{}", *XLA_COMMIT);
+        let checksum_suffix = self
+            .precompiled_artifact_checksum(artifact)
+            .map(|checksum| format!("-{checksum}"))
+            .unwrap_or_default();
+        let archive_name = match artifact {
+            Artifact::RyftXlaSys => format!("{artifact_name}-{}-{}{}", *XLA_COMMIT, *JAX_COMMIT, checksum_suffix),
+            Artifact::PjrtPlugin => format!("{artifact_name}-{}{}", *XLA_COMMIT, checksum_suffix),
+        };
 
         let extracted_path = dirs::cache_dir()
             .map(|cache_dir| cache_dir.join("ryft").join("xla"))
@@ -695,6 +712,8 @@ impl BuildConfiguration {
             PathBuf::from(".bazelrc"),
             PathBuf::from(".bazelversion"),
             PathBuf::from("BUILD.bazel"),
+            PathBuf::from("patches").join("BUILD.bazel"),
+            PathBuf::from("patches").join("jax-mosaic-gpu-capi-visibility.patch"),
             PathBuf::from("pjrt_plugin.def"),
             PathBuf::from("pjrt_plugin_exported_symbols.txt"),
             PathBuf::from("pjrt_plugin_version_script.lds"),
@@ -703,6 +722,8 @@ impl BuildConfiguration {
             PathBuf::from("src").join("c++").join("distributed.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.h"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_gpu.cc"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_gpu.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.h"),
             PathBuf::from("WORKSPACE"),
@@ -840,31 +861,31 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("f9e52f32b3a9916b853c38e1a4e3aae283dd73b15673b8a53a670fc78e1908d6")
+                Some("f971c2f49dc1f85b169883903555247d9b50cd4823d9560a01e3cf3858f7cbf5")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::AArch64, Device::Cpu) => {
-                Some("88fa7f53d31cafefe2a604375320474673c0d7584a81442bcfdb1db05136cd1e")
+                Some("9fe6c03ab044bf2a94d783ab804447166cdcdcbf07fba7fd84ad8d0017280ecc")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("15a0341444065aeb3feaa0a63c4e21749c4cfe851ec8c8b12e4c536257c9b067")
+                Some("f9393aa5cecc245c11b236f1448bc76f43fa6d8f983056fbc8ea113a2c36e0b7")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("51b043898ecfbc694c2a110ced0585118e831dd1e29acf873b8048164455935b")
+                Some("6e9e9a1fc989ed87ea0820260aac7a84751b6d9e74cef777f1a09f8ed5814010")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
-                Some("a15eb6df931406cb679dd09c425875c23c03cbe715ca1c604476eda5998ef864")
+                Some("9d78be71a84cbe7f5b55f624b96797033d19a2e5e7c31a89737b8a4068793eec")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda12) => {
-                Some("200552e999e9c4aaae90c3a22a01d3bdc61f3d1b28ebb0039d66a9519877f4db")
+                Some("a59153e22d50ce99bcfba1aa97cbd6e625ae0d9d70ba6b5a6b840dc635a6c5c0")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => {
-                Some("40460888de106f2742c5ee0a054edd7f761c3baff218a7993df078fbf4a89e45")
+                Some("3b0c6688a71bcc25dc1508d4c3302bb682e2dbd21814b19b0bab0c9e051e4743")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda13) => {
-                Some("2962847fff5cd17f397919b14c8c9b9f51de11558a2c8da9c090a344ebcb6ff9")
+                Some("8875db9641ee4bf892cfbc245121cd2ce07c485a0862f04483276d418f33b394")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => {
-                Some("f2f50ccffb76fe9df7a9e523f7cecb422f53b4e74156ea4cce4a62b9fc1c446c")
+                Some("31323fbe599f11057255454cd2c7f7792296587a391d13ab0ad569935bf93c6f")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
                 Some("5e600d7797ac801d0c903f52ae46c03538bb77817a48579aa581faa8d2a8a734")
@@ -901,6 +922,13 @@ fn main() {
     println!("cargo::rerun-if-changed=pjrt_plugin_exported_symbols.txt");
     println!("cargo::rerun-if-changed=pjrt_plugin_version_script.lds");
     println!("cargo::rerun-if-changed=WORKSPACE");
+    println!("cargo::rerun-if-env-changed={RYFT_XLA_SYS_ARCHIVE}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_CUDA_12_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_CUDA_13_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_ROCM_7_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_TPU_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_NEURON_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_METAL_LIB}");
 
     let build_configuration = BuildConfiguration::from_environment().unwrap();
 

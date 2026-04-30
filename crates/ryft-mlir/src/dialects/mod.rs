@@ -13,6 +13,7 @@ pub mod linalg;
 pub mod llvm;
 pub mod memref;
 pub mod mhlo;
+pub mod mosaic;
 pub mod pdl;
 pub mod quant;
 pub mod registry;
