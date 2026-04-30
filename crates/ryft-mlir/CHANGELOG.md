@@ -10,10 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Updated the StableHLO `composite` operation to support regions.
+- Added support for the `gpu` dialect.
+- Added support for the Triton `tt` dialect.
 
 ### Changed
 
+- Updated the StableHLO `composite` operation to support regions.
 - Minor performance optimizations for some of the `shardy` dialect builders.
 
 ## [0.0.2] - 2026-03-02

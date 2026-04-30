@@ -19,9 +19,15 @@ use ryft_xla_sys::bindings::mlirGetDialectHandle__gpu__;
 
 use crate::DialectHandle;
 
+pub mod attributes;
+pub mod operations;
 pub mod passes;
+pub mod types;
 
+pub use attributes::*;
+pub use operations::*;
 pub use passes::*;
+pub use types::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `gpu` [`Dialect`](crate::Dialect).

@@ -22,6 +22,7 @@ pub mod shardy;
 pub mod sparse_tensor;
 pub mod stable_hlo;
 pub mod tensor;
+pub mod triton;
 pub mod versioned_hlo;
 
 pub use dialect::*;
