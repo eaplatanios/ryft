@@ -116,15 +116,16 @@ pub trait StagingEngine: Engine {
     }
 }
 
-/// Stateless engine that synthesizes scalar-compatible values from [`ArrayType`] metadata.
+/// Stateless [`StagingEngine`] that uses [`ArrayType`] for representing types and scalars like `f32`, for example,
+/// for representing values. [`ScalarEngine`] is the "minimal backend" used throughout tests and scalar-only examples
+/// in `ryft-core`. It demonstrates the intended role of an [`Engine`] in the smallest possible form: there are no
+/// device handles, no mesh states, and no backend registries; just the built-in primitive carriers plus
+/// [`ArrayType`]-driven construction of scalar values.
 ///
-/// [`ScalarEngine<V>`] is the "minimal backend" used throughout tests and scalar-only examples. It demonstrates the
-/// intended role of an [`Engine`] in the smallest possible form: there is no device handle, no mesh state, and no
-/// backend registry, just the built-in primitive carriers plus metadata-driven construction of scalar identity values.
-///
-/// The engine ignores most of the supplied [`ArrayType`] metadata because scalar leaves have one canonical runtime
-/// representation. That makes it a compact teaching example for the tracing stack: if a transform works against
-/// [`ScalarEngine`], the same path can be reused by richer engines with sharding, device, or runtime context.
+/// Note that this engine ignores most of the [`ArrayType`] metadata (e.g., the [`Shape`](crate::Shape)) because scalar
+/// values have one canonical runtime representation. That makes it a compact teaching example for the tracing stack:
+/// if a transform works against [`ScalarEngine`], the same path can be reused by richer engines with sharding, device,
+/// or runtime context.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ScalarEngine<V> {
     /// Phantom marker that ties the zero-sized engine to its scalar leaf type.
