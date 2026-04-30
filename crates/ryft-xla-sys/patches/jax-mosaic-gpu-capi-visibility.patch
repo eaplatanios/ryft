@@ -1,0 +1,13 @@
+diff --git a/jaxlib/mosaic/dialect/gpu/BUILD b/jaxlib/mosaic/dialect/gpu/BUILD
+index c82cb8dfc8..7ea30d6152 100644
+--- a/jaxlib/mosaic/dialect/gpu/BUILD
++++ b/jaxlib/mosaic/dialect/gpu/BUILD
+@@ -23,7 +23,7 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
+ 
+ package(
+     default_applicable_licenses = [],
+-    default_visibility = ["//jax/experimental:mosaic_gpu_users"],
++    default_visibility = ["//visibility:public"],
+ )
+ 
+ td_library(
