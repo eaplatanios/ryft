@@ -185,16 +185,13 @@ impl_scalar_engine_for_scalar!(f16, DataType::F16, f16::ZERO, f16::ONE);
 impl_scalar_engine_for_scalar!(f32, DataType::F32, 0.0, 1.0);
 impl_scalar_engine_for_scalar!(f64, DataType::F64, 0.0, 1.0);
 
-/// Active engine used while staging one program.
-///
-/// [`TracingEngine`] bundles the active [`StagingEngine`] reference with the active
-/// [`ProgramBuilder`](crate::tracing::ProgramBuilder). Individual [`Tracer`] leaves carry a clone of this engine so
-/// ordinary Rust operator traits can keep staging without requiring an explicit engine argument at every call site.
+/// [`StagingEngine`] that can be used for tracing [`Program`]s. This engine bundles an underlying [`StagingEngine`]
+/// with a [`ProgramBuilder`] and uses [`Tracer`]s to represent values.
 pub struct TracingEngine<'engine, E: StagingEngine + ?Sized> {
-    /// Engine borrowed by this tracing engine for metadata-driven value synthesis and operation selection.
+    /// [`StagingEngine`] borrowed by this [`TracingEngine`] for type-driven value synthesis and operation selection.
     engine: &'engine E,
 
-    /// Shared builder that owns the staged program currently being traced.
+    /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced.
     builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>,
 }
 
