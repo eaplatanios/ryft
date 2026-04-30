@@ -79,6 +79,11 @@ update this file so that they do not need to remind you again in the future.
   abstraction and keep one source of truth.
 - Prefer putting type bounds directly in the generic type declarations over using `where` bounds later on in the same
   signature.
+- When a helper semantically belongs to an existing core type such as `Program`, prefer an associated function in the
+  relevant `impl` block over a free function unless there is a clear reuse reason that truly spans multiple owners.
+- When a generic API is centered on a parameterized input or output family, prefer using that family's canonical
+  reparameterized form (e.g., `Input::To<T>`) instead of introducing a separate generic metadata type that is
+  only coupled by matching `ParameterStructure`s.
 
 #### Formatting & Naming
 
@@ -92,10 +97,16 @@ update this file so that they do not need to remind you again in the future.
   `Result<_, Error>`; reserve `try_from_*` for trait-based conversions or when an infallible `from_*` already exists.
 - Always name the formatter argument `formatter` in `Display` and `Debug` implementations; do not use `f` or any other
   shorthand.
+- When writing indentation into `std::fmt::Formatter`, prefer inline width-based formatting like
+  `write!(formatter, "{:indentation$}", "")` over per-space loops or one-off helper functions.
 - For user-requested renames or removals, always run a targeted search afterward to verify that no old identifier
   references remain in the `ryft` codebase.
 - Use `r#type`, `r#await`, etc. when a reserved Rust keyword must be used as an identifier.
 - Prefer just `size_of::<T>()` instead of `std::mem::size_of<T>()` and do not `use std::mem::size_of` as it is built in.
+- In derive lists that include both `Copy` and `Clone`, list `Copy` before `Clone` and keep those two traits before
+  any other derived traits.
+- When changing a core trait contract that is consumed by derive macros, run the corresponding macro integration test
+  crate (e.g., `ryft-macros-tests`) in addition to the macro crate's own unit tests.
 
 ### Error Handling
 
@@ -198,29 +209,14 @@ update this file so that they do not need to remind you again in the future.
   cells across multiple lines instead of leaving oversized single-line blocks.
 - When revising one sentence inside a documentation paragraph, reread and polish the whole paragraph so the final
   wording is coherent as a unit instead of sounding locally patched.
+- When editing rustdoc prose, reflow the surrounding paragraph toward the 120-column limit where the text naturally
+  allows it; avoid leaving documentation lines arbitrarily short unless they are lists, code blocks, tables, links, or
+  readability-driven sentence breaks.
 
-## Testing Style
+## Testing Guidelines
 
-- Keep unit tests colocated in each module under `#[cfg(test)]`.
-- Every new/changed behavior should be covered by unit tests.
-- Use `pretty_assertions::assert_eq` for string/struct comparisons where output readability matters.
-- Use `indoc!` for multiline string matching assertions (e.g., for textual IR/program renderings).
-- Prefer deterministic tests with explicit assertions.
-- Always name unit tests with a `test_...` prefix for consistency across modules.
-- For `Result` assertions, prefer `assert_eq!(..., Ok(...))` for success paths and `assert!(matches!(..., Err(...)))`,
-  with guards when needed, for error paths, instead of manual `match` + `panic!` blocks.
-- For backend-dependent operations (e.g., in `ryft-pjrt`), assert an explicit set of acceptable error variants with
-  `matches!` and only run success-path assertions when the result is `Ok(...)`.
-- For asynchronous transfer/copy tests, await the returned completion handle before asserting final output contents
-  or invoking dependent callbacks.
-- Use the `test_for_each_platform!` macro for testing backend-specific behavior in `ryft-pjrt`, or an equivalent one
-  for other crates. You can create such a macro if you need it and it does not yet exist in a crate.
-- Reuse shared test helpers (e.g, `test_cpu_client`, `test_cpu_plugin`, etc.) instead of reimplementing setup logic.
-- When similar test patterns repeat, extract helper functions or declarative macros. Prefer to add them to the `tests`
-  module at the root `lib.rs` file of the corresponding crate, like we have already done for some helpers in
-  `ryft-mlir` and `ryft-pjrt`.
-- In tests, prefer flat sequences of explicit assertions over local helper closures or `for` loops unless the user
-  explicitly asks for the latter.
+- All ryft unit-testing conventions live in `.agents/unit-testing-guidelines.md`.
+  Consult that file before writing or revising unit tests.
 
 ## Crate-Specific Conventions
 
@@ -233,8 +229,6 @@ update this file so that they do not need to remind you again in the future.
 - For operation constructor APIs, pass `location` as the last parameter and use generic `L: Location<'c, 't>`.
 - For operation documentation strings, avoid Markdown tables for operands/results; prefer clear Markdown lists.
 - For operation constructor documentation strings, avoid boilerplate Rust call examples unless usage is non-obvious.
-- For operation tests, test operations individually where possible, and prefer full-string equality assertions using
-  `indoc!` and `pretty_assertions::assert_eq` over partial `.contains(...)` checks.
 
 ### `ryft-pjrt`
 
