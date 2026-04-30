@@ -5,9 +5,12 @@
 
 #ifdef __cplusplus
 #include <memory>
+#include <utility>
 
+#include "absl/status/status.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/distributed/distributed.h"
+
 extern "C" {
 #endif
 
@@ -36,20 +39,20 @@ struct PJRT_Error {
   do {                                                            \
     absl::Status _status = (expr);                                \
     if (!_status.ok()) {                                          \
-      PJRT_Error* _c_status = new PJRT_Error{std::move(_status)}; \
+      PJRT_Error *_c_status = new PJRT_Error{std::move(_status)}; \
       return _c_status;                                           \
     }                                                             \
   } while (false)
 
-#define PJRT_ASSIGN_OR_RETURN(lhs, rexpr)                                  \
-  _PJRT_ASSIGN_OR_RETURN_IMPL(_PJRT_CONCAT(_status_or_value, __COUNTER__), \
-                              lhs, rexpr,                                  \
+#define PJRT_ASSIGN_OR_RETURN(lhs, rexpr)                                      \
+  _PJRT_ASSIGN_OR_RETURN_IMPL(_PJRT_CONCAT(_status_or_value, __COUNTER__), lhs, \
+                              rexpr,                                           \
                               _PJRT_CONCAT(_c_status, __COUNTER__));
 
 #define _PJRT_ASSIGN_OR_RETURN_IMPL(statusor, lhs, rexpr, c_status) \
   auto statusor = (rexpr);                                          \
   if (!statusor.ok()) {                                             \
-    PJRT_Error* c_status = new PJRT_Error();                        \
+    PJRT_Error *c_status = new PJRT_Error();                        \
     c_status->status = statusor.status();                           \
     return c_status;                                                \
   }                                                                 \

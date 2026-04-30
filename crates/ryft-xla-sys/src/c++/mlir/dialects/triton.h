@@ -1,5 +1,4 @@
-#ifndef RYFT_XLA_SYS_MLIR_DIALECTS_TRITON_H_
-#define RYFT_XLA_SYS_MLIR_DIALECTS_TRITON_H_
+#pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -47,5 +46,3 @@ MlirStringRef mlirTritonTtEnumAttrGetValue(MlirAttribute attribute, enum MlirTri
 #ifdef __cplusplus
 }
 #endif
-
-#endif  // RYFT_XLA_SYS_MLIR_DIALECTS_TRITON_H_

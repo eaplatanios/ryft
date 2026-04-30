@@ -1,5 +1,4 @@
-#ifndef RYFT_XLA_SYS_MLIR_DIALECTS_GPU_H_
-#define RYFT_XLA_SYS_MLIR_DIALECTS_GPU_H_
+#pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -103,5 +102,3 @@ MlirAffineMap mlirGpuParallelLoopDimMappingAttrGetBound(MlirAttribute attribute)
 #ifdef __cplusplus
 }
 #endif
-
-#endif  // RYFT_XLA_SYS_MLIR_DIALECTS_GPU_H_
