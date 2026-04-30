@@ -146,7 +146,7 @@ macro_rules! impl_scalar_engine_for_scalar {
             fn zero(&self, r#type: &DataType) -> Result<$ty, TracingError> {
                 if *r#type != $data_type {
                     return Err(TypeError {
-                        message: format!("{} scalar engine cannot synthesize zero for type: {}", $data_type, r#type),
+                        message: format!("scalar engine for {} cannot synthesize zero for {}", $data_type, r#type),
                     }
                     .into());
                 }
@@ -157,7 +157,7 @@ macro_rules! impl_scalar_engine_for_scalar {
             fn one(&self, r#type: &DataType) -> Result<$ty, TracingError> {
                 if *r#type != $data_type {
                     return Err(TypeError {
-                        message: format!("{} scalar engine cannot synthesize one for type: {}", $data_type, r#type),
+                        message: format!("scalar engine for {} cannot synthesize one for {}", $data_type, r#type),
                     }
                     .into());
                 }
@@ -189,32 +189,17 @@ impl_scalar_engine_for_scalar!(f64, DataType::F64, 0.0, 1.0);
 /// with a [`ProgramBuilder`] and uses [`Tracer`]s to represent values.
 pub struct TracingEngine<'engine, E: StagingEngine + ?Sized> {
     /// [`StagingEngine`] borrowed by this [`TracingEngine`] for type-driven value synthesis and operation selection.
-    engine: &'engine E,
+    pub engine: &'engine E,
 
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced.
-    builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>,
+    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>,
 }
 
 impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
-    /// Creates a tracing engine over `engine` and `builder`.
-    ///
-    /// The caller owns the tracing scope: all tracers used together must carry a [`TracingEngine`] that refers to the
-    /// same outer engine handle and builder, or staging is rejected before mutation.
+    /// Creates a new [`TracingEngine`] that borrows the provided [`StagingEngine`] and [`ProgramBuilder`].
     #[inline]
     pub fn new(engine: &'engine E, builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>) -> Self {
         Self { engine, builder }
-    }
-
-    /// Returns the active staging engine used by this tracing engine.
-    #[inline]
-    pub fn outer_engine(&self) -> &'engine E {
-        self.engine
-    }
-
-    /// Returns the shared program builder owned by this tracing engine.
-    #[inline]
-    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>> {
-        &self.builder
     }
 
     /// Creates a sibling tracing engine over the same active engine handle and a fresh builder.
@@ -264,7 +249,7 @@ impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
         inputs: &[Tracer<'engine, E>],
         op: E::Operation,
     ) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
-        if inputs.iter().any(|input| !Rc::ptr_eq(&self.builder, input.engine.builder())) {
+        if inputs.iter().any(|input| !Rc::ptr_eq(&self.builder, &input.engine.builder)) {
             return Err(TracingError::MismatchedProgramBuilders);
         }
         if inputs
@@ -338,7 +323,7 @@ impl<'engine, E: StagingEngine + ?Sized> TracingEngine<'engine, E> {
         F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     {
         let input_structure = input_types.parameter_structure();
-        let builder = self.builder().clone();
+        let builder = self.builder.clone();
         let traced_input = Input::To::<Tracer<'engine, E>>::from_parameters(
             input_types.parameter_structure(),
             input_types.into_parameters().map(|r#type| {
@@ -392,14 +377,14 @@ impl<'engine, E: StagingEngine + ?Sized> Engine for TracingEngine<'engine, E> {
 
     #[inline]
     fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        let value = self.outer_engine().zero(r#type)?;
+        let value = self.engine.zero(r#type)?;
         let atom = self.builder.borrow_mut().add_constant(value);
         Ok(self.tracer_from_staged_parts(atom, r#type.clone()))
     }
 
     #[inline]
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        let value = self.outer_engine().one(r#type)?;
+        let value = self.engine.one(r#type)?;
         let atom = self.builder.borrow_mut().add_constant(value);
         Ok(self.tracer_from_staged_parts(atom, r#type.clone()))
     }
@@ -498,13 +483,13 @@ impl<'engine, E: StagingEngine + ?Sized> Tracer<'engine, E> {
     /// Returns the outer staging engine borrowed by this tracer's tracing engine.
     #[inline]
     pub fn outer_engine(&self) -> &'engine E {
-        self.engine.outer_engine()
+        self.engine.engine
     }
 
     /// Returns the shared program builder for this tracer's tracing engine.
     #[inline]
     pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>> {
-        self.engine.builder()
+        &self.engine.builder
     }
 
     /// Returns the staged atom id for this tracer when it is still live.

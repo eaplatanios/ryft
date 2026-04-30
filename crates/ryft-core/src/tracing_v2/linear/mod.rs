@@ -161,7 +161,7 @@ where
     let pullback = transpose_traced_linear_program(tracing_engine.clone(), &pushforward)?;
     let seed_type = traced_output.r#type().into_owned();
     let _ = <V as One<E::Type>>::one(&seed_type)?;
-    let seed_value = tracing_engine.outer_engine().one(&seed_type)?;
+    let seed_value = tracing_engine.engine.one(&seed_type)?;
     let seed_atom = tracing_builder.borrow_mut().add_constant(seed_value);
     let seed = traced_output.engine.tracer_from_staged_parts(seed_atom, seed_type);
     let traced_gradient = pullback.interpret(vec![seed])?;
