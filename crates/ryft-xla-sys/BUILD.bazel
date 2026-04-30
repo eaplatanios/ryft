@@ -112,6 +112,10 @@ RYFT_PJRT_SYS_DEPENDENCIES = XLA_DEPENDENCIES + select({
     ],
 })
 
+# `@triton//:TritonDialects` also compiles `TritonGPU`, `TritonNvidiaGPU`, and analysis utilities, but the
+# `ryft-mlir` TT wrappers only need the core `tt` IR dialect for type, attribute, operation, and dialect registration
+# helpers. Keeping this target scoped to `lib/Dialect/Triton/IR` avoids pulling unrelated GPU dialect code into the
+# cross-platform `ryft-xla-sys` archive, which is especially important for the Windows CPU artifact build.
 cc_library(
     name = "triton_tt_dialect",
     srcs = [
