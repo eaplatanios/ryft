@@ -149,6 +149,8 @@ cc_library(
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:InferTypeOpInterface",
         "@llvm-project//mlir:InliningUtils",
+        "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:MathDialect",
         "@llvm-project//mlir:SCFDialect",
         "@llvm-project//mlir:SideEffectInterfaces",
         "@llvm-project//mlir:Support",
@@ -179,7 +181,10 @@ cc_library(
         "src/c++/mlir/dialects/gpu.cc",
         "src/c++/mlir/dialects/triton.cc",
     ],
-    copts = tsl_copts(),
+    copts = tsl_copts() + [
+        "-Iexternal/triton/include",
+        "-I$(BINDIR)/external/triton/include",
+    ],
     deps = RYFT_PJRT_SYS_DEPENDENCIES,
     alwayslink = True,
 )
