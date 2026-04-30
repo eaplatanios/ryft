@@ -296,6 +296,8 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
 - In MLIR dialect operation modules, inline operation-specific attribute, segment, and async-token access logic
   in the owning trait or constructor instead of adding module-level helper functions, unless the helper is genuinely
   shared across dialect modules.
+- In MLIR dialect operation modules, write operation traits and their `mlir_op!` / `mlir_op_trait!` declarations
+  explicitly instead of adding dialect-local macros that generate the wrapper trait definitions.
 - Prefix MLIR-dialect-local declarative macros with the dialect or module prefix (for example, `gpu_`) unless they
   are intentionally shared across dialect modules.
 - For MLIR dialect attribute tests, follow the StableHLO attribute test structure: add construction/accessor, equality,
@@ -333,6 +335,7 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
   upstream symbols that already use it.
 - Prefix custom MLIR C API extension functions and opaque/helper enum types with `mlir` / `Mlir`, matching the upstream
   MLIR C API style; do not use project-specific prefixes such as `ryftMlir` / `RyftMlir` for those exported symbols.
+- Use `#pragma once` for source-owned C/C++ headers instead of include guards.
 - In custom C++ FFI shims, inline tiny nullable handle conversions at the getter call site instead of adding local
   helpers when the helper only wraps a null check for one or two nearby functions.
 
