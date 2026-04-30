@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Added support for the `gpu` dialect.
 - Added support for the Triton `tt` dialect.
+- Added support for the Mosaic GPU dialect.
 
 ### Changed
 

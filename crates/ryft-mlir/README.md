@@ -115,7 +115,7 @@ fn main() {
         - [ ] Add support for operations.
     - [ ] `memref`
     - [ ] `mhlo`
-    - [ ] [`mosaic_gpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
+    - [x] [`mosaic_gpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
     - [ ] [`mosaic_tpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/tpu/tpu.td)
     - [ ] `nvgpu`
         - [ ] Add support for types: `NVGPUTensorMapDescriptorType`.

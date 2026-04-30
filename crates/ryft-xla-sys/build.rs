@@ -44,6 +44,15 @@ static XLA_COMMIT: LazyLock<&'static str> = LazyLock::new(|| {
         .expect("failed to parse `XLA_COMMIT` from `WORKSPACE`")
 });
 
+/// JAX commit currently pinned in [`WORKSPACE`].
+static JAX_COMMIT: LazyLock<&'static str> = LazyLock::new(|| {
+    include_str!("WORKSPACE")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("JAX_COMMIT = \""))
+        .and_then(|line| line.strip_suffix('"'))
+        .expect("failed to parse `JAX_COMMIT` from `WORKSPACE`")
+});
+
 /// URL paired with an expected SHA-256 checksum for verifying downloads.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct UrlWithChecksum {
@@ -486,10 +495,14 @@ impl BuildConfiguration {
     /// any existing extracted directory is replaced to keep the contents up to date. For extracted
     /// `ryft-xla-sys` archives, post-processing (e.g., renaming the static library) is applied.
     fn artifact_directory(&self, artifact: Artifact) -> Result<PathBuf> {
-        // We include the XLA commit in the extracted archive name to ensure that we do not use stale extracted files.
+        // We include the native source pins in the extracted archive name to avoid reusing stale extracted files when
+        // either XLA or auxiliary native sources such as JAX change.
         let artifact_name = self.precompiled_artifact_name(artifact);
         let artifact_name = artifact_name.trim_end_matches(".tar.gz").trim_end_matches(".whl");
-        let archive_name = format!("{artifact_name}-{}", *XLA_COMMIT);
+        let archive_name = match artifact {
+            Artifact::RyftXlaSys => format!("{artifact_name}-{}-{}", *XLA_COMMIT, *JAX_COMMIT),
+            Artifact::PjrtPlugin => format!("{artifact_name}-{}", *XLA_COMMIT),
+        };
 
         let extracted_path = dirs::cache_dir()
             .map(|cache_dir| cache_dir.join("ryft").join("xla"))
@@ -905,6 +918,13 @@ fn main() {
     println!("cargo::rerun-if-changed=pjrt_plugin_exported_symbols.txt");
     println!("cargo::rerun-if-changed=pjrt_plugin_version_script.lds");
     println!("cargo::rerun-if-changed=WORKSPACE");
+    println!("cargo::rerun-if-env-changed={RYFT_XLA_SYS_ARCHIVE}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_CUDA_12_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_CUDA_13_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_ROCM_7_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_TPU_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_NEURON_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_METAL_LIB}");
 
     let build_configuration = BuildConfiguration::from_environment().unwrap();
 
