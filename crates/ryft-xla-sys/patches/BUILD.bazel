@@ -1,1 +1,1 @@
-exports_files(["jax-mosaic-gpu-capi-visibility.patch"])
+exports_files(["jax-mosaic-c-api-visibility.patch"])
