@@ -10,7 +10,7 @@ use crate::tracing_v2::engines::Tracer;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableStagingEngine, LinearPrimitiveOperation};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, TracedLinearizationCarrier,
@@ -54,12 +54,12 @@ impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
     }
 }
 
-impl<V: Typed<ArrayType>> ScaleOperation<ArrayType, V> {
+impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
     /// Validates abstract inputs without needing a concrete instance.
     ///
     /// This is mainly used by carrier-level wrappers that want to construct or validate a scale op
     /// from type information before they have committed to a concrete `ScaleOperation` value.
-    pub fn abstract_eval_static(inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    pub fn abstract_eval_static(inputs: &[T]) -> Result<Vec<T>, TypeError> {
         Ok(vec![unary_abstract(inputs)?])
     }
 }
@@ -76,12 +76,12 @@ impl<T: Type, V: Typed<T>> Display for ScaleOperation<T, V> {
     }
 }
 
-impl<V: Typed<ArrayType> + Display> Operation<ArrayType> for ScaleOperation<ArrayType, V> {
+impl<T: Type, V: Typed<T> + Display> Operation<T> for ScaleOperation<T, V> {
     fn name(&self) -> &'static str {
         "scale"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         Self::abstract_eval_static(input_types)
     }
 
@@ -91,33 +91,32 @@ impl<V: Typed<ArrayType> + Display> Operation<ArrayType> for ScaleOperation<Arra
     }
 }
 
-impl<V: Typed<ArrayType> + Display + Clone + Mul<Output = V>> InterpretableOperation<ArrayType, V>
-    for ScaleOperation<ArrayType, V>
-{
+impl<T: Type, V: Typed<T> + Display + Clone + Mul<Output = V>> InterpretableOperation<T, V> for ScaleOperation<T, V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![self.factor().clone() * inputs[0].clone()])
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<ArrayType, V>
-    for ScaleOperation<ArrayType, V>
+impl<T: Type + PartialEq, V: Traceable<T> + crate::parameters::Parameter + Mul<Output = V> + ZeroLike>
+    LinearOperation<T, V> for ScaleOperation<T, V>
+where
+    LinearPrimitiveOperation<V, T>: Operation<T>,
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<
-            '_,
-            ArrayType,
-            V,
-            LinearPrimitiveOperation<V>,
-        >,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearPrimitiveOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
-                    .apply_operation(&[atom], LinearPrimitiveOperation::Scale { factor: self.factor().clone() }, 1)?
+                    .apply_operation(
+                        &[atom],
+                        LinearPrimitiveOperation::<V, T>::Scale { factor: self.factor().clone() },
+                        1,
+                    )?
                     .into_iter()
                     .next()
                     .expect("scale transpose should produce one cotangent contribution"),
@@ -154,6 +153,33 @@ where
     }
 }
 
+impl<V, E> DifferentiableOperation<E> for ScaleOperation<DataType, V>
+where
+    V: Differentiable<DataType, Tangent = V> + Mul<Output = V>,
+    E: DifferentiableEngine<Type = DataType, Value = V> + ?Sized,
+    E::LinearOperation: SupportsScale<DataType, V>,
+{
+    fn jvp(
+        &self,
+        _engine: &E,
+        context: &mut JvpContext<'_, V, E::LinearOperation, DataType>,
+        inputs: &[JvpTracer<V, AtomId>],
+    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
+        check_input_count!(inputs, 1);
+        let input = &inputs[0];
+        let tangent = context
+            .apply_operation(
+                &[input.tangent],
+                <E::LinearOperation as SupportsScale<DataType, V>>::scale_operation(self.factor().clone()),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("scale jvp should produce one tangent");
+        Ok(vec![JvpTracer { primal: self.factor().clone() * input.primal.clone(), tangent }])
+    }
+}
+
 /// JVP rule for `ScaleOperation` under the
 /// [`TracingEngine`](crate::tracing_v2::TracingEngine) wrapper.
 ///
@@ -169,6 +195,7 @@ where
     EInner: DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized,
     EInner::Operation: TracedLinearizationCarrier<ArrayType, V>,
     Tracer<'engine, EInner>: Mul<Output = Tracer<'engine, EInner>>,
+    EInner::LinearOperation<'engine>: SupportsScale<ArrayType, Tracer<'engine, EInner>>,
 {
     fn jvp(
         &self,
@@ -227,7 +254,8 @@ mod tests {
     fn test_scale_transpose_scales_output_cotangents() {
         let transpose_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
-        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
+        let output_cotangent_atom =
+            transpose_builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
         let mut context = test_transposition_context(transpose_builder.clone());
         let contribution_atom = ScaleOperation::new(3.0f64)
             .transpose(&mut context, &[Some(output_cotangent_atom)])

@@ -231,8 +231,7 @@ pub struct Instruction<O> {
 /// consists of a sequence of [`Instruction`]s paired with [`Parameterized`] input and output types. This is the primary
 /// intermediate representation (IR) used by the Ryft tracing and transformation system (e.g., to support things like
 /// automatic differentiation and just-in-time compilation).
-pub struct Program<T: Type, V: Typed<T> + Parameter, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
-{
+pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
     /// [`Atom`]s contained in this [`Program`], in the order in which they will be evaluated.
     pub atoms: Vec<Atom<T, V>>,
 
@@ -255,7 +254,7 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O: Operation<T>, Input: Par
     pub marker: PhantomData<fn(Input) -> Output>,
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>> Clone
+impl<T: Type, V: Traceable<T>, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> Clone
     for Program<T, V, O, Input, Output>
 {
     fn clone(&self) -> Self {

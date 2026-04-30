@@ -7,7 +7,7 @@ use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableEngine;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsScale};
 
@@ -81,7 +81,30 @@ impl Operation<ArrayType> for MulOperation {
     }
 }
 
+impl Operation<DataType> for MulOperation {
+    fn name(&self) -> &'static str {
+        "mul"
+    }
+
+    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        if input_types.len() != 2 {
+            return Err(TypeError { message: format!("mul expected 2 input types but got {}", input_types.len()) });
+        }
+        input_types[0]
+            .broadcast(&input_types[1])
+            .map(|output| vec![output])
+            .map_err(|_| TypeError { message: "mul input types are not broadcast-compatible".to_string() })
+    }
+}
+
 impl<V: Typed<ArrayType> + Clone + Mul<Output = V>> InterpretableOperation<ArrayType, V> for MulOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        check_input_count!(inputs, 2);
+        Ok(vec![inputs[0].clone() * inputs[1].clone()])
+    }
+}
+
+impl<V: Typed<DataType> + Clone + Mul<Output = V>> InterpretableOperation<DataType, V> for MulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 2);
         Ok(vec![inputs[0].clone() * inputs[1].clone()])

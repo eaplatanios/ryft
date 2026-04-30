@@ -279,19 +279,19 @@ where
 #[allow(private_bounds)]
 pub fn transpose_traced_linear_program<'engine, Input, Output, V, O, E>(
     tracing_engine: TracingEngine<'engine, E>,
-    program: &Program<ArrayType, Tracer<'engine, E>, O, Input, Output>,
-) -> Result<Program<ArrayType, Tracer<'engine, E>, O, Output, Input>, TracingError>
+    program: &Program<E::Type, Tracer<'engine, E>, O, Input, Output>,
+) -> Result<Program<E::Type, Tracer<'engine, E>, O, Output, Input>, TracingError>
 where
-    V: Traceable<ArrayType>,
+    V: Traceable<E::Type>,
     Input: Parameterized<Tracer<'engine, E>>,
     Output: Parameterized<Tracer<'engine, E>>,
     O: Clone
-        + LinearOperation<ArrayType, Tracer<'engine, E>, O>
-        + SupportsAdd<ArrayType, Tracer<'engine, E>>
-        + SupportsZero<ArrayType, Tracer<'engine, E>>,
-    E: StagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+        + LinearOperation<E::Type, Tracer<'engine, E>, O>
+        + SupportsAdd<E::Type, Tracer<'engine, E>>
+        + SupportsZero<E::Type, Tracer<'engine, E>>,
+    E: StagingEngine<Value = V> + ?Sized + 'static,
 {
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, Tracer<'engine, E>, O>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new()));
     let mut context = TranspositionContext::new(builder);
     let pullback = transpose_linear_program_with_context(&mut context, program)?;
     materialize_tracer_zero_ops(pullback, tracing_engine)
@@ -306,20 +306,20 @@ where
 /// cannot satisfy [`Zero<ArrayType>`](crate::tracing_v2::operations::constants::Zero) statically,
 /// so traced pullbacks must be materialized away from `Zero` ops before being interpreted.
 fn materialize_tracer_zero_ops<'engine, Input, Output, V, O, E>(
-    program: Program<ArrayType, Tracer<'engine, E>, O, Input, Output>,
+    program: Program<E::Type, Tracer<'engine, E>, O, Input, Output>,
     tracing_engine: TracingEngine<'engine, E>,
-) -> Result<Program<ArrayType, Tracer<'engine, E>, O, Input, Output>, TracingError>
+) -> Result<Program<E::Type, Tracer<'engine, E>, O, Input, Output>, TracingError>
 where
-    V: Traceable<ArrayType>,
+    V: Traceable<E::Type>,
     Input: Parameterized<Tracer<'engine, E>>,
     Output: Parameterized<Tracer<'engine, E>>,
     O: Clone
-        + LinearOperation<ArrayType, Tracer<'engine, E>, O>
-        + SupportsAdd<ArrayType, Tracer<'engine, E>>
-        + SupportsZero<ArrayType, Tracer<'engine, E>>,
-    E: StagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+        + LinearOperation<E::Type, Tracer<'engine, E>, O>
+        + SupportsAdd<E::Type, Tracer<'engine, E>>
+        + SupportsZero<E::Type, Tracer<'engine, E>>,
+    E: StagingEngine<Value = V> + ?Sized + 'static,
 {
-    let mut builder = ProgramBuilder::<ArrayType, Tracer<'engine, E>, O>::new();
+    let mut builder = ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new();
     builder.atoms = program.atoms.clone();
     builder.input_ids = program.input_ids.clone();
     let mut atom_remapping: Vec<Option<AtomId>> = vec![None; builder.atoms.len()];

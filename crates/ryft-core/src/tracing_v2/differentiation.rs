@@ -8,7 +8,7 @@ use crate::tracing_v2::operations::{
     SupportsAdd, SupportsNeg, SupportsScale, SupportsZero, TracedLinearizationCarrier,
 };
 use crate::tracing_v2::{Differentiable, LinearPrimitiveOperation, PrimitiveOperation};
-use crate::types::ArrayType;
+use crate::types::{ArrayType, DataType};
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -192,13 +192,13 @@ where
 macro_rules! impl_differentiable_engine_for_scalar {
     ($ty:ty) => {
         impl DifferentiableEngine for ScalarEngine<$ty> {
-            type DifferentiableOperation = PrimitiveOperation<$ty>;
-            type LinearOperation = LinearPrimitiveOperation<$ty>;
+            type DifferentiableOperation = PrimitiveOperation<$ty, DataType>;
+            type LinearOperation = LinearPrimitiveOperation<$ty, DataType>;
         }
 
         impl DifferentiableStagingEngine for ScalarEngine<$ty> {
             type LinearOperation<'engine>
-                = LinearPrimitiveOperation<Tracer<'engine, Self>>
+                = LinearPrimitiveOperation<Tracer<'engine, Self>, DataType>
             where
                 Self: 'engine;
         }

@@ -8,9 +8,9 @@ use crate::tracing_v2::{JvpContext, TracingEngine};
 /// trait is the exact semantic contract needed for one staged operation carrier to participate in
 /// that pass.
 #[doc(hidden)]
-pub trait TracedLinearizableOperation<'engine, E>: Clone + Operation<ArrayType>
+pub trait TracedLinearizableOperation<'engine, E>: Clone + Operation<E::Type>
 where
-    E: crate::tracing_v2::DifferentiableStagingEngine<Type = ArrayType> + ?Sized,
+    E: crate::tracing_v2::DifferentiableStagingEngine + ?Sized,
 {
     /// Applies this operation's JVP rule to traced primals inside the active linearization pass.
     fn jvp_traced_linearization(
@@ -20,6 +20,7 @@ where
             '_,
             Tracer<'engine, E>,
             <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+            E::Type,
         >,
         inputs: &[JvpTracer<Tracer<'engine, E>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, E>, AtomId>>, TracingError>;
@@ -34,13 +35,13 @@ where
 #[doc(hidden)]
 pub fn linearize_traced_program<'engine, V, E>(
     tracing_engine: TracingEngine<'engine, E>,
-    program: &Program<ArrayType, V, E::Operation, Vec<V>, Vec<V>>,
+    program: &Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>,
     primals: Vec<Tracer<'engine, E>>,
 ) -> Result<
     (
         Vec<Tracer<'engine, E>>,
         Program<
-            ArrayType,
+            E::Type,
             Tracer<'engine, E>,
             <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
             Vec<Tracer<'engine, E>>,
@@ -50,8 +51,8 @@ pub fn linearize_traced_program<'engine, V, E>(
     TracingError,
 >
 where
-    V: Traceable<ArrayType>,
-    E: crate::tracing_v2::DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    V: Traceable<E::Type>,
+    E: crate::tracing_v2::DifferentiableStagingEngine<Value = V> + ?Sized + 'static,
     E::Operation: TracedLinearizableOperation<'engine, E> + 'static,
 {
     fn tangent_for_atom<'engine, V, E>(
@@ -59,7 +60,7 @@ where
         builder: &Rc<
             RefCell<
                 ProgramBuilder<
-                    ArrayType,
+                    E::Type,
                     Tracer<'engine, E>,
                     <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
                 >,
@@ -69,8 +70,8 @@ where
         atom_id: AtomId,
     ) -> Result<AtomId, TracingError>
     where
-        V: Traceable<ArrayType>,
-        E: crate::tracing_v2::DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized,
+        V: Traceable<E::Type>,
+        E: crate::tracing_v2::DifferentiableStagingEngine<Value = V> + ?Sized,
     {
         if let Some(atom) = tangents[atom_id.index] {
             return Ok(atom);
@@ -86,7 +87,7 @@ where
         return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_count });
     }
     let builder = Rc::new(RefCell::new(ProgramBuilder::<
-        ArrayType,
+        E::Type,
         Tracer<'engine, E>,
         <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
     >::new()));

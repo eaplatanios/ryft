@@ -8,7 +8,7 @@ use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableEngine;
 use crate::tracing_v2::engines::{StagingEngine, Tracer};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::sin::Sin;
 use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsNeg, SupportsScale, unary_abstract};
@@ -76,17 +76,24 @@ impl Display for CosOperation {
     }
 }
 
-impl Operation<ArrayType> for CosOperation {
+impl<T: Type> Operation<T> for CosOperation {
     fn name(&self) -> &'static str {
         "cos"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         Ok(vec![unary_abstract(input_types)?])
     }
 }
 
 impl<V: Typed<ArrayType> + Clone + Cos> InterpretableOperation<ArrayType, V> for CosOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        check_input_count!(inputs, 1);
+        Ok(vec![inputs[0].clone().cos()])
+    }
+}
+
+impl<V: Typed<DataType> + Clone + Cos> InterpretableOperation<DataType, V> for CosOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().cos()])
@@ -126,10 +133,11 @@ where
     }
 }
 
-impl<'engine, V: Traceable<ArrayType> + Cos, E> Cos for Tracer<'engine, E>
+impl<'engine, E> Cos for Tracer<'engine, E>
 where
-    E: StagingEngine<Type = ArrayType, Value = V> + ?Sized,
-    E::Operation: SupportsCos<ArrayType, V>,
+    E: StagingEngine + ?Sized,
+    E::Value: Cos,
+    E::Operation: SupportsCos<E::Type, E::Value>,
 {
     #[inline]
     fn cos(self) -> Self {

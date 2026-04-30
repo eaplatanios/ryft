@@ -8,7 +8,7 @@ use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
@@ -87,7 +87,30 @@ impl Operation<ArrayType> for AddOperation {
     }
 }
 
+impl Operation<DataType> for AddOperation {
+    fn name(&self) -> &'static str {
+        "add"
+    }
+
+    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        if input_types.len() != 2 {
+            return Err(TypeError { message: format!("add expected 2 input types but got {}", input_types.len()) });
+        }
+        input_types[0]
+            .broadcast(&input_types[1])
+            .map(|output| vec![output])
+            .map_err(|_| TypeError { message: "add input types are not broadcast-compatible".to_string() })
+    }
+}
+
 impl<V: Typed<ArrayType> + Clone + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        check_input_count!(inputs, 2);
+        Ok(vec![inputs[0].clone() + inputs[1].clone()])
+    }
+}
+
+impl<V: Typed<DataType> + Clone + Add<Output = V>> InterpretableOperation<DataType, V> for AddOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 2);
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
@@ -102,6 +125,24 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<Array
             ArrayType,
             V,
             LinearPrimitiveOperation<V>,
+        >,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        check_input_count!(output_cotangents, 1);
+        Ok(vec![output_cotangents[0], output_cotangents[0]])
+    }
+}
+
+impl<V: Traceable<DataType> + crate::parameters::Parameter + Add<Output = V> + ZeroLike> LinearOperation<DataType, V>
+    for AddOperation
+{
+    fn transpose(
+        &self,
+        _context: &mut crate::tracing_v2::operations::TranspositionContext<
+            '_,
+            DataType,
+            V,
+            LinearPrimitiveOperation<V, DataType>,
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {

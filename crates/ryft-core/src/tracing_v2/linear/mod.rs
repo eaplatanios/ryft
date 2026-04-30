@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::{
     Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
     Value,
@@ -67,57 +67,60 @@ pub(crate) fn trace_flat_program_from_input_types<'engine, Input, Output, V, E, 
     engine: &'engine E,
     function: F,
     input_types: Input,
-) -> Result<(Output, Program<ArrayType, V, E::Operation, Vec<V>, Vec<V>>), TracingError>
+) -> Result<(Output, Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>), TracingError>
 where
-    V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<ArrayType>,
-    Output: Parameterized<ArrayType>,
+    V: Traceable<E::Type> + Parameterized<V, ParameterStructure = Placeholder>,
+    Input: Parameterized<E::Type>,
+    Output: Parameterized<E::Type>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
-    E: StagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    E: StagingEngine<Value = V> + ?Sized + 'static,
     E::Operation: Clone,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
-    trace_flat_program_from_trace_result::<Input, Output, V, E::Operation>(engine.trace(function, input_types)?)
+    trace_flat_program_from_trace_result::<E::Type, Input, Output, V, E::Operation>(
+        engine.trace(function, input_types)?,
+    )
 }
 
 pub(crate) fn trace_flat_program_from_input_engine<'engine, Input, Output, V, E, F>(
     tracing_engine: &TracingEngine<'engine, E>,
     function: F,
     input_types: Input,
-) -> Result<(Output, Program<ArrayType, V, E::Operation, Vec<V>, Vec<V>>), TracingError>
+) -> Result<(Output, Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>), TracingError>
 where
-    V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<ArrayType>,
-    Output: Parameterized<ArrayType>,
+    V: Traceable<E::Type> + Parameterized<V, ParameterStructure = Placeholder>,
+    Input: Parameterized<E::Type>,
+    Output: Parameterized<E::Type>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
-    E: StagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    E: StagingEngine<Value = V> + ?Sized + 'static,
     E::Operation: Clone,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::Operation>::new()));
-    trace_flat_program_from_trace_result::<Input, Output, V, E::Operation>(
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, V, E::Operation>::new()));
+    trace_flat_program_from_trace_result::<E::Type, Input, Output, V, E::Operation>(
         tracing_engine.sibling(builder).trace(function, input_types)?,
     )
 }
 
-fn trace_flat_program_from_trace_result<Input, Output, V, O>(
-    trace_result: (Output, Program<ArrayType, V, O, Input::To<V>, Output::To<V>>),
-) -> Result<(Output, Program<ArrayType, V, O, Vec<V>, Vec<V>>), TracingError>
+fn trace_flat_program_from_trace_result<T, Input, Output, V, O>(
+    trace_result: (Output, Program<T, V, O, Input::To<V>, Output::To<V>>),
+) -> Result<(Output, Program<T, V, O, Vec<V>, Vec<V>>), TracingError>
 where
-    V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<ArrayType>,
-    Output: Parameterized<ArrayType>,
+    T: Type + Parameter,
+    V: Traceable<T> + Parameterized<V, ParameterStructure = Placeholder>,
+    Input: Parameterized<T>,
+    Output: Parameterized<T>,
     Input::Family: ParameterizedFamily<V>,
     Output::Family: ParameterizedFamily<V>,
-    O: Clone + Operation<ArrayType>,
+    O: Clone + Operation<T>,
 {
     let (output_types, traced_program) = trace_result;
     let input_leaf_count = traced_program.input_ids.len();
     let output_leaf_count = output_types.parameter_structure().parameter_count();
     let Program { atoms, input_ids, output_ids, instructions, .. } = traced_program;
-    let mut builder = ProgramBuilder::<ArrayType, V, O>::new();
+    let mut builder = ProgramBuilder::<T, V, O>::new();
     builder.atoms = atoms;
     builder.input_ids = input_ids;
     builder.instructions = instructions;
@@ -139,25 +142,25 @@ where
 /// output and the traced gradient leaves.
 fn reverse_mode_scalar_traced_program<'engine, V, E>(
     tracing_engine: TracingEngine<'engine, E>,
-    traced_program: &Program<ArrayType, V, E::Operation, Vec<V>, Vec<V>>,
+    traced_program: &Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>,
     traced_primals: Vec<Tracer<'engine, E>>,
 ) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
 where
-    V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
-    E: DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
+    E: DifferentiableStagingEngine<Value = V> + ?Sized + 'static,
     E::Operation: TracedLinearizableOperation<'engine, E> + 'static,
     <E as DifferentiableStagingEngine>::LinearOperation<'engine>: Clone
-        + InterpretableOperation<ArrayType, Tracer<'engine, E>>
-        + LinearOperation<ArrayType, Tracer<'engine, E>, <E as DifferentiableStagingEngine>::LinearOperation<'engine>>
-        + SupportsZero<ArrayType, Tracer<'engine, E>>,
+        + InterpretableOperation<E::Type, Tracer<'engine, E>>
+        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableStagingEngine>::LinearOperation<'engine>>
+        + SupportsZero<E::Type, Tracer<'engine, E>>,
 {
     let (outputs, pushforward) = linearize_traced_program(tracing_engine.clone(), traced_program, traced_primals)?;
-    ensure_single_gradient_output::<ArrayType, _>(outputs.as_slice())?;
+    ensure_single_gradient_output::<E::Type, _>(outputs.as_slice())?;
     let traced_output = outputs[0].clone();
     let tracing_builder = traced_output.builder().clone();
     let pullback = transpose_traced_linear_program(tracing_engine.clone(), &pushforward)?;
     let seed_type = traced_output.r#type().into_owned();
-    let _ = <V as One<ArrayType>>::one(&seed_type)?;
+    let _ = <V as One<E::Type>>::one(&seed_type)?;
     let seed_value = tracing_engine.outer_engine().one(&seed_type)?;
     let seed_atom = tracing_builder.borrow_mut().add_constant(seed_value);
     let seed = traced_output.engine.tracer_from_staged_parts(seed_atom, seed_type);
@@ -179,7 +182,7 @@ mod tests {
         CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearOperation, LinearPrimitiveOperation,
         PrimitiveOperation, Sin, test_support,
     };
-    use crate::types::{ArrayType, DataType, TypeError};
+    use crate::types::{ArrayType, DataType, TypeError, Typed};
     use indoc::indoc;
 
     use super::*;
@@ -194,6 +197,37 @@ mod tests {
         T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
     {
         x.clone() * x.clone() + x.sin()
+    }
+
+    struct ArrayScalarEngine;
+
+    impl Engine for ArrayScalarEngine {
+        type Type = ArrayType;
+        type Value = f64;
+
+        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(0.0)
+        }
+
+        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(1.0)
+        }
+    }
+
+    impl StagingEngine for ArrayScalarEngine {
+        type Operation = PrimitiveOperation<f64>;
+    }
+
+    impl DifferentiableEngine for ArrayScalarEngine {
+        type DifferentiableOperation = PrimitiveOperation<f64>;
+        type LinearOperation = LinearPrimitiveOperation<f64>;
+    }
+
+    impl DifferentiableStagingEngine for ArrayScalarEngine {
+        type LinearOperation<'engine>
+            = LinearPrimitiveOperation<Tracer<'engine, Self>>
+        where
+            Self: 'engine;
     }
 
     fn bilinear_sin<T>(inputs: (T, T)) -> T
@@ -252,10 +286,10 @@ mod tests {
         }
     }
 
-    impl DifferentiableOperation<ScalarEngine<f64>> for PanicReplayOp {
+    impl DifferentiableOperation<ArrayScalarEngine> for PanicReplayOp {
         fn jvp(
             &self,
-            _engine: &ScalarEngine<f64>,
+            _engine: &ArrayScalarEngine,
             _context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearPrimitiveOperation<f64>>,
             inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
@@ -287,7 +321,10 @@ mod tests {
 
     impl InterpretableOperation<ArrayType, f64> for OrdinaryAddOperation {
         fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
-            crate::tracing_v2::operations::AddOperation.interpret(inputs)
+            <crate::tracing_v2::operations::AddOperation as InterpretableOperation<ArrayType, f64>>::interpret(
+                &crate::tracing_v2::operations::AddOperation,
+                inputs,
+            )
         }
     }
 
@@ -318,7 +355,10 @@ mod tests {
 
     impl InterpretableOperation<ArrayType, f64> for DifferentiableAddOperation {
         fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
-            crate::tracing_v2::operations::AddOperation.interpret(inputs)
+            <crate::tracing_v2::operations::AddOperation as InterpretableOperation<ArrayType, f64>>::interpret(
+                &crate::tracing_v2::operations::AddOperation,
+                inputs,
+            )
         }
     }
 
@@ -388,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_jvp_program_returns_the_primal_output_and_pushforward() {
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let (primal, pushforward) = jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
@@ -410,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_transposed_linear_program_matches_the_reverse_mode_pullback() {
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let (primal, pushforward) = jvp_program(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
         let pullback = transpose_linear_program_with_output_examples(&pushforward, &[primal]).unwrap();
         let cotangent = pullback.interpret(1.0f64).unwrap();
@@ -435,9 +475,9 @@ mod tests {
     #[test]
     fn linearize_program_does_not_replay_the_forward_program_to_recover_representatives() {
         let primitive =
-            CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule::<ScalarEngine<f64>, _>(PanicReplayOp);
+            CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule::<ArrayScalarEngine, _>(PanicReplayOp);
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let input = builder.add_input(3.0f64.r#type().into_owned());
+        let input = builder.add_input(<f64 as Typed<ArrayType>>::r#type(&3.0f64).into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.instructions.push(Instruction {
             operation: PrimitiveOperation::Custom(Arc::new(primitive)),
@@ -447,7 +487,7 @@ mod tests {
         let output = vec![output_atom];
         let program = builder.build::<f64, f64>(output, Placeholder, Placeholder).unwrap();
 
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let pushforward = linearize_program(&engine, &program, vec![3.0f64]).unwrap();
         approx_eq(pushforward.interpret(2.5f64).unwrap(), 2.5);
     }
@@ -459,7 +499,7 @@ mod tests {
         )
         .unwrap();
         let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new();
-        let input = builder.add_input(0.0f64.r#type().into_owned());
+        let input = builder.add_input(<f64 as Typed<ArrayType>>::r#type(&0.0f64).into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.instructions.push(Instruction {
             operation: primitive,
@@ -477,18 +517,18 @@ mod tests {
     #[test]
     fn linear_program_display_delegates_to_the_underlying_program() {
         let engine = ScalarEngine::<f64>::new();
-        let (_, pushforward): (f64, Program<ArrayType, f64, LinearPrimitiveOperation<f64>, f64, f64>) =
+        let (_, pushforward): (f64, Program<DataType, f64, LinearPrimitiveOperation<f64, DataType>, f64, f64>) =
             jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
 
         assert_eq!(
             pushforward.to_string(),
             indoc! {"
-            lambda %0:f64[] .
-            let %1:f64[] = scale [factor=2] %0
-                %2:f64[] = scale [factor=2] %0
-                %3:f64[] = add %1 %2
-                %4:f64[] = scale [factor=-0.4161468365471424] %0
-                %5:f64[] = add %3 %4
+            lambda %0:f64 .
+            let %1:f64 = scale [factor=2] %0
+                %2:f64 = scale [factor=2] %0
+                %3:f64 = add %1 %2
+                %4:f64 = scale [factor=-0.4161468365471424] %0
+                %5:f64 = add %3 %4
             in (%5)
             "}
             .trim_end(),
@@ -555,7 +595,7 @@ mod tests {
     #[test]
     fn test_compile_grad_save_all_matches_compile_grad() {
         // SaveAll should produce the same gradient as the plain compile_grad.
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let compiled_plain = compile_grad(&engine, quadratic_plus_sin, 2.0f64).unwrap();
         let compiled_save_all =
             compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::SaveAll).unwrap();
@@ -573,7 +613,7 @@ mod tests {
     #[test]
     fn test_compile_grad_recompute_all_gives_correct_gradient() {
         // RecomputeAll should give d/dx(x^2 + sin(x)) = 2x + cos(x).
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let compiled =
             compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::RecomputeAll)
                 .unwrap();
@@ -589,7 +629,7 @@ mod tests {
     #[test]
     fn test_compile_grad_recompute_all_matches_compile_grad() {
         // RecomputeAll should give the same numerical gradient as compile_grad.
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let compiled_plain = compile_grad(&engine, quadratic_plus_sin, 2.0f64).unwrap();
         let compiled_recompute =
             compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::RecomputeAll)
@@ -606,7 +646,7 @@ mod tests {
     fn test_compile_grad_checkpoint_gives_correct_gradient() {
         // Checkpoint with segment_size=2 should give the correct gradient for a function with
         // ~4 instructions: x*x, sin(x), x*x + sin(x).
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let compiled = compile_grad_with_policy(
             &engine,
             quadratic_plus_sin,
@@ -622,7 +662,7 @@ mod tests {
     #[test]
     fn test_compile_grad_checkpoint_is_reusable_at_different_primals() {
         // The compiled gradient with Checkpoint can be called at multiple primal points.
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let compiled = compile_grad_with_policy(
             &engine,
             quadratic_plus_sin,
@@ -640,7 +680,7 @@ mod tests {
     #[test]
     fn test_compile_grad_checkpoint_matches_compile_grad() {
         // Checkpoint should give the same numerical gradient as compile_grad.
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let compiled_plain = compile_grad(&engine, quadratic_plus_sin, 2.0f64).unwrap();
         let compiled_checkpoint = compile_grad_with_policy(
             &engine,
@@ -660,7 +700,7 @@ mod tests {
     #[test]
     fn test_compile_grad_checkpoint_segment_size_one_matches_save_all() {
         // Checkpoint with segment_size=1 should degenerate to SaveAll.
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let compiled_save_all =
             compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::SaveAll).unwrap();
         let compiled_checkpoint = compile_grad_with_policy(
@@ -680,7 +720,7 @@ mod tests {
     fn test_compile_grad_checkpoint_large_segment_wraps_whole_program() {
         // Checkpoint with a segment_size larger than the number of instructions should wrap
         // the entire program in a single RematerializeOperation, equivalent to RecomputeAll.
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let compiled = compile_grad_with_policy(
             &engine,
             quadratic_plus_sin,

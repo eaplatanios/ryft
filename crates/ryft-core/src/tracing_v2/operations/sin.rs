@@ -7,7 +7,7 @@ use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableEngine;
 use crate::tracing_v2::engines::{StagingEngine, Tracer};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::cos::Cos;
 use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsScale, unary_abstract};
@@ -76,17 +76,24 @@ impl Display for SinOperation {
     }
 }
 
-impl Operation<ArrayType> for SinOperation {
+impl<T: Type> Operation<T> for SinOperation {
     fn name(&self) -> &'static str {
         "sin"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         Ok(vec![unary_abstract(input_types)?])
     }
 }
 
 impl<V: Typed<ArrayType> + Clone + Sin> InterpretableOperation<ArrayType, V> for SinOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        check_input_count!(inputs, 1);
+        Ok(vec![inputs[0].clone().sin()])
+    }
+}
+
+impl<V: Typed<DataType> + Clone + Sin> InterpretableOperation<DataType, V> for SinOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().sin()])
@@ -121,10 +128,11 @@ where
     }
 }
 
-impl<'engine, V: Traceable<ArrayType> + Sin, E> Sin for Tracer<'engine, E>
+impl<'engine, E> Sin for Tracer<'engine, E>
 where
-    E: StagingEngine<Type = ArrayType, Value = V> + ?Sized,
-    E::Operation: SupportsSin<ArrayType, V>,
+    E: StagingEngine + ?Sized,
+    E::Value: Sin,
+    E::Operation: SupportsSin<E::Type, E::Value>,
 {
     #[inline]
     fn sin(self) -> Self {

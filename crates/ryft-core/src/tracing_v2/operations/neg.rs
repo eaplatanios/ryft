@@ -6,7 +6,7 @@ use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, unary_abstract};
 
@@ -36,17 +36,24 @@ impl Display for NegOperation {
     }
 }
 
-impl Operation<ArrayType> for NegOperation {
+impl<T: Type> Operation<T> for NegOperation {
     fn name(&self) -> &'static str {
         "neg"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         Ok(vec![unary_abstract(input_types)?])
     }
 }
 
 impl<V: Typed<ArrayType> + Clone + Neg<Output = V>> InterpretableOperation<ArrayType, V> for NegOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        check_input_count!(inputs, 1);
+        Ok(vec![-inputs[0].clone()])
+    }
+}
+
+impl<V: Typed<DataType> + Clone + Neg<Output = V>> InterpretableOperation<DataType, V> for NegOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![-inputs[0].clone()])
@@ -69,6 +76,33 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<Array
             Some(atom) => Ok(vec![Some(
                 context
                     .apply_operation(&[atom], LinearPrimitiveOperation::Neg, 1)?
+                    .into_iter()
+                    .next()
+                    .expect("neg transpose should produce one cotangent contribution"),
+            )]),
+            None => Ok(vec![None]),
+        }
+    }
+}
+
+impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + ZeroLike> LinearOperation<DataType, V>
+    for NegOperation
+{
+    fn transpose(
+        &self,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<
+            '_,
+            DataType,
+            V,
+            LinearPrimitiveOperation<V, DataType>,
+        >,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        check_input_count!(output_cotangents, 1);
+        match output_cotangents[0] {
+            Some(atom) => Ok(vec![Some(
+                context
+                    .apply_operation(&[atom], LinearPrimitiveOperation::<V, DataType>::Neg, 1)?
                     .into_iter()
                     .next()
                     .expect("neg transpose should produce one cotangent contribution"),

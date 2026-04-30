@@ -395,14 +395,49 @@ where
 mod tests {
     use crate::parameters::Placeholder;
     use crate::tracing::TracingError;
-    use crate::tracing_v2::engines::ScalarEngine;
-    use crate::tracing_v2::{DifferentiationError, Sin};
+    use crate::tracing_v2::engines::{Engine, StagingEngine};
+    use crate::tracing_v2::{
+        DifferentiableEngine, DifferentiableStagingEngine, DifferentiationError, LinearPrimitiveOperation,
+        PrimitiveOperation, Sin, Tracer,
+    };
+    use crate::types::ArrayType;
 
     use super::{DenseJacobian, jacfwd, jacrev};
 
     fn assert_close(actual: f64, expected: f64) {
         let delta = (actual - expected).abs();
         assert!(delta <= 1e-12, "expected {actual} ~= {expected}; absolute error {delta} exceeded tolerance");
+    }
+
+    struct ArrayScalarEngine;
+
+    impl Engine for ArrayScalarEngine {
+        type Type = ArrayType;
+        type Value = f64;
+
+        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(0.0)
+        }
+
+        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(1.0)
+        }
+    }
+
+    impl StagingEngine for ArrayScalarEngine {
+        type Operation = PrimitiveOperation<f64>;
+    }
+
+    impl DifferentiableEngine for ArrayScalarEngine {
+        type DifferentiableOperation = PrimitiveOperation<f64>;
+        type LinearOperation = LinearPrimitiveOperation<f64>;
+    }
+
+    impl DifferentiableStagingEngine for ArrayScalarEngine {
+        type LinearOperation<'engine>
+            = LinearPrimitiveOperation<Tracer<'engine, Self>>
+        where
+            Self: 'engine;
     }
 
     #[test]
@@ -453,8 +488,8 @@ mod tests {
 
     #[test]
     fn test_jacfwd_batches_basis_tangents() {
-        let engine = ScalarEngine::<f64>::new();
-        let jacobian = jacfwd::<ScalarEngine<f64>, _, (f64, f64), (f64, f64), f64>(
+        let engine = ArrayScalarEngine;
+        let jacobian = jacfwd::<ArrayScalarEngine, _, (f64, f64), (f64, f64), f64>(
             &engine,
             |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
             (2.0f64, 3.0f64),
@@ -471,8 +506,8 @@ mod tests {
 
     #[test]
     fn test_jacrev_batches_basis_cotangents() {
-        let engine = ScalarEngine::<f64>::new();
-        let jacobian = jacrev::<ScalarEngine<f64>, _, (f64, f64), (f64, f64), f64>(
+        let engine = ArrayScalarEngine;
+        let jacobian = jacrev::<ArrayScalarEngine, _, (f64, f64), (f64, f64), f64>(
             &engine,
             |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
             (2.0f64, 3.0f64),

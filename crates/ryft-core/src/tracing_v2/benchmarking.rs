@@ -306,15 +306,35 @@ mod tests {
 
     use crate::tracing::Program;
     use crate::tracing_v2::Sin;
-    use crate::tracing_v2::engines::{ScalarEngine, StagingEngine};
+    use crate::tracing_v2::engines::{Engine, StagingEngine};
     use crate::tracing_v2::operations::constants::OneLike;
 
     use super::*;
 
+    #[derive(Copy, Clone, Debug)]
+    struct ArrayScalarEngine;
+
+    impl Engine for ArrayScalarEngine {
+        type Type = ArrayType;
+        type Value = f64;
+
+        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(0.0)
+        }
+
+        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(1.0)
+        }
+    }
+
+    impl StagingEngine for ArrayScalarEngine {
+        type Operation = crate::tracing_v2::PrimitiveOperation<f64>;
+    }
+
     /// Summarizes a small scalar program and verifies the structural metrics.
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
-        let engine = ScalarEngine::<f64>::new();
+        let engine = ArrayScalarEngine;
         let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<f64>, f64, f64>) =
             engine
                 .interpret_and_trace(

@@ -15,7 +15,7 @@ use crate::tracing_v2::forward::Differentiable;
 use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use crate::tracing_v2::operations::primitive::PrimitiveOperation;
 use crate::tracing_v2::operations::{SupportsAdd, SupportsMul, SupportsNeg, TracedLinearizationCarrier};
-use crate::types::{ArrayType, Type, Typed};
+use crate::types::{DataType, Type, TypeError, Typed};
 
 /// [`Engine`]s provide backend-specific functionality related to tracing, just-in-time compilation, automatic
 /// differentiation, and potentially other [`Program`] transforms. They also define the kinds of [`Type`]s and
@@ -23,7 +23,8 @@ use crate::types::{ArrayType, Type, Typed};
 /// remain backend-invariant.
 pub trait Engine {
     /// [`Type`]s that this [`Engine`] uses to represent the abstract metadata associated with its [`Traceable`] values.
-    /// A commonly used [`Type`] is [`ArrayType`], though richer backends may use richer types.
+    /// A commonly used [`Type`] is [`ArrayType`](crate::ArrayType), though scalar-only engines can use
+    /// [`DataType`] and richer backends may use richer metadata.
     type Type: Type + Parameter;
 
     /// [`Traceable`] value types supported by this [`Engine`]. Instances of this type are what [`Program`]
@@ -116,16 +117,15 @@ pub trait StagingEngine: Engine {
     }
 }
 
-/// Stateless [`StagingEngine`] that uses [`ArrayType`] for representing types and scalars like `f32`, for example,
-/// for representing values. [`ScalarEngine`] is the "minimal backend" used throughout tests and scalar-only examples
-/// in `ryft-core`. It demonstrates the intended role of an [`Engine`] in the smallest possible form: there are no
-/// device handles, no mesh states, and no backend registries; just the built-in primitive carriers plus
-/// [`ArrayType`]-driven construction of scalar values.
+/// Stateless [`StagingEngine`] that uses [`DataType`] for scalar metadata and Rust scalar values such as `f32` for
+/// runtime values. [`ScalarEngine`] is the minimal scalar-only backend used throughout tests and examples in
+/// `ryft-core`. It demonstrates the intended role of an [`Engine`] in the smallest possible form: there are no device
+/// handles, no mesh states, and no backend registries; just the built-in scalar primitive carriers plus
+/// [`DataType`]-driven construction of scalar values.
 ///
-/// Note that this engine ignores most of the [`ArrayType`] metadata (e.g., the [`Shape`](crate::Shape)) because scalar
-/// values have one canonical runtime representation. That makes it a compact teaching example for the tracing stack:
-/// if a transform works against [`ScalarEngine`], the same path can be reused by richer engines with sharding, device,
-/// or runtime context.
+/// This engine intentionally does not carry rank, shape, layout, or sharding metadata. Array backends should use
+/// [`ArrayType`](crate::ArrayType) through their own engine implementations when those properties are semantically
+/// relevant.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ScalarEngine<V> {
     /// Phantom marker that ties the zero-sized engine to its scalar leaf type.
@@ -143,41 +143,61 @@ impl<V> ScalarEngine<V> {
 }
 
 macro_rules! impl_scalar_engine_for_scalar {
-    ($ty:ty, $zero:expr, $one:expr) => {
+    ($ty:ty, $data_type:path, $zero:expr, $one:expr) => {
         impl Engine for ScalarEngine<$ty> {
-            type Type = ArrayType;
+            type Type = DataType;
             type Value = $ty;
 
             #[inline]
-            fn zero(&self, _type: &ArrayType) -> Result<$ty, TracingError> {
+            fn zero(&self, r#type: &DataType) -> Result<$ty, TracingError> {
+                if *r#type != $data_type {
+                    return Err(TypeError {
+                        message: format!(
+                            "scalar engine for {} cannot synthesize zero for {type_}",
+                            $data_type,
+                            type_ = r#type
+                        ),
+                    }
+                    .into());
+                }
                 Ok($zero)
             }
 
             #[inline]
-            fn one(&self, _type: &ArrayType) -> Result<$ty, TracingError> {
+            fn one(&self, r#type: &DataType) -> Result<$ty, TracingError> {
+                if *r#type != $data_type {
+                    return Err(TypeError {
+                        message: format!(
+                            "scalar engine for {} cannot synthesize one for {type_}",
+                            $data_type,
+                            type_ = r#type
+                        ),
+                    }
+                    .into());
+                }
                 Ok($one)
             }
         }
 
         impl StagingEngine for ScalarEngine<$ty> {
-            type Operation = PrimitiveOperation<$ty>;
+            type Operation = PrimitiveOperation<$ty, DataType>;
         }
     };
 }
 
-impl_scalar_engine_for_scalar!(bool, false, true);
-impl_scalar_engine_for_scalar!(i8, 0i8, 1i8);
-impl_scalar_engine_for_scalar!(i16, 0i16, 1i16);
-impl_scalar_engine_for_scalar!(i32, 0i32, 1i32);
-impl_scalar_engine_for_scalar!(i64, 0i64, 1i64);
-impl_scalar_engine_for_scalar!(u8, 0u8, 1u8);
-impl_scalar_engine_for_scalar!(u16, 0u16, 1u16);
-impl_scalar_engine_for_scalar!(u32, 0u32, 1u32);
-impl_scalar_engine_for_scalar!(u64, 0u64, 1u64);
-impl_scalar_engine_for_scalar!(bf16, bf16::ZERO, bf16::ONE);
-impl_scalar_engine_for_scalar!(f16, f16::ZERO, f16::ONE);
-impl_scalar_engine_for_scalar!(f32, 0.0, 1.0);
-impl_scalar_engine_for_scalar!(f64, 0.0, 1.0);
+impl_scalar_engine_for_scalar!(bool, DataType::Boolean, false, true);
+impl_scalar_engine_for_scalar!(i8, DataType::I8, 0i8, 1i8);
+impl_scalar_engine_for_scalar!(i16, DataType::I16, 0i16, 1i16);
+impl_scalar_engine_for_scalar!(i32, DataType::I32, 0i32, 1i32);
+impl_scalar_engine_for_scalar!(i64, DataType::I64, 0i64, 1i64);
+impl_scalar_engine_for_scalar!(u8, DataType::U8, 0u8, 1u8);
+impl_scalar_engine_for_scalar!(u16, DataType::U16, 0u16, 1u16);
+impl_scalar_engine_for_scalar!(u32, DataType::U32, 0u32, 1u32);
+impl_scalar_engine_for_scalar!(u64, DataType::U64, 0u64, 1u64);
+impl_scalar_engine_for_scalar!(bf16, DataType::BF16, bf16::ZERO, bf16::ONE);
+impl_scalar_engine_for_scalar!(f16, DataType::F16, f16::ZERO, f16::ONE);
+impl_scalar_engine_for_scalar!(f32, DataType::F32, 0.0, 1.0);
+impl_scalar_engine_for_scalar!(f64, DataType::F64, 0.0, 1.0);
 
 /// Active engine used while staging one program.
 ///
@@ -653,11 +673,12 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::tracing_v2::differentiation::DifferentiableEngine;
     use crate::tracing_v2::{Sin, jvp, test_support};
-    use crate::types::{DataType, Shape, Size, TypeError};
+    use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
     use super::*;
 
-    type F64ProgramBuilder = ProgramBuilder<ArrayType, f64, PrimitiveOperation<f64>>;
+    type F64ProgramBuilder = ProgramBuilder<DataType, f64, PrimitiveOperation<f64, DataType>>;
+    type ArrayF64ProgramBuilder = ProgramBuilder<ArrayType, f64, PrimitiveOperation<f64>>;
 
     fn assert_differentiable_engine<E: DifferentiableEngine>() {}
 
@@ -665,7 +686,15 @@ mod tests {
         Rc::new(RefCell::new(ProgramBuilder::new()))
     }
 
-    fn scalar_f64_type() -> ArrayType {
+    fn new_array_f64_builder() -> Rc<RefCell<ArrayF64ProgramBuilder>> {
+        Rc::new(RefCell::new(ProgramBuilder::new()))
+    }
+
+    fn scalar_f64_type() -> DataType {
+        DataType::F64
+    }
+
+    fn array_scalar_f64_type() -> ArrayType {
         ArrayType::scalar(DataType::F64)
     }
 
@@ -693,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_scalar_engine_is_zero_sized() {
+    fn test_scalar_engine_is_zero_sized() {
         assert_eq!(size_of::<ScalarEngine<bool>>(), 0);
         assert_eq!(size_of::<ScalarEngine<i8>>(), 0);
         assert_eq!(size_of::<ScalarEngine<u64>>(), 0);
@@ -704,41 +733,55 @@ mod tests {
     }
 
     #[test]
-    fn test_array_scalar_engine_produces_canonical_zero_and_one() {
-        let bool_type = ArrayType::scalar(DataType::Boolean);
+    fn test_scalar_engine_produces_canonical_zero_and_one() {
+        let bool_type = DataType::Boolean;
         let bool_engine = ScalarEngine::<bool>::new();
         assert_eq!(Engine::zero(&bool_engine, &bool_type), Ok(false));
         assert_eq!(Engine::one(&bool_engine, &bool_type), Ok(true));
 
-        let i32_type = ArrayType::scalar(DataType::I32);
+        let i32_type = DataType::I32;
         let i32_engine = ScalarEngine::<i32>::new();
         assert_eq!(Engine::zero(&i32_engine, &i32_type), Ok(0i32));
         assert_eq!(Engine::one(&i32_engine, &i32_type), Ok(1i32));
 
-        let u64_type = ArrayType::scalar(DataType::U64);
+        let u64_type = DataType::U64;
         let u64_engine = ScalarEngine::<u64>::new();
         assert_eq!(Engine::zero(&u64_engine, &u64_type), Ok(0u64));
         assert_eq!(Engine::one(&u64_engine, &u64_type), Ok(1u64));
 
-        let bf16_type = ArrayType::scalar(DataType::BF16);
+        let bf16_type = DataType::BF16;
         let bf16_engine = ScalarEngine::<bf16>::new();
         assert_eq!(Engine::zero(&bf16_engine, &bf16_type), Ok(bf16::ZERO));
         assert_eq!(Engine::one(&bf16_engine, &bf16_type), Ok(bf16::ONE));
 
-        let f16_type = ArrayType::scalar(DataType::F16);
+        let f16_type = DataType::F16;
         let f16_engine = ScalarEngine::<f16>::new();
         assert_eq!(Engine::zero(&f16_engine, &f16_type), Ok(f16::ZERO));
         assert_eq!(Engine::one(&f16_engine, &f16_type), Ok(f16::ONE));
 
-        let f32_type = ArrayType::scalar(DataType::F32);
+        let f32_type = DataType::F32;
         let f32_engine = ScalarEngine::<f32>::new();
         assert_eq!(Engine::zero(&f32_engine, &f32_type), Ok(0.0f32));
         assert_eq!(Engine::one(&f32_engine, &f32_type), Ok(1.0f32));
 
-        let f64_type = ArrayType::scalar(DataType::F64);
+        let f64_type = DataType::F64;
         let f64_engine = ScalarEngine::<f64>::new();
         assert_eq!(Engine::zero(&f64_engine, &f64_type), Ok(0.0f64));
         assert_eq!(Engine::one(&f64_engine, &f64_type), Ok(1.0f64));
+    }
+
+    #[test]
+    fn test_scalar_engine_rejects_mismatched_identity_type() {
+        let engine = ScalarEngine::<f64>::new();
+
+        assert_eq!(
+            Engine::zero(&engine, &DataType::F32).unwrap_err().to_string(),
+            "scalar engine for f64 cannot synthesize zero for f32",
+        );
+        assert_eq!(
+            Engine::one(&engine, &DataType::F32).unwrap_err().to_string(),
+            "scalar engine for f64 cannot synthesize one for f32",
+        );
     }
 
     #[test]
@@ -795,8 +838,8 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:f64[] = const
-                    %1:f64[] = const
+                let %0:f64 = const
+                    %1:f64 = const
                 in (%0, %1)
             "}
             .trim_end(),
@@ -806,7 +849,7 @@ mod tests {
     #[test]
     fn test_tracer_zero_like_adds_constant_atoms() {
         let builder = new_f64_builder();
-        let atom = builder.borrow_mut().add_input(3.0f64.r#type().into_owned());
+        let atom = builder.borrow_mut().add_input(<f64 as Typed<DataType>>::r#type(&3.0f64).into_owned());
         let engine = ScalarEngine::<f64>::new();
         let tracer: Tracer<ScalarEngine<f64>> = TracingEngine::new(&engine, builder).tracer_from_atom(atom);
         let zero = tracer.zero_like();
@@ -823,8 +866,8 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = const
+                lambda %0:f64 .
+                let %1:f64 = const
                 in (%1)
             "}
             .trim_end(),
@@ -844,10 +887,10 @@ mod tests {
 
     #[test]
     fn test_apply_staged_op_rejects_mismatched_program_builders() {
-        let builder_a = new_f64_builder();
-        let builder_b = new_f64_builder();
-        let atom_a = builder_a.borrow_mut().add_input(1.0f64.r#type().into_owned());
-        let atom_b = builder_b.borrow_mut().add_input(2.0f64.r#type().into_owned());
+        let builder_a = new_array_f64_builder();
+        let builder_b = new_array_f64_builder();
+        let atom_a = builder_a.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
+        let atom_b = builder_b.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&2.0f64).into_owned());
         let engine = TaggedEngine { id: 1 };
         let tracer_a = TracingEngine::new(&engine, builder_a.clone()).tracer_from_atom(atom_a);
         let tracer_b = TracingEngine::new(&engine, builder_b).tracer_from_atom(atom_b);
@@ -860,9 +903,9 @@ mod tests {
 
     #[test]
     fn test_apply_staged_op_rejects_mismatched_engines() {
-        let builder = new_f64_builder();
-        let atom_a = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
-        let atom_b = builder.borrow_mut().add_input(2.0f64.r#type().into_owned());
+        let builder = new_array_f64_builder();
+        let atom_a = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
+        let atom_b = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&2.0f64).into_owned());
         let engine_a = TaggedEngine { id: 1 };
         let engine_b = TaggedEngine { id: 2 };
         let tracer_a = TracingEngine::new(&engine_a, builder.clone()).tracer_from_atom(atom_a);
@@ -876,8 +919,8 @@ mod tests {
 
     #[test]
     fn test_apply_staged_op_returns_poisoned_tracers_after_builder_failure() {
-        let builder = new_f64_builder();
-        let atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
+        let builder = new_array_f64_builder();
+        let atom = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
         builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
         let engine = TaggedEngine { id: 1 };
         let tracer = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(atom);
@@ -889,14 +932,14 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             outputs[0].state(),
-            TracerState::Poison(output_type) if *output_type == scalar_f64_type()
+            TracerState::Poison(output_type) if *output_type == array_scalar_f64_type()
         ));
     }
 
     #[test]
     fn test_apply_staged_op_caches_live_output_types() {
-        let builder = new_f64_builder();
-        let input_type = scalar_f64_type();
+        let builder = new_array_f64_builder();
+        let input_type = array_scalar_f64_type();
         let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = TaggedEngine { id: 1 };
         let tracer = Tracer::from_staged_parts(atom, input_type, builder.clone(), &engine);
@@ -906,24 +949,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0].state(), TracerState::Live(_, output_type) if *output_type == scalar_f64_type()));
-        assert!(matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == scalar_f64_type()));
+        assert!(
+            matches!(outputs[0].state(), TracerState::Live(_, output_type) if *output_type == array_scalar_f64_type())
+        );
+        assert!(matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == array_scalar_f64_type()));
     }
 
     #[test]
     fn test_poisoned_tracer_atom_id_returns_poisoned_tracer_error() {
-        let builder = new_f64_builder();
+        let builder = new_array_f64_builder();
         let engine = TaggedEngine { id: 1 };
-        let tracer = TracingEngine::new(&engine, builder).poisoned_tracer(scalar_f64_type());
+        let tracer = TracingEngine::new(&engine, builder).poisoned_tracer(array_scalar_f64_type());
 
         assert_eq!(tracer.atom_id(), Err(TracingError::PoisonedTracer));
-        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == scalar_f64_type()));
+        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == array_scalar_f64_type()));
     }
 
     #[test]
     fn test_interpret_and_trace_replays_staged_graphs() {
         let engine = ScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+        let (output, program): (f64, Program<DataType, f64, PrimitiveOperation<f64, DataType>, f64, f64>) = engine
             .interpret_and_trace(
                 |x: Tracer<ScalarEngine<f64>>| {
                     let squared = x.clone() * x.clone();
@@ -939,10 +984,10 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = mul %0 %0
-                    %2:f64[] = sin %0
-                    %3:f64[] = add %1 %2
+                lambda %0:f64 .
+                let %1:f64 = mul %0 %0
+                    %2:f64 = sin %0
+                    %3:f64 = add %1 %2
                 in (%3)
             "}
             .trim_end(),
@@ -952,7 +997,7 @@ mod tests {
     #[test]
     fn test_interpret_and_trace_prunes_unused_staged_operations() {
         let engine = ScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+        let (output, program): (f64, Program<DataType, f64, PrimitiveOperation<f64, DataType>, f64, f64>) = engine
             .interpret_and_trace(
                 |x: Tracer<ScalarEngine<f64>>| {
                     let _unused = x.clone().sin();
@@ -967,8 +1012,8 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = mul %0 %0
+                lambda %0:f64 .
+                let %1:f64 = mul %0 %0
                 in (%1)
             "}
             .trim_end(),
@@ -979,25 +1024,26 @@ mod tests {
     fn test_trace_stages_program_from_type_metadata() {
         let engine = ScalarEngine::<f64>::new();
         let input_type = scalar_f64_type();
-        let (output_type, program): (ArrayType, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
-            .trace(
-                |x: Tracer<ScalarEngine<f64>>| {
-                    let squared = x.clone() * x.clone();
-                    Ok(squared + x.one_like())
-                },
-                input_type.clone(),
-            )
-            .unwrap();
+        let (output_type, program): (DataType, Program<DataType, f64, PrimitiveOperation<f64, DataType>, f64, f64>) =
+            engine
+                .trace(
+                    |x: Tracer<ScalarEngine<f64>>| {
+                        let squared = x.clone() * x.clone();
+                        Ok(squared + x.one_like())
+                    },
+                    input_type.clone(),
+                )
+                .unwrap();
 
         assert_eq!(output_type, input_type);
         assert_eq!(program.interpret(3.0).unwrap(), 10.0);
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = mul %0 %0
-                    %2:f64[] = const
-                    %3:f64[] = add %1 %2
+                lambda %0:f64 .
+                let %1:f64 = mul %0 %0
+                    %2:f64 = const
+                    %3:f64 = add %1 %2
                 in (%3)
             "}
             .trim_end(),
@@ -1008,14 +1054,16 @@ mod tests {
     fn test_trace_rejects_escaped_program_builder() {
         let engine = ScalarEngine::<f64>::new();
         let escaped_builder = Rc::new(RefCell::new(None));
-        let result: Result<(ArrayType, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>), TracingError> =
-            engine.trace(
-                |x: Tracer<ScalarEngine<f64>>| {
-                    *escaped_builder.borrow_mut() = Some(x.builder().clone());
-                    Ok(x)
-                },
-                scalar_f64_type(),
-            );
+        let result: Result<
+            (DataType, Program<DataType, f64, PrimitiveOperation<f64, DataType>, f64, f64>),
+            TracingError,
+        > = engine.trace(
+            |x: Tracer<ScalarEngine<f64>>| {
+                *escaped_builder.borrow_mut() = Some(x.builder().clone());
+                Ok(x)
+            },
+            scalar_f64_type(),
+        );
 
         assert!(matches!(result, Err(TracingError::EscapedProgramBuilder)));
     }
@@ -1030,19 +1078,19 @@ mod tests {
 
         assert_eq!(live.to_string(), "%0");
         assert_eq!(format!("{live:?}"), "Tracer { state: Live(AtomId { index: 0 }), .. }");
-        assert_eq!(poison.to_string(), "<poison:f64[]>");
+        assert_eq!(poison.to_string(), "<poison:f64>");
         assert_eq!(format!("{poison:?}"), "Tracer { state: Poison(..), .. }");
         assert_eq!(format!("{:?}", live.engine), "TracingEngine { .. }");
     }
 
     #[test]
     fn test_apply_staged_op_records_abstract_eval_error_and_returns_poisoned_output() {
-        let builder = new_f64_builder();
+        let builder = new_array_f64_builder();
         let lhs_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
         let rhs_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
         let lhs_atom = builder.borrow_mut().add_input(lhs_type.clone());
         let rhs_atom = builder.borrow_mut().add_input(rhs_type);
-        let engine = ScalarEngine::<f64>::new();
+        let engine = TaggedEngine { id: 1 };
         let lhs = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(lhs_atom);
         let rhs = TracingEngine::new(&engine, builder.clone()).tracer_from_atom(rhs_atom);
 
@@ -1061,8 +1109,8 @@ mod tests {
 
     #[test]
     fn test_apply_staged_op_uses_input_type_when_poisoned_abstract_eval_fails() {
-        let builder = new_f64_builder();
-        let input_type = scalar_f64_type();
+        let builder = new_array_f64_builder();
+        let input_type = array_scalar_f64_type();
         let atom = builder.borrow_mut().add_input(input_type.clone());
         builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
         let engine = TaggedEngine { id: 1 };
@@ -1412,17 +1460,17 @@ mod tests {
     #[test]
     fn test_staged_program_display_renders_the_staged_program() {
         let engine = ScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+        let (_, compiled): (f64, Program<DataType, f64, PrimitiveOperation<f64, DataType>, f64, f64>) = engine
             .interpret_and_trace(|x: Tracer<ScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()), 2.0f64)
             .unwrap();
 
         assert_eq!(
             compiled.to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = mul %0 %0
-                    %2:f64[] = sin %0
-                    %3:f64[] = add %1 %2
+                lambda %0:f64 .
+                let %1:f64 = mul %0 %0
+                    %2:f64 = sin %0
+                    %3:f64 = add %1 %2
                 in (%3)
             "}
             .trim_end(),

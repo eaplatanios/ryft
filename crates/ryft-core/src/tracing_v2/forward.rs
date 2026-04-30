@@ -138,14 +138,22 @@ impl<V: Display, T> Display for JvpTracer<V, T> {
 
 impl<Ty: Type, V: Traceable<Ty>, T: Clone + Parameter> Traceable<Ty> for JvpTracer<V, T> {}
 
+/// Marker selecting concrete-value [`jvp`] dispatch.
+#[doc(hidden)]
+pub struct ConcreteJvpInvocation;
+
+/// Marker selecting already-traced [`jvp`] dispatch.
+#[doc(hidden)]
+pub struct TracedJvpInvocation;
+
 /// Dispatch trait used by [`jvp`] so it can operate both on concrete values and on already traced values.
 ///
 /// The public transform is intentionally small; this trait is where the concrete, traced, and
 /// batched execution strategies branch apart.
 #[doc(hidden)]
-pub trait JvpInvocationLeaf<E, Input, Output>: Parameter + Sized
+pub trait JvpInvocationLeaf<E, Input, Output, Mode>: Parameter + Sized
 where
-    E: Engine<Type = ArrayType>,
+    E: Engine,
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<Self>,
 {
@@ -174,22 +182,22 @@ where
 /// pushforward via [`jvp_program`] and evaluates it at the supplied tangents.
 impl<
     E,
-    V: Value<ArrayType>
-        + Differentiable<ArrayType, Tangent = V>
-        + Zero<ArrayType>
+    V: Value<E::Type>
+        + Differentiable<E::Type, Tangent = V>
+        + Zero<E::Type>
         + Parameterized<V, ParameterStructure: PartialEq>,
     Input: Parameterized<V, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<V>,
-> JvpInvocationLeaf<E, Input, Output> for V
+> JvpInvocationLeaf<E, Input, Output, ConcreteJvpInvocation> for V
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
+    E: DifferentiableEngine<Value = V> + 'static,
     Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
-    E::LinearOperation: InterpretableOperation<ArrayType, V>
-        + SupportsAdd<ArrayType, V>
-        + SupportsNeg<ArrayType, V>
-        + SupportsScale<ArrayType, V>,
+    E::LinearOperation: InterpretableOperation<E::Type, V>
+        + SupportsAdd<E::Type, V>
+        + SupportsNeg<E::Type, V>
+        + SupportsScale<E::Type, V>,
 {
     type FunctionInput<'engine>
         = Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>
@@ -219,7 +227,7 @@ where
             .into());
         }
 
-        let (primal_output, tangent_program): (Output, Program<ArrayType, V, E::LinearOperation, Input, Output>) =
+        let (primal_output, tangent_program): (Output, Program<E::Type, V, E::LinearOperation, Input, Output>) =
             jvp_program(engine, |input| Ok(function(input)), primals)?;
         let tangent_output = tangent_program.interpret(tangents)?;
         Ok((primal_output, tangent_output))
@@ -232,21 +240,18 @@ where
 impl<
     'engine,
     E,
-    V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V> + Parameterized<V, ParameterStructure = Placeholder>,
+    V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Debug + PartialEq, To<Tracer<'engine, E>> = Input>,
     Output: Parameterized<Tracer<'engine, E>, To<Tracer<'engine, E>> = Output>,
-> JvpInvocationLeaf<E, Input, Output> for Tracer<'engine, E>
+> JvpInvocationLeaf<E, Input, Output, TracedJvpInvocation> for Tracer<'engine, E>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V>
-        + DifferentiableStagingEngine<Type = ArrayType, Value = V>
-        + StagingEngine
-        + 'static,
-    Input::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
-    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
+    E: DifferentiableEngine<Value = V> + DifferentiableStagingEngine<Value = V> + StagingEngine + 'static,
+    Input::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
+    Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
+    Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
+    Output::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Output>,
     E::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, E>,
-    <E as DifferentiableStagingEngine>::LinearOperation<'engine>: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
+    <E as DifferentiableStagingEngine>::LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     type FunctionInput<'call>
         = Input
@@ -278,20 +283,20 @@ where
 /// Primitive-specific local JVP rules live in [`crate::tracing_v2::operations`]; [`jvp`] is the
 /// orchestration layer that selects the concrete or traced execution path.
 #[allow(private_bounds, private_interfaces)]
-pub fn jvp<'engine, E, F, Input, Output, Leaf>(
+pub fn jvp<'engine, E, F, Input, Output, Leaf, Mode>(
     engine: &'engine E,
     function: F,
     primals: Input,
     tangents: Input,
 ) -> Result<(Output, Output), TracingError>
 where
-    E: Engine<Type = ArrayType>,
-    Leaf: JvpInvocationLeaf<E, Input, Output>,
+    E: Engine,
+    Leaf: JvpInvocationLeaf<E, Input, Output, Mode>,
     Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<Leaf>,
     F: FnOnce(
-        <Leaf as JvpInvocationLeaf<E, Input, Output>>::FunctionInput<'engine>,
-    ) -> <Leaf as JvpInvocationLeaf<E, Input, Output>>::FunctionOutput<'engine>,
+        <Leaf as JvpInvocationLeaf<E, Input, Output, Mode>>::FunctionInput<'engine>,
+    ) -> <Leaf as JvpInvocationLeaf<E, Input, Output, Mode>>::FunctionOutput<'engine>,
 {
     Leaf::invoke(engine, function, primals, tangents)
 }
@@ -303,6 +308,7 @@ mod tests {
     use crate::tracing_v2::engines::{ScalarEngine, TracingEngine};
     use crate::tracing_v2::operations::{AddOperation, DifferentiableOperation};
     use crate::tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation, test_support};
+    use crate::types::DataType;
 
     use super::*;
 
@@ -312,20 +318,21 @@ mod tests {
     #[test]
     fn tracing_engine_dispatches_add_jvp_with_traced_primals() {
         let engine = ScalarEngine::<f64>::new();
-        let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
-        let outer_input_a = outer_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
-        let outer_input_b = outer_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
+        let outer_builder =
+            Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, PrimitiveOperation<f64, DataType>>::new()));
+        let outer_input_a = outer_builder.borrow_mut().add_input(crate::types::DataType::F64);
+        let outer_input_b = outer_builder.borrow_mut().add_input(crate::types::DataType::F64);
         let outer_tracing_engine = TracingEngine::new(&engine, outer_builder.clone());
         let primal_a = outer_tracing_engine.tracer_from_atom(outer_input_a);
         let primal_b = outer_tracing_engine.tracer_from_atom(outer_input_b);
 
         let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
+            DataType,
             Tracer<'_, ScalarEngine<f64>>,
-            LinearPrimitiveOperation<Tracer<'_, ScalarEngine<f64>>>,
+            LinearPrimitiveOperation<Tracer<'_, ScalarEngine<f64>>, DataType>,
         >::new()));
-        let tangent_a = linear_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
-        let tangent_b = linear_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
+        let tangent_a = linear_builder.borrow_mut().add_input(crate::types::DataType::F64);
+        let tangent_b = linear_builder.borrow_mut().add_input(crate::types::DataType::F64);
         let mut context = JvpContext::new(linear_builder.clone());
 
         let outputs = AddOperation

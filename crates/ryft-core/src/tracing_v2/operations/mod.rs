@@ -93,16 +93,7 @@ pub use sin::{Sin, SinOperation, SupportsSin};
 /// repeating the individual primitive support traits.
 #[doc(hidden)]
 pub trait TracedLinearizationCarrier<T: Type, V: Traceable<T>>:
-    Clone
-    + Operation<T>
-    + SupportsAdd<T, V>
-    + SupportsMul<T, V>
-    + SupportsNeg<T, V>
-    + SupportsScale<T, V>
-    + SupportsMatMul<T, V>
-    + SupportsMatrixTranspose<T, V>
-    + SupportsReshape<T, V>
-    + 'static
+    Clone + Operation<T> + SupportsAdd<T, V> + SupportsMul<T, V> + SupportsNeg<T, V> + SupportsScale<T, V> + 'static
 {
 }
 
@@ -110,16 +101,7 @@ impl<T, V, O> TracedLinearizationCarrier<T, V> for O
 where
     T: Type,
     V: Traceable<T>,
-    O: Clone
-        + Operation<T>
-        + SupportsAdd<T, V>
-        + SupportsMul<T, V>
-        + SupportsNeg<T, V>
-        + SupportsScale<T, V>
-        + SupportsMatMul<T, V>
-        + SupportsMatrixTranspose<T, V>
-        + SupportsReshape<T, V>
-        + 'static,
+    O: Clone + Operation<T> + SupportsAdd<T, V> + SupportsMul<T, V> + SupportsNeg<T, V> + SupportsScale<T, V> + 'static,
 {
 }
 
@@ -135,7 +117,7 @@ pub fn lift_jit_constant<'engine, V: Traceable<ArrayType>, E: StagingEngine<Type
 }
 
 /// Propagates one unary input type through a shape-preserving staged op.
-pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
+pub fn unary_abstract<T: Type>(inputs: &[T]) -> Result<T, TypeError> {
     if inputs.len() != 1 {
         return Err(TypeError { message: format!("expected 1 input type but got {}", inputs.len()) });
     }
@@ -244,7 +226,7 @@ impl<'a, T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> Transpos
     }
 }
 
-pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primitive::LinearPrimitiveOperation<V>>:
+pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primitive::LinearPrimitiveOperation<V, T>>:
     Operation<T>
 {
     /// Applies the transpose rule for reverse-mode differentiation.

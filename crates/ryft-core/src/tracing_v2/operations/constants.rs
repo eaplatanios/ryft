@@ -4,7 +4,7 @@ use half::{bf16, f16};
 
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
 use crate::tracing_v2::operations::primitive::LinearPrimitiveOperation;
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{InterpretableOperation, LinearOperation, Operation, TranspositionContext};
 
@@ -67,6 +67,16 @@ fn ensure_scalar_array_seed_type(r#type: &ArrayType) -> Result<(), TracingError>
     Ok(())
 }
 
+fn ensure_scalar_data_type(r#type: DataType, expected: DataType) -> Result<(), TracingError> {
+    if r#type != expected {
+        return Err(TypeError {
+            message: format!("scalar value expected data type {expected} but got {type_}", type_ = r#type),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Hidden carrier capability for staging the zero primitive.
 ///
 /// `SupportsZero` lets generic transform code stage the typed-zero primitive on linear-program
@@ -87,7 +97,7 @@ pub trait SupportsZero<T: Type, V: Traceable<T>>: Clone {
     }
 }
 
-/// Typed-zero primitive: a 0-input, 1-output op that produces a value of the carried [`ArrayType`].
+/// Typed-zero primitive: a 0-input, 1-output op that produces a value of the carried type metadata.
 ///
 /// [`ZeroOperation`] is emitted by the linear-program transpose pass at the pullback boundary for
 /// primal inputs that have no cotangent contribution accumulated onto them. Closed carriers
@@ -95,43 +105,43 @@ pub trait SupportsZero<T: Type, V: Traceable<T>>: Clone {
 /// own trait impls then delegate to this op for [`Operation`], [`InterpretableOperation`], and
 /// [`LinearOperation`] semantics.
 #[derive(Clone)]
-pub struct ZeroOperation {
+pub struct ZeroOperation<T: Type = ArrayType> {
     /// Type of the value produced when this op is interpreted.
-    output_type: ArrayType,
+    output_type: T,
 }
 
-impl ZeroOperation {
+impl<T: Type> ZeroOperation<T> {
     /// Creates a zero op that produces values of `output_type`.
     #[inline]
-    pub fn new(output_type: ArrayType) -> Self {
+    pub fn new(output_type: T) -> Self {
         Self { output_type }
     }
 
     /// Returns the type produced by this zero op.
     #[inline]
-    pub fn output_type(&self) -> &ArrayType {
+    pub fn output_type(&self) -> &T {
         &self.output_type
     }
 }
 
-impl Debug for ZeroOperation {
+impl<T: Type> Debug for ZeroOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Zero({})", self.output_type)
     }
 }
 
-impl Display for ZeroOperation {
+impl<T: Type> Display for ZeroOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "zero")
     }
 }
 
-impl Operation<ArrayType> for ZeroOperation {
+impl<T: Type> Operation<T> for ZeroOperation<T> {
     fn name(&self) -> &'static str {
         "zero"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         if !input_types.is_empty() {
             return Err(TypeError { message: format!("zero expected 0 input types but got {}", input_types.len()) });
         }
@@ -144,7 +154,7 @@ impl Operation<ArrayType> for ZeroOperation {
     }
 }
 
-impl<V: Typed<ArrayType> + Zero<ArrayType>> InterpretableOperation<ArrayType, V> for ZeroOperation {
+impl<T: Type, V: Typed<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperation<T> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         if !inputs.is_empty() {
             return Err(TracingError::InvalidInputCount { expected: 0, got: inputs.len() });
@@ -153,10 +163,13 @@ impl<V: Typed<ArrayType> + Zero<ArrayType>> InterpretableOperation<ArrayType, V>
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for ZeroOperation {
+impl<T: Type + PartialEq, V: Traceable<T> + crate::parameters::Parameter> LinearOperation<T, V> for ZeroOperation<T>
+where
+    LinearPrimitiveOperation<V, T>: Operation<T>,
+{
     fn transpose(
         &self,
-        _context: &mut TranspositionContext<'_, ArrayType, V, LinearPrimitiveOperation<V>>,
+        _context: &mut TranspositionContext<'_, T, V, LinearPrimitiveOperation<V, T>>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
         if output_cotangents.len() != 1 {
@@ -167,8 +180,12 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for ZeroOperation {
 }
 
 macro_rules! impl_scalar_value_traits {
-    ($ty:ty, $zero:expr, $one:expr) => {
+    ($ty:ty, $data_type:path, $zero:expr, $one:expr) => {
+        impl Value<DataType> for $ty {}
+
         impl Value<ArrayType> for $ty {}
+
+        impl Traceable<DataType> for $ty {}
 
         impl Traceable<ArrayType> for $ty {}
 
@@ -186,10 +203,26 @@ macro_rules! impl_scalar_value_traits {
             }
         }
 
+        impl Zero<DataType> for $ty {
+            #[inline]
+            fn zero(r#type: &DataType) -> Result<Self, TracingError> {
+                ensure_scalar_data_type(*r#type, $data_type)?;
+                Ok($zero)
+            }
+        }
+
         impl Zero<ArrayType> for $ty {
             #[inline]
             fn zero(_type: &ArrayType) -> Result<Self, TracingError> {
                 Ok($zero)
+            }
+        }
+
+        impl One<DataType> for $ty {
+            #[inline]
+            fn one(r#type: &DataType) -> Result<Self, TracingError> {
+                ensure_scalar_data_type(*r#type, $data_type)?;
+                Ok($one)
             }
         }
 
@@ -201,25 +234,29 @@ macro_rules! impl_scalar_value_traits {
             }
         }
 
+        impl crate::tracing_v2::forward::Differentiable<DataType> for $ty {
+            type Tangent = Self;
+        }
+
         impl crate::tracing_v2::forward::Differentiable<ArrayType> for $ty {
             type Tangent = Self;
         }
     };
 }
 
-impl_scalar_value_traits!(bool, false, true);
-impl_scalar_value_traits!(i8, 0i8, 1i8);
-impl_scalar_value_traits!(i16, 0i16, 1i16);
-impl_scalar_value_traits!(i32, 0i32, 1i32);
-impl_scalar_value_traits!(i64, 0i64, 1i64);
-impl_scalar_value_traits!(u8, 0u8, 1u8);
-impl_scalar_value_traits!(u16, 0u16, 1u16);
-impl_scalar_value_traits!(u32, 0u32, 1u32);
-impl_scalar_value_traits!(u64, 0u64, 1u64);
-impl_scalar_value_traits!(bf16, bf16::ZERO, bf16::ONE);
-impl_scalar_value_traits!(f16, f16::ZERO, f16::ONE);
-impl_scalar_value_traits!(f32, 0.0f32, 1.0f32);
-impl_scalar_value_traits!(f64, 0.0f64, 1.0f64);
+impl_scalar_value_traits!(bool, DataType::Boolean, false, true);
+impl_scalar_value_traits!(i8, DataType::I8, 0i8, 1i8);
+impl_scalar_value_traits!(i16, DataType::I16, 0i16, 1i16);
+impl_scalar_value_traits!(i32, DataType::I32, 0i32, 1i32);
+impl_scalar_value_traits!(i64, DataType::I64, 0i64, 1i64);
+impl_scalar_value_traits!(u8, DataType::U8, 0u8, 1u8);
+impl_scalar_value_traits!(u16, DataType::U16, 0u16, 1u16);
+impl_scalar_value_traits!(u32, DataType::U32, 0u32, 1u32);
+impl_scalar_value_traits!(u64, DataType::U64, 0u64, 1u64);
+impl_scalar_value_traits!(bf16, DataType::BF16, bf16::ZERO, bf16::ONE);
+impl_scalar_value_traits!(f16, DataType::F16, f16::ZERO, f16::ONE);
+impl_scalar_value_traits!(f32, DataType::F32, 0.0f32, 1.0f32);
+impl_scalar_value_traits!(f64, DataType::F64, 0.0f64, 1.0f64);
 
 #[cfg(test)]
 mod tests {
@@ -235,6 +272,10 @@ mod tests {
         assert_eq!(value.r#type().into_owned(), ArrayType::scalar(expected_type));
     }
 
+    fn assert_scalar_data_type<V: Value<DataType>>(value: V, expected_type: DataType) {
+        assert_eq!(value.r#type().into_owned(), expected_type);
+    }
+
     fn assert_scalar_identities<V>(value: V, zero: V, one: V)
     where
         V: Value<ArrayType> + ZeroLike + OneLike + std::fmt::Debug + PartialEq,
@@ -245,6 +286,20 @@ mod tests {
 
     #[test]
     fn test_scalar_leaf_traits_report_expected_values() {
+        assert_scalar_data_type(false, DataType::Boolean);
+        assert_scalar_data_type(1i8, DataType::I8);
+        assert_scalar_data_type(1i16, DataType::I16);
+        assert_scalar_data_type(1i32, DataType::I32);
+        assert_scalar_data_type(1i64, DataType::I64);
+        assert_scalar_data_type(1u8, DataType::U8);
+        assert_scalar_data_type(1u16, DataType::U16);
+        assert_scalar_data_type(1u32, DataType::U32);
+        assert_scalar_data_type(1u64, DataType::U64);
+        assert_scalar_data_type(bf16::from_f32(1.25), DataType::BF16);
+        assert_scalar_data_type(f16::from_f32(1.25), DataType::F16);
+        assert_eq!(<f32 as Typed<DataType>>::r#type(&1.25f32).into_owned(), DataType::F32);
+        assert_eq!(<f64 as Typed<DataType>>::r#type(&2.5f64).into_owned(), DataType::F64);
+
         assert_scalar_value_type(false, DataType::Boolean);
         assert_scalar_value_type(1i8, DataType::I8);
         assert_scalar_value_type(1i16, DataType::I16);

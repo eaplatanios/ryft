@@ -49,6 +49,12 @@ pub trait Typed<T: Type> {
 
 macro_rules! impl_typed_for_scalar {
     ($ty:ty, $data_type:path) => {
+        impl Typed<DataType> for $ty {
+            fn r#type(&self) -> Cow<'_, DataType> {
+                Cow::Owned($data_type)
+            }
+        }
+
         impl Typed<ArrayType> for $ty {
             fn r#type(&self) -> Cow<'_, ArrayType> {
                 Cow::Owned(ArrayType::scalar($data_type))

@@ -6,18 +6,18 @@ use crate::parameters::Placeholder;
 use crate::tracing::{Program, ProgramBuilder};
 use crate::tracing_v2::engines::ScalarEngine;
 use crate::tracing_v2::*;
-use crate::types::{ArrayType, Typed};
+use crate::types::{DataType, Typed};
 
 pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
     let engine = ScalarEngine::<f64>::new();
-    let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
+    let (_, compiled): (f64, Program<DataType, f64, PrimitiveOperation<f64, DataType>, f64, f64>) =
         engine.interpret_and_trace(|x| Ok(x.sin()), 2.0f64).unwrap();
 
     assert_eq!(
         compiled.to_string(),
         indoc! {"
-            lambda %0:f64[] .
-            let %1:f64[] = sin %0
+            lambda %0:f64 .
+            let %1:f64 = sin %0
             in (%1)
         "}
         .trim_end(),
@@ -25,8 +25,8 @@ pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
 }
 
 pub(crate) fn assert_reference_program_rendering() {
-    let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-    let x = builder.add_input(1.0f64.r#type().into_owned());
+    let mut builder = ProgramBuilder::<DataType, f64, PrimitiveOperation<f64, DataType>>::new();
+    let x = builder.add_input(<f64 as Typed<DataType>>::r#type(&1.0f64).into_owned());
     let three = builder.add_constant(3.0f64);
     let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
     let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder).unwrap();
@@ -34,9 +34,9 @@ pub(crate) fn assert_reference_program_rendering() {
     assert_eq!(
         program.to_string(),
         indoc! {"
-            lambda %0:f64[] .
-            let %1:f64[] = const
-                %2:f64[] = add %0 %1
+            lambda %0:f64 .
+            let %1:f64 = const
+                %2:f64 = add %0 %1
             in (%2)
         "}
         .trim_end(),
@@ -59,18 +59,18 @@ where
 
 pub(crate) fn assert_bilinear_pushforward_rendering() {
     let engine = ScalarEngine::<f64>::new();
-    let (_, pushforward): (f64, Program<ArrayType, f64, LinearPrimitiveOperation<f64>, (f64, f64), f64>) =
+    let (_, pushforward): (f64, Program<DataType, f64, LinearPrimitiveOperation<f64, DataType>, (f64, f64), f64>) =
         jvp_program(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
         pushforward.to_string(),
         indoc! {"
-            lambda %0:f64[], %1:f64[] .
-            let %2:f64[] = scale [factor=3] %0
-                %3:f64[] = scale [factor=2] %1
-                %4:f64[] = add %2 %3
-                %5:f64[] = scale [factor=-0.4161468365471424] %0
-                %6:f64[] = add %4 %5
+            lambda %0:f64, %1:f64 .
+            let %2:f64 = scale [factor=3] %0
+                %3:f64 = scale [factor=2] %1
+                %4:f64 = add %2 %3
+                %5:f64 = scale [factor=-0.4161468365471424] %0
+                %6:f64 = add %4 %5
             in (%6)
         "}
         .trim_end(),
@@ -79,16 +79,16 @@ pub(crate) fn assert_bilinear_pushforward_rendering() {
 
 pub(crate) fn assert_bilinear_jit_rendering() {
     let engine = ScalarEngine::<f64>::new();
-    let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, (f64, f64), f64>) =
+    let (_, compiled): (f64, Program<DataType, f64, PrimitiveOperation<f64, DataType>, (f64, f64), f64>) =
         engine.interpret_and_trace(|inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
         compiled.to_string(),
         indoc! {"
-            lambda %0:f64[], %1:f64[] .
-            let %2:f64[] = mul %0 %1
-                %3:f64[] = sin %0
-                %4:f64[] = add %2 %3
+            lambda %0:f64, %1:f64 .
+            let %2:f64 = mul %0 %1
+                %3:f64 = sin %0
+                %4:f64 = add %2 %3
             in (%4)
         "}
         .trim_end(),
@@ -97,18 +97,18 @@ pub(crate) fn assert_bilinear_jit_rendering() {
 
 pub(crate) fn assert_quadratic_pushforward_rendering() {
     let engine = ScalarEngine::<f64>::new();
-    let (_, pushforward): (f64, Program<ArrayType, f64, LinearPrimitiveOperation<f64>, f64, f64>) =
+    let (_, pushforward): (f64, Program<DataType, f64, LinearPrimitiveOperation<f64, DataType>, f64, f64>) =
         jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
 
     assert_eq!(
         pushforward.to_string(),
         indoc! {"
-            lambda %0:f64[] .
-            let %1:f64[] = scale [factor=2] %0
-                %2:f64[] = scale [factor=2] %0
-                %3:f64[] = add %1 %2
-                %4:f64[] = scale [factor=-0.4161468365471424] %0
-                %5:f64[] = add %3 %4
+            lambda %0:f64 .
+            let %1:f64 = scale [factor=2] %0
+                %2:f64 = scale [factor=2] %0
+                %3:f64 = add %1 %2
+                %4:f64 = scale [factor=-0.4161468365471424] %0
+                %5:f64 = add %3 %4
             in (%5)
         "}
         .trim_end(),

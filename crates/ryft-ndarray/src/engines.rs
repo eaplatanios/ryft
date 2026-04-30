@@ -129,7 +129,7 @@ mod tests {
         let tangent = Array::from_shape_vec([2], vec![5.0, 7.0]).unwrap();
 
         let (primal_output, tangent_output): (Array<f64>, Array<f64>) =
-            jvp::<_, _, _, _, Array<f64>>(&engine, |x| x.clone() * x, primal, tangent).unwrap();
+            jvp(&engine, |x| x.clone() * x, primal, tangent).unwrap();
 
         assert_eq!(primal_output.as_ndarray(), &arr1(&[4.0, 9.0]).into_dyn());
         assert_eq!(tangent_output.as_ndarray(), &arr1(&[20.0, 42.0]).into_dyn());
