@@ -47,6 +47,7 @@ XLA_DEPENDENCIES = [
     "@com_google_absl//absl/status",
     "@com_google_absl//absl/status:statusor",
     "@jax//jaxlib/mosaic/dialect/gpu:gpu_dialect_capi_objects",
+    "@jax//jaxlib/mosaic:tpu_dialect_capi_objects",
     "@llvm-project//llvm:Support",
     "@llvm-project//mlir:CAPIAMDGPU",
     "@llvm-project//mlir:CAPIArith",
@@ -175,12 +176,14 @@ cc_library(
         "src/c++/distributed.h",
         "src/c++/mlir/dialects/gpu.h",
         "src/c++/mlir/dialects/mosaic_gpu.h",
+        "src/c++/mlir/dialects/mosaic_tpu.h",
         "src/c++/mlir/dialects/triton.h",
     ],
     srcs = [
         "src/c++/distributed.cc",
         "src/c++/mlir/dialects/gpu.cc",
         "src/c++/mlir/dialects/mosaic_gpu.cc",
+        "src/c++/mlir/dialects/mosaic_tpu.cc",
         "src/c++/mlir/dialects/triton.cc",
     ],
     copts = tsl_copts() + [
