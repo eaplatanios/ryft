@@ -495,13 +495,17 @@ impl BuildConfiguration {
     /// any existing extracted directory is replaced to keep the contents up to date. For extracted
     /// `ryft-xla-sys` archives, post-processing (e.g., renaming the static library) is applied.
     fn artifact_directory(&self, artifact: Artifact) -> Result<PathBuf> {
-        // We include the native source pins in the extracted archive name to avoid reusing stale extracted files when
-        // either XLA or auxiliary native sources such as JAX change.
+        // We include the native source pins and the expected checksum in the extracted archive name to avoid reusing
+        // stale extracted files when either the native sources or the published artifact contents change.
         let artifact_name = self.precompiled_artifact_name(artifact);
         let artifact_name = artifact_name.trim_end_matches(".tar.gz").trim_end_matches(".whl");
+        let checksum_suffix = self
+            .precompiled_artifact_checksum(artifact)
+            .map(|checksum| format!("-{checksum}"))
+            .unwrap_or_default();
         let archive_name = match artifact {
-            Artifact::RyftXlaSys => format!("{artifact_name}-{}-{}", *XLA_COMMIT, *JAX_COMMIT),
-            Artifact::PjrtPlugin => format!("{artifact_name}-{}", *XLA_COMMIT),
+            Artifact::RyftXlaSys => format!("{artifact_name}-{}-{}{}", *XLA_COMMIT, *JAX_COMMIT, checksum_suffix),
+            Artifact::PjrtPlugin => format!("{artifact_name}-{}{}", *XLA_COMMIT, checksum_suffix),
         };
 
         let extracted_path = dirs::cache_dir()
