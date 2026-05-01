@@ -2433,4 +2433,49 @@ mod tests {
             "},
         );
     }
+
+    #[test]
+    fn test_yield() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        let result_type = context.tensor_type(f32_type, &[], None, location).unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let value = block.argument(0).unwrap().into();
+            let mut body = context.region();
+            let mut body_block = context.block_with_no_arguments();
+            let yield_op = r#yield(value, location);
+            assert_eq!(yield_op.value(), value);
+            body_block.append_operation(yield_op);
+            body.append_block(body_block);
+            let op = block.append_operation(generate(&[], result_type, body, location));
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "yield_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![result_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @yield_test(%arg0: f32) -> tensor<f32> {
+                    %generated = tensor.generate  {
+                      tensor.yield %arg0 : f32
+                    } : tensor<f32>
+                    return %generated : tensor<f32>
+                  }
+                }
+            "},
+        );
+    }
 }
