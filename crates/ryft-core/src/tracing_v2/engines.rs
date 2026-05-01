@@ -333,26 +333,23 @@ pub enum TracerState {
     Poison,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-/// Symbolic leaf used while staging ordinary traced programs.
-///
-/// A [`Tracer`] is the value-level facade for one staged traced leaf. Primitive trait impls on [`Tracer`] stage
-/// instructions in a shared [`ProgramBuilder`](crate::tracing::ProgramBuilder) instead of doing numerical work, and
-/// return new tracers for the staged outputs. When tracing has already failed, later operations return poisoned tracers
-/// that retain cached abstract type metadata rather than manufacturing dummy atoms. This makes [`Tracer`] the symbolic
-/// leaf used when `tracing_v2` executes a closure symbolically instead of eagerly.
+/// Value used for tracing [`Program`]s, substituting actual runtime values and recording the executed [`Operation`]s
+/// via its [`TracingContext`]. Trait implementations on [`Tracer`]s stage [`Instruction`]s in a shared
+/// [`ProgramBuilder`] instead of executing those instructions, and return new [`Tracer`]s for the staged outputs.
+/// When tracing fails, later operations return _poisoned_ tracers which are represented using [`TracerState::Poison`].
 #[derive(Parameter)]
 pub struct Tracer<'engine, E: TracingEngine + ?Sized> {
-    /// Execution state for this traced leaf.
-    pub(crate) state: TracerState,
+    /// [`TracerState`] of this [`Tracer`].
+    pub state: TracerState,
 
-    /// Cached abstract type for this traced leaf.
-    pub(crate) r#type: E::Type,
+    /// [`Type`] of the value that this [`Tracer`] represents.
+    pub r#type: E::Type,
 
-    /// Tracing context that owns the shared builder and outer tracing engine reference.
+    /// [`TracingContext`] associated with this [`Tracer`] that owns the underlying shared [`ProgramBuilder`].
     pub context: TracingContext<'engine, E>,
 }
 
+// TODO(eaplatanios): Review from here onwards.
 impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
     /// Constructs a traced leaf from staged tracing parts.
     ///
@@ -368,15 +365,9 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
         TracingContext::new(engine, builder).tracer(atom, Some(r#type))
     }
 
-    /// Returns this tracer's leaf state.
-    #[inline]
-    pub fn state(&self) -> &TracerState {
-        &self.state
-    }
-
     /// Returns the outer tracing engine borrowed by this tracer's tracing context.
     #[inline]
-    pub fn outer_engine(&self) -> &'engine E {
+    pub fn engine(&self) -> &'engine E {
         self.context.engine
     }
 
@@ -463,7 +454,7 @@ impl<'engine, E: TracingEngine + ?Sized> ZeroLike for Tracer<'engine, E> {
     #[inline]
     fn zero_like(&self) -> Self {
         let r#type = self.r#type().into_owned();
-        let value = match self.outer_engine().zero(&r#type) {
+        let value = match self.engine().zero(&r#type) {
             Ok(value) => value,
             Err(error) => {
                 if self.builder().borrow().error.is_none() {
@@ -481,7 +472,7 @@ impl<'engine, E: TracingEngine + ?Sized> OneLike for Tracer<'engine, E> {
     #[inline]
     fn one_like(&self) -> Self {
         let r#type = self.r#type().into_owned();
-        let value = match self.outer_engine().one(&r#type) {
+        let value = match self.engine().one(&r#type) {
             Ok(value) => value,
             Err(error) => {
                 if self.builder().borrow().error.is_none() {
@@ -723,7 +714,7 @@ mod tests {
         let tracer: Tracer<ScalarEngine<f64>> = TracingContext::new(&engine, builder).tracer(atom, None);
         let zero = tracer.zero_like();
         assert_eq!(zero.r#type().into_owned(), scalar_f64_type());
-        let zero_atom = match zero.state() {
+        let zero_atom = match &zero.state {
             TracerState::Live(atom) => *atom,
             TracerState::Poison => panic!("zero-like tracer should remain live"),
         };
@@ -786,7 +777,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0].state(), TracerState::Poison));
+        assert!(matches!(&outputs[0].state, TracerState::Poison));
         assert!(matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == array_scalar_f64_type()));
     }
 
@@ -803,7 +794,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0].state(), TracerState::Live(_)));
+        assert!(matches!(&outputs[0].state, TracerState::Live(_)));
         assert!(matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == array_scalar_f64_type()));
     }
 
