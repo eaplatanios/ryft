@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
-use std::ops::{Add, Mul, Neg};
 use std::rc::Rc;
 
 use half::{bf16, f16};
@@ -11,9 +10,7 @@ use ryft_macros::Parameter;
 
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
 use crate::tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use crate::tracing_v2::operations::primitive::PrimitiveOperation;
-use crate::tracing_v2::operations::{SupportsAdd, SupportsMul, SupportsNeg};
 use crate::types::{DataType, Type, TypeError, Typed};
 
 /// [`Engine`]s provide backend-specific functionality related to tracing, just-in-time compilation, automatic
@@ -442,7 +439,7 @@ impl<'engine, E: TracingEngine<Type: Debug> + ?Sized> Debug for Tracer<'engine, 
 impl<'engine, E: TracingEngine + ?Sized> Display for Tracer<'engine, E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.state {
-            TracerState::Live(atom) => write!(formatter, "{atom}"),
+            TracerState::Live(atom_id) => write!(formatter, "{atom_id}"),
             TracerState::Poison => write!(formatter, "<poison:{}>", self.r#type),
         }
     }
@@ -457,82 +454,10 @@ impl<'engine, E: TracingEngine + ?Sized> Typed<E::Type> for Tracer<'engine, E> {
 
 impl<'engine, E: TracingEngine + ?Sized> Traceable<E::Type> for Tracer<'engine, E> {}
 
-// TODO(eaplatanios): Review from here onwards.
-impl<'engine, E: TracingEngine + ?Sized> ZeroLike for Tracer<'engine, E> {
-    #[inline]
-    fn zero_like(&self) -> Self {
-        let r#type = self.r#type().into_owned();
-        let value = match self.engine().zero(&r#type) {
-            Ok(value) => value,
-            Err(error) => {
-                if self.builder().borrow().error.is_none() {
-                    self.builder().borrow_mut().error = Some(error);
-                }
-                return Tracer { state: TracerState::Poison, r#type, context: self.context.clone() };
-            }
-        };
-        let atom = self.builder().borrow_mut().add_constant(value);
-        self.context.tracer(atom, Some(r#type))
-    }
-}
-
-impl<'engine, E: TracingEngine + ?Sized> OneLike for Tracer<'engine, E> {
-    #[inline]
-    fn one_like(&self) -> Self {
-        let r#type = self.r#type().into_owned();
-        let value = match self.engine().one(&r#type) {
-            Ok(value) => value,
-            Err(error) => {
-                if self.builder().borrow().error.is_none() {
-                    self.builder().borrow_mut().error = Some(error);
-                }
-                return Tracer { state: TracerState::Poison, r#type, context: self.context.clone() };
-            }
-        };
-        let atom = self.builder().borrow_mut().add_constant(value);
-        self.context.tracer(atom, Some(r#type))
-    }
-}
-
-impl<'engine, E: TracingEngine + ?Sized> Add for Tracer<'engine, E>
-where
-    E::Operation: SupportsAdd<E::Type, E::Value>,
-{
-    type Output = Self;
-
-    #[inline]
-    fn add(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, E::Operation::add_operation())
-    }
-}
-
-impl<'engine, E: TracingEngine + ?Sized> Mul for Tracer<'engine, E>
-where
-    E::Operation: SupportsMul<E::Type, E::Value>,
-{
-    type Output = Self;
-
-    #[inline]
-    fn mul(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, E::Operation::mul_operation())
-    }
-}
-
-impl<'engine, E: TracingEngine + ?Sized> Neg for Tracer<'engine, E>
-where
-    E::Operation: SupportsNeg<E::Type, E::Value>,
-{
-    type Output = Self;
-
-    #[inline]
-    fn neg(self) -> Self::Output {
-        self.unary(E::Operation::neg_operation())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::ops::{Add, Mul, Neg};
     use std::rc::Rc;
 
     use indoc::indoc;
@@ -540,6 +465,8 @@ mod tests {
 
     use crate::parameters::Placeholder;
     use crate::tracing_v2::differentiation::DifferentiableEngine;
+    use crate::tracing_v2::operations::SupportsAdd;
+    use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
     use crate::tracing_v2::{Sin, jvp, test_support};
     use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 

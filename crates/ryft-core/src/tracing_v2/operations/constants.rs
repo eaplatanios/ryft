@@ -4,6 +4,7 @@ use half::{bf16, f16};
 
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
 use crate::tracing_v2::operations::primitive::LinearPrimitiveOperation;
+use crate::tracing_v2::{Engine, Tracer, TracerState, TracingEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{InterpretableOperation, LinearOperation, Operation, TranspositionContext};
@@ -31,6 +32,38 @@ pub trait ZeroLike {
 pub trait OneLike {
     /// Returns a one value with the same shape as `self`.
     fn one_like(&self) -> Self;
+}
+
+impl<'engine, E: TracingEngine + ?Sized> ZeroLike for Tracer<'engine, E> {
+    #[inline]
+    fn zero_like(&self) -> Self {
+        let r#type = self.r#type().into_owned();
+        let value = match Engine::zero(self.engine(), &r#type) {
+            Ok(value) => value,
+            Err(error) => {
+                self.context.error(error);
+                return Tracer { state: TracerState::Poison, r#type, context: self.context.clone() };
+            }
+        };
+        let atom = self.builder().borrow_mut().add_constant(value);
+        self.context.tracer(atom, Some(r#type))
+    }
+}
+
+impl<'engine, E: TracingEngine + ?Sized> OneLike for Tracer<'engine, E> {
+    #[inline]
+    fn one_like(&self) -> Self {
+        let r#type = self.r#type().into_owned();
+        let value = match Engine::one(self.engine(), &r#type) {
+            Ok(value) => value,
+            Err(error) => {
+                self.context.error(error);
+                return Tracer { state: TracerState::Poison, r#type, context: self.context.clone() };
+            }
+        };
+        let atom = self.builder().borrow_mut().add_constant(value);
+        self.context.tracer(atom, Some(r#type))
+    }
 }
 
 /// Synthesizes a typed zero value without an exemplar.

@@ -7,7 +7,7 @@ use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation};
+use crate::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation, Tracer, TracingEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
@@ -21,6 +21,18 @@ use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Op
 pub trait SupportsAdd<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the addition primitive.
     fn add_operation() -> Self;
+}
+
+impl<'engine, E: TracingEngine + ?Sized> Add for Tracer<'engine, E>
+where
+    E::Operation: SupportsAdd<E::Type, E::Value>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self::Output {
+        self.binary(rhs, E::Operation::add_operation())
+    }
 }
 
 /// Elementwise addition primitive.

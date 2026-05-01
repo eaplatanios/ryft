@@ -5,7 +5,7 @@ use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation};
+use crate::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation, Tracer, TracingEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, unary_abstract};
@@ -15,6 +15,18 @@ use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Op
 pub trait SupportsNeg<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the negation primitive.
     fn neg_operation() -> Self;
+}
+
+impl<'engine, E: TracingEngine + ?Sized> Neg for Tracer<'engine, E>
+where
+    E::Operation: SupportsNeg<E::Type, E::Value>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn neg(self) -> Self::Output {
+        self.unary(E::Operation::neg_operation())
+    }
 }
 
 /// Elementwise negation primitive.

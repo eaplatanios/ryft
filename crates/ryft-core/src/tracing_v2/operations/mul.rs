@@ -5,8 +5,8 @@ use std::ops::Mul;
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::DifferentiableEngine;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::{DifferentiableEngine, Tracer, TracingEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsScale};
@@ -16,6 +16,18 @@ use super::{DifferentiableOperation, InterpretableOperation, Operation, Supports
 pub trait SupportsMul<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the multiplication primitive.
     fn mul_operation() -> Self;
+}
+
+impl<'engine, E: TracingEngine + ?Sized> Mul for Tracer<'engine, E>
+where
+    E::Operation: SupportsMul<E::Type, E::Value>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self::Output {
+        self.binary(rhs, E::Operation::mul_operation())
+    }
 }
 
 /// Elementwise multiplication primitive.
