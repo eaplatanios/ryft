@@ -531,7 +531,6 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::ProgramBuilder;
-    use ryft_core::tracing_v2::Tracer;
     use ryft_core::types::{DataType, Typed};
 
     use crate::experimental::engines::XlaEngine;
@@ -615,7 +614,7 @@ mod tests {
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new()));
         let traced_input_atom = tracing_builder.borrow_mut().add_input(scalar_type());
         let traced_input =
-            Tracer::from_staged_parts(traced_input_atom, scalar_type(), tracing_builder, XlaEngine::token());
+            TracingContext::new(XlaEngine::token(), tracing_builder).tracer(traced_input_atom, Some(scalar_type()));
 
         let outputs = replay_xla_program_with_tracers(&program, vec![traced_input]).unwrap();
 

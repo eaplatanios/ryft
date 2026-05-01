@@ -349,35 +349,22 @@ pub struct Tracer<'engine, E: TracingEngine + ?Sized> {
     pub context: TracingContext<'engine, E>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
 impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
-    /// Constructs a traced leaf from staged tracing parts.
-    ///
-    /// Callers that already know the staged atom's abstract type should prefer this constructor so future type queries
-    /// can use cached metadata without re-borrowing the shared builder.
-    #[inline]
-    pub fn from_staged_parts(
-        atom: AtomId,
-        r#type: E::Type,
-        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>,
-        engine: &'engine E,
-    ) -> Self {
-        TracingContext::new(engine, builder).tracer(atom, Some(r#type))
-    }
-
-    /// Returns the outer tracing engine borrowed by this tracer's tracing context.
+    /// Returns the [`TracingEngine`] associated with this [`Tracer`].
     #[inline]
     pub fn engine(&self) -> &'engine E {
         self.context.engine
     }
 
-    /// Returns the shared program builder for this tracer's tracing context.
+    /// Returns the [`ProgramBuilder`] associated with this [`Tracer`].
     #[inline]
     pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>> {
         &self.context.builder
     }
 
-    /// Returns the staged atom id for this tracer when it is still live.
+    /// Returns the staged [`AtomId`] for this [`Tracer`] if it is _live_,
+    /// and [`TracingError::PoisonedTracer`] otherwise.
+    #[inline]
     pub fn atom_id(&self) -> Result<AtomId, TracingError> {
         match &self.state {
             TracerState::Live(atom) => Ok(*atom),
@@ -385,16 +372,15 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
         }
     }
 
+    // TODO(eaplatanios): Review from here onwards.
     /// Stages a single-input operation application and returns its unique output.
     ///
     /// Convenience wrapper for operator trait implementations whose staged operation should produce one output.
-    pub fn unary(self, op: E::Operation) -> Self {
-        let context = self.context.clone();
-        let poison_type = self.r#type.clone();
-        match context.trace(op, std::slice::from_ref(&self)) {
+    pub fn unary(self, operation: E::Operation) -> Self {
+        match self.context.trace(operation, std::slice::from_ref(&self)) {
             Ok(outputs) => outputs.into_iter().next().expect("unary traced staging should produce one output"),
-            Err(_error) if context.builder.borrow().error.is_some() => {
-                Tracer { state: TracerState::Poison, r#type: poison_type, context }
+            Err(_) if self.context.builder.borrow().error.is_some() => {
+                Tracer { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
             Err(error) => panic!("unary traced staging failed before recording a builder error: {error}"),
         }
@@ -403,11 +389,11 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
     /// Stages a two-input operation application and returns its unique output.
     ///
     /// Convenience wrapper for operator trait implementations whose staged operation should produce one output.
-    pub fn binary(self, rhs: Self, op: E::Operation) -> Self {
+    pub fn binary(self, rhs: Self, operation: E::Operation) -> Self {
         debug_assert!(Rc::ptr_eq(self.builder(), rhs.builder()));
         let context = self.context.clone();
         let poison_type = self.r#type.clone();
-        match context.trace(op, &[self, rhs]) {
+        match context.trace(operation, &[self, rhs]) {
             Ok(outputs) => outputs.into_iter().next().expect("binary traced staging should produce one output"),
             Err(_error) if context.builder.borrow().error.is_some() => {
                 Tracer { state: TracerState::Poison, r#type: poison_type, context }
@@ -423,16 +409,17 @@ impl<'engine, E: TracingEngine + ?Sized> Clone for Tracer<'engine, E> {
     }
 }
 
-impl<'engine, E: TracingEngine + ?Sized> std::fmt::Debug for Tracer<'engine, E> {
+impl<'engine, E: TracingEngine<Type: Debug> + ?Sized> Debug for Tracer<'engine, E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Tracer").field("state", &self.state).finish_non_exhaustive()
+        formatter
+            .debug_struct("Tracer")
+            .field("state", &self.state)
+            .field("type", &self.r#type)
+            .finish_non_exhaustive()
     }
 }
 
-impl<'engine, E> Display for Tracer<'engine, E>
-where
-    E: TracingEngine + ?Sized,
-{
+impl<'engine, E: TracingEngine + ?Sized> Display for Tracer<'engine, E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.state {
             TracerState::Live(atom) => Display::fmt(atom, formatter),
@@ -448,7 +435,7 @@ impl<'engine, E: TracingEngine + ?Sized> Typed<E::Type> for Tracer<'engine, E> {
     }
 }
 
-impl<'engine, E> Traceable<E::Type> for Tracer<'engine, E> where E: TracingEngine + ?Sized {}
+impl<'engine, E: TracingEngine + ?Sized> Traceable<E::Type> for Tracer<'engine, E> {}
 
 impl<'engine, E: TracingEngine + ?Sized> ZeroLike for Tracer<'engine, E> {
     #[inline]
@@ -743,7 +730,7 @@ mod tests {
         let input_type = scalar_f64_type();
         let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = ScalarEngine::<f64>::new();
-        let tracer: Tracer<ScalarEngine<f64>> = Tracer::from_staged_parts(atom, input_type, builder, &engine);
+        let tracer: Tracer<ScalarEngine<f64>> = TracingContext::new(&engine, builder).tracer(atom, Some(input_type));
 
         assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == scalar_f64_type()));
     }
@@ -787,7 +774,7 @@ mod tests {
         let input_type = array_scalar_f64_type();
         let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = TaggedEngine { id: 1 };
-        let tracer = Tracer::from_staged_parts(atom, input_type, builder.clone(), &engine);
+        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, Some(input_type));
 
         let outputs = TracingContext::new(&engine, builder)
             .trace(PrimitiveOperation::Neg, std::slice::from_ref(&tracer))
