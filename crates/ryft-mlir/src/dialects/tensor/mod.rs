@@ -27,6 +27,10 @@ use ryft_xla_sys::bindings::mlirGetDialectHandle__tensor__;
 
 use crate::DialectHandle;
 
+pub mod operations;
+
+pub use operations::*;
+
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `tensor` [`Dialect`](crate::Dialect).
     pub fn tensor() -> Self {

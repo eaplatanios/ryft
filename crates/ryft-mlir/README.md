@@ -142,7 +142,7 @@ fn main() {
         - [ ] Add checks for operation arguments when constructing them to prevent panics and return informative errors:
             - https://openxla.org/stablehlo/spec
             - https://github.com/openxla/stablehlo/blob/4c0d4841519aed22e3689c30b72a0e4228051249/stablehlo/dialect/StablehloOps.cpp
-    - [ ] `tensor`
+    - [x] `tensor`
     - [/] `triton`
       - [x] `tt`
       - [ ] `tti`
