@@ -9,9 +9,6 @@ use crate::types::TypeError;
 /// Represents errors related to tracing in `ryft-core`.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TracingError {
-    #[error("tracing values that are used in the same operation must share the same tracing engine")]
-    MismatchedEngines,
-
     #[error("tracing values that are used in the same operation must share the same program builder")]
     MismatchedProgramBuilders,
 

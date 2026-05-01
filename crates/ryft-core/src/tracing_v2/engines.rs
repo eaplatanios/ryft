@@ -255,60 +255,53 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
         if inputs.iter().any(|input| !Rc::ptr_eq(&self.builder, &input.context.builder)) {
             return Err(TracingError::MismatchedProgramBuilders);
         }
-        if inputs
-            .iter()
-            .any(|input| !std::ptr::addr_eq(std::ptr::from_ref(input.context.engine), std::ptr::from_ref(self.engine)))
-        {
-            return Err(TracingError::MismatchedEngines);
-        }
 
         if self.builder.borrow().error.is_some() {
             let input_types = inputs.iter().map(|input| input.state.r#type().clone()).collect::<Vec<_>>();
-            let output_types = match operation.infer_output_types(input_types.as_slice()) {
-                Ok(output_types) => output_types,
+            match operation.infer_output_types(input_types.as_slice()) {
+                Ok(output_types) => Ok(output_types
+                    .into_iter()
+                    .map(|r#type| Tracer { state: TracerState::Poison(r#type), context: self.clone() })
+                    .collect()),
                 Err(error) => {
                     let poison_type = input_types.first().cloned().ok_or(error)?;
+                    Ok(vec![Tracer { state: TracerState::Poison(poison_type), context: self.clone() }])
+                }
+            }
+        } else {
+            let input_atoms = inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>()?;
+            let add_result = {
+                let mut builder = self.builder.borrow_mut();
+                match builder.add_instruction(operation, input_atoms) {
+                    Ok(outputs) => Ok(outputs.to_vec()),
+                    Err(error) => {
+                        if builder.error.is_none() {
+                            builder.error = Some(error.clone());
+                        }
+                        Err(error)
+                    }
+                }
+            };
+            let output_atoms = match add_result {
+                Ok(output_atoms) => output_atoms,
+                Err(error) => {
+                    let poison_type = match inputs.first() {
+                        Some(input) => input.state.r#type().clone(),
+                        None => return Err(error),
+                    };
                     return Ok(vec![Tracer { state: TracerState::Poison(poison_type), context: self.clone() }]);
                 }
             };
-            return Ok(output_types
-                .into_iter()
-                .map(|r#type| Tracer { state: TracerState::Poison(r#type), context: self.clone() })
-                .collect());
+
+            let output_states = {
+                let builder = self.builder.borrow();
+                output_atoms
+                    .into_iter()
+                    .map(|atom| TracerState::Live(atom, builder.atoms[atom.index].r#type().into_owned()))
+                    .collect::<Vec<_>>()
+            };
+            Ok(output_states.into_iter().map(|state| Tracer { state, context: self.clone() }).collect())
         }
-
-        let input_atoms = inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>()?;
-        let add_result = {
-            let mut builder = self.builder.borrow_mut();
-            match builder.add_instruction(operation, input_atoms) {
-                Ok(outputs) => Ok(outputs.to_vec()),
-                Err(error) => {
-                    if builder.error.is_none() {
-                        builder.error = Some(error.clone());
-                    }
-                    Err(error)
-                }
-            }
-        };
-        let output_atoms = match add_result {
-            Ok(output_atoms) => output_atoms,
-            Err(error) => {
-                let poison_type = match inputs.first() {
-                    Some(input) => input.state.r#type().clone(),
-                    None => return Err(error),
-                };
-                return Ok(vec![Tracer { state: TracerState::Poison(poison_type), context: self.clone() }]);
-            }
-        };
-
-        let output_states = {
-            let builder = self.builder.borrow();
-            output_atoms
-                .into_iter()
-                .map(|atom| TracerState::Live(atom, builder.atoms[atom.index].r#type().into_owned()))
-                .collect::<Vec<_>>()
-        };
-        Ok(output_states.into_iter().map(|state| Tracer { state, context: self.clone() }).collect())
     }
 }
 
@@ -809,22 +802,6 @@ mod tests {
         assert!(matches!(
             TracingContext::new(&engine, builder_a).trace(PrimitiveOperation::Add, &[tracer_a, tracer_b]),
             Err(TracingError::MismatchedProgramBuilders),
-        ));
-    }
-
-    #[test]
-    fn test_trace_rejects_mismatched_engines() {
-        let builder = new_array_f64_builder();
-        let atom_a = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
-        let atom_b = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&2.0f64).into_owned());
-        let engine_a = TaggedEngine { id: 1 };
-        let engine_b = TaggedEngine { id: 2 };
-        let tracer_a = TracingContext::new(&engine_a, builder.clone()).tracer(atom_a, None);
-        let tracer_b = TracingContext::new(&engine_b, builder.clone()).tracer(atom_b, None);
-
-        assert!(matches!(
-            TracingContext::new(&engine_a, builder).trace(PrimitiveOperation::Add, &[tracer_a, tracer_b]),
-            Err(TracingError::MismatchedEngines),
         ));
     }
 
