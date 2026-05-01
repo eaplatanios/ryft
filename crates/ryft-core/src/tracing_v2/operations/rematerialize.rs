@@ -214,9 +214,10 @@ where
             Vec::new()
         } else {
             let exemplar = primal_inputs[0].clone();
+            let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
             exemplar
                 .context
-                .trace(EInner::Operation::rematerialize_operation(self.clone()), primal_inputs.as_slice())?
+                .trace(EInner::Operation::rematerialize_operation(self.clone()), primal_input_refs.as_slice())?
         };
 
         if tangent_inputs.is_empty() && !self.body.output_types.is_empty() {
@@ -331,7 +332,10 @@ where
             };
         }
         let exemplar_input = inputs[0].clone();
-        exemplar_input.context.trace(E::Operation::rematerialize_operation(self.clone()), inputs)
+        let input_refs = inputs.iter().collect::<Vec<_>>();
+        exemplar_input
+            .context
+            .trace(E::Operation::rematerialize_operation(self.clone()), input_refs.as_slice())
     }
 }
 
@@ -610,9 +614,10 @@ where
             builder.build(output_ids, vec![Placeholder; input_leaf_count], vec![Placeholder; output_leaf_count])?,
         );
 
+        let traced_input_refs = traced_inputs.iter().collect::<Vec<_>>();
         let staged_outputs = exemplar_traced_input.context.trace(
             E::Operation::rematerialize_operation(RematerializeOperation::new(body)),
-            traced_inputs.as_slice(),
+            traced_input_refs.as_slice(),
         )?;
         Output::from_parameters(output_structure, staged_outputs).map_err(TracingError::from)
     }

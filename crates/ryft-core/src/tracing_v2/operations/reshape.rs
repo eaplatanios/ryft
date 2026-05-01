@@ -201,10 +201,7 @@ where
         }
         let context = self.context.clone();
         Ok(context
-            .trace(
-                E::Operation::reshape_operation(input_type.shape.clone(), output_type.shape.clone()),
-                std::slice::from_ref(&self),
-            )?
+            .trace(E::Operation::reshape_operation(input_type.shape.clone(), output_type.shape.clone()), &[&self])?
             .into_iter()
             .next()
             .expect("reshape should produce one traced output"))

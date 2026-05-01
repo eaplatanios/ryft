@@ -354,8 +354,9 @@ impl LinearShardMapOperation<ShardMapTracer> {
     ) -> Result<Vec<ShardMapTracer>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
+        let input_refs = inputs.iter().collect::<Vec<_>>();
         TracingContext::new(XlaEngine::token(), tracing_builder)
-            .trace(XlaPrimitiveOperation::LinearShardMap(Box::new(self.to_tensor_xla_op())), inputs)
+            .trace(XlaPrimitiveOperation::LinearShardMap(Box::new(self.to_tensor_xla_op())), input_refs.as_slice())
     }
 }
 
@@ -368,8 +369,9 @@ impl LinearShardMapOperation<ShardMapTensor> {
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
         let primal_outputs = TracingContext::new(XlaEngine::token(), tracing_builder)
-            .trace(XlaPrimitiveOperation::LinearShardMap(Box::new(self.clone())), primal_inputs.as_slice())?;
+            .trace(XlaPrimitiveOperation::LinearShardMap(Box::new(self.clone())), primal_input_refs.as_slice())?;
         let traced_op = self.to_tracer_linear_op(primal_inputs.as_slice())?;
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let tangent_outputs = context.apply_operation(
@@ -1275,10 +1277,11 @@ fn apply_flat_traced_shard_map(
     body: FlatTracedShardMap,
     traced_inputs: Vec<ShardMapTracer>,
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
+    let traced_input_refs = traced_inputs.iter().collect::<Vec<_>>();
     TracingContext::new(XlaEngine::token(), tracing_builder)
         .trace(
             XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(body.clone()))),
-            traced_inputs.as_slice(),
+            traced_input_refs.as_slice(),
         )
         .map_err(ShardMapTraceError::from)
 }
@@ -1490,9 +1493,10 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     traced_inputs: Vec<ShardMapTracer>,
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError> {
+    let traced_input_refs = traced_inputs.iter().collect::<Vec<_>>();
     let staged_outputs = TracingContext::new(XlaEngine::token(), tracing_builder).trace(
         XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))),
-        traced_inputs.as_slice(),
+        traced_input_refs.as_slice(),
     )?;
     Ok(Output::from_parameters(output_structure, staged_outputs)?)
 }

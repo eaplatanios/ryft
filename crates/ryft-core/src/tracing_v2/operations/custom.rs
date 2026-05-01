@@ -619,7 +619,7 @@ mod tests {
     {
         let context = input.context.clone();
         Ok(context
-            .trace(PrimitiveOperation::Custom(Arc::new(primitive)), std::slice::from_ref(&input))?
+            .trace(PrimitiveOperation::Custom(Arc::new(primitive)), &[&input])?
             .into_iter()
             .next()
             .expect("unary custom primitive should produce one output"))

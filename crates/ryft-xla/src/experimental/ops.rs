@@ -305,11 +305,13 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaPrimitiveOperation
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                exemplar.context.trace(XlaPrimitiveOperation::Condition(condition.clone()), inputs)
+                let input_refs = inputs.iter().collect::<Vec<_>>();
+                exemplar.context.trace(XlaPrimitiveOperation::Condition(condition.clone()), input_refs.as_slice())
             }
             Self::While(while_operation) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                exemplar.context.trace(XlaPrimitiveOperation::While(while_operation.clone()), inputs)
+                let input_refs = inputs.iter().collect::<Vec<_>>();
+                exemplar.context.trace(XlaPrimitiveOperation::While(while_operation.clone()), input_refs.as_slice())
             }
             Self::ShardMap(op) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
@@ -427,10 +429,7 @@ impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaPrimitiveOp
                 let primal = input
                     .primal
                     .context
-                    .trace(
-                        XlaPrimitiveOperation::WithShardingConstraint(op.clone()),
-                        std::slice::from_ref(&input.primal),
-                    )?
+                    .trace(XlaPrimitiveOperation::WithShardingConstraint(op.clone()), &[&input.primal])?
                     .into_iter()
                     .next()
                     .expect("with_sharding_constraint should produce one primal output");

@@ -263,7 +263,7 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
     pub fn trace(
         &self,
         operation: E::Operation,
-        inputs: &[Tracer<'engine, E>],
+        inputs: &[&Tracer<'engine, E>],
     ) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         if inputs.iter().any(|input| !Rc::ptr_eq(&self.builder, &input.context.builder)) {
             return Err(self.error(TracingError::MismatchedProgramBuilders));
@@ -394,7 +394,8 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
     pub fn unary(self, operation: E::Operation) -> Self {
         let context = self.context.clone();
         let poison_type = self.r#type.clone();
-        match context.trace(operation, std::slice::from_ref(&self)) {
+        let inputs = [&self];
+        match context.trace(operation, &inputs) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
@@ -413,7 +414,8 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
     pub fn binary(self, rhs: Self, operation: E::Operation) -> Self {
         let context = self.context.clone();
         let poison_type = self.r#type.clone();
-        match context.trace(operation, &[self, rhs]) {
+        let inputs = [&self, &rhs];
+        match context.trace(operation, &inputs) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
@@ -802,7 +804,7 @@ mod tests {
         let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
 
         assert!(matches!(
-            TracingContext::new(&engine, builder_a.clone()).trace(PrimitiveOperation::Add, &[tracer_a, tracer_b]),
+            TracingContext::new(&engine, builder_a.clone()).trace(PrimitiveOperation::Add, &[&tracer_a, &tracer_b]),
             Err(TracingError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
@@ -848,9 +850,7 @@ mod tests {
         let engine = TaggedEngine { id: 1 };
         let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
 
-        let outputs = TracingContext::new(&engine, builder)
-            .trace(PrimitiveOperation::Neg, std::slice::from_ref(&tracer))
-            .unwrap();
+        let outputs = TracingContext::new(&engine, builder).trace(PrimitiveOperation::Neg, &[&tracer]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert!(matches!(&outputs[0].state, TracerState::Poison));
@@ -865,9 +865,7 @@ mod tests {
         let engine = TaggedEngine { id: 1 };
         let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, Some(input_type));
 
-        let outputs = TracingContext::new(&engine, builder)
-            .trace(PrimitiveOperation::Neg, std::slice::from_ref(&tracer))
-            .unwrap();
+        let outputs = TracingContext::new(&engine, builder).trace(PrimitiveOperation::Neg, &[&tracer]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert!(matches!(&outputs[0].state, TracerState::Live(_)));
@@ -1018,7 +1016,7 @@ mod tests {
         let lhs = TracingContext::new(&engine, builder.clone()).tracer(lhs_atom, None);
         let rhs = TracingContext::new(&engine, builder.clone()).tracer(rhs_atom, None);
 
-        let result = TracingContext::new(&engine, builder.clone()).trace(PrimitiveOperation::Add, &[lhs, rhs]);
+        let result = TracingContext::new(&engine, builder.clone()).trace(PrimitiveOperation::Add, &[&lhs, &rhs]);
 
         assert!(matches!(
             result,
@@ -1041,8 +1039,7 @@ mod tests {
         let engine = TaggedEngine { id: 1 };
         let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
 
-        let result =
-            TracingContext::new(&engine, builder).trace(PrimitiveOperation::Add, std::slice::from_ref(&tracer));
+        let result = TracingContext::new(&engine, builder).trace(PrimitiveOperation::Add, &[&tracer]);
 
         assert!(matches!(
             result,
