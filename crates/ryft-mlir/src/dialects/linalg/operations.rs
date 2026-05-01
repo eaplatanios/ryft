@@ -2,8 +2,9 @@ use ryft_xla_sys::bindings::mlirLinalgFillBuiltinNamedOpRegion;
 
 use crate::{
     ArrayAttributeRef, Attribute, AttributeRef, DenseInteger32ArrayAttributeRef, DenseInteger64ArrayAttributeRef,
-    DenseIntegerElementsAttributeRef, DetachedOp, DetachedRegion, DialectHandle, Location, Operation, OperationBuilder,
-    RegionRef, StringAttributeRef, TypeRef, Value, ValueRef, mlir_op, mlir_op_trait,
+    DenseIntegerElementsAttributeRef, DetachedOp, DetachedRegion, DialectHandle, Location, MemRefTypeRef, Operation,
+    OperationBuilder, RegionRef, StringAttributeRef, TensorTypeRef, Type, TypeRef, Value, ValueRef, mlir_op,
+    mlir_op_trait,
 };
 
 use super::{
@@ -346,7 +347,6 @@ pub fn transpose<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     init: ValueRef<'v, 'c, 't>,
     result_types: &[TypeRef<'c, 't>],
     permutation: &[i64],
-    region: DetachedRegion<'c, 't>,
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
 ) -> DetachedTransposeOperation<'c, 't> {
@@ -356,14 +356,13 @@ pub fn transpose<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_attribute(PERMUTATION_ATTRIBUTE, context.dense_i64_array_attribute(permutation).unwrap())
         .add_operands(&[input, init])
         .add_results(result_types)
-        .add_region(region);
+        .add_region(context.region());
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::transpose`")
+    let operation = builder.build().expect("invalid arguments to `linalg::transpose`");
+    unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
+    unsafe { operation.cast() }.expect("invalid `linalg::transpose` operation cast")
 }
 
 /// Operation trait for `linalg.broadcast`.
@@ -394,7 +393,6 @@ pub fn broadcast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     init: ValueRef<'v, 'c, 't>,
     result_types: &[TypeRef<'c, 't>],
     dimensions: &[i64],
-    region: DetachedRegion<'c, 't>,
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
 ) -> DetachedBroadcastOperation<'c, 't> {
@@ -404,14 +402,13 @@ pub fn broadcast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_attribute(DIMENSIONS_ATTRIBUTE, context.dense_i64_array_attribute(dimensions).unwrap())
         .add_operands(&[input, init])
         .add_results(result_types)
-        .add_region(region);
+        .add_region(context.region());
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::broadcast`")
+    let operation = builder.build().expect("invalid arguments to `linalg::broadcast`");
+    unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
+    unsafe { operation.cast() }.expect("invalid `linalg::broadcast` operation cast")
 }
 
 /// Name of the Linalg elementwise kind attribute.
@@ -442,30 +439,44 @@ pub fn elementwise<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     kind: ElementwiseKind,
     indexing_maps: Option<ArrayAttributeRef<'c, 't>>,
-    region: DetachedRegion<'c, 't>,
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
 ) -> DetachedElementwiseOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::linalg());
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
+    let indexing_maps = indexing_maps.unwrap_or_else(|| {
+        let rank = outputs
+            .first()
+            .map(|output| {
+                let r#type = output.r#type();
+                if let Some(tensor_type) = r#type.cast::<TensorTypeRef>() {
+                    tensor_type.rank()
+                } else if let Some(memref_type) = r#type.cast::<MemRefTypeRef>() {
+                    memref_type.rank()
+                } else {
+                    panic!("expected shaped output type for `linalg::elementwise`")
+                }
+            })
+            .unwrap_or(0);
+        let identity_map = context.affine_map_attribute(context.identity_affine_map(rank));
+        let maps = vec![identity_map; inputs.len() + outputs.len()];
+        context.array_attribute(&maps)
+    });
     let mut builder = OperationBuilder::new("linalg.elementwise", location)
         .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
         .add_attribute(KIND_ATTRIBUTE, context.linalg_elementwise_kind_attribute(kind))
+        .add_attribute(INDEXING_MAPS_ATTRIBUTE, indexing_maps)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
-        .add_region(region);
-    if let Some(indexing_maps) = indexing_maps {
-        builder = builder.add_attribute(INDEXING_MAPS_ATTRIBUTE, indexing_maps);
-    }
+        .add_region(context.region());
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::elementwise`")
+    let operation = builder.build().expect("invalid arguments to `linalg::elementwise`");
+    unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
+    unsafe { operation.cast() }.expect("invalid `linalg::elementwise` operation cast")
 }
 
 /// Name of the Linalg numeric cast attribute.
@@ -507,7 +518,6 @@ pub fn matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     inputs: &[ValueRef<'v, 'c, 't>],
     outputs: &[ValueRef<'v, 'c, 't>],
     result_types: &[TypeRef<'c, 't>],
-    region: DetachedRegion<'c, 't>,
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
 ) -> DetachedMatmulOperation<'c, 't> {
@@ -519,14 +529,13 @@ pub fn matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
-        .add_region(region);
+        .add_region(context.region());
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::matmul`")
+    let operation = builder.build().expect("invalid arguments to `linalg::matmul`");
+    unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
+    unsafe { operation.cast() }.expect("invalid `linalg::matmul` operation cast")
 }
 
 /// Operation trait for `linalg.contract`.
@@ -544,7 +553,6 @@ pub fn contract<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     inputs: &[ValueRef<'v, 'c, 't>],
     outputs: &[ValueRef<'v, 'c, 't>],
     result_types: &[TypeRef<'c, 't>],
-    region: DetachedRegion<'c, 't>,
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
 ) -> DetachedContractOperation<'c, 't> {
@@ -556,14 +564,13 @@ pub fn contract<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
-        .add_region(region);
+        .add_region(context.region());
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::contract`")
+    let operation = builder.build().expect("invalid arguments to `linalg::contract`");
+    unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
+    unsafe { operation.cast() }.expect("invalid `linalg::contract` operation cast")
 }
 
 /// Operation trait for `linalg.batch_matmul`.
@@ -581,7 +588,6 @@ pub fn batch_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     inputs: &[ValueRef<'v, 'c, 't>],
     outputs: &[ValueRef<'v, 'c, 't>],
     result_types: &[TypeRef<'c, 't>],
-    region: DetachedRegion<'c, 't>,
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
 ) -> DetachedBatchMatmulOperation<'c, 't> {
@@ -593,14 +599,13 @@ pub fn batch_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
-        .add_region(region);
+        .add_region(context.region());
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::batch_matmul`")
+    let operation = builder.build().expect("invalid arguments to `linalg::batch_matmul`");
+    unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
+    unsafe { operation.cast() }.expect("invalid `linalg::batch_matmul` operation cast")
 }
 
 /// Operation trait for `linalg.batch_reduce_matmul`.
@@ -618,7 +623,6 @@ pub fn batch_reduce_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     inputs: &[ValueRef<'v, 'c, 't>],
     outputs: &[ValueRef<'v, 'c, 't>],
     result_types: &[TypeRef<'c, 't>],
-    region: DetachedRegion<'c, 't>,
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
 ) -> DetachedBatchReduceMatmulOperation<'c, 't> {
@@ -630,14 +634,13 @@ pub fn batch_reduce_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
-        .add_region(region);
+        .add_region(context.region());
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::batch_reduce_matmul`")
+    let operation = builder.build().expect("invalid arguments to `linalg::batch_reduce_matmul`");
+    unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
+    unsafe { operation.cast() }.expect("invalid `linalg::batch_reduce_matmul` operation cast")
 }
 
 /// Name of the Linalg dimension attribute.
@@ -691,10 +694,10 @@ pub fn softmax<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the Linalg Winograd FMR attribute.
 pub const FMR_ATTRIBUTE: &str = "fmr";
 
-/// Common API for Linalg Winograd transform operations.
-pub trait LinalgWinogradTransformOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
-    /// Returns the transform input operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
+/// Operation trait for `linalg.winograd_filter_transform`.
+pub trait WinogradFilterTransformOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the filter operand.
+    fn filter(&self) -> ValueRef<'o, 'c, 't> {
         self.operand_value(0).unwrap()
     }
 
@@ -709,11 +712,7 @@ pub trait LinalgWinogradTransformOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c
     }
 }
 
-/// Operation trait for `linalg.winograd_filter_transform`.
-pub trait WinogradFilterTransformOperation<'o, 'c: 'o, 't: 'c>: LinalgWinogradTransformOperation<'o, 'c, 't> {}
-
 mlir_op!(WinogradFilterTransform);
-mlir_op_trait!(WinogradFilterTransform, @local LinalgWinogradTransformOperation);
 mlir_op_trait!(WinogradFilterTransform, ZeroRegions);
 mlir_op_trait!(WinogradFilterTransform, ZeroSuccessors);
 
@@ -737,10 +736,24 @@ pub fn winograd_filter_transform<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 }
 
 /// Operation trait for `linalg.winograd_input_transform`.
-pub trait WinogradInputTransformOperation<'o, 'c: 'o, 't: 'c>: LinalgWinogradTransformOperation<'o, 'c, 't> {}
+pub trait WinogradInputTransformOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the input operand.
+    fn input(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the output operand.
+    fn output_operand(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(1).unwrap()
+    }
+
+    /// Returns the Winograd FMR value.
+    fn fmr(&self) -> WinogradConv2DFmr {
+        self.attribute(FMR_ATTRIBUTE).unwrap().cast::<WinogradConv2DFmrAttributeRef>().unwrap().value()
+    }
+}
 
 mlir_op!(WinogradInputTransform);
-mlir_op_trait!(WinogradInputTransform, @local LinalgWinogradTransformOperation);
 mlir_op_trait!(WinogradInputTransform, ZeroRegions);
 mlir_op_trait!(WinogradInputTransform, ZeroSuccessors);
 
@@ -764,10 +777,24 @@ pub fn winograd_input_transform<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 }
 
 /// Operation trait for `linalg.winograd_output_transform`.
-pub trait WinogradOutputTransformOperation<'o, 'c: 'o, 't: 'c>: LinalgWinogradTransformOperation<'o, 'c, 't> {}
+pub trait WinogradOutputTransformOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the value operand.
+    fn value(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the output operand.
+    fn output_operand(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(1).unwrap()
+    }
+
+    /// Returns the Winograd FMR value.
+    fn fmr(&self) -> WinogradConv2DFmr {
+        self.attribute(FMR_ATTRIBUTE).unwrap().cast::<WinogradConv2DFmrAttributeRef>().unwrap().value()
+    }
+}
 
 mlir_op!(WinogradOutputTransform);
-mlir_op_trait!(WinogradOutputTransform, @local LinalgWinogradTransformOperation);
 mlir_op_trait!(WinogradOutputTransform, ZeroRegions);
 mlir_op_trait!(WinogradOutputTransform, ZeroSuccessors);
 
@@ -3711,36 +3738,524 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::dialects::{func, linalg::TypeFn};
-    use crate::{Attribute, Block, Context, Operation, Size, Type, Value, VectorTypeDimension};
-
-    use super::{
-        CAST_ATTRIBUTE, DILATIONS_ATTRIBUTE, LinalgCastedOperation, LinalgNamedStructuredOperation,
-        LinalgStridedDilatedOperation, STRIDES_ATTRIBUTE, add, conv_1d_nwc_wcf, copy,
+    use crate::dialects::{func, linalg::IteratorType};
+    use crate::{
+        ArrayAttributeRef, Attribute, AttributeRef, Block, Context, Operation, Region, Size, Type, Value,
+        VectorTypeDimension,
     };
 
+    use super::*;
+
+    macro_rules! linalg_test_type {
+        ($context:ident, $location:ident, tensor(f32, $rank:literal)) => {{
+            let dimensions = vec![Size::Dynamic; $rank];
+            $context.tensor_type($context.float32_type(), &dimensions, None, $location).unwrap().as_ref()
+        }};
+        ($context:ident, $location:ident, tensor(i32, $rank:literal)) => {{
+            let dimensions = vec![Size::Dynamic; $rank];
+            $context
+                .tensor_type($context.signless_integer_type(32), &dimensions, None, $location)
+                .unwrap()
+                .as_ref()
+        }};
+        ($context:ident, $location:ident, tensor(i1, $rank:literal)) => {{
+            let dimensions = vec![Size::Dynamic; $rank];
+            $context
+                .tensor_type($context.signless_integer_type(1), &dimensions, None, $location)
+                .unwrap()
+                .as_ref()
+        }};
+        ($context:ident, $location:ident, scalar(f64)) => {
+            $context.float64_type().as_ref()
+        };
+        ($context:ident, $location:ident, scalar(f32)) => {
+            $context.float32_type().as_ref()
+        };
+        ($context:ident, $location:ident, scalar(i32)) => {
+            $context.signless_integer_type(32).as_ref()
+        };
+    }
+
+    macro_rules! linalg_named_structured_operation_test {
+        (
+            $test_name:ident,
+            $constructor:ident,
+            $operation_name:literal,
+            [$($argument_kind:ident($($argument_args:tt)*)),+ $(,)?],
+            inputs = [$($input_index:expr),* $(,)?],
+            outputs = [$($output_index:expr),* $(,)?]
+        ) => {
+            linalg_named_structured_operation_test!(
+                $test_name,
+                $constructor,
+                $operation_name,
+                [$($argument_kind($($argument_args)*)),+],
+                inputs = [$($input_index),*],
+                outputs = [$($output_index),*],
+                attributes = Vec::new(),
+                attribute_text = String::new()
+            );
+        };
+        (
+            $test_name:ident,
+            $constructor:ident,
+            $operation_name:literal,
+            [$($argument_kind:ident($($argument_args:tt)*)),+ $(,)?],
+            inputs = [$($input_index:expr),* $(,)?],
+            outputs = [$($output_index:expr),* $(,)?],
+            attributes = $attributes:expr,
+            attribute_text = $attribute_text:expr
+        ) => {
+            #[test]
+            fn $test_name() {
+                let context = Context::new();
+                let location = context.unknown_location();
+                let module = context.module(location);
+                let argument_types = vec![$(linalg_test_type!(context, location, $argument_kind($($argument_args)*))),+];
+                let block_arguments = argument_types
+                    .iter()
+                    .map(|r#type| (*r#type, location))
+                    .collect::<Vec<_>>();
+                module.body().append_operation({
+                    let mut block = context.block(&block_arguments);
+                    let values = (0..argument_types.len())
+                        .map(|index| block.argument(index).unwrap().as_ref())
+                        .collect::<Vec<_>>();
+                    let input_indices = vec![$($input_index),*];
+                    let output_indices = vec![$($output_index),*];
+                    let inputs = input_indices.iter().map(|index| values[*index]).collect::<Vec<_>>();
+                    let outputs = output_indices.iter().map(|index| values[*index]).collect::<Vec<_>>();
+                    let result_types = outputs.iter().map(|value| value.r#type()).collect::<Vec<_>>();
+                    let attributes: Vec<(&str, AttributeRef<'_, '_>)> = $attributes;
+                    let op = $constructor(&inputs, &outputs, &result_types, &attributes, location);
+                    assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
+                    assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
+                    assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
+                    assert_eq!(op.operands().count(), inputs.len() + outputs.len());
+                    assert_eq!(op.results().count(), result_types.len());
+                    let op = block.append_operation(op);
+                    block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+                    func::func(
+                        concat!(stringify!($test_name), "_func"),
+                        func::FuncAttributes {
+                            arguments: argument_types.iter().map(|r#type| (*r#type).into()).collect(),
+                            results: result_types.iter().map(|r#type| (*r#type).into()).collect(),
+                            ..Default::default()
+                        },
+                        block.into(),
+                        location,
+                    )
+                });
+                assert!(module.verify());
+
+                let function_arguments = argument_types
+                    .iter()
+                    .enumerate()
+                    .map(|(index, r#type)| format!("%arg{index}: {type}", type = r#type))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let input_names = vec![$($input_index),*]
+                    .iter()
+                    .map(|index| format!("%arg{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let input_types = vec![$($input_index),*]
+                    .iter()
+                    .map(|index| argument_types[*index].to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let output_names = vec![$($output_index),*]
+                    .iter()
+                    .map(|index| format!("%arg{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let output_types = vec![$($output_index),*]
+                    .iter()
+                    .map(|index| argument_types[*index].to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let result_type = output_types.clone();
+                let expected = format!(
+                    "module {{\n  func.func @{}_func({}) -> {} {{\n    %0 = linalg.{}{} ins({} : {}) outs({} : {}) -> {}\n    return %0 : {}\n  }}\n}}\n",
+                    stringify!($test_name),
+                    function_arguments,
+                    result_type,
+                    $operation_name,
+                    $attribute_text,
+                    input_names,
+                    input_types,
+                    output_names,
+                    output_types,
+                    result_type,
+                    result_type,
+                );
+                assert_eq!(module.to_string(), expected);
+            }
+        };
+    }
+
+    macro_rules! linalg_strided_named_structured_operation_test {
+        (
+            $test_name:ident,
+            $constructor:ident,
+            $operation_name:literal,
+            spatial_rank = $spatial_rank:literal,
+            [$($argument_kind:ident($($argument_args:tt)*)),+ $(,)?],
+            inputs = [$($input_index:expr),* $(,)?],
+            outputs = [$($output_index:expr),* $(,)?]
+        ) => {
+            #[test]
+            fn $test_name() {
+                let context = Context::new();
+                let location = context.unknown_location();
+                let module = context.module(location);
+                let argument_types = vec![$(linalg_test_type!(context, location, $argument_kind($($argument_args)*))),+];
+                let block_arguments = argument_types
+                    .iter()
+                    .map(|r#type| (*r#type, location))
+                    .collect::<Vec<_>>();
+                module.body().append_operation({
+                    let mut block = context.block(&block_arguments);
+                    let values = (0..argument_types.len())
+                        .map(|index| block.argument(index).unwrap().as_ref())
+                        .collect::<Vec<_>>();
+                    let input_indices = vec![$($input_index),*];
+                    let output_indices = vec![$($output_index),*];
+                    let inputs = input_indices.iter().map(|index| values[*index]).collect::<Vec<_>>();
+                    let outputs = output_indices.iter().map(|index| values[*index]).collect::<Vec<_>>();
+                    let result_types = outputs.iter().map(|value| value.r#type()).collect::<Vec<_>>();
+                    let attribute_type = context
+                        .vector_type(
+                            context.signless_integer_type(64),
+                            &[VectorTypeDimension::Fixed($spatial_rank)],
+                            location,
+                        )
+                        .unwrap();
+                    let values = vec![1; $spatial_rank];
+                    let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                    let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                    let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                    let op = $constructor(&inputs, &outputs, &result_types, &attributes, location);
+                    assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
+                    assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
+                    assert_eq!(
+                        unsafe {
+                            LinalgStridedDilatedOperation::strides(&op)
+                                .unwrap()
+                                .i64_elements()
+                                .collect::<Vec<_>>()
+                        },
+                        vec![1; $spatial_rank],
+                    );
+                    assert_eq!(
+                        unsafe {
+                            LinalgStridedDilatedOperation::dilations(&op)
+                                .unwrap()
+                                .i64_elements()
+                                .collect::<Vec<_>>()
+                        },
+                        vec![1; $spatial_rank],
+                    );
+                    assert_eq!(op.operands().count(), inputs.len() + outputs.len());
+                    assert_eq!(op.results().count(), result_types.len());
+                    let op = block.append_operation(op);
+                    block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+                    func::func(
+                        concat!(stringify!($test_name), "_func"),
+                        func::FuncAttributes {
+                            arguments: argument_types.iter().map(|r#type| (*r#type).into()).collect(),
+                            results: result_types.iter().map(|r#type| (*r#type).into()).collect(),
+                            ..Default::default()
+                        },
+                        block.into(),
+                        location,
+                    )
+                });
+                assert!(module.verify());
+
+                let function_arguments = argument_types
+                    .iter()
+                    .enumerate()
+                    .map(|(index, r#type)| format!("%arg{index}: {type}", type = r#type))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let input_names = vec![$($input_index),*]
+                    .iter()
+                    .map(|index| format!("%arg{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let input_types = vec![$($input_index),*]
+                    .iter()
+                    .map(|index| argument_types[*index].to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let output_names = vec![$($output_index),*]
+                    .iter()
+                    .map(|index| format!("%arg{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let output_types = vec![$($output_index),*]
+                    .iter()
+                    .map(|index| argument_types[*index].to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let result_type = output_types.clone();
+                let attribute_text = format!(
+                    " {{dilations = dense<1> : vector<{}xi64>, strides = dense<1> : vector<{}xi64>}}",
+                    $spatial_rank, $spatial_rank,
+                );
+                let expected = format!(
+                    "module {{\n  func.func @{}_func({}) -> {} {{\n    %0 = linalg.{}{} ins({} : {}) outs({} : {}) -> {}\n    return %0 : {}\n  }}\n}}\n",
+                    stringify!($test_name),
+                    function_arguments,
+                    result_type,
+                    $operation_name,
+                    attribute_text,
+                    input_names,
+                    input_types,
+                    output_names,
+                    output_types,
+                    result_type,
+                    result_type,
+                );
+                assert_eq!(module.to_string(), expected);
+            }
+        };
+    }
+
     #[test]
-    fn test_linalg_add_operation() {
+    fn test_yield() {
         let context = Context::new();
         let location = context.unknown_location();
         let module = context.module(location);
-        let tensor_type = context.tensor_type(context.float32_type(), &[Size::Static(3)], None, location).unwrap();
+        let f32_type = context.float32_type();
+        let tensor_type = context.tensor_type(f32_type, &[Size::Dynamic], None, location).unwrap();
+        let indexing_map = context.affine_map_attribute(context.identity_affine_map(1));
+        let indexing_maps = context.array_attribute(&[indexing_map]);
+        let iterator_type = context.linalg_iterator_type_attribute(IteratorType::Parallel);
+        let iterator_types = context.array_attribute(&[iterator_type]);
+        module.body().append_operation({
+            let mut block = context.block(&[(tensor_type, location)]);
+            let output = block.argument(0).unwrap().as_ref();
+            let mut region = context.region();
+            let mut body = context.block(&[(f32_type, location)]);
+            let value = body.argument(0).unwrap().as_ref();
+            let yield_op = r#yield(&[value], location);
+            assert_eq!(yield_op.values(), vec![value]);
+            body.append_operation(yield_op);
+            region.append_block(body);
+            let result_types = [tensor_type.as_ref()];
+            let op = generic(
+                &[],
+                &[output],
+                &result_types,
+                indexing_maps,
+                iterator_types,
+                None,
+                None,
+                region,
+                &[],
+                location,
+            );
+            assert_eq!(op.outputs(), vec![output]);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "yield_test",
+                func::FuncAttributes {
+                    arguments: vec![tensor_type.into()],
+                    results: vec![tensor_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                #map = affine_map<(d0) -> (d0)>
+                module {
+                  func.func @yield_test(%arg0: tensor<?xf32>) -> tensor<?xf32> {
+                    %0 = linalg.generic {indexing_maps = [#map], iterator_types = [\"parallel\"]} outs(%arg0 : tensor<?xf32>) {
+                    ^bb0(%out: f32):
+                      linalg.yield %out : f32
+                    } -> tensor<?xf32>
+                    return %0 : tensor<?xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_index() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let index_type = context.index_type();
+        let tensor_type = context.tensor_type(index_type, &[Size::Dynamic], None, location).unwrap();
+        let indexing_map = context.affine_map_attribute(context.identity_affine_map(1));
+        let indexing_maps = context.array_attribute(&[indexing_map]);
+        let iterator_type = context.linalg_iterator_type_attribute(IteratorType::Parallel);
+        let iterator_types = context.array_attribute(&[iterator_type]);
+        module.body().append_operation({
+            let mut block = context.block(&[(tensor_type, location)]);
+            let output = block.argument(0).unwrap().as_ref();
+            let mut region = context.region();
+            let mut body = context.block(&[(index_type, location)]);
+            let op = index(0, location);
+            assert_eq!(op.dimension(), 0);
+            assert_eq!(op.result(0).unwrap().r#type(), index_type.as_ref());
+            let op = body.append_operation(op);
+            body.append_operation(r#yield(&[op.result(0).unwrap().as_ref()], location));
+            region.append_block(body);
+            let result_types = [tensor_type.as_ref()];
+            let op = generic(
+                &[],
+                &[output],
+                &result_types,
+                indexing_maps,
+                iterator_types,
+                None,
+                None,
+                region,
+                &[],
+                location,
+            );
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "index_test",
+                func::FuncAttributes {
+                    arguments: vec![tensor_type.into()],
+                    results: vec![tensor_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                #map = affine_map<(d0) -> (d0)>
+                module {
+                  func.func @index_test(%arg0: tensor<?xindex>) -> tensor<?xindex> {
+                    %0 = linalg.generic {indexing_maps = [#map], iterator_types = [\"parallel\"]} outs(%arg0 : tensor<?xindex>) {
+                    ^bb0(%out: index):
+                      %1 = linalg.index 0 : index
+                      linalg.yield %1 : index
+                    } -> tensor<?xindex>
+                    return %0 : tensor<?xindex>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_generic() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        let tensor_type = context.tensor_type(f32_type, &[Size::Dynamic], None, location).unwrap();
+        let indexing_map = context.affine_map_attribute(context.identity_affine_map(1));
+        let indexing_maps = context.array_attribute(&[indexing_map, indexing_map]);
+        let iterator_type = context.linalg_iterator_type_attribute(IteratorType::Parallel);
+        let iterator_types = context.array_attribute(&[iterator_type]);
+        let doc = context.string_attribute("generic test");
+        let library_call = context.string_attribute("linalg_generic_test");
+        module.body().append_operation({
+            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+            let input = block.argument(0).unwrap().as_ref();
+            let output = block.argument(1).unwrap().as_ref();
+            let mut region = context.region();
+            let mut body = context.block(&[(f32_type, location), (f32_type, location)]);
+            let value = body.argument(0).unwrap().as_ref();
+            body.append_operation(r#yield(&[value], location));
+            region.append_block(body);
+            let result_types = [tensor_type.as_ref()];
+            let op = generic(
+                &[input],
+                &[output],
+                &result_types,
+                indexing_maps,
+                iterator_types,
+                Some(doc),
+                Some(library_call),
+                region,
+                &[],
+                location,
+            );
+            assert_eq!(op.inputs(), vec![input]);
+            assert_eq!(op.outputs(), vec![output]);
+            assert_eq!(op.indexing_maps(), indexing_maps);
+            assert_eq!(op.iterator_types(), iterator_types);
+            assert_eq!(op.doc(), Some(doc));
+            assert_eq!(op.library_call(), Some(library_call));
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "generic_test",
+                func::FuncAttributes {
+                    arguments: vec![tensor_type.into(), tensor_type.into()],
+                    results: vec![tensor_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                #map = affine_map<(d0) -> (d0)>
+                module {
+                  func.func @generic_test(%arg0: tensor<?xf32>, %arg1: tensor<?xf32>) -> tensor<?xf32> {
+                    %0 = linalg.generic {doc = \"generic test\", indexing_maps = [#map, #map], iterator_types = [\"parallel\"], library_call = \"linalg_generic_test\"} ins(%arg0 : tensor<?xf32>) outs(%arg1 : tensor<?xf32>) {
+                    ^bb0(%in: f32, %out: f32):
+                      linalg.yield %in : f32
+                    } -> tensor<?xf32>
+                    return %0 : tensor<?xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_map() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        let tensor_type = context.tensor_type(f32_type, &[Size::Dynamic], None, location).unwrap();
         module.body().append_operation({
             let mut block = context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
             let lhs = block.argument(0).unwrap().as_ref();
             let rhs = block.argument(1).unwrap().as_ref();
-            let output = block.argument(2).unwrap().as_ref();
+            let init = block.argument(2).unwrap().as_ref();
+            let mut region = context.region();
+            let mut body = context.block(&[(f32_type, location), (f32_type, location), (f32_type, location)]);
+            let lhs_element = body.argument(0).unwrap().as_ref();
+            body.append_operation(r#yield(&[lhs_element], location));
+            region.append_block(body);
             let result_types = [tensor_type.as_ref()];
-            let op = add(&[lhs, rhs], &[output], &result_types, &[], location);
+            let op = map(&[lhs, rhs], init, &result_types, region, &[], location);
             assert_eq!(op.inputs(), vec![lhs, rhs]);
-            assert_eq!(op.outputs(), vec![output]);
-            assert_eq!(op.result_tensors()[0].r#type(), tensor_type.as_ref());
+            assert_eq!(op.init(), init);
+            assert_eq!(op.result(0).unwrap().r#type(), tensor_type.as_ref());
             assert_eq!(op.operands().count(), 3);
             assert_eq!(op.results().count(), 1);
             let op = block.append_operation(op);
             block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
             func::func(
-                "linalg_add_test",
+                "map_test",
                 func::FuncAttributes {
                     arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
                     results: vec![tensor_type.into()],
@@ -3755,9 +4270,12 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @linalg_add_test(%arg0: tensor<3xf32>, %arg1: tensor<3xf32>, %arg2: tensor<3xf32>) -> tensor<3xf32> {
-                    %0 = linalg.add ins(%arg0, %arg1 : tensor<3xf32>, tensor<3xf32>) outs(%arg2 : tensor<3xf32>) -> tensor<3xf32>
-                    return %0 : tensor<3xf32>
+                  func.func @map_test(%arg0: tensor<?xf32>, %arg1: tensor<?xf32>, %arg2: tensor<?xf32>) -> tensor<?xf32> {
+                    %mapped = linalg.map ins(%arg0, %arg1 : tensor<?xf32>, tensor<?xf32>) outs(%arg2 : tensor<?xf32>)
+                      (%in: f32, %in_0: f32, %init: f32) {
+                        linalg.yield %in : f32
+                      }
+                    return %mapped : tensor<?xf32>
                   }
                 }
             "},
@@ -3765,26 +4283,450 @@ mod tests {
     }
 
     #[test]
-    fn test_linalg_copy_operation_cast_attribute() {
+    fn test_reduce() {
         let context = Context::new();
         let location = context.unknown_location();
         let module = context.module(location);
-        let tensor_type = context.tensor_type(context.float32_type(), &[Size::Static(3)], None, location).unwrap();
+        let f32_type = context.float32_type();
+        let input_type = context.tensor_type(f32_type, &[Size::Dynamic, Size::Dynamic], None, location).unwrap();
+        let output_type = context.tensor_type(f32_type, &[Size::Dynamic], None, location).unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(input_type, location), (output_type, location)]);
+            let input = block.argument(0).unwrap().as_ref();
+            let init = block.argument(1).unwrap().as_ref();
+            let mut region = context.region();
+            let mut body = context.block(&[(f32_type, location), (f32_type, location)]);
+            let input_element = body.argument(0).unwrap().as_ref();
+            body.append_operation(r#yield(&[input_element], location));
+            region.append_block(body);
+            let result_types = [output_type.as_ref()];
+            let op = reduce(&[input], &[init], &result_types, &[1], region, &[], location);
+            assert_eq!(op.inputs(), vec![input]);
+            assert_eq!(op.inits(), vec![init]);
+            assert_eq!(op.dimensions().values().collect::<Vec<_>>(), vec![1]);
+            assert_eq!(op.result(0).unwrap().r#type(), output_type.as_ref());
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "reduce_test",
+                func::FuncAttributes {
+                    arguments: vec![input_type.into(), output_type.into()],
+                    results: vec![output_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            concat!(
+                "module {\n",
+                "  func.func @reduce_test(%arg0: tensor<?x?xf32>, %arg1: tensor<?xf32>) -> tensor<?xf32> {\n",
+                "    %reduced = linalg.reduce ins(%arg0 : tensor<?x?xf32>) outs(%arg1 : tensor<?xf32>) ",
+                "dimensions = [1] \n",
+                "      (%in: f32, %init: f32) {\n",
+                "        linalg.yield %in : f32\n",
+                "      }\n",
+                "    return %reduced : tensor<?xf32>\n",
+                "  }\n",
+                "}\n",
+            ),
+        );
+    }
+
+    #[test]
+    fn test_transpose() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let tensor_type = context
+            .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
+            .unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+            let input = block.argument(0).unwrap().as_ref();
+            let init = block.argument(1).unwrap().as_ref();
+            let result_types = [tensor_type.as_ref()];
+            let op = transpose(input, init, &result_types, &[1, 0], &[], location);
+            assert_eq!(op.input(), input);
+            assert_eq!(op.init(), init);
+            assert_eq!(op.permutation().values().collect::<Vec<_>>(), vec![1, 0]);
+            assert_eq!(op.result(0).unwrap().r#type(), tensor_type.as_ref());
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "transpose_test",
+                func::FuncAttributes {
+                    arguments: vec![tensor_type.into(), tensor_type.into()],
+                    results: vec![tensor_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            concat!(
+                "module {\n",
+                "  func.func @transpose_test(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>) -> ",
+                "tensor<?x?xf32> {\n",
+                "    %transposed = linalg.transpose ins(%arg0 : tensor<?x?xf32>) outs(%arg1 : ",
+                "tensor<?x?xf32>) permutation = [1, 0] \n",
+                "    return %transposed : tensor<?x?xf32>\n",
+                "  }\n",
+                "}\n",
+            ),
+        );
+    }
+
+    #[test]
+    fn test_broadcast() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        let input_type = context.tensor_type(f32_type, &[Size::Dynamic], None, location).unwrap();
+        let output_type = context.tensor_type(f32_type, &[Size::Dynamic, Size::Dynamic], None, location).unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(input_type, location), (output_type, location)]);
+            let input = block.argument(0).unwrap().as_ref();
+            let init = block.argument(1).unwrap().as_ref();
+            let result_types = [output_type.as_ref()];
+            let op = broadcast(input, init, &result_types, &[1], &[], location);
+            assert_eq!(op.input(), input);
+            assert_eq!(op.init(), init);
+            assert_eq!(op.dimensions().values().collect::<Vec<_>>(), vec![1]);
+            assert_eq!(op.result(0).unwrap().r#type(), output_type.as_ref());
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "broadcast_test",
+                func::FuncAttributes {
+                    arguments: vec![input_type.into(), output_type.into()],
+                    results: vec![output_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            concat!(
+                "module {\n",
+                "  func.func @broadcast_test(%arg0: tensor<?xf32>, %arg1: tensor<?x?xf32>) -> ",
+                "tensor<?x?xf32> {\n",
+                "    %broadcasted = linalg.broadcast ins(%arg0 : tensor<?xf32>) outs(%arg1 : ",
+                "tensor<?x?xf32>) dimensions = [1] \n",
+                "    return %broadcasted : tensor<?x?xf32>\n",
+                "  }\n",
+                "}\n",
+            ),
+        );
+    }
+
+    #[test]
+    fn test_elementwise() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let tensor_type = context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
+            let lhs = block.argument(0).unwrap().as_ref();
+            let rhs = block.argument(1).unwrap().as_ref();
+            let output = block.argument(2).unwrap().as_ref();
+            let inputs = [lhs, rhs];
+            let outputs = [output];
+            let result_types = [tensor_type.as_ref()];
+            let op = elementwise(&inputs, &outputs, &result_types, ElementwiseKind::Add, None, &[], location);
+            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
+            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
+            assert_eq!(op.kind(), ElementwiseKind::Add);
+            assert_eq!(op.indexing_maps().unwrap().len(), 3);
+            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), tensor_type.as_ref());
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "elementwise_test",
+                func::FuncAttributes {
+                    arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
+                    results: vec![tensor_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @elementwise_test(%arg0: tensor<?xf32>, %arg1: tensor<?xf32>, %arg2: tensor<?xf32>) -> tensor<?xf32> {
+                    %0 = linalg.elementwise kind=#linalg.elementwise_kind<add> ins(%arg0, %arg1 : tensor<?xf32>, tensor<?xf32>) outs(%arg2 : tensor<?xf32>) -> tensor<?xf32>
+                    return %0 : tensor<?xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_matmul() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let tensor_type = context
+            .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
+            .unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
+            let lhs = block.argument(0).unwrap().as_ref();
+            let rhs = block.argument(1).unwrap().as_ref();
+            let output = block.argument(2).unwrap().as_ref();
+            let inputs = [lhs, rhs];
+            let outputs = [output];
+            let result_types = [tensor_type.as_ref()];
+            let op = matmul(&inputs, &outputs, &result_types, &[], location);
+            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), vec![lhs, rhs]);
+            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), vec![output]);
+            assert_eq!(LinalgCoreStructuredOperation::indexing_maps(&op), None);
+            assert_eq!(LinalgCastedOperation::cast(&op), TypeFn::CastSigned);
+            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), tensor_type.as_ref());
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "matmul_test",
+                func::FuncAttributes {
+                    arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
+                    results: vec![tensor_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @matmul_test(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>, %arg2: tensor<?x?xf32>) -> tensor<?x?xf32> {
+                    %0 = linalg.matmul ins(%arg0, %arg1 : tensor<?x?xf32>, tensor<?x?xf32>) outs(%arg2 : tensor<?x?xf32>) -> tensor<?x?xf32>
+                    return %0 : tensor<?x?xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_contract() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let tensor_type = context
+            .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
+            .unwrap();
+        let indexing_maps = context
+            .parse_attribute(
+                "[affine_map<(d0, d1, d2) -> (d0, d2)>, affine_map<(d0, d1, d2) -> (d2, d1)>, affine_map<(d0, d1, d2) -> (d0, d1)>]",
+            )
+            .unwrap()
+            .cast::<ArrayAttributeRef>()
+            .unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
+            let lhs = block.argument(0).unwrap().as_ref();
+            let rhs = block.argument(1).unwrap().as_ref();
+            let output = block.argument(2).unwrap().as_ref();
+            let inputs = [lhs, rhs];
+            let outputs = [output];
+            let result_types = [tensor_type.as_ref()];
+            let attributes = [(INDEXING_MAPS_ATTRIBUTE, indexing_maps.as_ref())];
+            let op = contract(&inputs, &outputs, &result_types, &attributes, location);
+            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), vec![lhs, rhs]);
+            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), vec![output]);
+            assert_eq!(LinalgCoreStructuredOperation::indexing_maps(&op), Some(indexing_maps));
+            assert_eq!(LinalgCastedOperation::cast(&op), TypeFn::CastSigned);
+            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), tensor_type.as_ref());
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "contract_test",
+                func::FuncAttributes {
+                    arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
+                    results: vec![tensor_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                #map = affine_map<(d0, d1, d2) -> (d0, d2)>
+                #map1 = affine_map<(d0, d1, d2) -> (d2, d1)>
+                #map2 = affine_map<(d0, d1, d2) -> (d0, d1)>
+                module {
+                  func.func @contract_test(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>, %arg2: tensor<?x?xf32>) -> tensor<?x?xf32> {
+                    %0 = linalg.contract indexing_maps = [#map, #map1, #map2] ins(%arg0, %arg1 : tensor<?x?xf32>, tensor<?x?xf32>) outs(%arg2 : tensor<?x?xf32>) -> tensor<?x?xf32>
+                    return %0 : tensor<?x?xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_batch_matmul() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let tensor_type = context
+            .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
+            .unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
+            let lhs = block.argument(0).unwrap().as_ref();
+            let rhs = block.argument(1).unwrap().as_ref();
+            let output = block.argument(2).unwrap().as_ref();
+            let inputs = [lhs, rhs];
+            let outputs = [output];
+            let result_types = [tensor_type.as_ref()];
+            let op = batch_matmul(&inputs, &outputs, &result_types, &[], location);
+            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), vec![lhs, rhs]);
+            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), vec![output]);
+            assert_eq!(LinalgCoreStructuredOperation::indexing_maps(&op), None);
+            assert_eq!(LinalgCastedOperation::cast(&op), TypeFn::CastSigned);
+            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), tensor_type.as_ref());
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "batch_matmul_test",
+                func::FuncAttributes {
+                    arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
+                    results: vec![tensor_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @batch_matmul_test(%arg0: tensor<?x?x?xf32>, %arg1: tensor<?x?x?xf32>, %arg2: tensor<?x?x?xf32>) -> tensor<?x?x?xf32> {
+                    %0 = linalg.batch_matmul ins(%arg0, %arg1 : tensor<?x?x?xf32>, tensor<?x?x?xf32>) outs(%arg2 : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+                    return %0 : tensor<?x?x?xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_batch_reduce_matmul() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let input_type = context
+            .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
+            .unwrap();
+        let output_type = context
+            .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
+            .unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(input_type, location), (input_type, location), (output_type, location)]);
+            let lhs = block.argument(0).unwrap().as_ref();
+            let rhs = block.argument(1).unwrap().as_ref();
+            let output = block.argument(2).unwrap().as_ref();
+            let inputs = [lhs, rhs];
+            let outputs = [output];
+            let result_types = [output_type.as_ref()];
+            let op = batch_reduce_matmul(&inputs, &outputs, &result_types, &[], location);
+            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), vec![lhs, rhs]);
+            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), vec![output]);
+            assert_eq!(LinalgCoreStructuredOperation::indexing_maps(&op), None);
+            assert_eq!(LinalgCastedOperation::cast(&op), TypeFn::CastSigned);
+            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), output_type.as_ref());
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "batch_reduce_matmul_test",
+                func::FuncAttributes {
+                    arguments: vec![input_type.into(), input_type.into(), output_type.into()],
+                    results: vec![output_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @batch_reduce_matmul_test(%arg0: tensor<?x?x?xf32>, %arg1: tensor<?x?x?xf32>, %arg2: tensor<?x?xf32>) -> tensor<?x?xf32> {
+                    %0 = linalg.batch_reduce_matmul ins(%arg0, %arg1 : tensor<?x?x?xf32>, tensor<?x?x?xf32>) outs(%arg2 : tensor<?x?xf32>) -> tensor<?x?xf32>
+                    return %0 : tensor<?x?xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_softmax() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let tensor_type = context
+            .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
+            .unwrap();
         module.body().append_operation({
             let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
             let input = block.argument(0).unwrap().as_ref();
             let output = block.argument(1).unwrap().as_ref();
             let result_types = [tensor_type.as_ref()];
-            let cast = context.linalg_type_fn_attribute(TypeFn::CastUnsigned);
-            let attributes = [(CAST_ATTRIBUTE, cast.as_ref())];
-            let op = copy(&[input], &[output], &result_types, &attributes, location);
-            assert_eq!(LinalgCastedOperation::cast(&op), TypeFn::CastUnsigned);
-            assert_eq!(op.inputs(), vec![input]);
-            assert_eq!(op.outputs(), vec![output]);
+            let op = softmax(input, output, &result_types, 1, location);
+            assert_eq!(op.input(), input);
+            assert_eq!(op.output_operand(), output);
+            assert_eq!(op.dimension(), 1);
+            assert_eq!(op.result(0).unwrap().r#type(), tensor_type.as_ref());
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
             let op = block.append_operation(op);
             block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
             func::func(
-                "linalg_copy_test",
+                "softmax_test",
                 func::FuncAttributes {
                     arguments: vec![tensor_type.into(), tensor_type.into()],
                     results: vec![tensor_type.into()],
@@ -3799,9 +4741,9 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @linalg_copy_test(%arg0: tensor<3xf32>, %arg1: tensor<3xf32>) -> tensor<3xf32> {
-                    %0 = linalg.copy {cast = #linalg.type_fn<cast_unsigned>} ins(%arg0 : tensor<3xf32>) outs(%arg1 : tensor<3xf32>) -> tensor<3xf32>
-                    return %0 : tensor<3xf32>
+                  func.func @softmax_test(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>) -> tensor<?x?xf32> {
+                    %0 = linalg.softmax dimension(1) ins(%arg0 : tensor<?x?xf32>) outs(%arg1 : tensor<?x?xf32>) -> tensor<?x?xf32>
+                    return %0 : tensor<?x?xf32>
                   }
                 }
             "},
@@ -3809,46 +4751,44 @@ mod tests {
     }
 
     #[test]
-    fn test_linalg_conv_1d_nwc_wcf_operation_stride_and_dilation_attributes() {
+    fn test_winograd_filter_transform() {
         let context = Context::new();
         let location = context.unknown_location();
         let module = context.module(location);
-        let input_type = context
-            .tensor_type(context.float32_type(), &[Size::Static(1), Size::Static(9), Size::Static(2)], None, location)
-            .unwrap();
         let filter_type = context
-            .tensor_type(context.float32_type(), &[Size::Static(3), Size::Static(2), Size::Static(4)], None, location)
+            .tensor_type(
+                context.float32_type(),
+                &[Size::Dynamic, Size::Static(3), Size::Static(3), Size::Dynamic],
+                None,
+                location,
+            )
             .unwrap();
         let output_type = context
-            .tensor_type(context.float32_type(), &[Size::Static(1), Size::Static(4), Size::Static(4)], None, location)
+            .tensor_type(
+                context.float32_type(),
+                &[Size::Static(4), Size::Static(4), Size::Dynamic, Size::Dynamic],
+                None,
+                location,
+            )
             .unwrap();
         module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (filter_type, location), (output_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let filter = block.argument(1).unwrap().as_ref();
-            let output = block.argument(2).unwrap().as_ref();
+            let mut block = context.block(&[(filter_type, location), (output_type, location)]);
+            let filter = block.argument(0).unwrap().as_ref();
+            let output = block.argument(1).unwrap().as_ref();
             let result_types = [output_type.as_ref()];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let strides = context.dense_i64_elements_attribute(attribute_type, &[2]).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &[1]).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_1d_nwc_wcf(&[input, filter], &[output], &result_types, &attributes, location);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1],
-            );
+            let op = winograd_filter_transform(filter, output, &result_types, WinogradConv2DFmr::F2R3, location);
+            assert_eq!(op.filter(), filter);
+            assert_eq!(op.output_operand(), output);
+            assert_eq!(op.fmr(), WinogradConv2DFmr::F2R3);
+            assert_eq!(op.result(0).unwrap().r#type(), output_type.as_ref());
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
             let op = block.append_operation(op);
             block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
             func::func(
-                "linalg_conv_1d_nwc_wcf_test",
+                "winograd_filter_transform_test",
                 func::FuncAttributes {
-                    arguments: vec![input_type.into(), filter_type.into(), output_type.into()],
+                    arguments: vec![filter_type.into(), output_type.into()],
                     results: vec![output_type.into()],
                     ..Default::default()
                 },
@@ -3861,12 +4801,1062 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @linalg_conv_1d_nwc_wcf_test(%arg0: tensor<1x9x2xf32>, %arg1: tensor<3x2x4xf32>, %arg2: tensor<1x4x4xf32>) -> tensor<1x4x4xf32> {
-                    %0 = linalg.conv_1d_nwc_wcf {dilations = dense<1> : vector<1xi64>, strides = dense<2> : vector<1xi64>} ins(%arg0, %arg1 : tensor<1x9x2xf32>, tensor<3x2x4xf32>) outs(%arg2 : tensor<1x4x4xf32>) -> tensor<1x4x4xf32>
-                    return %0 : tensor<1x4x4xf32>
+                  func.func @winograd_filter_transform_test(%arg0: tensor<?x3x3x?xf32>, %arg1: tensor<4x4x?x?xf32>) -> tensor<4x4x?x?xf32> {
+                    %0 = linalg.winograd_filter_transform fmr(F_2_3) ins(%arg0 : tensor<?x3x3x?xf32>) outs(%arg1 : tensor<4x4x?x?xf32>) -> tensor<4x4x?x?xf32>
+                    return %0 : tensor<4x4x?x?xf32>
                   }
                 }
             "},
         );
     }
+
+    #[test]
+    fn test_winograd_input_transform() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let input_type = context
+            .tensor_type(
+                context.float32_type(),
+                &[Size::Dynamic, Size::Dynamic, Size::Dynamic, Size::Dynamic],
+                None,
+                location,
+            )
+            .unwrap();
+        let output_type = context
+            .tensor_type(
+                context.float32_type(),
+                &[Size::Dynamic, Size::Dynamic, Size::Dynamic, Size::Dynamic, Size::Dynamic, Size::Dynamic],
+                None,
+                location,
+            )
+            .unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(input_type, location), (output_type, location)]);
+            let input = block.argument(0).unwrap().as_ref();
+            let output = block.argument(1).unwrap().as_ref();
+            let result_types = [output_type.as_ref()];
+            let op = winograd_input_transform(input, output, &result_types, WinogradConv2DFmr::F2R3, location);
+            assert_eq!(op.input(), input);
+            assert_eq!(op.output_operand(), output);
+            assert_eq!(op.fmr(), WinogradConv2DFmr::F2R3);
+            assert_eq!(op.result(0).unwrap().r#type(), output_type.as_ref());
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "winograd_input_transform_test",
+                func::FuncAttributes {
+                    arguments: vec![input_type.into(), output_type.into()],
+                    results: vec![output_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @winograd_input_transform_test(%arg0: tensor<?x?x?x?xf32>, %arg1: tensor<?x?x?x?x?x?xf32>) -> tensor<?x?x?x?x?x?xf32> {
+                    %0 = linalg.winograd_input_transform fmr(F_2_3) ins(%arg0 : tensor<?x?x?x?xf32>) outs(%arg1 : tensor<?x?x?x?x?x?xf32>) -> tensor<?x?x?x?x?x?xf32>
+                    return %0 : tensor<?x?x?x?x?x?xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_winograd_output_transform() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let value_type = context
+            .tensor_type(
+                context.float32_type(),
+                &[Size::Dynamic, Size::Dynamic, Size::Dynamic, Size::Dynamic, Size::Dynamic, Size::Dynamic],
+                None,
+                location,
+            )
+            .unwrap();
+        let output_type = context
+            .tensor_type(
+                context.float32_type(),
+                &[Size::Dynamic, Size::Dynamic, Size::Dynamic, Size::Dynamic],
+                None,
+                location,
+            )
+            .unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(value_type, location), (output_type, location)]);
+            let value = block.argument(0).unwrap().as_ref();
+            let output = block.argument(1).unwrap().as_ref();
+            let result_types = [output_type.as_ref()];
+            let op = winograd_output_transform(value, output, &result_types, WinogradConv2DFmr::F2R3, location);
+            assert_eq!(op.value(), value);
+            assert_eq!(op.output_operand(), output);
+            assert_eq!(op.fmr(), WinogradConv2DFmr::F2R3);
+            assert_eq!(op.result(0).unwrap().r#type(), output_type.as_ref());
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "winograd_output_transform_test",
+                func::FuncAttributes {
+                    arguments: vec![value_type.into(), output_type.into()],
+                    results: vec![output_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @winograd_output_transform_test(%arg0: tensor<?x?x?x?x?x?xf32>, %arg1: tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32> {
+                    %0 = linalg.winograd_output_transform fmr(F_2_3) ins(%arg0 : tensor<?x?x?x?x?x?xf32>) outs(%arg1 : tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+                    return %0 : tensor<?x?x?x?xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_pack() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let source_type = context
+            .tensor_type(context.float32_type(), &[Size::Static(8), Size::Static(16)], None, location)
+            .unwrap();
+        let destination_type = context
+            .tensor_type(
+                context.float32_type(),
+                &[Size::Static(2), Size::Static(2), Size::Static(4), Size::Static(8)],
+                None,
+                location,
+            )
+            .unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(source_type, location), (destination_type, location)]);
+            let source = block.argument(0).unwrap().as_ref();
+            let destination = block.argument(1).unwrap().as_ref();
+            let result_types = [destination_type.as_ref()];
+            let op = pack(source, destination, None, &[], &result_types, &[], &[0, 1], &[4, 8], location);
+            assert_eq!(op.source(), source);
+            assert_eq!(op.destination(), destination);
+            assert_eq!(op.padding_value(), None);
+            assert!(op.inner_tiles().is_empty());
+            assert_eq!(op.outer_dims_perm().values().collect::<Vec<_>>(), Vec::<i64>::new());
+            assert_eq!(op.inner_dims_pos().values().collect::<Vec<_>>(), vec![0, 1]);
+            assert_eq!(op.static_inner_tiles().values().collect::<Vec<_>>(), vec![4, 8]);
+            assert_eq!(op.result(0).unwrap().r#type(), destination_type.as_ref());
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "pack_test",
+                func::FuncAttributes {
+                    arguments: vec![source_type.into(), destination_type.into()],
+                    results: vec![destination_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @pack_test(%arg0: tensor<8x16xf32>, %arg1: tensor<2x2x4x8xf32>) -> tensor<2x2x4x8xf32> {
+                    %pack = linalg.pack %arg0 inner_dims_pos = [0, 1] inner_tiles = [4, 8] into %arg1 : tensor<8x16xf32> -> tensor<2x2x4x8xf32>
+                    return %pack : tensor<2x2x4x8xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_unpack() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let source_type = context
+            .tensor_type(
+                context.float32_type(),
+                &[Size::Static(2), Size::Static(2), Size::Static(4), Size::Static(8)],
+                None,
+                location,
+            )
+            .unwrap();
+        let destination_type = context
+            .tensor_type(context.float32_type(), &[Size::Static(8), Size::Static(16)], None, location)
+            .unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(source_type, location), (destination_type, location)]);
+            let source = block.argument(0).unwrap().as_ref();
+            let destination = block.argument(1).unwrap().as_ref();
+            let result_types = [destination_type.as_ref()];
+            let op = unpack(source, destination, &[], &result_types, &[], &[0, 1], &[4, 8], location);
+            assert_eq!(op.source(), source);
+            assert_eq!(op.destination(), destination);
+            assert!(op.inner_tiles().is_empty());
+            assert_eq!(op.outer_dims_perm().values().collect::<Vec<_>>(), Vec::<i64>::new());
+            assert_eq!(op.inner_dims_pos().values().collect::<Vec<_>>(), vec![0, 1]);
+            assert_eq!(op.static_inner_tiles().values().collect::<Vec<_>>(), vec![4, 8]);
+            assert_eq!(op.result(0).unwrap().r#type(), destination_type.as_ref());
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "unpack_test",
+                func::FuncAttributes {
+                    arguments: vec![source_type.into(), destination_type.into()],
+                    results: vec![destination_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @unpack_test(%arg0: tensor<2x2x4x8xf32>, %arg1: tensor<8x16xf32>) -> tensor<8x16xf32> {
+                    %unpack = linalg.unpack %arg0 inner_dims_pos = [0, 1] inner_tiles = [4, 8] into %arg1 : tensor<2x2x4x8xf32> -> tensor<8x16xf32>
+                    return %unpack : tensor<8x16xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_copy() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let tensor_type = context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap();
+        let cast = context.linalg_type_fn_attribute(TypeFn::CastUnsigned);
+        module.body().append_operation({
+            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+            let input = block.argument(0).unwrap().as_ref();
+            let output = block.argument(1).unwrap().as_ref();
+            let inputs = [input];
+            let outputs = [output];
+            let result_types = [tensor_type.as_ref()];
+            let attributes = [(CAST_ATTRIBUTE, cast.as_ref())];
+            let op = copy(&inputs, &outputs, &result_types, &attributes, location);
+            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), vec![input]);
+            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), vec![output]);
+            assert_eq!(LinalgCastedOperation::cast(&op), TypeFn::CastUnsigned);
+            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), tensor_type.as_ref());
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "copy_test",
+                func::FuncAttributes {
+                    arguments: vec![tensor_type.into(), tensor_type.into()],
+                    results: vec![tensor_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @copy_test(%arg0: tensor<?xf32>, %arg1: tensor<?xf32>) -> tensor<?xf32> {
+                    %0 = linalg.copy {cast = #linalg.type_fn<cast_unsigned>} ins(%arg0 : tensor<?xf32>) outs(%arg1 : tensor<?xf32>) -> tensor<?xf32>
+                    return %0 : tensor<?xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    linalg_named_structured_operation_test!(
+        test_exp,
+        exp,
+        "exp",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_log,
+        log,
+        "log",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_abs,
+        abs,
+        "abs",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_ceil,
+        ceil,
+        "ceil",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_floor,
+        floor,
+        "floor",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_negf,
+        negf,
+        "negf",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_reciprocal,
+        reciprocal,
+        "reciprocal",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_round,
+        round,
+        "round",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_sqrt,
+        sqrt,
+        "sqrt",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_rsqrt,
+        rsqrt,
+        "rsqrt",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_square,
+        square,
+        "square",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_tanh,
+        tanh,
+        "tanh",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_erf,
+        erf,
+        "erf",
+        [tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_add,
+        add,
+        "add",
+        [tensor(f32, 1), tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_sub,
+        sub,
+        "sub",
+        [tensor(f32, 1), tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_mul,
+        mul,
+        "mul",
+        [tensor(f32, 1), tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_div,
+        div,
+        "div",
+        [tensor(f32, 1), tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_div_unsigned,
+        div_unsigned,
+        "div_unsigned",
+        [tensor(i32, 1), tensor(i32, 1), tensor(i32, 1)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_max,
+        max,
+        "max",
+        [tensor(f32, 1), tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_min,
+        min,
+        "min",
+        [tensor(f32, 1), tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_powf,
+        powf,
+        "powf",
+        [tensor(f32, 1), tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_select,
+        select,
+        "select",
+        [tensor(i1, 1), tensor(f32, 1), tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0, 1, 2],
+        outputs = [3]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_quantized_matmul,
+        quantized_matmul,
+        "quantized_matmul",
+        [tensor(i32, 2), tensor(i32, 2), scalar(i32), scalar(i32), tensor(i32, 2)],
+        inputs = [0, 1, 2, 3],
+        outputs = [4]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_mmt4d,
+        mmt4d,
+        "mmt4d",
+        [tensor(f32, 4), tensor(f32, 4), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_batch_mmt4d,
+        batch_mmt4d,
+        "batch_mmt4d",
+        [tensor(f32, 5), tensor(f32, 5), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_quantized_batch_matmul,
+        quantized_batch_matmul,
+        "quantized_batch_matmul",
+        [tensor(i32, 3), tensor(i32, 3), scalar(i32), scalar(i32), tensor(i32, 3)],
+        inputs = [0, 1, 2, 3],
+        outputs = [4]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_matvec,
+        matvec,
+        "matvec",
+        [tensor(f32, 2), tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_vecmat,
+        vecmat,
+        "vecmat",
+        [tensor(f32, 1), tensor(f32, 2), tensor(f32, 1)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_batch_matvec,
+        batch_matvec,
+        "batch_matvec",
+        [tensor(f32, 3), tensor(f32, 2), tensor(f32, 2)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_batch_vecmat,
+        batch_vecmat,
+        "batch_vecmat",
+        [tensor(f32, 2), tensor(f32, 3), tensor(f32, 2)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_dot,
+        dot,
+        "dot",
+        [tensor(f32, 1), tensor(f32, 1), tensor(f32, 0)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_conv_1d,
+        conv_1d,
+        "conv_1d",
+        [tensor(f32, 1), tensor(f32, 1), tensor(f32, 1)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_conv_2d,
+        conv_2d,
+        "conv_2d",
+        [tensor(f32, 2), tensor(f32, 2), tensor(f32, 2)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_conv_3d,
+        conv_3d,
+        "conv_3d",
+        [tensor(f32, 3), tensor(f32, 3), tensor(f32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_1d_nwc_wcf,
+        conv_1d_nwc_wcf,
+        "conv_1d_nwc_wcf",
+        spatial_rank = 1,
+        [tensor(f32, 3), tensor(f32, 3), tensor(f32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_1d_ncw_fcw,
+        conv_1d_ncw_fcw,
+        "conv_1d_ncw_fcw",
+        spatial_rank = 1,
+        [tensor(f32, 3), tensor(f32, 3), tensor(f32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_2d_nhwc_hwcf,
+        conv_2d_nhwc_hwcf,
+        "conv_2d_nhwc_hwcf",
+        spatial_rank = 2,
+        [tensor(f32, 4), tensor(f32, 4), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_2d_nhwc_fhwc,
+        conv_2d_nhwc_fhwc,
+        "conv_2d_nhwc_fhwc",
+        spatial_rank = 2,
+        [tensor(f32, 4), tensor(f32, 4), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_2d_nhwc_hwcf_q,
+        conv_2d_nhwc_hwcf_q,
+        "conv_2d_nhwc_hwcf_q",
+        spatial_rank = 2,
+        [tensor(i32, 4), tensor(i32, 4), scalar(i32), scalar(i32), tensor(i32, 4)],
+        inputs = [0, 1, 2, 3],
+        outputs = [4]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_2d_nhwc_fhwc_q,
+        conv_2d_nhwc_fhwc_q,
+        "conv_2d_nhwc_fhwc_q",
+        spatial_rank = 2,
+        [tensor(i32, 4), tensor(i32, 4), scalar(i32), scalar(i32), tensor(i32, 4)],
+        inputs = [0, 1, 2, 3],
+        outputs = [4]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_2d_nchw_fchw_q,
+        conv_2d_nchw_fchw_q,
+        "conv_2d_nchw_fchw_q",
+        spatial_rank = 2,
+        [tensor(i32, 4), tensor(i32, 4), scalar(i32), scalar(i32), tensor(i32, 4)],
+        inputs = [0, 1, 2, 3],
+        outputs = [4]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_2d_nchw_fchw,
+        conv_2d_nchw_fchw,
+        "conv_2d_nchw_fchw",
+        spatial_rank = 2,
+        [tensor(f32, 4), tensor(f32, 4), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_2d_ngchw_fgchw,
+        conv_2d_ngchw_fgchw,
+        "conv_2d_ngchw_fgchw",
+        spatial_rank = 2,
+        [tensor(f32, 5), tensor(f32, 5), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_2d_ngchw_gfchw,
+        conv_2d_ngchw_gfchw,
+        "conv_2d_ngchw_gfchw",
+        spatial_rank = 2,
+        [tensor(f32, 5), tensor(f32, 5), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_2d_nhwgc_gfhwc,
+        conv_2d_nhwgc_gfhwc,
+        "conv_2d_nhwgc_gfhwc",
+        spatial_rank = 2,
+        [tensor(f32, 5), tensor(f32, 5), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_2d_nhwgc_gfhwc_q,
+        conv_2d_nhwgc_gfhwc_q,
+        "conv_2d_nhwgc_gfhwc_q",
+        spatial_rank = 2,
+        [tensor(i32, 5), tensor(i32, 5), scalar(i32), scalar(i32), tensor(i32, 5)],
+        inputs = [0, 1, 2, 3],
+        outputs = [4]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_2d_ngchw_gfchw_q,
+        conv_2d_ngchw_gfchw_q,
+        "conv_2d_ngchw_gfchw_q",
+        spatial_rank = 2,
+        [tensor(i32, 5), tensor(i32, 5), scalar(i32), scalar(i32), tensor(i32, 5)],
+        inputs = [0, 1, 2, 3],
+        outputs = [4]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_3d_ndhwc_dhwcf,
+        conv_3d_ndhwc_dhwcf,
+        "conv_3d_ndhwc_dhwcf",
+        spatial_rank = 3,
+        [tensor(f32, 5), tensor(f32, 5), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_3d_ndhwc_dhwcf_q,
+        conv_3d_ndhwc_dhwcf_q,
+        "conv_3d_ndhwc_dhwcf_q",
+        spatial_rank = 3,
+        [tensor(i32, 5), tensor(i32, 5), scalar(i32), scalar(i32), tensor(i32, 5)],
+        inputs = [0, 1, 2, 3],
+        outputs = [4]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_conv_3d_ncdhw_fcdhw,
+        conv_3d_ncdhw_fcdhw,
+        "conv_3d_ncdhw_fcdhw",
+        spatial_rank = 3,
+        [tensor(f32, 5), tensor(f32, 5), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_depthwise_conv_1d_nwc_wc,
+        depthwise_conv_1d_nwc_wc,
+        "depthwise_conv_1d_nwc_wc",
+        spatial_rank = 1,
+        [tensor(f32, 3), tensor(f32, 2), tensor(f32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_depthwise_conv_1d_ncw_cw,
+        depthwise_conv_1d_ncw_cw,
+        "depthwise_conv_1d_ncw_cw",
+        spatial_rank = 1,
+        [tensor(f32, 3), tensor(f32, 2), tensor(f32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_depthwise_conv_1d_nwc_wcm,
+        depthwise_conv_1d_nwc_wcm,
+        "depthwise_conv_1d_nwc_wcm",
+        spatial_rank = 1,
+        [tensor(f32, 3), tensor(f32, 3), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_depthwise_conv_2d_nhwc_hwc,
+        depthwise_conv_2d_nhwc_hwc,
+        "depthwise_conv_2d_nhwc_hwc",
+        spatial_rank = 2,
+        [tensor(f32, 4), tensor(f32, 3), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_depthwise_conv_2d_nchw_chw,
+        depthwise_conv_2d_nchw_chw,
+        "depthwise_conv_2d_nchw_chw",
+        spatial_rank = 2,
+        [tensor(f32, 4), tensor(f32, 3), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_depthwise_conv_2d_nhwc_hwc_q,
+        depthwise_conv_2d_nhwc_hwc_q,
+        "depthwise_conv_2d_nhwc_hwc_q",
+        spatial_rank = 2,
+        [tensor(i32, 4), tensor(i32, 3), scalar(i32), scalar(i32), tensor(i32, 4)],
+        inputs = [0, 1, 2, 3],
+        outputs = [4]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_depthwise_conv_2d_nhwc_hwcm,
+        depthwise_conv_2d_nhwc_hwcm,
+        "depthwise_conv_2d_nhwc_hwcm",
+        spatial_rank = 2,
+        [tensor(f32, 4), tensor(f32, 4), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_depthwise_conv_2d_nhwc_hwcm_q,
+        depthwise_conv_2d_nhwc_hwcm_q,
+        "depthwise_conv_2d_nhwc_hwcm_q",
+        spatial_rank = 2,
+        [tensor(i32, 4), tensor(i32, 4), scalar(i32), scalar(i32), tensor(i32, 5)],
+        inputs = [0, 1, 2, 3],
+        outputs = [4]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_depthwise_conv_3d_ndhwc_dhwc,
+        depthwise_conv_3d_ndhwc_dhwc,
+        "depthwise_conv_3d_ndhwc_dhwc",
+        spatial_rank = 3,
+        [tensor(f32, 5), tensor(f32, 4), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_depthwise_conv_3d_ncdhw_cdhw,
+        depthwise_conv_3d_ncdhw_cdhw,
+        "depthwise_conv_3d_ncdhw_cdhw",
+        spatial_rank = 3,
+        [tensor(f32, 5), tensor(f32, 4), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_depthwise_conv_3d_ndhwc_dhwcm,
+        depthwise_conv_3d_ndhwc_dhwcm,
+        "depthwise_conv_3d_ndhwc_dhwcm",
+        spatial_rank = 3,
+        [tensor(f32, 5), tensor(f32, 5), tensor(f32, 6)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nhwc_sum,
+        pooling_nhwc_sum,
+        "pooling_nhwc_sum",
+        spatial_rank = 2,
+        [tensor(f32, 4), tensor(f32, 2), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nchw_sum,
+        pooling_nchw_sum,
+        "pooling_nchw_sum",
+        spatial_rank = 2,
+        [tensor(f32, 4), tensor(f32, 2), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nhwc_max,
+        pooling_nhwc_max,
+        "pooling_nhwc_max",
+        spatial_rank = 2,
+        [tensor(f32, 4), tensor(f32, 2), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nhwc_max_unsigned,
+        pooling_nhwc_max_unsigned,
+        "pooling_nhwc_max_unsigned",
+        spatial_rank = 2,
+        [tensor(i32, 4), tensor(i32, 2), tensor(i32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nchw_max,
+        pooling_nchw_max,
+        "pooling_nchw_max",
+        spatial_rank = 2,
+        [tensor(f32, 4), tensor(f32, 2), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nhwc_min,
+        pooling_nhwc_min,
+        "pooling_nhwc_min",
+        spatial_rank = 2,
+        [tensor(f32, 4), tensor(f32, 2), tensor(f32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nhwc_min_unsigned,
+        pooling_nhwc_min_unsigned,
+        "pooling_nhwc_min_unsigned",
+        spatial_rank = 2,
+        [tensor(i32, 4), tensor(i32, 2), tensor(i32, 4)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nwc_sum,
+        pooling_nwc_sum,
+        "pooling_nwc_sum",
+        spatial_rank = 1,
+        [tensor(f32, 3), tensor(f32, 1), tensor(f32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_ncw_sum,
+        pooling_ncw_sum,
+        "pooling_ncw_sum",
+        spatial_rank = 1,
+        [tensor(f32, 3), tensor(f32, 1), tensor(f32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nwc_max,
+        pooling_nwc_max,
+        "pooling_nwc_max",
+        spatial_rank = 1,
+        [tensor(f32, 3), tensor(f32, 1), tensor(f32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nwc_max_unsigned,
+        pooling_nwc_max_unsigned,
+        "pooling_nwc_max_unsigned",
+        spatial_rank = 1,
+        [tensor(i32, 3), tensor(i32, 1), tensor(i32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_ncw_max,
+        pooling_ncw_max,
+        "pooling_ncw_max",
+        spatial_rank = 1,
+        [tensor(f32, 3), tensor(f32, 1), tensor(f32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nwc_min,
+        pooling_nwc_min,
+        "pooling_nwc_min",
+        spatial_rank = 1,
+        [tensor(f32, 3), tensor(f32, 1), tensor(f32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_nwc_min_unsigned,
+        pooling_nwc_min_unsigned,
+        "pooling_nwc_min_unsigned",
+        spatial_rank = 1,
+        [tensor(i32, 3), tensor(i32, 1), tensor(i32, 3)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_ndhwc_sum,
+        pooling_ndhwc_sum,
+        "pooling_ndhwc_sum",
+        spatial_rank = 3,
+        [tensor(f32, 5), tensor(f32, 3), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_ndhwc_max,
+        pooling_ndhwc_max,
+        "pooling_ndhwc_max",
+        spatial_rank = 3,
+        [tensor(f32, 5), tensor(f32, 3), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_strided_named_structured_operation_test!(
+        test_pooling_ndhwc_min,
+        pooling_ndhwc_min,
+        "pooling_ndhwc_min",
+        spatial_rank = 3,
+        [tensor(f32, 5), tensor(f32, 3), tensor(f32, 5)],
+        inputs = [0, 1],
+        outputs = [2]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_fill,
+        fill,
+        "fill",
+        [scalar(f32), tensor(f32, 1)],
+        inputs = [0],
+        outputs = [1]
+    );
+
+    linalg_named_structured_operation_test!(
+        test_fill_rng_2d,
+        fill_rng_2d,
+        "fill_rng_2d",
+        [scalar(f64), scalar(f64), scalar(i32), tensor(f32, 2)],
+        inputs = [0, 1, 2],
+        outputs = [3]
+    );
 }
