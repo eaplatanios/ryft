@@ -14,6 +14,10 @@ use ryft_xla_sys::bindings::mlirGetDialectHandle__scf__;
 
 use crate::DialectHandle;
 
+pub mod operations;
+
+pub use operations::*;
+
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `scf` [`Dialect`](crate::Dialect).
     pub fn scf() -> Self {
