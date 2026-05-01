@@ -201,7 +201,7 @@ where
         }
         let context = self.context.clone();
         Ok(context
-            .trace_operation(
+            .trace(
                 E::Operation::reshape_operation(input_type.shape.clone(), output_type.shape.clone()),
                 std::slice::from_ref(&self),
             )?

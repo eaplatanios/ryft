@@ -166,7 +166,7 @@ where
 /// [`TracingContext`](crate::tracing_v2::TracingContext).
 ///
 /// Stages the primal effect by tracing the rematerialize op in the outer trace via
-/// [`TracingContext::trace_operation`](crate::tracing_v2::TracingContext::trace_operation), then recursively linearizes
+/// [`TracingContext::trace`](crate::tracing_v2::TracingContext::trace), then recursively linearizes
 /// the body through
 /// [`linearize_traced_program`] to obtain a pushforward over `Tracer` values, and finally wraps
 /// that pushforward (paired with its transpose) in a
@@ -216,7 +216,7 @@ where
             let exemplar = primal_inputs[0].clone();
             exemplar
                 .context
-                .trace_operation(EInner::Operation::rematerialize_operation(self.clone()), primal_inputs.as_slice())?
+                .trace(EInner::Operation::rematerialize_operation(self.clone()), primal_inputs.as_slice())?
         };
 
         if tangent_inputs.is_empty() && !self.body.output_types.is_empty() {
@@ -331,7 +331,7 @@ where
             };
         }
         let exemplar_input = inputs[0].clone();
-        exemplar_input.context.trace_operation(E::Operation::rematerialize_operation(self.clone()), inputs)
+        exemplar_input.context.trace(E::Operation::rematerialize_operation(self.clone()), inputs)
     }
 }
 
@@ -610,7 +610,7 @@ where
             builder.build(output_ids, vec![Placeholder; input_leaf_count], vec![Placeholder; output_leaf_count])?,
         );
 
-        let staged_outputs = exemplar_traced_input.context.trace_operation(
+        let staged_outputs = exemplar_traced_input.context.trace(
             E::Operation::rematerialize_operation(RematerializeOperation::new(body)),
             traced_inputs.as_slice(),
         )?;

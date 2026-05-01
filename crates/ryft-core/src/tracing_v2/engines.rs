@@ -11,10 +11,9 @@ use ryft_macros::Parameter;
 
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
 use crate::tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::forward::Differentiable;
 use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use crate::tracing_v2::operations::primitive::PrimitiveOperation;
-use crate::tracing_v2::operations::{SupportsAdd, SupportsMul, SupportsNeg, TracedLinearizationCarrier};
+use crate::tracing_v2::operations::{SupportsAdd, SupportsMul, SupportsNeg};
 use crate::types::{DataType, Type, TypeError, Typed};
 
 /// [`Engine`]s provide backend-specific functionality related to tracing, just-in-time compilation, automatic
@@ -52,16 +51,16 @@ pub trait TracingEngine: Engine {
     /// and relies on [`Operation::infer_output_types`] for inferring output types.
     #[inline]
     fn trace<
-        'e,
-        F: FnOnce(I::To<Tracer<'e, Self>>) -> Result<O::To<Tracer<'e, Self>>, TracingError>,
-        I: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'e, Self>>>,
+        'engine,
+        F: FnOnce(I::To<Tracer<'engine, Self>>) -> Result<O::To<Tracer<'engine, Self>>, TracingError>,
+        I: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>>,
         O: Parameterized<
                 Self::Type,
-                Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'e, Self>>,
-                To<Tracer<'e, Self>>: Parameterized<Tracer<'e, Self>, To<Self::Type> = O>,
+                Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>,
+                To<Tracer<'engine, Self>>: Parameterized<Tracer<'engine, Self>, To<Self::Type> = O>,
             >,
     >(
-        &'e self,
+        &'engine self,
         function: F,
         input_types: I,
     ) -> Result<
@@ -91,12 +90,16 @@ pub trait TracingEngine: Engine {
     /// used instead of [`TracingEngine::trace`] when the caller wants to both trace a computation and execute it at the
     /// same time.
     fn interpret_and_trace<
-        'e,
-        F: FnOnce(I::To<Tracer<'e, Self>>) -> Result<O::To<Tracer<'e, Self>>, TracingError>,
-        I: Parameterized<Self::Value, Family: ParameterFamily<Tracer<'e, Self>>, ParameterStructure: Debug + PartialEq>,
-        O: Parameterized<Self::Value, Family: ParameterFamily<Tracer<'e, Self>>>,
+        'engine,
+        F: FnOnce(I::To<Tracer<'engine, Self>>) -> Result<O::To<Tracer<'engine, Self>>, TracingError>,
+        I: Parameterized<
+                Self::Value,
+                Family: ParameterFamily<Tracer<'engine, Self>>,
+                ParameterStructure: Debug + PartialEq,
+            >,
+        O: Parameterized<Self::Value, Family: ParameterFamily<Tracer<'engine, Self>>>,
     >(
-        &'e self,
+        &'engine self,
         function: F,
         input: I,
     ) -> Result<(O, Program<Self::Type, Self::Value, Self::Operation, I, O>), TracingError>
@@ -112,7 +115,7 @@ pub trait TracingEngine: Engine {
             Program<Self::Type, Self::Value, Self::Operation, Vec<Self::Value>, Vec<Self::Value>>,
         ) = self.trace(
             |flat_input| {
-                let input = I::To::<Tracer<'e, Self>>::from_parameters(input_structure.clone(), flat_input)?;
+                let input = I::To::<Tracer<'engine, Self>>::from_parameters(input_structure.clone(), flat_input)?;
                 let output = function(input)?;
                 output_structure = Some(output.parameter_structure());
                 Ok(output.into_parameters().collect::<Vec<_>>())
@@ -236,19 +239,19 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
         Tracer { state: TracerState::Live(atom, r#type), context: self.clone() }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-    /// Traces one operation application in this tracing context and returns tracers for its outputs.
-    ///
-    /// The method validates that all inputs belong to this tracing context and then delegates normal instruction
-    /// construction to [`ProgramBuilder::add_instruction`]. If the builder has already recorded an error, it avoids
-    /// mutating the partial program and only uses abstract evaluation to synthesize poisoned output tracers with the
-    /// expected types. If abstract evaluation also fails after an earlier builder error, a non-empty input list still
-    /// produces one poisoned tracer using the first input type so later staging can continue to short-circuit.
-    pub fn trace_operation(
+    /// Traces one [`Operation`] application in this [`TracingContext`] and returns [`Tracer`]s for its outputs.
+    /// This function validates that all provided `inputs` belong to this [`TracingContext`] and then delegates normal
+    /// [`Instruction`](crate::tracing::Instruction) construction to [`ProgramBuilder::add_instruction`]. If the builder
+    /// has already recorded an error, this function avoids mutating the partial [`Program`] and only uses type
+    /// inference to synthesize poisoned output [`Tracer`]s with the expected types. If type inference also fails
+    /// after an earlier builder error, a non-empty input list still produces one poisoned [`Tracer`] using the first
+    /// input type so that later staging can continue to short-circuit.
+    pub fn trace(
         &self,
         operation: E::Operation,
         inputs: &[Tracer<'engine, E>],
     ) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
+        // TODO(eaplatanios): Review from here onwards.
         if inputs.iter().any(|input| !Rc::ptr_eq(&self.builder, &input.context.builder)) {
             return Err(TracingError::MismatchedProgramBuilders);
         }
@@ -338,16 +341,6 @@ impl<'engine, E: TracingEngine + ?Sized> Engine for TracingContext<'engine, E> {
         let atom = self.builder.borrow_mut().add_constant(value);
         Ok(self.tracer(atom, Some(r#type.clone())))
     }
-}
-
-impl<'engine, E> TracingEngine for TracingContext<'engine, E>
-where
-    E: TracingEngine + ?Sized,
-    E::Value: Differentiable<E::Type, Tangent = E::Value>,
-    E::Operation: TracedLinearizationCarrier<E::Type, E::Value>,
-    crate::tracing_v2::operations::AddOperation: Operation<E::Type>,
-{
-    type Operation = crate::tracing_v2::operations::AddOperation;
 }
 
 /// Execution state carried by a [`Tracer`] leaf.
@@ -453,7 +446,7 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
     pub fn unary(self, op: E::Operation) -> Self {
         let context = self.context.clone();
         context
-            .trace_operation(op, std::slice::from_ref(&self))
+            .trace(op, std::slice::from_ref(&self))
             .expect("unary traced staging should preserve non-empty inputs")
             .into_iter()
             .next()
@@ -467,7 +460,7 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
         debug_assert!(Rc::ptr_eq(self.builder(), rhs.builder()));
         let context = self.context.clone();
         context
-            .trace_operation(op, &[self, rhs])
+            .trace(op, &[self, rhs])
             .expect("binary traced staging should preserve non-empty inputs")
             .into_iter()
             .next()
@@ -804,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_operation_rejects_mismatched_program_builders() {
+    fn test_trace_rejects_mismatched_program_builders() {
         let builder_a = new_array_f64_builder();
         let builder_b = new_array_f64_builder();
         let atom_a = builder_a.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
@@ -814,13 +807,13 @@ mod tests {
         let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
 
         assert!(matches!(
-            TracingContext::new(&engine, builder_a).trace_operation(PrimitiveOperation::Add, &[tracer_a, tracer_b]),
+            TracingContext::new(&engine, builder_a).trace(PrimitiveOperation::Add, &[tracer_a, tracer_b]),
             Err(TracingError::MismatchedProgramBuilders),
         ));
     }
 
     #[test]
-    fn test_trace_operation_rejects_mismatched_engines() {
+    fn test_trace_rejects_mismatched_engines() {
         let builder = new_array_f64_builder();
         let atom_a = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
         let atom_b = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&2.0f64).into_owned());
@@ -830,13 +823,13 @@ mod tests {
         let tracer_b = TracingContext::new(&engine_b, builder.clone()).tracer(atom_b, None);
 
         assert!(matches!(
-            TracingContext::new(&engine_a, builder).trace_operation(PrimitiveOperation::Add, &[tracer_a, tracer_b]),
+            TracingContext::new(&engine_a, builder).trace(PrimitiveOperation::Add, &[tracer_a, tracer_b]),
             Err(TracingError::MismatchedEngines),
         ));
     }
 
     #[test]
-    fn test_trace_operation_returns_poisoned_tracers_after_builder_failure() {
+    fn test_trace_returns_poisoned_tracers_after_builder_failure() {
         let builder = new_array_f64_builder();
         let atom = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
         builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
@@ -844,7 +837,7 @@ mod tests {
         let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
 
         let outputs = TracingContext::new(&engine, builder)
-            .trace_operation(PrimitiveOperation::Neg, std::slice::from_ref(&tracer))
+            .trace(PrimitiveOperation::Neg, std::slice::from_ref(&tracer))
             .unwrap();
 
         assert_eq!(outputs.len(), 1);
@@ -855,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_operation_caches_live_output_types() {
+    fn test_trace_caches_live_output_types() {
         let builder = new_array_f64_builder();
         let input_type = array_scalar_f64_type();
         let atom = builder.borrow_mut().add_input(input_type.clone());
@@ -863,7 +856,7 @@ mod tests {
         let tracer = Tracer::from_staged_parts(atom, input_type, builder.clone(), &engine);
 
         let outputs = TracingContext::new(&engine, builder)
-            .trace_operation(PrimitiveOperation::Neg, std::slice::from_ref(&tracer))
+            .trace(PrimitiveOperation::Neg, std::slice::from_ref(&tracer))
             .unwrap();
 
         assert_eq!(outputs.len(), 1);
@@ -1004,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_operation_records_abstract_eval_error_and_returns_poisoned_output() {
+    fn test_trace_records_abstract_eval_error_and_returns_poisoned_output() {
         let builder = new_array_f64_builder();
         let lhs_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
         let rhs_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
@@ -1014,9 +1007,8 @@ mod tests {
         let lhs = TracingContext::new(&engine, builder.clone()).tracer(lhs_atom, None);
         let rhs = TracingContext::new(&engine, builder.clone()).tracer(rhs_atom, None);
 
-        let outputs = TracingContext::new(&engine, builder.clone())
-            .trace_operation(PrimitiveOperation::Add, &[lhs, rhs])
-            .unwrap();
+        let outputs =
+            TracingContext::new(&engine, builder.clone()).trace(PrimitiveOperation::Add, &[lhs, rhs]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].state(), TracerState::Poison(output_type) if *output_type == lhs_type));
@@ -1028,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_operation_uses_input_type_when_poisoned_abstract_eval_fails() {
+    fn test_trace_uses_input_type_when_poisoned_abstract_eval_fails() {
         let builder = new_array_f64_builder();
         let input_type = array_scalar_f64_type();
         let atom = builder.borrow_mut().add_input(input_type.clone());
@@ -1037,7 +1029,7 @@ mod tests {
         let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
 
         let outputs = TracingContext::new(&engine, builder)
-            .trace_operation(PrimitiveOperation::Add, std::slice::from_ref(&tracer))
+            .trace(PrimitiveOperation::Add, std::slice::from_ref(&tracer))
             .unwrap();
 
         assert_eq!(outputs.len(), 1);

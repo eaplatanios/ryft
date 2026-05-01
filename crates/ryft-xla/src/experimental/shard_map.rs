@@ -660,7 +660,7 @@ where
         }
         let context = input.context.clone();
         Ok(context
-            .trace_operation(XlaPrimitiveOperation::WithShardingConstraint(op), std::slice::from_ref(&input))?
+            .trace(XlaPrimitiveOperation::WithShardingConstraint(op), std::slice::from_ref(&input))?
             .into_iter()
             .next()
             .expect("with_sharding_constraint should produce one output per input leaf"))

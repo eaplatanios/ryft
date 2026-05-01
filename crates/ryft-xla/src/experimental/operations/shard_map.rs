@@ -355,7 +355,7 @@ impl LinearShardMapOperation<ShardMapTracer> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
         TracingContext::new(XlaEngine::token(), tracing_builder)
-            .trace_operation(XlaPrimitiveOperation::LinearShardMap(Box::new(self.to_tensor_xla_op())), inputs)
+            .trace(XlaPrimitiveOperation::LinearShardMap(Box::new(self.to_tensor_xla_op())), inputs)
     }
 }
 
@@ -369,7 +369,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = TracingContext::new(XlaEngine::token(), tracing_builder)
-            .trace_operation(XlaPrimitiveOperation::LinearShardMap(Box::new(self.clone())), primal_inputs.as_slice())?;
+            .trace(XlaPrimitiveOperation::LinearShardMap(Box::new(self.clone())), primal_inputs.as_slice())?;
         let traced_op = self.to_tracer_linear_op(primal_inputs.as_slice())?;
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let tangent_outputs = context.apply_operation(
@@ -1276,7 +1276,7 @@ fn apply_flat_traced_shard_map(
     traced_inputs: Vec<ShardMapTracer>,
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
     TracingContext::new(XlaEngine::token(), tracing_builder)
-        .trace_operation(
+        .trace(
             XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(body.clone()))),
             traced_inputs.as_slice(),
         )
@@ -1490,7 +1490,7 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     traced_inputs: Vec<ShardMapTracer>,
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError> {
-    let staged_outputs = TracingContext::new(XlaEngine::token(), tracing_builder).trace_operation(
+    let staged_outputs = TracingContext::new(XlaEngine::token(), tracing_builder).trace(
         XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))),
         traced_inputs.as_slice(),
     )?;
