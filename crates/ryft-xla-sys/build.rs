@@ -478,13 +478,13 @@ impl BuildConfiguration {
     /// Returns a directory containing the requested [`Artifact`] by attempting to find it using the following
     /// approaches, in this order, and returning an [`Err`] if it is not found:
     ///
-    ///   1. If the extracted archive containing the artifact is found in a local cache (e.g., from an earlier build),
-    ///      return it. Otherwise, move on to step 2. Note that steps 2 and 3, if successful, will update the local
-    ///      cache so that the extracted [`Artifact`] can be reused in subsequent builds.
-    ///   2. If a path is provided via the appropriate environment variable (e.g., `RYFT_XLA_SYS_ARCHIVE` or
+    ///   1. If a path is provided via the appropriate environment variable (e.g., `RYFT_XLA_SYS_ARCHIVE` or
     ///      `PJRT_PLUGIN_*_LIB`), extract the archive pointed to by that path, if it is a `.tar.gz` or `.whl` archive,
     ///      and return the extracted path. Note that the archive will be extracted into a local cache directory
     ///      so that it can be reused in subsequent builds.
+    ///   2. If the extracted archive containing the artifact is found in a local cache (e.g., from an earlier build),
+    ///      return it. Otherwise, move on to step 3. Note that steps 1 and 3, if successful, will update the local
+    ///      cache so that the extracted [`Artifact`] can be reused in subsequent builds.
     ///   3. Otherwise, try to download and extract a precompiled archive and return the extracted path if successful.
     ///      Note that the downloaded archive will be extracted into a local cache directory so that it can be reused
     ///      in subsequent builds.
@@ -514,29 +514,28 @@ impl BuildConfiguration {
             .join("extracted")
             .join(archive_name.as_str());
 
-        // Check if the extracted artifact already exists in the cache and return immediately if it does.
-        let cached_artifact_found = match artifact {
-            Artifact::RyftXlaSys => fs::exists(extracted_path.join("lib").join(format!(
-                "{}ryft-xla-sys.{}",
-                self.operating_system.library_prefix(),
-                self.operating_system.static_library_extension()
-            )))
-            .unwrap_or(false),
-            Artifact::PjrtPlugin => {
-                fs::exists(extracted_path.join(self.pjrt_plugin_library_file_name())).unwrap_or(false)
-            }
-        };
-        if cached_artifact_found {
-            return Ok(extracted_path);
-        }
+        let artifact_path = match self.artifact_path_from_environment(artifact)? {
+            Some(artifact_path) => artifact_path,
+            None => {
+                // Check if the extracted artifact already exists in the cache and return immediately if it does.
+                let cached_artifact_found = match artifact {
+                    Artifact::RyftXlaSys => fs::exists(extracted_path.join("lib").join(format!(
+                        "{}ryft-xla-sys.{}",
+                        self.operating_system.library_prefix(),
+                        self.operating_system.static_library_extension()
+                    )))
+                    .unwrap_or(false),
+                    Artifact::PjrtPlugin => {
+                        fs::exists(extracted_path.join(self.pjrt_plugin_library_file_name())).unwrap_or(false)
+                    }
+                };
 
-        // Check if a path to the archive has already been provided via the corresponding environment variable.
-        let artifact_path = match self.artifact_path_from_environment(artifact) {
-            Ok(artifact_path) => artifact_path,
-            Err(error) => {
-                println!("cargo::warning={error}\nAttempting to download a precompiled artifact instead.");
+                if cached_artifact_found {
+                    return Ok(extracted_path);
+                }
 
                 // Try to download a precompiled build artifact if one exists.
+                println!("cargo::warning=Attempting to download a precompiled artifact instead.");
                 match self.download_precompiled_artifact_archive(artifact) {
                     Ok(artifact_path) => artifact_path,
                     Err(error) => {
@@ -629,11 +628,8 @@ impl BuildConfiguration {
         format!("{}-{}-{}", self.operating_system, self.architecture, self.device)
     }
 
-    /// Returns the path to the requested [`Artifact`] for this [`BuildConfiguration`] set via environment variables,
-    /// if present. Specifically, this function looks for environment variables like [`RYFT_XLA_SYS_ARCHIVE`],
-    /// [`PJRT_PLUGIN_CUDA_12_LIB`], [`PJRT_PLUGIN_CUDA_13_LIB`], [`PJRT_PLUGIN_ROCM_7_LIB`], [`PJRT_PLUGIN_TPU_LIB`],
-    /// [`PJRT_PLUGIN_NEURON_LIB`], [`PJRT_PLUGIN_METAL_LIB`] and returns the appropriate path, if present.
-    fn artifact_path_from_environment(&self, artifact: Artifact) -> Result<PathBuf> {
+    /// Returns the path to the requested [`Artifact`] set via environment variables, if present.
+    fn artifact_path_from_environment(&self, artifact: Artifact) -> Result<Option<PathBuf>> {
         let artifact_name = artifact.name();
 
         let environment_variable = match (artifact, self.device) {
@@ -648,22 +644,18 @@ impl BuildConfiguration {
         };
 
         if let Some(environment_variable) = environment_variable {
-            let path = env::var(environment_variable).ok().map(PathBuf::from);
-            if let Some(path) = path {
+            if let Some(path) = env::var_os(environment_variable).map(PathBuf::from) {
                 println!(
                     "cargo:warning=Using the `{artifact_name}` artifact specified \
                     in the `{environment_variable}` environment variable: {}.",
                     path.display(),
                 );
-                Ok(path)
+                Ok(Some(path))
             } else {
-                Err(anyhow!(
-                    "no path provided for the `{artifact_name}` artifact via \
-                    the `{environment_variable}` environment variable",
-                ))
+                Ok(None)
             }
         } else {
-            Err(anyhow!("failed to obtain the `{artifact_name}` artifact from the current environment"))
+            Ok(None)
         }
     }
 
@@ -730,6 +722,8 @@ impl BuildConfiguration {
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_tpu.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("nvgpu.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("nvgpu.h"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("shape.cc"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("shape.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.h"),
             PathBuf::from("WORKSPACE"),
@@ -867,31 +861,31 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("f9c5a5d95d5cfc1adc4ca8cce435b4f283291675e95012bd9b1cf14e97c30cf5")
+                Some("8126d1a90570a9a1197332fbee5974d33d180e641bd0bfd101820471adffd6de")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::AArch64, Device::Cpu) => {
-                Some("0b5bab986f602e3762b4ae9c4593c83ad5d28a56ba23e9b3fe5907a768c0da45")
+                Some("1a4bc38ae4f887b0afe54a51d8afa799d1b8f32dccf3efabf6c222643de08559")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("437e6e57adadc4a19ada6f76d12438721179f5a67d58b35ce596b117c9d5dcb6")
+                Some("47e0455c46f35552e3b3b0088bad4a2553c476893bcd95e206f97d4f08f92836")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("7216fd56ae00e05dde9c58c716096f292fef06fa97fe8f101339d4e0d1562083")
+                Some("88414a0c6be15d184cdb6868615d6b0422e1bad8b0a5f453efd85feb2ed60eeb")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
-                Some("b1c878d3e3f1524b88cc795d4de3f563bbab1bf12b40cd233de7f01781e01271")
+                Some("42212b3567785b5fc11584ca71913b5bf51e4b5c9c983c79f949a48703f5f9c0")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda12) => {
-                Some("45e51d7bf273071c25f4fa582080800d0a42acb9bc701c62205242e30432f430")
+                Some("d2559bc848c040f8e913679a604757b3331ec9ab930b5d362205a4f52d2c8859")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => {
-                Some("09463876b60b18a3086ff3dbc14eb894a2ff557b16027ff5aabd0e303bbe1421")
+                Some("d6e56235bae018121897d8cf4d7292a5b6738caf00614226cf541b246097207f")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda13) => {
-                Some("f8bb3d04eb70eb026c18fd200d9c9d8e5dfabeb1c3e048277ddfd11be99884be")
+                Some("cb2fd87858b810501e9323b0d707980d4760a6e1d8d8dca1ce12103ea5ffd261")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => {
-                Some("556b15372955919a437c4b0c888355cfd12ec96909b7acb869ef00f3dbd1c22b")
+                Some("5800d5ec2b7ea62416c8a5a6bceb9407ced61a8819d390076c7c9546cc0a5748")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
                 Some("5e600d7797ac801d0c903f52ae46c03538bb77817a48579aa581faa8d2a8a734")

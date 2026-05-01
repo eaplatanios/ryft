@@ -124,7 +124,7 @@ fn main() {
           `UniformQuantizedPerAxisType`, `UniformQuantizedType`, `UniformQuantizedSubChannelType`.
         - [ ] Add support for operations.
     - [ ] `scf`
-    - [ ] `shape`
+    - [x] `shape`
     - [/] `shardy`: Current support for the Shardy dialect is only partial and aimed at attributes and operations that
       are relevant when building StableHLO programs to be compiled by XLA, and not covering attributes and operations
       that are internal to the Shardy compiler. Also, the current support was added hastily and is likely to change as
