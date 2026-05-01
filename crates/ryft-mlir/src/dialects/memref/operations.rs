@@ -34,24 +34,6 @@ impl<'v, 'c: 'v, 't: 'c> StaticOrDynamicIndex<'v, 'c, 't> {
     }
 }
 
-fn join_static_or_dynamic_indices<'o, 'c: 'o, 't: 'c>(
-    static_indices: Vec<i64>,
-    dynamic_indices: Vec<ValueRef<'o, 'c, 't>>,
-) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-    let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
-    let mut dynamic_indices = dynamic_indices.into_iter();
-    static_indices
-        .into_iter()
-        .map(|index| {
-            if index == dynamic_index {
-                StaticOrDynamicIndex::Dynamic(dynamic_indices.next().expect("missing dynamic index operand"))
-            } else {
-                StaticOrDynamicIndex::Static(index)
-            }
-        })
-        .collect()
-}
-
 /// Name of the [`Attribute`] that stores byte alignment requirements for MemRef operations.
 pub const ALIGNMENT_ATTRIBUTE: &str = "alignment";
 
@@ -1033,9 +1015,18 @@ pub trait SubViewOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResul
         let static_offsets = self
             .attribute(STATIC_OFFSETS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
+            .map(|attribute| attribute.values().collect::<Vec<i64>>())
             .unwrap_or_else(|| panic!("invalid '{STATIC_OFFSETS_ATTRIBUTE}' attribute in `memref::subview`"));
-        join_static_or_dynamic_indices(static_offsets, dynamic_offsets)
+        let dynamic_size = unsafe { Size::Dynamic.to_c_api() };
+        let mut dynamic_offsets = dynamic_offsets.into_iter();
+        static_offsets
+            .into_iter()
+            .map(|index| {
+                (index == dynamic_size)
+                    .then(|| dynamic_offsets.next().expect("missing dynamic offset operand"))
+                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+            })
+            .collect()
     }
 
     /// Returns the mixed static and dynamic sizes.
@@ -1048,9 +1039,18 @@ pub trait SubViewOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResul
         let static_sizes = self
             .attribute(STATIC_SIZES_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
+            .map(|attribute| attribute.values().collect::<Vec<i64>>())
             .unwrap_or_else(|| panic!("invalid '{STATIC_SIZES_ATTRIBUTE}' attribute in `memref::subview`"));
-        join_static_or_dynamic_indices(static_sizes, dynamic_sizes)
+        let dynamic_size = unsafe { Size::Dynamic.to_c_api() };
+        let mut dynamic_sizes = dynamic_sizes.into_iter();
+        static_sizes
+            .into_iter()
+            .map(|index| {
+                (index == dynamic_size)
+                    .then(|| dynamic_sizes.next().expect("missing dynamic size operand"))
+                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+            })
+            .collect()
     }
 
     /// Returns the mixed static and dynamic strides.
@@ -1063,9 +1063,18 @@ pub trait SubViewOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResul
         let static_strides = self
             .attribute(STATIC_STRIDES_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
+            .map(|attribute| attribute.values().collect::<Vec<i64>>())
             .unwrap_or_else(|| panic!("invalid '{STATIC_STRIDES_ATTRIBUTE}' attribute in `memref::subview`"));
-        join_static_or_dynamic_indices(static_strides, dynamic_strides)
+        let dynamic_size = unsafe { Size::Dynamic.to_c_api() };
+        let mut dynamic_strides = dynamic_strides.into_iter();
+        static_strides
+            .into_iter()
+            .map(|index| {
+                (index == dynamic_size)
+                    .then(|| dynamic_strides.next().expect("missing dynamic stride operand"))
+                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+            })
+            .collect()
     }
 
     /// Returns the resulting subview memref.
