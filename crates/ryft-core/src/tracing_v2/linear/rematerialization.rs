@@ -77,7 +77,7 @@ where
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<E::Type>, V::To<E::Type>, V, E, _>(
+    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<E::Type>, E::Type, V, E, _>(
         _engine,
         |staged_input| Ok(function(staged_input)),
         staged_input_types,
@@ -202,7 +202,7 @@ where
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<ArrayType>, V::To<ArrayType>, V, E, _>(
+    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<ArrayType>, ArrayType, V, E, _>(
         engine,
         |staged_input| Ok(function(staged_input)),
         staged_input_types,

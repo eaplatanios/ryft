@@ -422,6 +422,7 @@ where
         Parameterized<ArrayType, To<V> = Input, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
     Output::To<ArrayType>:
         Parameterized<ArrayType, To<V> = Output, To<Tracer<'engine, E>> = Output::To<Tracer<'engine, E>>>,
+    Output::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, To<ArrayType> = Output::To<ArrayType>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     E::Operation: Clone + BatchableOperation<V>,
 {

@@ -55,7 +55,11 @@ pub trait TracingEngine: Engine {
         'e,
         F: FnOnce(I::To<Tracer<'e, Self>>) -> Result<O::To<Tracer<'e, Self>>, TracingError>,
         I: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'e, Self>>>,
-        O: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'e, Self>>>,
+        O: Parameterized<
+                Self::Type,
+                Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'e, Self>>,
+                To<Tracer<'e, Self>>: Parameterized<Tracer<'e, Self>, To<Self::Type> = O>,
+            >,
     >(
         &'e self,
         function: F,
@@ -64,39 +68,24 @@ pub trait TracingEngine: Engine {
         (O, Program<Self::Type, Self::Value, Self::Operation, I::To<Self::Value>, O::To<Self::Value>>),
         TracingError,
     > {
-        // TODO(eaplatanios): Review this function implementation.
-        let program_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let input_structure = input_types.parameter_structure();
-        let traced_input = input_types
+        let input = input_types
             .map_parameters(|r#type| Tracer {
-                state: TracerState::Live(program_builder.borrow_mut().add_input(r#type.clone()), r#type),
-                context: TracingContext::new(self, program_builder.clone()),
+                state: TracerState::Live(builder.borrow_mut().add_input(r#type.clone()), r#type),
+                context: TracingContext::new(self, builder.clone()),
             })
             .map_err(TracingError::from)?;
-        let (output_structure, output_types, outputs) = {
-            let traced_output = function(traced_input)?;
-            let output_structure = traced_output.parameter_structure();
-            let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
-            let output_types = O::from_parameters(
-                output_structure.clone(),
-                traced_outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>(),
-            )?;
-            if let Some(tracing_error) = program_builder.borrow_mut().error.take() {
-                return Err(tracing_error);
-            }
-            let outputs = traced_outputs.into_iter().map(|output| output.atom_id()).collect::<Result<Vec<_>, _>>()?;
-            let output_structure = output_types.parameter_structure();
-            (output_structure, output_types, outputs)
-        };
-        let program_builder = match Rc::try_unwrap(program_builder) {
-            Ok(program_builder) => program_builder.into_inner(),
-            Err(_) => return Err(TracingError::EscapedProgramBuilder),
-        };
-        let program = program_builder.build::<I::To<Self::Value>, O::To<Self::Value>>(
-            outputs,
-            input_structure,
-            output_structure,
-        )?;
+        let output = function(input)?;
+        let output_structure = output.parameter_structure();
+        let outputs = output.parameters().map(|output| output.atom_id()).collect::<Vec<_>>();
+        let output_types = output.map_parameters(|o| o.r#type().into_owned()).map_err(TracingError::from)?;
+        if let Some(tracing_error) = builder.borrow_mut().error.take() {
+            return Err(tracing_error);
+        }
+        let outputs = outputs.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
+        let program = builder.build(outputs, input_structure, output_structure)?;
         Ok((output_types, program))
     }
 

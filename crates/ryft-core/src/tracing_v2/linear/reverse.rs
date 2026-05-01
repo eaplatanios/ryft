@@ -268,7 +268,7 @@ where
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
         let tracing_context = traced_primals[0].context.clone();
-        let (_, traced_program) = trace_flat_program_from_input_engine::<Input::To<E::Type>, V::To<E::Type>, V, E, _>(
+        let (_, traced_program) = trace_flat_program_from_input_engine::<Input::To<E::Type>, E::Type, V, E, _>(
             &tracing_context,
             |staged_input| Ok(function(staged_input)),
             staged_input_types,
