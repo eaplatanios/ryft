@@ -106,7 +106,7 @@ fn main() {
     - [x] `func`
     - [x] `gpu`
     - [x] `index`
-    - [ ] `linalg`
+    - [x] `linalg`
     - [ ] `llvm`
         - [ ] Add support for types: `LLVMPointerType`, `LLVMStructType`.
         - [ ] Add support for operations.
