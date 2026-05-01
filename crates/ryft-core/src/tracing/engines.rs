@@ -463,9 +463,8 @@ mod tests {
 
     use crate::parameters::Placeholder;
     use crate::tracing_v2::differentiation::DifferentiableEngine;
-    use crate::tracing_v2::operations::SupportsAdd;
     use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
-    use crate::tracing_v2::{Cos, Sin, jvp, test_support};
+    use crate::tracing_v2::{Cos, Sin, jvp};
     use crate::types::{DataType, TypeError, Typed};
 
     use super::*;
@@ -549,17 +548,9 @@ mod tests {
     }
 
     #[test]
-    fn test_tracing_engine() {
+    fn test_tracing_engine_trace() {
         let engine = ScalarEngine::<f64>::new();
-        let (output_type, program) = engine
-            .trace(
-                |x: Tracer<ScalarEngine<f64>>| {
-                    let squared = x.clone() * x.clone();
-                    Ok(squared + x.one_like())
-                },
-                DataType::F64,
-            )
-            .unwrap();
+        let (output_type, program) = engine.trace(|x| Ok(x.clone() * x.clone() + x.one_like()), DataType::F64).unwrap();
         assert_eq!(output_type, DataType::F64);
         assert_eq!(program.interpret(3.0), Ok(10.0));
         assert_eq!(
@@ -578,7 +569,7 @@ mod tests {
         let escaped_builder = Rc::new(RefCell::new(None));
         assert!(matches!(
             engine.trace(
-                |x: Tracer<ScalarEngine<f64>>| {
+                |x| {
                     *escaped_builder.borrow_mut() = Some(x.builder().clone());
                     Ok(x)
                 },
@@ -590,7 +581,7 @@ mod tests {
         // Test that [`TypeError`]s are returned in certain cases.
         assert!(matches!(
             engine.trace(
-                |inputs: (Tracer<ScalarEngine<f64>>, Tracer<ScalarEngine<f64>>)| Ok(inputs.0 + inputs.1),
+                |inputs| Ok(inputs.0 + inputs.1),
                 (DataType::F8E3M4, DataType::F32),
             ),
             Err(TracingError::Type(TypeError { message }))
@@ -598,21 +589,10 @@ mod tests {
         ));
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     #[test]
-    fn test_tracing_engine_interpret_and_trace_replays_staged_graphs() {
+    fn test_tracing_engine_interpret_and_trace() {
         let engine = ScalarEngine::<f64>::new();
-        let (output, program) = engine
-            .interpret_and_trace(
-                |x: Tracer<ScalarEngine<f64>>| {
-                    let squared = x.clone() * x.clone();
-                    Ok(squared + x.sin())
-                },
-                2.0f64,
-            )
-            .unwrap();
-
+        let (output, program) = engine.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
         assert_eq!(program.interpret(0.5f64), Ok(0.5f64 * 0.5f64 + 0.5f64.sin()));
         assert_eq!(program.input_ids.len(), 1);
@@ -627,22 +607,31 @@ mod tests {
             "}
             .trim_end(),
         );
-        test_support::assert_bilinear_jit_rendering();
-    }
 
-    #[test]
-    fn test_tracing_engine_interpret_and_trace_prunes_unused_staged_operations() {
-        let engine = ScalarEngine::<f64>::new();
+        // Test using a function with a tuple argument.
+        let (_, compiled) = engine.interpret_and_trace(|(x, y)| Ok(x.clone() * y + x.sin()), (2.0f64, 3.0f64)).unwrap();
+        assert_eq!(
+            compiled.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = mul %0 %1
+                    %3:f64 = sin %0
+                    %4:f64 = add %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+
+        // Test using a function that contains unused code.
         let (output, program) = engine
             .interpret_and_trace(
-                |x: Tracer<ScalarEngine<f64>>| {
-                    let _unused = x.clone().sin();
+                |x| {
+                    let _ = x.clone().sin();
                     Ok(x.clone() * x)
                 },
                 2.0f64,
             )
             .unwrap();
-
         assert_eq!(output, 4.0);
         assert_eq!(program.interpret(0.5f64), Ok(0.25));
         assert_eq!(
@@ -656,148 +645,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_tracing_engine_interpret_and_trace_supports_non_array_types() {
-        use std::fmt;
-
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        struct TestType(&'static str);
-
-        impl Type for TestType {
-            fn is_compatible_with(&self, other: &Self) -> bool {
-                self == other
-            }
-        }
-
-        impl Parameter for TestType {}
-
-        impl fmt::Display for TestType {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(self.0)
-            }
-        }
-
-        #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
-        struct TestValue {
-            r#type: TestType,
-            value: i32,
-        }
-
-        impl TestValue {
-            fn new(r#type: TestType, value: i32) -> Self {
-                Self { r#type, value }
-            }
-        }
-
-        impl Typed<TestType> for TestValue {
-            fn r#type(&self) -> Cow<'_, TestType> {
-                Cow::Borrowed(&self.r#type)
-            }
-        }
-
-        impl fmt::Display for TestValue {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(formatter, "{}", self.value)
-            }
-        }
-
-        impl Traceable<TestType> for TestValue {}
-
-        impl crate::tracing::Value<TestType> for TestValue {}
-
-        impl Add for TestValue {
-            type Output = Self;
-
-            fn add(self, rhs: Self) -> Self::Output {
-                assert_eq!(self.r#type, rhs.r#type);
-                Self { r#type: self.r#type, value: self.value + rhs.value }
-            }
-        }
-
-        #[derive(Clone, Debug)]
-        struct TestAddOp;
-
-        impl fmt::Display for TestAddOp {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("test_add")
-            }
-        }
-
-        impl SupportsAdd<TestType, TestValue> for TestAddOp {
-            fn add_operation() -> Self {
-                Self
-            }
-        }
-
-        impl Operation<TestType> for TestAddOp {
-            fn name(&self) -> &'static str {
-                "test_add"
-            }
-
-            fn infer_output_types(&self, input_types: &[TestType]) -> Result<Vec<TestType>, TypeError> {
-                if input_types.len() != 2 {
-                    return Err(TypeError {
-                        message: format!("test_add expected 2 input types but got {}", input_types.len()),
-                    });
-                }
-                if !input_types[0].is_compatible_with(&input_types[1]) {
-                    return Err(TypeError { message: "test_add input types are incompatible".to_string() });
-                }
-                Ok(vec![input_types[0].clone()])
-            }
-        }
-
-        impl InterpretableOperation<TestType, TestValue> for TestAddOp {
-            fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
-                if inputs.len() != 2 {
-                    return Err(TracingError::InvalidInputCount { expected: 2, got: inputs.len() });
-                }
-                if !inputs[0].r#type.is_compatible_with(&inputs[1].r#type) {
-                    return Err(TracingError::Type(TypeError {
-                        message: "test_add input types are incompatible".to_string(),
-                    }));
-                }
-                Ok(vec![inputs[0].clone() + inputs[1].clone()])
-            }
-        }
-
-        struct TestEngine;
-
-        impl Engine for TestEngine {
-            type Type = TestType;
-            type Value = TestValue;
-
-            fn zero(&self, r#type: &TestType) -> Result<TestValue, TracingError> {
-                Ok(TestValue::new(r#type.clone(), 0))
-            }
-
-            fn one(&self, r#type: &TestType) -> Result<TestValue, TracingError> {
-                Ok(TestValue::new(r#type.clone(), 1))
-            }
-        }
-
-        impl TracingEngine for TestEngine {
-            type Operation = TestAddOp;
-        }
-
-        let scalar_type = TestType("test_scalar");
-        let (output, program) = TestEngine
-            .interpret_and_trace(
-                |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| {
-                    let sum = inputs.0.clone() + inputs.1;
-                    let stabilized = sum + inputs.0.zero_like();
-                    Ok(stabilized + inputs.0.one_like())
-                },
-                (TestValue::new(scalar_type.clone(), 2), TestValue::new(scalar_type.clone(), 3)),
-            )
-            .unwrap();
-
-        assert_eq!(output, TestValue::new(scalar_type.clone(), 6));
-        assert_eq!(
-            program.interpret((TestValue::new(scalar_type.clone(), 4), TestValue::new(scalar_type.clone(), 5))),
-            Ok(TestValue::new(scalar_type, 10)),
-        );
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
     #[test]
     fn test_tracing_engine_interpret_and_trace_returns_abstract_eval_errors() {

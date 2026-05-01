@@ -77,24 +77,6 @@ pub(crate) fn assert_bilinear_pushforward_rendering() {
     );
 }
 
-pub(crate) fn assert_bilinear_jit_rendering() {
-    let engine = ScalarEngine::<f64>::new();
-    let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, (f64, f64), f64>) =
-        engine.interpret_and_trace(|inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
-
-    assert_eq!(
-        compiled.to_string(),
-        indoc! {"
-            lambda %0:f64, %1:f64 .
-            let %2:f64 = mul %0 %1
-                %3:f64 = sin %0
-                %4:f64 = add %2 %3
-            in (%4)
-        "}
-        .trim_end(),
-    );
-}
-
 pub(crate) fn assert_quadratic_pushforward_rendering() {
     let engine = ScalarEngine::<f64>::new();
     let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
