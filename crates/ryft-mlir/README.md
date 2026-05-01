@@ -95,7 +95,7 @@ fn main() {
 - Support more MLIR dialects:
     - [x] `affine`
     - [x] `arith`
-    - [ ] `async`
+    - [x] `async`
     - [x] `builtin`
     - [x] `cf`
     - [ ] `chlo`
