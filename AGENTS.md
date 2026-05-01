@@ -288,11 +288,13 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
 - When adding MLIR dialect operation wrappers, audit the pinned TableGen operation definitions for arguments, results,
   regions, segment-size traits, and builders; do not stop at empty marker traits unless the operation definition itself
   has no named API surface.
-- In MLIR dialect operation modules, colocate public operation attribute-name constants directly above the first
-  operation trait or macro-generated operation group that uses them.
+- In MLIR dialect operation modules, colocate public operation attribute-name constants immediately above the first
+  operation trait or macro-generated operation group that references them. Do not collect operation attribute-name
+  constants in a module-level block at the top of the operations file.
 - In MLIR dialect operation modules, inline operation-specific attribute, segment, and async-token access logic
   in the owning trait or constructor instead of adding module-level helper functions, unless the helper is genuinely
-  shared across dialect modules.
+  shared across dialect modules. Do not add tiny private wrappers for one-line attribute casts, attribute value
+  extraction, or operand slicing.
 - In MLIR dialect operation modules, write operation traits and their `mlir_op!` / `mlir_op_trait!` declarations
   explicitly instead of adding dialect-local macros that generate the wrapper trait definitions.
 - Prefix MLIR-dialect-local declarative macros with the dialect or module prefix (for example, `gpu_`) unless they
@@ -301,9 +303,12 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
   display/debug, and casting tests for each attribute in the same order in which attributes appear in the module.
 - For MLIR dialect type tests, follow the StableHLO type test structure: add construction/accessor, equality,
   display/debug, parsing, and casting tests for each type in the same order in which types appear in the module.
-- For MLIR dialect operation tests, add source-ordered tests for every operation wrapper. Prefer constructor
-  tests when a constructor exists, and use `OperationBuilder` to exercise accessor behavior for wrappers that only
-  expose typed operation traits.
+- For MLIR dialect operation tests, mirror the StableHLO operation test structure: build the containing module
+  programmatically with typed operation constructors, assert typed accessors before insertion where practical, verify
+  the module, and compare the canonical `module.to_string()` output. Avoid parsing a module and walking it with helper
+  functions unless the operation has no constructor or the test is explicitly about parsing behavior.
+- In MLIR dialect operation tests, inline trivial context/registry setup at the test site instead of adding tiny helpers
+  that hides only one or two lines of code.
 
 ### `ryft-xla-sys`
 

@@ -1,8 +1,8 @@
 use crate::{
     ArrayAttributeRef, Attribute, AttributeRef, DenseInteger32ArrayAttributeRef, DetachedOp, DetachedRegion,
-    DialectHandle, FlatSymbolRefAttributeRef, Function, IntegerAttributeRef, Location, OneRegion, Operation,
-    OperationBuilder, RegionRef, StringAttributeRef, StringRef, Symbol, SymbolTable, Type, TypeAttributeRef, TypeRef,
-    Value, ValueRef, mlir_op, mlir_op_trait,
+    DialectHandle, FUNCTION_TYPE_ATTRIBUTE, FlatSymbolRefAttributeRef, Function, IntegerAttributeRef, IntoWithContext,
+    Location, OneRegion, Operation, OperationBuilder, RegionRef, SYMBOL_NAME_ATTRIBUTE, StringAttributeRef, StringRef,
+    Symbol, SymbolTable, Type, TypeAttributeRef, TypeRef, Value, ValueRef, mlir_op, mlir_op_trait,
 };
 
 use super::attributes::{
@@ -311,6 +311,76 @@ mlir_op_trait!(Func, IsolatedFromAbove);
 mlir_op_trait!(Func, OneRegion);
 mlir_op_trait!(Func, Symbol);
 mlir_op_trait!(Func, ZeroSuccessors);
+
+/// Properties used to construct a [`FuncOperation`].
+#[derive(Clone, Debug, Default)]
+pub struct FuncProperties<'c, 't> {
+    /// Function argument types.
+    pub arguments: Vec<TypeRef<'c, 't>>,
+
+    /// Function result types.
+    pub results: Vec<TypeRef<'c, 't>>,
+
+    /// Whether the function is a host-launchable GPU kernel.
+    pub is_kernel: bool,
+
+    /// Optional known block-size launch hint.
+    pub known_block_size: Option<[i32; 3]>,
+
+    /// Optional known grid-size launch hint.
+    pub known_grid_size: Option<[i32; 3]>,
+
+    /// Optional known cluster-size launch hint.
+    pub known_cluster_size: Option<[i32; 3]>,
+
+    /// Number of workgroup attribution block arguments following the function arguments.
+    pub workgroup_attribution_count: usize,
+}
+
+/// Constructs a new detached/owned [`FuncOperation`] at the specified [`Location`].
+pub fn func<'c, 't: 'c, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
+    name: N,
+    properties: FuncProperties<'c, 't>,
+    body: DetachedRegion<'c, 't>,
+    location: L,
+) -> DetachedFuncOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.func", location)
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.into_with_context(context))
+        .add_attribute(
+            FUNCTION_TYPE_ATTRIBUTE,
+            context.type_attribute(context.function_type(&properties.arguments, &properties.results)),
+        );
+    if properties.is_kernel {
+        builder = builder.add_attribute(KERNEL_ATTRIBUTE, context.unit_attribute());
+    }
+    if let Some(known_block_size) = properties.known_block_size {
+        builder = builder
+            .add_attribute(KNOWN_BLOCK_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_block_size).unwrap());
+    }
+    if let Some(known_grid_size) = properties.known_grid_size {
+        builder = builder
+            .add_attribute(KNOWN_GRID_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_grid_size).unwrap());
+    }
+    if let Some(known_cluster_size) = properties.known_cluster_size {
+        builder = builder.add_attribute(
+            KNOWN_CLUSTER_SIZE_ATTRIBUTE,
+            context.dense_i32_array_attribute(&known_cluster_size).unwrap(),
+        );
+    }
+    if properties.workgroup_attribution_count > 0 {
+        builder = builder.add_attribute(
+            WORKGROUP_ATTRIBUTIONS_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(64), properties.workgroup_attribution_count as i64),
+        );
+    }
+    builder
+        .add_region(body)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::func`")
+}
 
 /// GPU operation that returns the dynamic shared-memory memref for the current kernel.
 pub trait DynamicSharedMemoryOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -1665,6 +1735,31 @@ mlir_op_trait!(SubgroupMmaLoadMatrix, OneResult);
 mlir_op_trait!(SubgroupMmaLoadMatrix, ZeroRegions);
 mlir_op_trait!(SubgroupMmaLoadMatrix, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`SubgroupMmaLoadMatrixOperation`] at the specified [`Location`].
+pub fn subgroup_mma_load_matrix<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    source_memref: ValueRef<'o, 'c, 't>,
+    indices: &[ValueRef<'o, 'c, 't>],
+    lead_dimension: i64,
+    transpose: bool,
+    result_type: T,
+    location: L,
+) -> DetachedSubgroupMmaLoadMatrixOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.subgroup_mma_load_matrix", location)
+        .add_operand(source_memref)
+        .add_operands(indices)
+        .add_attribute(LEAD_DIMENSION_ATTRIBUTE, context.integer_attribute(context.index_type(), lead_dimension))
+        .add_result(result_type);
+    if transpose {
+        builder = builder.add_attribute(TRANSPOSE_ATTRIBUTE, context.unit_attribute());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::subgroup_mma_load_matrix`")
+}
+
 /// GPU subgroup MMA matrix store operation.
 pub trait SubgroupMmaStoreMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source MMA matrix.
@@ -1699,6 +1794,31 @@ pub trait SubgroupMmaStoreMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c,
 mlir_op!(SubgroupMmaStoreMatrix);
 mlir_op_trait!(SubgroupMmaStoreMatrix, ZeroRegions);
 mlir_op_trait!(SubgroupMmaStoreMatrix, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`SubgroupMmaStoreMatrixOperation`] at the specified [`Location`].
+pub fn subgroup_mma_store_matrix<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
+    source: ValueRef<'o, 'c, 't>,
+    destination_memref: ValueRef<'o, 'c, 't>,
+    indices: &[ValueRef<'o, 'c, 't>],
+    lead_dimension: i64,
+    transpose: bool,
+    location: L,
+) -> DetachedSubgroupMmaStoreMatrixOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.subgroup_mma_store_matrix", location)
+        .add_operand(source)
+        .add_operand(destination_memref)
+        .add_operands(indices)
+        .add_attribute(LEAD_DIMENSION_ATTRIBUTE, context.integer_attribute(context.index_type(), lead_dimension));
+    if transpose {
+        builder = builder.add_attribute(TRANSPOSE_ATTRIBUTE, context.unit_attribute());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::subgroup_mma_store_matrix`")
+}
 
 /// Name of the [`Attribute`] that marks transposed MMA matrix A operands.
 pub const A_TRANSPOSE_ATTRIBUTE: &str = "a_transpose";
@@ -1744,6 +1864,35 @@ mlir_op_trait!(SubgroupMmaCompute, OneResult);
 mlir_op_trait!(SubgroupMmaCompute, ZeroRegions);
 mlir_op_trait!(SubgroupMmaCompute, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`SubgroupMmaComputeOperation`] at the specified [`Location`].
+pub fn subgroup_mma_compute<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    a: ValueRef<'o, 'c, 't>,
+    b: ValueRef<'o, 'c, 't>,
+    c: ValueRef<'o, 'c, 't>,
+    a_transpose: bool,
+    b_transpose: bool,
+    result_type: T,
+    location: L,
+) -> DetachedSubgroupMmaComputeOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.subgroup_mma_compute", location)
+        .add_operand(a)
+        .add_operand(b)
+        .add_operand(c)
+        .add_result(result_type);
+    if a_transpose {
+        builder = builder.add_attribute(A_TRANSPOSE_ATTRIBUTE, context.unit_attribute());
+    }
+    if b_transpose {
+        builder = builder.add_attribute(B_TRANSPOSE_ATTRIBUTE, context.unit_attribute());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::subgroup_mma_compute`")
+}
+
 /// GPU subgroup MMA constant matrix operation.
 pub trait SubgroupMmaConstantMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the scalar value broadcast into the matrix.
@@ -1762,6 +1911,21 @@ mlir_op_trait!(SubgroupMmaConstantMatrix, OneOperand);
 mlir_op_trait!(SubgroupMmaConstantMatrix, OneResult);
 mlir_op_trait!(SubgroupMmaConstantMatrix, ZeroRegions);
 mlir_op_trait!(SubgroupMmaConstantMatrix, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`SubgroupMmaConstantMatrixOperation`] at the specified [`Location`].
+pub fn subgroup_mma_constant_matrix<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    value: ValueRef<'o, 'c, 't>,
+    result_type: T,
+    location: L,
+) -> DetachedSubgroupMmaConstantMatrixOperation<'c, 't> {
+    location.context().load_dialect(DialectHandle::gpu());
+    OperationBuilder::new("gpu.subgroup_mma_constant_matrix", location)
+        .add_operand(value)
+        .add_result(result_type)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::subgroup_mma_constant_matrix`")
+}
 
 /// GPU subgroup MMA thread-local extract operation.
 pub trait SubgroupMmaExtractThreadLocalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -1785,6 +1949,23 @@ mlir_op!(SubgroupMmaExtractThreadLocal);
 mlir_op_trait!(SubgroupMmaExtractThreadLocal, OneResult);
 mlir_op_trait!(SubgroupMmaExtractThreadLocal, ZeroRegions);
 mlir_op_trait!(SubgroupMmaExtractThreadLocal, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`SubgroupMmaExtractThreadLocalOperation`] at the specified [`Location`].
+pub fn subgroup_mma_extract_thread_local<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    matrix: ValueRef<'o, 'c, 't>,
+    indices: &[ValueRef<'o, 'c, 't>],
+    result_type: T,
+    location: L,
+) -> DetachedSubgroupMmaExtractThreadLocalOperation<'c, 't> {
+    location.context().load_dialect(DialectHandle::gpu());
+    OperationBuilder::new("gpu.subgroup_mma_extract_thread_local", location)
+        .add_operand(matrix)
+        .add_operands(indices)
+        .add_result(result_type)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::subgroup_mma_extract_thread_local`")
+}
 
 /// GPU subgroup MMA thread-local insert operation.
 pub trait SubgroupMmaInsertThreadLocalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -1813,6 +1994,25 @@ mlir_op!(SubgroupMmaInsertThreadLocal);
 mlir_op_trait!(SubgroupMmaInsertThreadLocal, OneResult);
 mlir_op_trait!(SubgroupMmaInsertThreadLocal, ZeroRegions);
 mlir_op_trait!(SubgroupMmaInsertThreadLocal, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`SubgroupMmaInsertThreadLocalOperation`] at the specified [`Location`].
+pub fn subgroup_mma_insert_thread_local<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    value: ValueRef<'o, 'c, 't>,
+    matrix: ValueRef<'o, 'c, 't>,
+    indices: &[ValueRef<'o, 'c, 't>],
+    result_type: T,
+    location: L,
+) -> DetachedSubgroupMmaInsertThreadLocalOperation<'c, 't> {
+    location.context().load_dialect(DialectHandle::gpu());
+    OperationBuilder::new("gpu.subgroup_mma_insert_thread_local", location)
+        .add_operand(value)
+        .add_operand(matrix)
+        .add_operands(indices)
+        .add_result(result_type)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::subgroup_mma_insert_thread_local`")
+}
 
 /// Name of the [`Attribute`] that stores the MMA elementwise operation kind.
 pub const OP_TYPE_ATTRIBUTE: &str = "opType";
@@ -1844,8 +2044,26 @@ mlir_op_trait!(SubgroupMmaElementwise, OneResult);
 mlir_op_trait!(SubgroupMmaElementwise, ZeroRegions);
 mlir_op_trait!(SubgroupMmaElementwise, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`SubgroupMmaElementwiseOperation`] at the specified [`Location`].
+pub fn subgroup_mma_elementwise<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    arguments: &[ValueRef<'o, 'c, 't>],
+    operation: MmaElementwiseOperation,
+    result_type: T,
+    location: L,
+) -> DetachedSubgroupMmaElementwiseOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    OperationBuilder::new("gpu.subgroup_mma_elementwise", location)
+        .add_operands(arguments)
+        .add_attribute(OP_TYPE_ATTRIBUTE, context.gpu_mma_elementwise_operation_attribute(operation))
+        .add_result(result_type)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::subgroup_mma_elementwise`")
+}
+
 macro_rules! gpu_sparse_async_operation {
-    ($name:ident, $doc:literal, operands = { $($method:ident => $index:expr),* $(,)* } $(,)*) => {
+    ($name:ident, $function_name:ident, $operation_name:literal, $doc:literal, operands = { $($method:ident => $index:expr),* $(,)* } $(,)*) => {
         paste::paste! {
             #[doc = $doc]
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -1880,12 +2098,34 @@ macro_rules! gpu_sparse_async_operation {
             mlir_op!($name);
             mlir_op_trait!($name, ZeroRegions);
             mlir_op_trait!($name, ZeroSuccessors);
+
+            #[doc = "Constructs a new detached/owned [`"]
+            #[doc = stringify!($name)]
+            #[doc = "Operation`] at the specified [`Location`]."]
+            pub fn $function_name<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
+                async_dependencies: &[ValueRef<'o, 'c, 't>],
+                $($method: ValueRef<'o, 'c, 't>,)*
+                is_async: bool,
+                location: L,
+            ) -> [<Detached $name Operation>]<'c, 't> {
+                let context = location.context();
+                context.load_dialect(DialectHandle::gpu());
+                let mut builder = OperationBuilder::new($operation_name, location).add_operands(async_dependencies);
+                $(builder = builder.add_operand($method);)*
+                if is_async {
+                    builder = builder.add_result(context.gpu_async_token_type());
+                }
+                builder
+                    .build()
+                    .and_then(|operation| unsafe { operation.cast() })
+                    .expect(concat!("invalid arguments to `gpu::", stringify!($function_name), "`"))
+            }
         }
     };
 }
 
 macro_rules! gpu_sparse_create_sp_mat_operation {
-    ($name:ident, $doc:literal, operands = { $($method:ident => $index:expr),+ $(,)* } $(,)*) => {
+    ($name:ident, $function_name:ident, $operation_name:literal, $doc:literal, operands = { $($method:ident => $index:expr),+ $(,)* } $(,)*) => {
         paste::paste! {
             #[doc = $doc]
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -1921,6 +2161,30 @@ macro_rules! gpu_sparse_create_sp_mat_operation {
             mlir_op!($name);
             mlir_op_trait!($name, ZeroRegions);
             mlir_op_trait!($name, ZeroSuccessors);
+
+            #[doc = "Constructs a new detached/owned [`"]
+            #[doc = stringify!($name)]
+            #[doc = "Operation`] at the specified [`Location`]."]
+            pub fn $function_name<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
+                async_dependencies: &[ValueRef<'o, 'c, 't>],
+                $($method: ValueRef<'o, 'c, 't>,)+
+                is_async: bool,
+                location: L,
+            ) -> [<Detached $name Operation>]<'c, 't> {
+                let context = location.context();
+                context.load_dialect(DialectHandle::gpu());
+                let mut builder = OperationBuilder::new($operation_name, location)
+                    .add_operands(async_dependencies)
+                    $(.add_operand($method))+
+                    .add_result(context.gpu_sparse_sp_mat_handle_type());
+                if is_async {
+                    builder = builder.add_result(context.gpu_async_token_type());
+                }
+                builder
+                    .build()
+                    .and_then(|operation| unsafe { operation.cast() })
+                    .expect(concat!("invalid arguments to `gpu::", stringify!($function_name), "`"))
+            }
         }
     };
 }
@@ -1973,38 +2237,80 @@ mlir_op!(CreateDnTensor);
 mlir_op_trait!(CreateDnTensor, ZeroRegions);
 mlir_op_trait!(CreateDnTensor, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`CreateDnTensorOperation`] at the specified [`Location`].
+pub fn create_dn_tensor<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    memref: ValueRef<'o, 'c, 't>,
+    dimensions: &[ValueRef<'o, 'c, 't>],
+    is_async: bool,
+    location: L,
+) -> DetachedCreateDnTensorOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.create_dn_tensor", location)
+        .add_operands(async_dependencies)
+        .add_operand(memref)
+        .add_operands(dimensions)
+        .add_attribute(
+            OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+            context
+                .dense_i32_array_attribute(&[async_dependencies.len() as i32, 1, dimensions.len() as i32])
+                .unwrap(),
+        )
+        .add_result(context.gpu_sparse_dn_tensor_handle_type());
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::create_dn_tensor`")
+}
+
 gpu_sparse_async_operation!(
     DestroyDnTensor,
+    destroy_dn_tensor,
+    "gpu.destroy_dn_tensor",
     "GPU operation that destroys a dense tensor sparse handle.",
     operands = { dense_tensor => 0 },
 );
 
 gpu_sparse_create_sp_mat_operation!(
     CreateCoo,
+    create_coo,
+    "gpu.create_coo",
     "GPU operation that creates a sparse matrix in COO format.",
     operands = { rows => 0, columns => 1, non_zero_count => 2, row_indices => 3, column_indices => 4, values => 5 },
 );
 
 gpu_sparse_create_sp_mat_operation!(
     CreateCooAos,
+    create_coo_aos,
+    "gpu.create_coo_aos",
     "GPU operation that creates a sparse matrix in COO AoS format.",
     operands = { rows => 0, columns => 1, non_zero_count => 2, indices => 3, values => 4 },
 );
 
 gpu_sparse_create_sp_mat_operation!(
     CreateCsr,
+    create_csr,
+    "gpu.create_csr",
     "GPU operation that creates a sparse matrix in CSR format.",
     operands = { rows => 0, columns => 1, non_zero_count => 2, row_positions => 3, column_indices => 4, values => 5 },
 );
 
 gpu_sparse_create_sp_mat_operation!(
     CreateCsc,
+    create_csc,
+    "gpu.create_csc",
     "GPU operation that creates a sparse matrix in CSC format.",
     operands = { rows => 0, columns => 1, non_zero_count => 2, column_positions => 3, row_indices => 4, values => 5 },
 );
 
 gpu_sparse_create_sp_mat_operation!(
     CreateBsr,
+    create_bsr,
+    "gpu.create_bsr",
     "GPU operation that creates a sparse matrix in BSR format.",
     operands = {
         block_rows => 0,
@@ -2074,8 +2380,38 @@ mlir_op!(Create2To4SpMat);
 mlir_op_trait!(Create2To4SpMat, ZeroRegions);
 mlir_op_trait!(Create2To4SpMat, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`Create2To4SpMatOperation`] at the specified [`Location`].
+pub fn create_2_to_4_sp_mat<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    rows: ValueRef<'o, 'c, 't>,
+    columns: ValueRef<'o, 'c, 't>,
+    prune_flag: Prune2To4SparseMatrixFlag,
+    memref: ValueRef<'o, 'c, 't>,
+    is_async: bool,
+    location: L,
+) -> DetachedCreate2To4SpMatOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.create_2to4_spmat", location)
+        .add_operands(async_dependencies)
+        .add_operand(rows)
+        .add_operand(columns)
+        .add_operand(memref)
+        .add_attribute(PRUNE_FLAG_ATTRIBUTE, context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(prune_flag))
+        .add_result(context.gpu_sparse_sp_mat_handle_type());
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::create_2_to_4_sp_mat`")
+}
+
 gpu_sparse_async_operation!(
     DestroySpMat,
+    destroy_sp_mat,
+    "gpu.destroy_sp_mat",
     "GPU operation that destroys a sparse matrix handle.",
     operands = { sparse_matrix => 0 },
 );
@@ -2151,6 +2487,36 @@ mlir_op!(SpmvBufferSize);
 mlir_op_trait!(SpmvBufferSize, ZeroRegions);
 mlir_op_trait!(SpmvBufferSize, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`SpmvBufferSizeOperation`] at the specified [`Location`].
+pub fn spmv_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    mode_a: MatrixTransposeMode,
+    sparse_matrix_a: ValueRef<'o, 'c, 't>,
+    dense_tensor_x: ValueRef<'o, 'c, 't>,
+    dense_tensor_y: ValueRef<'o, 'c, 't>,
+    compute_type: T,
+    is_async: bool,
+    location: L,
+) -> DetachedSpmvBufferSizeOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.spmv_buffer_size", location)
+        .add_operands(async_dependencies)
+        .add_operand(sparse_matrix_a)
+        .add_operand(dense_tensor_x)
+        .add_operand(dense_tensor_y)
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
+        .add_result(context.index_type());
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::spmv_buffer_size`")
+}
+
 /// GPU SpMV compute operation.
 pub trait SpmvOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
@@ -2214,6 +2580,37 @@ pub trait SpmvOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(Spmv);
 mlir_op_trait!(Spmv, ZeroRegions);
 mlir_op_trait!(Spmv, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`SpmvOperation`] at the specified [`Location`].
+pub fn spmv<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    mode_a: MatrixTransposeMode,
+    sparse_matrix_a: ValueRef<'o, 'c, 't>,
+    dense_tensor_x: ValueRef<'o, 'c, 't>,
+    dense_tensor_y: ValueRef<'o, 'c, 't>,
+    compute_type: T,
+    buffer: ValueRef<'o, 'c, 't>,
+    is_async: bool,
+    location: L,
+) -> DetachedSpmvOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.spmv", location)
+        .add_operands(async_dependencies)
+        .add_operand(sparse_matrix_a)
+        .add_operand(dense_tensor_x)
+        .add_operand(dense_tensor_y)
+        .add_operand(buffer)
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type));
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::spmv`")
+}
 
 /// Name of the MLIR attribute storing operation result segment sizes.
 pub const RESULT_SEGMENT_SIZES_ATTRIBUTE: &str = "result_segment_sizes";
@@ -2298,6 +2695,47 @@ pub trait SpmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(SpmmBufferSize);
 mlir_op_trait!(SpmmBufferSize, ZeroRegions);
 mlir_op_trait!(SpmmBufferSize, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`SpmmBufferSizeOperation`] at the specified [`Location`].
+pub fn spmm_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    mode_a: MatrixTransposeMode,
+    mode_b: MatrixTransposeMode,
+    sparse_matrix_a: ValueRef<'o, 'c, 't>,
+    dense_matrix_b: ValueRef<'o, 'c, 't>,
+    dense_matrix_c: ValueRef<'o, 'c, 't>,
+    compute_type: T,
+    buffer_size_count: usize,
+    is_async: bool,
+    location: L,
+) -> DetachedSpmmBufferSizeOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.spmm_buffer_size", location)
+        .add_operands(async_dependencies)
+        .add_operand(sparse_matrix_a)
+        .add_operand(dense_matrix_b)
+        .add_operand(dense_matrix_c)
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
+        .add_attribute(
+            RESULT_SEGMENT_SIZES_ATTRIBUTE,
+            context
+                .dense_i32_array_attribute(&[buffer_size_count as i32, if is_async { 1 } else { 0 }])
+                .unwrap(),
+        );
+    for _ in 0..buffer_size_count {
+        builder = builder.add_result(context.index_type());
+    }
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::spmm_buffer_size`")
+}
 
 /// GPU SpMM compute operation.
 pub trait SpmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -2389,6 +2827,45 @@ mlir_op!(Spmm);
 mlir_op_trait!(Spmm, ZeroRegions);
 mlir_op_trait!(Spmm, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`SpmmOperation`] at the specified [`Location`].
+pub fn spmm<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    mode_a: MatrixTransposeMode,
+    mode_b: MatrixTransposeMode,
+    sparse_matrix_a: ValueRef<'o, 'c, 't>,
+    dense_matrix_b: ValueRef<'o, 'c, 't>,
+    dense_matrix_c: ValueRef<'o, 'c, 't>,
+    compute_type: T,
+    buffers: &[ValueRef<'o, 'c, 't>],
+    is_async: bool,
+    location: L,
+) -> DetachedSpmmOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.spmm", location)
+        .add_operands(async_dependencies)
+        .add_operand(sparse_matrix_a)
+        .add_operand(dense_matrix_b)
+        .add_operand(dense_matrix_c)
+        .add_operands(buffers)
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
+        .add_attribute(
+            OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+            context
+                .dense_i32_array_attribute(&[async_dependencies.len() as i32, 1, 1, 1, buffers.len() as i32])
+                .unwrap(),
+        );
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::spmm`")
+}
+
 /// GPU SDDMM buffer-size operation.
 pub trait SddmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
@@ -2459,6 +2936,38 @@ pub trait SddmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(SddmmBufferSize);
 mlir_op_trait!(SddmmBufferSize, ZeroRegions);
 mlir_op_trait!(SddmmBufferSize, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`SddmmBufferSizeOperation`] at the specified [`Location`].
+pub fn sddmm_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    mode_a: MatrixTransposeMode,
+    mode_b: MatrixTransposeMode,
+    dense_matrix_a: ValueRef<'o, 'c, 't>,
+    dense_matrix_b: ValueRef<'o, 'c, 't>,
+    sparse_matrix_c: ValueRef<'o, 'c, 't>,
+    compute_type: T,
+    is_async: bool,
+    location: L,
+) -> DetachedSddmmBufferSizeOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.sddmm_buffer_size", location)
+        .add_operands(async_dependencies)
+        .add_operand(dense_matrix_a)
+        .add_operand(dense_matrix_b)
+        .add_operand(sparse_matrix_c)
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
+        .add_result(context.index_type());
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::sddmm_buffer_size`")
+}
 
 /// GPU SDDMM compute operation.
 pub trait SddmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -2533,6 +3042,39 @@ mlir_op!(Sddmm);
 mlir_op_trait!(Sddmm, ZeroRegions);
 mlir_op_trait!(Sddmm, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`SddmmOperation`] at the specified [`Location`].
+pub fn sddmm<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    mode_a: MatrixTransposeMode,
+    mode_b: MatrixTransposeMode,
+    dense_matrix_a: ValueRef<'o, 'c, 't>,
+    dense_matrix_b: ValueRef<'o, 'c, 't>,
+    sparse_matrix_c: ValueRef<'o, 'c, 't>,
+    compute_type: T,
+    buffer: ValueRef<'o, 'c, 't>,
+    is_async: bool,
+    location: L,
+) -> DetachedSddmmOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.sddmm", location)
+        .add_operands(async_dependencies)
+        .add_operand(dense_matrix_a)
+        .add_operand(dense_matrix_b)
+        .add_operand(sparse_matrix_c)
+        .add_operand(buffer)
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type));
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::sddmm`")
+}
+
 /// GPU operation that creates a SpGEMM descriptor.
 pub trait SpGemmCreateDescrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
@@ -2556,8 +3098,30 @@ mlir_op!(SpGemmCreateDescr);
 mlir_op_trait!(SpGemmCreateDescr, ZeroRegions);
 mlir_op_trait!(SpGemmCreateDescr, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`SpGemmCreateDescrOperation`] at the specified [`Location`].
+pub fn sp_gemm_create_descr<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    is_async: bool,
+    location: L,
+) -> DetachedSpGemmCreateDescrOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.spgemm_create_descr", location)
+        .add_operands(async_dependencies)
+        .add_result(context.gpu_sparse_sp_gemm_operation_handle_type());
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::sp_gemm_create_descr`")
+}
+
 gpu_sparse_async_operation!(
     SpGemmDestroyDescr,
+    sp_gemm_destroy_descr,
+    "gpu.spgemm_destroy_descr",
     "GPU operation that destroys a SpGEMM descriptor.",
     operands = { descriptor => 0 },
 );
@@ -2666,6 +3230,46 @@ mlir_op!(SpGemmWorkEstimationOrCompute);
 mlir_op_trait!(SpGemmWorkEstimationOrCompute, ZeroRegions);
 mlir_op_trait!(SpGemmWorkEstimationOrCompute, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`SpGemmWorkEstimationOrComputeOperation`] at the specified [`Location`].
+pub fn sp_gemm_work_estimation_or_compute<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    descriptor: ValueRef<'o, 'c, 't>,
+    mode_a: MatrixTransposeMode,
+    mode_b: MatrixTransposeMode,
+    sparse_matrix_a: ValueRef<'o, 'c, 't>,
+    sparse_matrix_b: ValueRef<'o, 'c, 't>,
+    sparse_matrix_c: ValueRef<'o, 'c, 't>,
+    compute_type: T,
+    buffer_size: ValueRef<'o, 'c, 't>,
+    buffer: ValueRef<'o, 'c, 't>,
+    kind: SpGemmWorkKind,
+    is_async: bool,
+    location: L,
+) -> DetachedSpGemmWorkEstimationOrComputeOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.spgemm_work_estimation_or_compute", location)
+        .add_operands(async_dependencies)
+        .add_operand(descriptor)
+        .add_operand(sparse_matrix_a)
+        .add_operand(sparse_matrix_b)
+        .add_operand(sparse_matrix_c)
+        .add_operand(buffer_size)
+        .add_operand(buffer)
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
+        .add_attribute(KIND_ATTRIBUTE, context.gpu_sp_gemm_work_kind_attribute(kind))
+        .add_result(context.index_type());
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::sp_gemm_work_estimation_or_compute`")
+}
+
 /// GPU SpGEMM copy operation.
 pub trait SpGemmCopyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
@@ -2739,6 +3343,39 @@ mlir_op!(SpGemmCopy);
 mlir_op_trait!(SpGemmCopy, ZeroRegions);
 mlir_op_trait!(SpGemmCopy, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`SpGemmCopyOperation`] at the specified [`Location`].
+pub fn sp_gemm_copy<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    descriptor: ValueRef<'o, 'c, 't>,
+    mode_a: MatrixTransposeMode,
+    mode_b: MatrixTransposeMode,
+    sparse_matrix_a: ValueRef<'o, 'c, 't>,
+    sparse_matrix_b: ValueRef<'o, 'c, 't>,
+    sparse_matrix_c: ValueRef<'o, 'c, 't>,
+    compute_type: T,
+    is_async: bool,
+    location: L,
+) -> DetachedSpGemmCopyOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.spgemm_copy", location)
+        .add_operands(async_dependencies)
+        .add_operand(descriptor)
+        .add_operand(sparse_matrix_a)
+        .add_operand(sparse_matrix_b)
+        .add_operand(sparse_matrix_c)
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type));
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::sp_gemm_copy`")
+}
+
 /// GPU sparse matrix get-size operation.
 pub trait SpMatGetSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
@@ -2779,8 +3416,34 @@ mlir_op!(SpMatGetSize);
 mlir_op_trait!(SpMatGetSize, ZeroRegions);
 mlir_op_trait!(SpMatGetSize, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`SpMatGetSizeOperation`] at the specified [`Location`].
+pub fn sp_mat_get_size<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
+    async_dependencies: &[ValueRef<'o, 'c, 't>],
+    sparse_matrix: ValueRef<'o, 'c, 't>,
+    is_async: bool,
+    location: L,
+) -> DetachedSpMatGetSizeOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.spmat_get_size", location)
+        .add_operands(async_dependencies)
+        .add_operand(sparse_matrix)
+        .add_result(context.index_type())
+        .add_result(context.index_type())
+        .add_result(context.index_type());
+    if is_async {
+        builder = builder.add_result(context.gpu_async_token_type());
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::sp_mat_get_size`")
+}
+
 gpu_sparse_async_operation!(
     SetCsrPointers,
+    set_csr_pointers,
+    "gpu.set_csr_pointers",
     "GPU operation that sets CSR pointers for a sparse matrix.",
     operands = { sparse_matrix => 0, positions => 1, coordinates => 2, values => 3 },
 );
@@ -2824,6 +3487,28 @@ mlir_op_trait!(WarpExecuteOnLane0, OneRegion);
 mlir_op_trait!(WarpExecuteOnLane0, SingleBlockRegions);
 mlir_op_trait!(WarpExecuteOnLane0, ZeroSuccessors);
 
+/// Constructs a new detached/owned [`WarpExecuteOnLane0Operation`] at the specified [`Location`].
+pub fn warp_execute_on_lane_0<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
+    lane_id: ValueRef<'o, 'c, 't>,
+    warp_size: i64,
+    arguments: &[ValueRef<'o, 'c, 't>],
+    result_types: &[TypeRef<'c, 't>],
+    region: DetachedRegion<'c, 't>,
+    location: L,
+) -> DetachedWarpExecuteOnLane0Operation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    OperationBuilder::new("gpu.warp_execute_on_lane_0", location)
+        .add_operand(lane_id)
+        .add_operands(arguments)
+        .add_attribute(WARP_SIZE_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), warp_size))
+        .add_results(result_types)
+        .add_region(region)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::warp_execute_on_lane_0`")
+}
+
 /// Name of the [`Attribute`] that stores subgroup broadcast type.
 pub const BROADCAST_TYPE_ATTRIBUTE: &str = "broadcast_type";
 
@@ -2858,6 +3543,28 @@ mlir_op!(SubgroupBroadcast);
 mlir_op_trait!(SubgroupBroadcast, OneResult);
 mlir_op_trait!(SubgroupBroadcast, ZeroRegions);
 mlir_op_trait!(SubgroupBroadcast, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`SubgroupBroadcastOperation`] at the specified [`Location`].
+pub fn subgroup_broadcast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
+    source: ValueRef<'o, 'c, 't>,
+    lane: Option<ValueRef<'o, 'c, 't>>,
+    broadcast_type: BroadcastType,
+    location: L,
+) -> DetachedSubgroupBroadcastOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::gpu());
+    let mut builder = OperationBuilder::new("gpu.subgroup_broadcast", location)
+        .add_operand(source)
+        .add_attribute(BROADCAST_TYPE_ATTRIBUTE, context.gpu_broadcast_type_attribute(broadcast_type))
+        .add_result(source.r#type());
+    if let Some(lane) = lane {
+        builder = builder.add_operand(lane);
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `gpu::subgroup_broadcast`")
+}
 
 /// GPU subgroup ballot operation.
 pub trait BallotOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -2899,13 +3606,9 @@ mod tests {
 
     use crate::dialects::gpu::attributes::ObjectFormat;
     use crate::dialects::gpu::types::MmaMatrixOperand;
-    use crate::{Attribute, Block, Context, DetachedOp, OneResult, Operation, OperationBuilder, Region, Size, Type};
+    use crate::{Attribute, Block, Context, OneResult, Operation, Region, Size, Type};
 
     use super::*;
-
-    fn build_detached_operation<'c, 't: 'c, O: DetachedOp<'c, 'c, 't>>(builder: OperationBuilder<'c, 't>) -> O {
-        builder.build().and_then(|operation| unsafe { operation.cast::<O>() }).unwrap()
-    }
 
     macro_rules! gpu_dimension_operation_test {
         ($test_name:ident, $function_name:ident, $operation_name:literal, $dimension:expr $(,)?) => {
@@ -2941,7 +3644,7 @@ mod tests {
     macro_rules! gpu_sparse_async_operation_test {
         (
             $test_name:ident,
-            $operation_type:ident,
+            $function_name:ident,
             $operation_name:literal,
             operand_count = $operand_count:expr,
             operands = { $($method:ident => $index:expr),* $(,)* } $(,)*
@@ -2955,14 +3658,11 @@ mod tests {
                 let mut arguments = vec![(token_type, location)];
                 arguments.extend((0..$operand_count).map(|_| (index_type, location)));
                 let block = context.block(arguments.as_slice());
-                let token = block.argument(0).unwrap();
-                let operands = (1..=$operand_count).map(|index| block.argument(index).unwrap()).collect::<Vec<_>>();
-                let operation: $operation_type<'_, '_> = build_detached_operation(
-                    OperationBuilder::new($operation_name, location)
-                        .add_operand(token)
-                        .add_operands(operands.as_slice())
-                        .add_result(context.gpu_async_token_type()),
-                );
+                let token = block.argument(0).unwrap().as_ref();
+                let operands = (1..=$operand_count)
+                    .map(|index| block.argument(index).unwrap().as_ref())
+                    .collect::<Vec<_>>();
+                let operation = $function_name(&[token], $(operands[$index],)* true, location);
 
                 assert_eq!(operation.name().as_str(), Ok($operation_name));
                 assert_eq!(operation.async_dependencies(), vec![token]);
@@ -2975,7 +3675,7 @@ mod tests {
     macro_rules! gpu_sparse_create_sp_mat_operation_test {
         (
             $test_name:ident,
-            $operation_type:ident,
+            $function_name:ident,
             $operation_name:literal,
             operand_count = $operand_count:expr,
             operands = { $($method:ident => $index:expr),+ $(,)* } $(,)*
@@ -2989,15 +3689,11 @@ mod tests {
                 let mut arguments = vec![(token_type, location)];
                 arguments.extend((0..$operand_count).map(|_| (index_type, location)));
                 let block = context.block(arguments.as_slice());
-                let token = block.argument(0).unwrap();
-                let operands = (1..=$operand_count).map(|index| block.argument(index).unwrap()).collect::<Vec<_>>();
-                let operation: $operation_type<'_, '_> = build_detached_operation(
-                    OperationBuilder::new($operation_name, location)
-                        .add_operand(token)
-                        .add_operands(operands.as_slice())
-                        .add_result(context.gpu_sparse_sp_mat_handle_type())
-                        .add_result(context.gpu_async_token_type()),
-                );
+                let token = block.argument(0).unwrap().as_ref();
+                let operands = (1..=$operand_count)
+                    .map(|index| block.argument(index).unwrap().as_ref())
+                    .collect::<Vec<_>>();
+                let operation = $function_name(&[token], $(operands[$index],)+ true, location);
 
                 assert_eq!(operation.name().as_str(), Ok($operation_name));
                 assert_eq!(operation.async_dependencies(), vec![token]);
@@ -3037,21 +3733,22 @@ mod tests {
     fn test_func_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        context.load_dialect(DialectHandle::gpu());
-        let operation: DetachedFuncOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.func", location)
-                .add_attribute(KERNEL_ATTRIBUTE, context.unit_attribute())
-                .add_attribute(KNOWN_BLOCK_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&[1, 2, 3]).unwrap())
-                .add_attribute(KNOWN_GRID_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&[4, 5, 6]).unwrap())
-                .add_attribute(KNOWN_CLUSTER_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&[7, 8, 9]).unwrap())
-                .add_attribute(
-                    WORKGROUP_ATTRIBUTIONS_ATTRIBUTE,
-                    context.integer_attribute(context.signless_integer_type(64), 2),
-                )
-                .add_region(context.region()),
+        let operation = func(
+            "kernel",
+            FuncProperties {
+                is_kernel: true,
+                known_block_size: Some([1, 2, 3]),
+                known_grid_size: Some([4, 5, 6]),
+                known_cluster_size: Some([7, 8, 9]),
+                workgroup_attribution_count: 2,
+                ..Default::default()
+            },
+            context.region(),
+            location,
         );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.func"));
+        assert_eq!(operation.function_name().as_str(), Ok("kernel"));
         assert!(operation.is_kernel());
         assert_eq!(operation.known_block_size(), Some(vec![1, 2, 3]));
         assert_eq!(operation.known_grid_size(), Some(vec![4, 5, 6]));
@@ -3469,18 +4166,10 @@ mod tests {
         let index_type = context.index_type().as_ref();
         let matrix_type = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A);
         let block = context.block(&[(memref_type.as_ref(), location), (index_type, location), (index_type, location)]);
-        let source_memref = block.argument(0).unwrap();
-        let index_0 = block.argument(1).unwrap();
-        let index_1 = block.argument(2).unwrap();
-        let operation: DetachedSubgroupMmaLoadMatrixOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.subgroup_mma_load_matrix", location)
-                .add_operand(source_memref)
-                .add_operand(index_0)
-                .add_operand(index_1)
-                .add_attribute(LEAD_DIMENSION_ATTRIBUTE, context.integer_attribute(context.index_type(), 16))
-                .add_attribute(TRANSPOSE_ATTRIBUTE, context.unit_attribute())
-                .add_result(matrix_type),
-        );
+        let source_memref = block.argument(0).unwrap().as_ref();
+        let index_0 = block.argument(1).unwrap().as_ref();
+        let index_1 = block.argument(2).unwrap().as_ref();
+        let operation = subgroup_mma_load_matrix(source_memref, &[index_0, index_1], 16, true, matrix_type, location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_load_matrix"));
         assert_eq!(operation.source_memref(), source_memref);
@@ -3503,19 +4192,11 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let source = block.argument(0).unwrap();
-        let destination_memref = block.argument(1).unwrap();
-        let index_0 = block.argument(2).unwrap();
-        let index_1 = block.argument(3).unwrap();
-        let operation: DetachedSubgroupMmaStoreMatrixOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.subgroup_mma_store_matrix", location)
-                .add_operand(source)
-                .add_operand(destination_memref)
-                .add_operand(index_0)
-                .add_operand(index_1)
-                .add_attribute(LEAD_DIMENSION_ATTRIBUTE, context.integer_attribute(context.index_type(), 16))
-                .add_attribute(TRANSPOSE_ATTRIBUTE, context.unit_attribute()),
-        );
+        let source = block.argument(0).unwrap().as_ref();
+        let destination_memref = block.argument(1).unwrap().as_ref();
+        let index_0 = block.argument(2).unwrap().as_ref();
+        let index_1 = block.argument(3).unwrap().as_ref();
+        let operation = subgroup_mma_store_matrix(source, destination_memref, &[index_0, index_1], 16, true, location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_store_matrix"));
         assert_eq!(operation.source(), source);
@@ -3534,18 +4215,10 @@ mod tests {
         let c_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C);
         let block =
             context.block(&[(a_type.as_ref(), location), (b_type.as_ref(), location), (c_type.as_ref(), location)]);
-        let a = block.argument(0).unwrap();
-        let b = block.argument(1).unwrap();
-        let c = block.argument(2).unwrap();
-        let operation: DetachedSubgroupMmaComputeOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.subgroup_mma_compute", location)
-                .add_operand(a)
-                .add_operand(b)
-                .add_operand(c)
-                .add_attribute(A_TRANSPOSE_ATTRIBUTE, context.unit_attribute())
-                .add_attribute(B_TRANSPOSE_ATTRIBUTE, context.unit_attribute())
-                .add_result(c_type),
-        );
+        let a = block.argument(0).unwrap().as_ref();
+        let b = block.argument(1).unwrap().as_ref();
+        let c = block.argument(2).unwrap().as_ref();
+        let operation = subgroup_mma_compute(a, b, c, true, true, c_type, location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_compute"));
         assert_eq!(operation.a(), a);
@@ -3562,12 +4235,8 @@ mod tests {
         let location = context.unknown_location();
         let matrix_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C);
         let block = context.block(&[(context.float32_type().as_ref(), location)]);
-        let value = block.argument(0).unwrap();
-        let operation: DetachedSubgroupMmaConstantMatrixOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.subgroup_mma_constant_matrix", location)
-                .add_operand(value)
-                .add_result(matrix_type),
-        );
+        let value = block.argument(0).unwrap().as_ref();
+        let operation = subgroup_mma_constant_matrix(value, matrix_type, location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_constant_matrix"));
         assert_eq!(operation.value(), value);
@@ -3581,16 +4250,11 @@ mod tests {
         let matrix_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C);
         let index_type = context.index_type().as_ref();
         let block = context.block(&[(matrix_type.as_ref(), location), (index_type, location), (index_type, location)]);
-        let matrix = block.argument(0).unwrap();
-        let index_0 = block.argument(1).unwrap();
-        let index_1 = block.argument(2).unwrap();
-        let operation: DetachedSubgroupMmaExtractThreadLocalOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.subgroup_mma_extract_thread_local", location)
-                .add_operand(matrix)
-                .add_operand(index_0)
-                .add_operand(index_1)
-                .add_result(context.float32_type()),
-        );
+        let matrix = block.argument(0).unwrap().as_ref();
+        let index_0 = block.argument(1).unwrap().as_ref();
+        let index_1 = block.argument(2).unwrap().as_ref();
+        let operation =
+            subgroup_mma_extract_thread_local(matrix, &[index_0, index_1], context.float32_type(), location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_extract_thread_local"));
         assert_eq!(operation.matrix(), matrix);
@@ -3610,18 +4274,11 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let value = block.argument(0).unwrap();
-        let matrix = block.argument(1).unwrap();
-        let index_0 = block.argument(2).unwrap();
-        let index_1 = block.argument(3).unwrap();
-        let operation: DetachedSubgroupMmaInsertThreadLocalOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.subgroup_mma_insert_thread_local", location)
-                .add_operand(value)
-                .add_operand(matrix)
-                .add_operand(index_0)
-                .add_operand(index_1)
-                .add_result(matrix_type),
-        );
+        let value = block.argument(0).unwrap().as_ref();
+        let matrix = block.argument(1).unwrap().as_ref();
+        let index_0 = block.argument(2).unwrap().as_ref();
+        let index_1 = block.argument(3).unwrap().as_ref();
+        let operation = subgroup_mma_insert_thread_local(value, matrix, &[index_0, index_1], matrix_type, location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_insert_thread_local"));
         assert_eq!(operation.value(), value);
@@ -3636,18 +4293,9 @@ mod tests {
         let location = context.unknown_location();
         let matrix_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C);
         let block = context.block(&[(matrix_type.as_ref(), location), (matrix_type.as_ref(), location)]);
-        let lhs = block.argument(0).unwrap();
-        let rhs = block.argument(1).unwrap();
-        let operation: DetachedSubgroupMmaElementwiseOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.subgroup_mma_elementwise", location)
-                .add_operand(lhs)
-                .add_operand(rhs)
-                .add_attribute(
-                    OP_TYPE_ATTRIBUTE,
-                    context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat),
-                )
-                .add_result(matrix_type),
-        );
+        let lhs = block.argument(0).unwrap().as_ref();
+        let rhs = block.argument(1).unwrap().as_ref();
+        let operation = subgroup_mma_elementwise(&[lhs, rhs], MmaElementwiseOperation::AddFloat, matrix_type, location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_elementwise"));
         assert_eq!(operation.arguments(), vec![lhs, rhs]);
@@ -3667,21 +4315,11 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let token = block.argument(0).unwrap();
-        let memref = block.argument(1).unwrap();
-        let dimension = block.argument(2).unwrap();
-        let stride = block.argument(3).unwrap();
-        let segment_sizes = context.dense_i32_array_attribute(&[1, 1, 2]).unwrap();
-        let operation: DetachedCreateDnTensorOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.create_dn_tensor", location)
-                .add_operand(token)
-                .add_operand(memref)
-                .add_operand(dimension)
-                .add_operand(stride)
-                .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
-                .add_result(context.gpu_sparse_dn_tensor_handle_type())
-                .add_result(context.gpu_async_token_type()),
-        );
+        let token = block.argument(0).unwrap().as_ref();
+        let memref = block.argument(1).unwrap().as_ref();
+        let dimension = block.argument(2).unwrap().as_ref();
+        let stride = block.argument(3).unwrap().as_ref();
+        let operation = create_dn_tensor(&[token], memref, &[dimension, stride], true, location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.create_dn_tensor"));
         assert_eq!(operation.async_dependencies(), vec![token]);
@@ -3693,7 +4331,7 @@ mod tests {
 
     gpu_sparse_async_operation_test!(
         test_destroy_dn_tensor_operation,
-        DetachedDestroyDnTensorOperation,
+        destroy_dn_tensor,
         "gpu.destroy_dn_tensor",
         operand_count = 1,
         operands = { dense_tensor => 0 },
@@ -3701,7 +4339,7 @@ mod tests {
 
     gpu_sparse_create_sp_mat_operation_test!(
         test_create_coo_operation,
-        DetachedCreateCooOperation,
+        create_coo,
         "gpu.create_coo",
         operand_count = 6,
         operands = {
@@ -3716,7 +4354,7 @@ mod tests {
 
     gpu_sparse_create_sp_mat_operation_test!(
         test_create_coo_aos_operation,
-        DetachedCreateCooAosOperation,
+        create_coo_aos,
         "gpu.create_coo_aos",
         operand_count = 5,
         operands = { rows => 0, columns => 1, non_zero_count => 2, indices => 3, values => 4 },
@@ -3724,7 +4362,7 @@ mod tests {
 
     gpu_sparse_create_sp_mat_operation_test!(
         test_create_csr_operation,
-        DetachedCreateCsrOperation,
+        create_csr,
         "gpu.create_csr",
         operand_count = 6,
         operands = {
@@ -3739,7 +4377,7 @@ mod tests {
 
     gpu_sparse_create_sp_mat_operation_test!(
         test_create_csc_operation,
-        DetachedCreateCscOperation,
+        create_csc,
         "gpu.create_csc",
         operand_count = 6,
         operands = {
@@ -3754,7 +4392,7 @@ mod tests {
 
     gpu_sparse_create_sp_mat_operation_test!(
         test_create_bsr_operation,
-        DetachedCreateBsrOperation,
+        create_bsr,
         "gpu.create_bsr",
         operand_count = 8,
         operands = {
@@ -3781,22 +4419,18 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let token = block.argument(0).unwrap();
-        let rows = block.argument(1).unwrap();
-        let columns = block.argument(2).unwrap();
-        let memref = block.argument(3).unwrap();
-        let operation: DetachedCreate2To4SpMatOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.create_2to4_spmat", location)
-                .add_operand(token)
-                .add_operand(rows)
-                .add_operand(columns)
-                .add_operand(memref)
-                .add_attribute(
-                    PRUNE_FLAG_ATTRIBUTE,
-                    context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneAndCheck),
-                )
-                .add_result(context.gpu_sparse_sp_mat_handle_type())
-                .add_result(context.gpu_async_token_type()),
+        let token = block.argument(0).unwrap().as_ref();
+        let rows = block.argument(1).unwrap().as_ref();
+        let columns = block.argument(2).unwrap().as_ref();
+        let memref = block.argument(3).unwrap().as_ref();
+        let operation = create_2_to_4_sp_mat(
+            &[token],
+            rows,
+            columns,
+            Prune2To4SparseMatrixFlag::PruneAndCheck,
+            memref,
+            true,
+            location,
         );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.create_2to4_spmat"));
@@ -3811,7 +4445,7 @@ mod tests {
 
     gpu_sparse_async_operation_test!(
         test_destroy_sp_mat_operation,
-        DetachedDestroySpMatOperation,
+        destroy_sp_mat,
         "gpu.destroy_sp_mat",
         operand_count = 1,
         operands = { sparse_matrix => 0 },
@@ -3829,23 +4463,19 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let token = block.argument(0).unwrap();
-        let sparse_matrix_a = block.argument(1).unwrap();
-        let dense_tensor_x = block.argument(2).unwrap();
-        let dense_tensor_y = block.argument(3).unwrap();
-        let operation: DetachedSpmvBufferSizeOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.spmv_buffer_size", location)
-                .add_operand(token)
-                .add_operand(sparse_matrix_a)
-                .add_operand(dense_tensor_x)
-                .add_operand(dense_tensor_y)
-                .add_attribute(
-                    MODE_A_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::Transpose),
-                )
-                .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(context.float32_type()))
-                .add_result(context.index_type())
-                .add_result(context.gpu_async_token_type()),
+        let token = block.argument(0).unwrap().as_ref();
+        let sparse_matrix_a = block.argument(1).unwrap().as_ref();
+        let dense_tensor_x = block.argument(2).unwrap().as_ref();
+        let dense_tensor_y = block.argument(3).unwrap().as_ref();
+        let operation = spmv_buffer_size(
+            &[token],
+            MatrixTransposeMode::Transpose,
+            sparse_matrix_a,
+            dense_tensor_x,
+            dense_tensor_y,
+            context.float32_type(),
+            true,
+            location,
         );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spmv_buffer_size"));
@@ -3872,24 +4502,21 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let token = block.argument(0).unwrap();
-        let sparse_matrix_a = block.argument(1).unwrap();
-        let dense_tensor_x = block.argument(2).unwrap();
-        let dense_tensor_y = block.argument(3).unwrap();
-        let buffer = block.argument(4).unwrap();
-        let operation: DetachedSpmvOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.spmv", location)
-                .add_operand(token)
-                .add_operand(sparse_matrix_a)
-                .add_operand(dense_tensor_x)
-                .add_operand(dense_tensor_y)
-                .add_operand(buffer)
-                .add_attribute(
-                    MODE_A_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose),
-                )
-                .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(context.float32_type()))
-                .add_result(context.gpu_async_token_type()),
+        let token = block.argument(0).unwrap().as_ref();
+        let sparse_matrix_a = block.argument(1).unwrap().as_ref();
+        let dense_tensor_x = block.argument(2).unwrap().as_ref();
+        let dense_tensor_y = block.argument(3).unwrap().as_ref();
+        let buffer = block.argument(4).unwrap().as_ref();
+        let operation = spmv(
+            &[token],
+            MatrixTransposeMode::NonTranspose,
+            sparse_matrix_a,
+            dense_tensor_x,
+            dense_tensor_y,
+            context.float32_type(),
+            buffer,
+            true,
+            location,
         );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spmv"));
@@ -3915,29 +4542,21 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let token = block.argument(0).unwrap();
-        let sparse_matrix_a = block.argument(1).unwrap();
-        let dense_matrix_b = block.argument(2).unwrap();
-        let dense_matrix_c = block.argument(3).unwrap();
-        let operation: DetachedSpmmBufferSizeOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.spmm_buffer_size", location)
-                .add_operand(token)
-                .add_operand(sparse_matrix_a)
-                .add_operand(dense_matrix_b)
-                .add_operand(dense_matrix_c)
-                .add_attribute(
-                    MODE_A_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose),
-                )
-                .add_attribute(
-                    MODE_B_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::Transpose),
-                )
-                .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(context.float32_type()))
-                .add_attribute(RESULT_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&[2, 1]).unwrap())
-                .add_result(context.index_type())
-                .add_result(context.index_type())
-                .add_result(context.gpu_async_token_type()),
+        let token = block.argument(0).unwrap().as_ref();
+        let sparse_matrix_a = block.argument(1).unwrap().as_ref();
+        let dense_matrix_b = block.argument(2).unwrap().as_ref();
+        let dense_matrix_c = block.argument(3).unwrap().as_ref();
+        let operation = spmm_buffer_size(
+            &[token],
+            MatrixTransposeMode::NonTranspose,
+            MatrixTransposeMode::Transpose,
+            sparse_matrix_a,
+            dense_matrix_b,
+            dense_matrix_c,
+            context.float32_type(),
+            2,
+            true,
+            location,
         );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spmm_buffer_size"));
@@ -3966,32 +4585,23 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let token = block.argument(0).unwrap();
-        let sparse_matrix_a = block.argument(1).unwrap();
-        let dense_matrix_b = block.argument(2).unwrap();
-        let dense_matrix_c = block.argument(3).unwrap();
-        let buffer_0 = block.argument(4).unwrap();
-        let buffer_1 = block.argument(5).unwrap();
-        let segment_sizes = context.dense_i32_array_attribute(&[1, 1, 1, 1, 2]).unwrap();
-        let operation: DetachedSpmmOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.spmm", location)
-                .add_operand(token)
-                .add_operand(sparse_matrix_a)
-                .add_operand(dense_matrix_b)
-                .add_operand(dense_matrix_c)
-                .add_operand(buffer_0)
-                .add_operand(buffer_1)
-                .add_attribute(
-                    MODE_A_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose),
-                )
-                .add_attribute(
-                    MODE_B_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::Transpose),
-                )
-                .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
-                .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(context.float32_type()))
-                .add_result(context.gpu_async_token_type()),
+        let token = block.argument(0).unwrap().as_ref();
+        let sparse_matrix_a = block.argument(1).unwrap().as_ref();
+        let dense_matrix_b = block.argument(2).unwrap().as_ref();
+        let dense_matrix_c = block.argument(3).unwrap().as_ref();
+        let buffer_0 = block.argument(4).unwrap().as_ref();
+        let buffer_1 = block.argument(5).unwrap().as_ref();
+        let operation = spmm(
+            &[token],
+            MatrixTransposeMode::NonTranspose,
+            MatrixTransposeMode::Transpose,
+            sparse_matrix_a,
+            dense_matrix_b,
+            dense_matrix_c,
+            context.float32_type(),
+            &[buffer_0, buffer_1],
+            true,
+            location,
         );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spmm"));
@@ -4018,27 +4628,20 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let token = block.argument(0).unwrap();
-        let dense_matrix_a = block.argument(1).unwrap();
-        let dense_matrix_b = block.argument(2).unwrap();
-        let sparse_matrix_c = block.argument(3).unwrap();
-        let operation: DetachedSddmmBufferSizeOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.sddmm_buffer_size", location)
-                .add_operand(token)
-                .add_operand(dense_matrix_a)
-                .add_operand(dense_matrix_b)
-                .add_operand(sparse_matrix_c)
-                .add_attribute(
-                    MODE_A_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose),
-                )
-                .add_attribute(
-                    MODE_B_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::Transpose),
-                )
-                .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(context.float32_type()))
-                .add_result(context.index_type())
-                .add_result(context.gpu_async_token_type()),
+        let token = block.argument(0).unwrap().as_ref();
+        let dense_matrix_a = block.argument(1).unwrap().as_ref();
+        let dense_matrix_b = block.argument(2).unwrap().as_ref();
+        let sparse_matrix_c = block.argument(3).unwrap().as_ref();
+        let operation = sddmm_buffer_size(
+            &[token],
+            MatrixTransposeMode::NonTranspose,
+            MatrixTransposeMode::Transpose,
+            dense_matrix_a,
+            dense_matrix_b,
+            sparse_matrix_c,
+            context.float32_type(),
+            true,
+            location,
         );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.sddmm_buffer_size"));
@@ -4066,28 +4669,22 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let token = block.argument(0).unwrap();
-        let dense_matrix_a = block.argument(1).unwrap();
-        let dense_matrix_b = block.argument(2).unwrap();
-        let sparse_matrix_c = block.argument(3).unwrap();
-        let buffer = block.argument(4).unwrap();
-        let operation: DetachedSddmmOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.sddmm", location)
-                .add_operand(token)
-                .add_operand(dense_matrix_a)
-                .add_operand(dense_matrix_b)
-                .add_operand(sparse_matrix_c)
-                .add_operand(buffer)
-                .add_attribute(
-                    MODE_A_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose),
-                )
-                .add_attribute(
-                    MODE_B_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::Transpose),
-                )
-                .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(context.float32_type()))
-                .add_result(context.gpu_async_token_type()),
+        let token = block.argument(0).unwrap().as_ref();
+        let dense_matrix_a = block.argument(1).unwrap().as_ref();
+        let dense_matrix_b = block.argument(2).unwrap().as_ref();
+        let sparse_matrix_c = block.argument(3).unwrap().as_ref();
+        let buffer = block.argument(4).unwrap().as_ref();
+        let operation = sddmm(
+            &[token],
+            MatrixTransposeMode::NonTranspose,
+            MatrixTransposeMode::Transpose,
+            dense_matrix_a,
+            dense_matrix_b,
+            sparse_matrix_c,
+            context.float32_type(),
+            buffer,
+            true,
+            location,
         );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.sddmm"));
@@ -4108,13 +4705,8 @@ mod tests {
         let location = context.unknown_location();
         let token_type = context.gpu_async_token_type().as_ref();
         let block = context.block(&[(token_type, location)]);
-        let token = block.argument(0).unwrap();
-        let operation: DetachedSpGemmCreateDescrOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.spgemm_create_descr", location)
-                .add_operand(token)
-                .add_result(context.gpu_sparse_sp_gemm_operation_handle_type())
-                .add_result(context.gpu_async_token_type()),
-        );
+        let token = block.argument(0).unwrap().as_ref();
+        let operation = sp_gemm_create_descr(&[token], true, location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spgemm_create_descr"));
         assert_eq!(operation.async_dependencies(), vec![token]);
@@ -4124,7 +4716,7 @@ mod tests {
 
     gpu_sparse_async_operation_test!(
         test_sp_gemm_destroy_descr_operation,
-        DetachedSpGemmDestroyDescrOperation,
+        sp_gemm_destroy_descr,
         "gpu.spgemm_destroy_descr",
         operand_count = 1,
         operands = { descriptor => 0 },
@@ -4145,34 +4737,27 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let token = block.argument(0).unwrap();
-        let descriptor = block.argument(1).unwrap();
-        let sparse_matrix_a = block.argument(2).unwrap();
-        let sparse_matrix_b = block.argument(3).unwrap();
-        let sparse_matrix_c = block.argument(4).unwrap();
-        let buffer_size = block.argument(5).unwrap();
-        let buffer = block.argument(6).unwrap();
-        let operation: DetachedSpGemmWorkEstimationOrComputeOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.spgemm_work_estimation_or_compute", location)
-                .add_operand(token)
-                .add_operand(descriptor)
-                .add_operand(sparse_matrix_a)
-                .add_operand(sparse_matrix_b)
-                .add_operand(sparse_matrix_c)
-                .add_operand(buffer_size)
-                .add_operand(buffer)
-                .add_attribute(
-                    MODE_A_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose),
-                )
-                .add_attribute(
-                    MODE_B_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::Transpose),
-                )
-                .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(context.float32_type()))
-                .add_attribute(KIND_ATTRIBUTE, context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::Compute))
-                .add_result(context.index_type())
-                .add_result(context.gpu_async_token_type()),
+        let token = block.argument(0).unwrap().as_ref();
+        let descriptor = block.argument(1).unwrap().as_ref();
+        let sparse_matrix_a = block.argument(2).unwrap().as_ref();
+        let sparse_matrix_b = block.argument(3).unwrap().as_ref();
+        let sparse_matrix_c = block.argument(4).unwrap().as_ref();
+        let buffer_size = block.argument(5).unwrap().as_ref();
+        let buffer = block.argument(6).unwrap().as_ref();
+        let operation = sp_gemm_work_estimation_or_compute(
+            &[token],
+            descriptor,
+            MatrixTransposeMode::NonTranspose,
+            MatrixTransposeMode::Transpose,
+            sparse_matrix_a,
+            sparse_matrix_b,
+            sparse_matrix_c,
+            context.float32_type(),
+            buffer_size,
+            buffer,
+            SpGemmWorkKind::Compute,
+            true,
+            location,
         );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spgemm_work_estimation_or_compute"));
@@ -4204,28 +4789,22 @@ mod tests {
             (index_type, location),
             (index_type, location),
         ]);
-        let token = block.argument(0).unwrap();
-        let descriptor = block.argument(1).unwrap();
-        let sparse_matrix_a = block.argument(2).unwrap();
-        let sparse_matrix_b = block.argument(3).unwrap();
-        let sparse_matrix_c = block.argument(4).unwrap();
-        let operation: DetachedSpGemmCopyOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.spgemm_copy", location)
-                .add_operand(token)
-                .add_operand(descriptor)
-                .add_operand(sparse_matrix_a)
-                .add_operand(sparse_matrix_b)
-                .add_operand(sparse_matrix_c)
-                .add_attribute(
-                    MODE_A_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose),
-                )
-                .add_attribute(
-                    MODE_B_ATTRIBUTE,
-                    context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::Transpose),
-                )
-                .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(context.float32_type()))
-                .add_result(context.gpu_async_token_type()),
+        let token = block.argument(0).unwrap().as_ref();
+        let descriptor = block.argument(1).unwrap().as_ref();
+        let sparse_matrix_a = block.argument(2).unwrap().as_ref();
+        let sparse_matrix_b = block.argument(3).unwrap().as_ref();
+        let sparse_matrix_c = block.argument(4).unwrap().as_ref();
+        let operation = sp_gemm_copy(
+            &[token],
+            descriptor,
+            MatrixTransposeMode::NonTranspose,
+            MatrixTransposeMode::Transpose,
+            sparse_matrix_a,
+            sparse_matrix_b,
+            sparse_matrix_c,
+            context.float32_type(),
+            true,
+            location,
         );
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spgemm_copy"));
@@ -4247,17 +4826,9 @@ mod tests {
         let token_type = context.gpu_async_token_type().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[(token_type, location), (index_type, location)]);
-        let token = block.argument(0).unwrap();
-        let sparse_matrix = block.argument(1).unwrap();
-        let operation: DetachedSpMatGetSizeOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.spmat_get_size", location)
-                .add_operand(token)
-                .add_operand(sparse_matrix)
-                .add_result(context.index_type())
-                .add_result(context.index_type())
-                .add_result(context.index_type())
-                .add_result(context.gpu_async_token_type()),
-        );
+        let token = block.argument(0).unwrap().as_ref();
+        let sparse_matrix = block.argument(1).unwrap().as_ref();
+        let operation = sp_mat_get_size(&[token], sparse_matrix, true, location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spmat_get_size"));
         assert_eq!(operation.async_dependencies(), vec![token]);
@@ -4270,7 +4841,7 @@ mod tests {
 
     gpu_sparse_async_operation_test!(
         test_set_csr_pointers_operation,
-        DetachedSetCsrPointersOperation,
+        set_csr_pointers,
         "gpu.set_csr_pointers",
         operand_count = 4,
         operands = {
@@ -4287,19 +4858,12 @@ mod tests {
         let location = context.unknown_location();
         let index_type = context.index_type();
         let block = context.block(&[(index_type, location), (index_type, location), (index_type, location)]);
-        let lane_id = block.argument(0).unwrap();
-        let argument_0 = block.argument(1).unwrap();
-        let argument_1 = block.argument(2).unwrap();
-        let operation: DetachedWarpExecuteOnLane0Operation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.warp_execute_on_lane_0", location)
-                .add_operand(lane_id)
-                .add_operand(argument_0)
-                .add_operand(argument_1)
-                .add_attribute(WARP_SIZE_ATTRIBUTE, context.integer_attribute(context.index_type(), 32))
-                .add_result(context.index_type())
-                .add_result(context.index_type())
-                .add_region(context.region()),
-        );
+        let lane_id = block.argument(0).unwrap().as_ref();
+        let argument_0 = block.argument(1).unwrap().as_ref();
+        let argument_1 = block.argument(2).unwrap().as_ref();
+        let result_types = [context.index_type().as_ref(), context.index_type().as_ref()];
+        let operation =
+            warp_execute_on_lane_0(lane_id, 32, &[argument_0, argument_1], &result_types, context.region(), location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.warp_execute_on_lane_0"));
         assert_eq!(operation.lane_id(), lane_id);
@@ -4315,18 +4879,9 @@ mod tests {
         let location = context.unknown_location();
         let index_type = context.index_type();
         let block = context.block(&[(index_type, location), (index_type, location)]);
-        let source = block.argument(0).unwrap();
-        let lane = block.argument(1).unwrap();
-        let operation: DetachedSubgroupBroadcastOperation<'_, '_> = build_detached_operation(
-            OperationBuilder::new("gpu.subgroup_broadcast", location)
-                .add_operand(source)
-                .add_operand(lane)
-                .add_attribute(
-                    BROADCAST_TYPE_ATTRIBUTE,
-                    context.gpu_broadcast_type_attribute(BroadcastType::SpecificLane),
-                )
-                .add_result(context.index_type()),
-        );
+        let source = block.argument(0).unwrap().as_ref();
+        let lane = block.argument(1).unwrap().as_ref();
+        let operation = subgroup_broadcast(source, Some(lane), BroadcastType::SpecificLane, location);
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_broadcast"));
         assert_eq!(operation.source(), source);

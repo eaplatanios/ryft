@@ -93,8 +93,7 @@ fn main() {
   thinking was that libraries building on top of `ryft_mlir` would create safer wrappers with more robust error handling
   that is also aware of the specifics of any custom MLIR dialects they may be using.
 - Support more MLIR dialects:
-    - [/] `affine`
-        - [ ] Add support for operations.
+    - [x] `affine`
     - [/] `arith`
         - [ ] Add support for operations: `addui_extended`, `mulsi_extended`, `mului_extended`.
         - [ ] Add support for attributes: `FastMathFlags`, `IntegerOverflowFlags`, `RoundingMode`, `AtomicRMWKind`.

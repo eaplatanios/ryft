@@ -53,6 +53,7 @@ mod tests {
 
     #[test]
     fn test_dialect_handle() {
+        assert_eq!(DialectHandle::affine().namespace().unwrap(), "affine");
         assert_eq!(DialectHandle::gpu().namespace().unwrap(), "gpu");
         assert_eq!(DialectHandle::linalg().namespace().unwrap(), "linalg");
         assert_eq!(DialectHandle::sparse_tensor().namespace().unwrap(), "sparse_tensor");
