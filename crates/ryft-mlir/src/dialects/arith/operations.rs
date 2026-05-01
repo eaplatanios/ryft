@@ -1,6 +1,7 @@
 use crate::{
     Attribute, AttributeRef, DetachedOp, DialectHandle, IntegerAttributeRef, Location, Operation, OperationBuilder,
-    Value, ValueRef, mlir_binary_op, mlir_generic_unary_op, mlir_op, mlir_op_trait, mlir_unary_op,
+    TensorTypeRef, Type, TypeRef, UnrankedTensorTypeRef, Value, ValueRef, VectorTypeRef, mlir_binary_op,
+    mlir_generic_unary_op, mlir_op, mlir_op_trait, mlir_unary_op,
 };
 
 pub const CONSTANT_VALUE_ATTRIBUTE: &str = "value";
@@ -50,6 +51,71 @@ mlir_unary_op!(arith, negf);
 
 mlir_binary_op!(arith, addf);
 mlir_binary_op!(arith, addi);
+
+/// Operation trait for the `arith.addui_extended` operation.
+pub trait AdduiExtendedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the left-hand side input of this operation.
+    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the right-hand side input of this operation.
+    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(1).unwrap()
+    }
+
+    /// Returns the fixed-width sum result.
+    fn sum(&self) -> ValueRef<'o, 'c, 't> {
+        self.result(0).unwrap().as_ref()
+    }
+
+    /// Returns the boolean-like overflow result.
+    fn overflow(&self) -> ValueRef<'o, 'c, 't> {
+        self.result(1).unwrap().as_ref()
+    }
+}
+
+mlir_op!(AdduiExtended);
+mlir_op_trait!(AdduiExtended, ZeroRegions);
+mlir_op_trait!(AdduiExtended, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`AdduiExtendedOperation`] at the specified [`Location`].
+pub fn addui_extended<
+    'lhs,
+    'rhs,
+    'c: 'lhs + 'rhs,
+    't: 'c,
+    LHS: Value<'lhs, 'c, 't>,
+    RHS: Value<'rhs, 'c, 't>,
+    L: Location<'c, 't>,
+>(
+    lhs: LHS,
+    rhs: RHS,
+    location: L,
+) -> DetachedAdduiExtendedOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::arith());
+    let input_type = lhs.r#type();
+    let i1_type = context.signless_integer_type(1);
+    let overflow_type: TypeRef<'c, 't> = if let Some(tensor_type) = input_type.cast::<TensorTypeRef>() {
+        let shape = tensor_type.dimensions().collect::<Vec<_>>();
+        context.tensor_type(i1_type, &shape, tensor_type.encoding(), location).unwrap().as_ref()
+    } else if input_type.is::<UnrankedTensorTypeRef>() {
+        context.unranked_tensor_type(i1_type, location).unwrap().as_ref()
+    } else if let Some(vector_type) = input_type.cast::<VectorTypeRef>() {
+        let shape = vector_type.dimensions().collect::<Vec<_>>();
+        context.vector_type(i1_type, &shape, location).unwrap().as_ref()
+    } else {
+        i1_type.as_ref()
+    };
+    OperationBuilder::new("arith.addui_extended", location)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
+        .add_results(&[input_type, overflow_type])
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `arith::addui_extended`")
+}
+
 mlir_binary_op!(arith, andi);
 mlir_binary_op!(arith, ceildivsi);
 mlir_binary_op!(arith, ceildivui);
@@ -67,6 +133,109 @@ mlir_binary_op!(arith, minsi);
 mlir_binary_op!(arith, minui);
 mlir_binary_op!(arith, mulf);
 mlir_binary_op!(arith, muli);
+
+/// Operation trait for the `arith.mulsi_extended` operation.
+pub trait MulsiExtendedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the left-hand side input of this operation.
+    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the right-hand side input of this operation.
+    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(1).unwrap()
+    }
+
+    /// Returns the low half of the product.
+    fn low(&self) -> ValueRef<'o, 'c, 't> {
+        self.result(0).unwrap().as_ref()
+    }
+
+    /// Returns the high half of the product.
+    fn high(&self) -> ValueRef<'o, 'c, 't> {
+        self.result(1).unwrap().as_ref()
+    }
+}
+
+mlir_op!(MulsiExtended);
+mlir_op_trait!(MulsiExtended, ZeroRegions);
+mlir_op_trait!(MulsiExtended, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`MulsiExtendedOperation`] at the specified [`Location`].
+pub fn mulsi_extended<
+    'lhs,
+    'rhs,
+    'c: 'lhs + 'rhs,
+    't: 'c,
+    LHS: Value<'lhs, 'c, 't>,
+    RHS: Value<'rhs, 'c, 't>,
+    L: Location<'c, 't>,
+>(
+    lhs: LHS,
+    rhs: RHS,
+    location: L,
+) -> DetachedMulsiExtendedOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::arith());
+    OperationBuilder::new("arith.mulsi_extended", location)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
+        .enable_result_type_inference()
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `arith::mulsi_extended`")
+}
+
+/// Operation trait for the `arith.mului_extended` operation.
+pub trait MuluiExtendedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the left-hand side input of this operation.
+    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the right-hand side input of this operation.
+    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(1).unwrap()
+    }
+
+    /// Returns the low half of the product.
+    fn low(&self) -> ValueRef<'o, 'c, 't> {
+        self.result(0).unwrap().as_ref()
+    }
+
+    /// Returns the high half of the product.
+    fn high(&self) -> ValueRef<'o, 'c, 't> {
+        self.result(1).unwrap().as_ref()
+    }
+}
+
+mlir_op!(MuluiExtended);
+mlir_op_trait!(MuluiExtended, ZeroRegions);
+mlir_op_trait!(MuluiExtended, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`MuluiExtendedOperation`] at the specified [`Location`].
+pub fn mului_extended<
+    'lhs,
+    'rhs,
+    'c: 'lhs + 'rhs,
+    't: 'c,
+    LHS: Value<'lhs, 'c, 't>,
+    RHS: Value<'rhs, 'c, 't>,
+    L: Location<'c, 't>,
+>(
+    lhs: LHS,
+    rhs: RHS,
+    location: L,
+) -> DetachedMuluiExtendedOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::arith());
+    OperationBuilder::new("arith.mului_extended", location)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
+        .enable_result_type_inference()
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `arith::mului_extended`")
+}
+
 mlir_binary_op!(arith, ori);
 mlir_binary_op!(arith, remf);
 mlir_binary_op!(arith, remsi);
@@ -1060,6 +1229,52 @@ mod tests {
     }
 
     #[test]
+    fn test_addui_extended() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = addui_extended(lhs, rhs, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(op.sum().r#type(), i32_type);
+            assert_eq!(op.overflow().r#type(), i1_type);
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 2);
+            let results = op.results().collect::<Vec<_>>();
+            block.append_operation(op);
+            block.append_operation(func::r#return(&results, location));
+            func::func(
+                "addui_extended_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into(), i1_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @addui_extended_test(%arg0: i32, %arg1: i32) -> (i32, i1) {
+                    %sum, %overflow = arith.addui_extended %arg0, %arg1 : i32, i1
+                    return %sum, %overflow : i32, i1
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
     fn test_andi() {
         let context = Context::new();
         let location = context.unknown_location();
@@ -1784,6 +1999,96 @@ mod tests {
                   func.func @muli_test(%arg0: i32, %arg1: i32) -> i32 {
                     %0 = arith.muli %arg0, %arg1 : i32
                     return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_mulsi_extended() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = mulsi_extended(lhs, rhs, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(op.low().r#type(), i32_type);
+            assert_eq!(op.high().r#type(), i32_type);
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 2);
+            let results = op.results().collect::<Vec<_>>();
+            block.append_operation(op);
+            block.append_operation(func::r#return(&results, location));
+            func::func(
+                "mulsi_extended_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into(), i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @mulsi_extended_test(%arg0: i32, %arg1: i32) -> (i32, i32) {
+                    %low, %high = arith.mulsi_extended %arg0, %arg1 : i32
+                    return %low, %high : i32, i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_mului_extended() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = mului_extended(lhs, rhs, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(op.low().r#type(), i32_type);
+            assert_eq!(op.high().r#type(), i32_type);
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 2);
+            let results = op.results().collect::<Vec<_>>();
+            block.append_operation(op);
+            block.append_operation(func::r#return(&results, location));
+            func::func(
+                "mului_extended_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into(), i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @mului_extended_test(%arg0: i32, %arg1: i32) -> (i32, i32) {
+                    %low, %high = arith.mului_extended %arg0, %arg1 : i32
+                    return %low, %high : i32, i32
                   }
                 }
             "},

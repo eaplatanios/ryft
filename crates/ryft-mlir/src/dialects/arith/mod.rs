@@ -11,8 +11,10 @@ use ryft_xla_sys::bindings::mlirGetDialectHandle__arith__;
 
 use crate::DialectHandle;
 
+pub mod attributes;
 pub mod operations;
 
+pub use attributes::*;
 pub use operations::*;
 
 impl DialectHandle<'_, '_> {

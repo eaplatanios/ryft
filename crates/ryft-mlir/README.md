@@ -93,12 +93,9 @@ fn main() {
   thinking was that libraries building on top of `ryft_mlir` would create safer wrappers with more robust error handling
   that is also aware of the specifics of any custom MLIR dialects they may be using.
 - Support more MLIR dialects:
-    - [/] `affine`
-        - [ ] Add support for operations.
-    - [/] `arith`
-        - [ ] Add support for operations: `addui_extended`, `mulsi_extended`, `mului_extended`.
-        - [ ] Add support for attributes: `FastMathFlags`, `IntegerOverflowFlags`, `RoundingMode`, `AtomicRMWKind`.
-    - [ ] `async`
+    - [x] `affine`
+    - [x] `arith`
+    - [x] `async`
     - [x] `builtin`
     - [x] `cf`
     - [ ] `chlo`
@@ -109,17 +106,15 @@ fn main() {
     - [x] `func`
     - [x] `gpu`
     - [x] `index`
-    - [ ] `linalg`
+    - [x] `linalg`
     - [ ] `llvm`
         - [ ] Add support for types: `LLVMPointerType`, `LLVMStructType`.
         - [ ] Add support for operations.
-    - [ ] `memref`
+    - [x] `memref`
     - [ ] `mhlo`
-    - [ ] [`mosaic_gpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
-    - [ ] [`mosaic_tpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/tpu/tpu.td)
-    - [ ] `nvgpu`
-        - [ ] Add support for types: `NVGPUTensorMapDescriptorType`.
-        - [ ] Add support for operations.
+    - [x] [`mosaic_gpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
+    - [x] [`mosaic_tpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/tpu/tpu.td)
+    - [x] `nvgpu`
     - [ ] `pdl`
         - [ ] Add support for types: `PDLAttributeType`, `PDLOperationType`, `PDLRangeType`, `PDLType`,
           `PDLTypeType`, `PDLValueType`.

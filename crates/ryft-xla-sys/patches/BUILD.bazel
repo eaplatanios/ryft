@@ -1,0 +1,1 @@
+exports_files(["jax-mosaic-c-api-visibility.patch"])

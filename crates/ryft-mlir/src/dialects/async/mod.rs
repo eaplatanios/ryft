@@ -6,9 +6,13 @@ use ryft_xla_sys::bindings::mlirGetDialectHandle__async__;
 
 use crate::DialectHandle;
 
+pub mod operations;
 pub mod passes;
+pub mod types;
 
+pub use operations::*;
 pub use passes::*;
+pub use types::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `async` [`Dialect`](crate::Dialect).

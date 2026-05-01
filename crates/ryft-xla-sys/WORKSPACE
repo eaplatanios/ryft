@@ -10,9 +10,9 @@ XLA_COMMIT = "7b1be14958aac5c83f1b9f7bcdfc51fdbd29acba"
 
 XLA_SHA256 = "9ed81c034535e6398e8463882d6b517e303e0abdc2d8147dd66fd245ace33b54"
 
-JAX_COMMIT = "d40b4c951a9b53207974330c620130f664a0383e"
+JAX_COMMIT = "a33ed614c58ee8a10d0b7536c50c2609c38500c1"
 
-JAX_SHA256 = "4d931e881c22b12246c2aeaf89bca91815cca4030390979504d7b4d7690b632d"
+JAX_SHA256 = "d1cfa8bc2503ed34531230a6c502d69c49c4fd746a929766cb2c25fae63e2e5f"
 
 http_archive(
     name = "xla",
@@ -26,6 +26,8 @@ http_archive(
 
 http_archive(
     name = "jax",
+    patch_args = ["-p1"],
+    patches = ["//patches:jax-mosaic-c-api-visibility.patch"],
     sha256 = JAX_SHA256,
     strip_prefix = "jax-{commit}".format(commit = JAX_COMMIT),
     urls = [
@@ -195,7 +197,13 @@ jax_python_wheel_repository(
 
 load(
     "@xla//third_party/py:python_wheel.bzl",
+    "nvidia_wheel_versions_repository",
     "python_wheel_version_suffix_repository",
+)
+
+nvidia_wheel_versions_repository(
+    name = "nvidia_wheel_versions",
+    versions_source = "@jax//build:nvidia-requirements.txt",
 )
 
 python_wheel_version_suffix_repository(
