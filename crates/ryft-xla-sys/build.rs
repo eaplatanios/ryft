@@ -728,6 +728,8 @@ impl BuildConfiguration {
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_gpu.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_tpu.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_tpu.h"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("nvgpu.cc"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("nvgpu.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.h"),
             PathBuf::from("WORKSPACE"),
