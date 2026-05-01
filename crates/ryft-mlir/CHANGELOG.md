@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added missing `arith` dialect operations.
 - Added support for the `async` dialect.
 - Added support for the `gpu` dialect.
+- Added support for the `linalg` dialect.
 - Added support for the `memref` dialect.
 - Added support for the Triton `tt` dialect.
 - Added support for the Mosaic GPU dialect.

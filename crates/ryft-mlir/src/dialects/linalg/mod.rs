@@ -7,8 +7,12 @@ use ryft_xla_sys::bindings::mlirGetDialectHandle__linalg__;
 
 use crate::DialectHandle;
 
+pub mod attributes;
+pub mod operations;
 pub mod passes;
 
+pub use attributes::*;
+pub use operations::*;
 pub use passes::*;
 
 impl DialectHandle<'_, '_> {
