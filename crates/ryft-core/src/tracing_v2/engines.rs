@@ -253,11 +253,9 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
         operation: E::Operation,
         inputs: &[Tracer<'engine, E>],
     ) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
-        // TODO(eaplatanios): Review from here onwards.
         if inputs.iter().any(|input| !Rc::ptr_eq(&self.builder, &input.context.builder)) {
             return Err(TracingError::MismatchedProgramBuilders);
         }
-
         if self.builder.borrow().error.is_some() {
             let input_types = inputs.iter().map(|input| input.r#type.clone()).collect::<Vec<_>>();
             let output_types = operation.infer_output_types(input_types.as_slice())?;
@@ -279,22 +277,20 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
                     }
                 }
             };
-            let outputs = {
-                let builder = self.builder.borrow();
-                output_atom_ids
-                    .into_iter()
-                    .map(|atom| Tracer {
-                        state: TracerState::Live(atom),
-                        r#type: builder.atoms[atom.index].r#type().into_owned(),
-                        context: self.clone(),
-                    })
-                    .collect::<Vec<_>>()
-            };
-            Ok(outputs)
+            let builder = self.builder.borrow();
+            Ok(output_atom_ids
+                .into_iter()
+                .map(|atom| Tracer {
+                    state: TracerState::Live(atom),
+                    r#type: builder.atoms[atom.index].r#type().into_owned(),
+                    context: self.clone(),
+                })
+                .collect::<Vec<_>>())
         }
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
 impl<'engine, E: TracingEngine + ?Sized> Clone for TracingContext<'engine, E> {
     fn clone(&self) -> Self {
         Self { engine: self.engine, builder: self.builder.clone() }
