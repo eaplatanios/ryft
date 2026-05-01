@@ -15,7 +15,7 @@ use ryft_core::tracing_v2::operations::{
 };
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableEngine, DifferentiableOperation, DifferentiationError,
-    JvpContext, LinearPrimitiveOperation, TracingContext,
+    JvpContext, LinearArrayOperation, TracingContext,
 };
 use ryft_core::types::{ArrayType, Shape, TypeError};
 
@@ -26,15 +26,16 @@ use crate::experimental::operations::{
 };
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 
-type XlaLinearOperation = LinearPrimitiveOperation<ShardMapTensor>;
+/// Linear staged operation carrier used by the XLA backend.
+pub type LinearXlaOperation<V = ShardMapTensor> = LinearArrayOperation<V>;
 
 fn make_linear_xla_rematerialize<E>(
     engine: &E,
-    body: &FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaPrimitiveOperation>,
+    body: &FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaOperation>,
     input_primals: Vec<ShardMapTensor>,
 ) -> Result<LinearRematerializeOperation<ArrayType, ShardMapTensor>, TracingError>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = XlaLinearOperation>,
+    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
 {
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
@@ -51,7 +52,7 @@ fn replay_xla_program_with_tracers(
     program: &ryft_core::tracing::Program<
         ArrayType,
         ShardMapTensor,
-        XlaPrimitiveOperation,
+        XlaOperation,
         Vec<ShardMapTensor>,
         Vec<ShardMapTensor>,
     >,
@@ -92,13 +93,13 @@ fn replay_xla_program_with_tracers(
 }
 
 fn interpret_xla_condition_jvp<E>(
-    condition: &ConditionOperation<ShardMapTensor, XlaPrimitiveOperation>,
-    context: &mut JvpContext<'_, ShardMapTensor, XlaLinearOperation>,
+    condition: &ConditionOperation<ShardMapTensor, XlaOperation>,
+    context: &mut JvpContext<'_, ShardMapTensor, LinearXlaOperation>,
     inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     engine: &E,
 ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = XlaLinearOperation>,
+    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
 {
     let ConditionPredicate::Captured(predicate) = condition.predicate() else {
         return Err(ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition jvp" }.into());
@@ -117,7 +118,7 @@ where
         .map_err(TracingError::from)?;
     let tangent_outputs = context.apply_operation(
         tangent_inputs.as_slice(),
-        LinearPrimitiveOperation::Condition(Box::new(linear_condition)),
+        LinearArrayOperation::Condition(Box::new(linear_condition)),
         condition.output_types().len(),
     )?;
     Ok(primal_outputs
@@ -130,7 +131,7 @@ where
 /// Closed ordinary staged-op universe owned by the XLA backend.
 #[allow(private_interfaces)]
 #[derive(Clone)]
-pub enum XlaPrimitiveOperation {
+pub enum XlaOperation {
     /// Elementwise addition.
     Add,
 
@@ -159,13 +160,13 @@ pub enum XlaPrimitiveOperation {
     Reshape { input_shape: Shape, output_shape: Shape },
 
     /// Higher-order rematerialization.
-    Rematerialize(Box<RematerializeOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation, XlaLinearOperation>>),
+    Rematerialize(Box<RematerializeOperation<ArrayType, ShardMapTensor, XlaOperation, LinearXlaOperation>>),
 
     /// Higher-order conditional.
-    Condition(Box<ConditionOperation<ShardMapTensor, XlaPrimitiveOperation>>),
+    Condition(Box<ConditionOperation<ShardMapTensor, XlaOperation>>),
 
     /// Higher-order while loop.
-    While(Box<WhileOperation<ShardMapTensor, XlaPrimitiveOperation>>),
+    While(Box<WhileOperation<ShardMapTensor, XlaOperation>>),
 
     /// XLA-specific `shard_map`.
     ShardMap(Box<ShardMapOperation<ShardMapTensor>>),
@@ -180,7 +181,7 @@ pub enum XlaPrimitiveOperation {
     Custom(Arc<CustomPrimitive<ArrayType, ShardMapTensor>>),
 }
 
-impl Debug for XlaPrimitiveOperation {
+impl Debug for XlaOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Add => write!(formatter, "Add"),
@@ -205,7 +206,7 @@ impl Debug for XlaPrimitiveOperation {
     }
 }
 
-impl Display for XlaPrimitiveOperation {
+impl Display for XlaOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Reshape { output_shape, .. } => write!(formatter, "reshape{output_shape}"),
@@ -214,7 +215,7 @@ impl Display for XlaPrimitiveOperation {
     }
 }
 
-impl Operation<ArrayType> for XlaPrimitiveOperation {
+impl Operation<ArrayType> for XlaOperation {
     fn name(&self) -> &'static str {
         match self {
             Self::Add => "add",
@@ -260,7 +261,7 @@ impl Operation<ArrayType> for XlaPrimitiveOperation {
     }
 }
 
-impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaOperation {
     fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
         match self {
             Self::Add => AddOperation.interpret(inputs),
@@ -285,7 +286,7 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation
     }
 }
 
-impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaPrimitiveOperation {
+impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
         match self {
             Self::Add => AddOperation.interpret(inputs),
@@ -306,12 +307,12 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaPrimitiveOperation
             Self::Condition(condition) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 let input_refs = inputs.iter().collect::<Vec<_>>();
-                exemplar.context.trace(XlaPrimitiveOperation::Condition(condition.clone()), input_refs.as_slice())
+                exemplar.context.trace(XlaOperation::Condition(condition.clone()), input_refs.as_slice())
             }
             Self::While(while_operation) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 let input_refs = inputs.iter().collect::<Vec<_>>();
-                exemplar.context.trace(XlaPrimitiveOperation::While(while_operation.clone()), input_refs.as_slice())
+                exemplar.context.trace(XlaOperation::While(while_operation.clone()), input_refs.as_slice())
             }
             Self::ShardMap(op) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
@@ -340,15 +341,15 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaPrimitiveOperation
     }
 }
 
-impl<E> DifferentiableOperation<E> for XlaPrimitiveOperation
+impl<E> DifferentiableOperation<E> for XlaOperation
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = XlaLinearOperation>,
+    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
     ShardMapTensor: Differentiable<ArrayType, Tangent = ShardMapTensor>,
 {
     fn jvp(
         &self,
         engine: &E,
-        context: &mut JvpContext<'_, ShardMapTensor, XlaLinearOperation>,
+        context: &mut JvpContext<'_, ShardMapTensor, LinearXlaOperation>,
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         match self {
@@ -372,7 +373,7 @@ where
                 }
                 let tangent_outputs = context.apply_operation(
                     tangent_inputs.as_slice(),
-                    LinearPrimitiveOperation::Rematerialize(Box::new(make_linear_xla_rematerialize(
+                    LinearArrayOperation::Rematerialize(Box::new(make_linear_xla_rematerialize(
                         engine,
                         remat.body(),
                         primal_inputs,
@@ -397,11 +398,11 @@ where
     }
 }
 
-impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaPrimitiveOperation {
+impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaOperation {
     fn jvp_traced_linearization(
         &self,
         engine: &TracingContext<'static, XlaEngine<'static>>,
-        context: &mut JvpContext<'_, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>,
+        context: &mut JvpContext<'_, ShardMapTracer, LinearArrayOperation<ShardMapTracer>>,
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
         match self {
@@ -429,14 +430,14 @@ impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaPrimitiveOp
                 let primal = input
                     .primal
                     .context
-                    .trace(XlaPrimitiveOperation::WithShardingConstraint(op.clone()), &[&input.primal])?
+                    .trace(XlaOperation::WithShardingConstraint(op.clone()), &[&input.primal])?
                     .into_iter()
                     .next()
                     .expect("with_sharding_constraint should produce one primal output");
                 let tangent = context
                     .apply_operation(
                         &[input.tangent],
-                        LinearPrimitiveOperation::Custom(Arc::new(op.to_tracer_linear_custom_primitive())),
+                        LinearArrayOperation::Custom(Arc::new(op.to_tracer_linear_custom_primitive())),
                         1,
                     )?
                     .into_iter()
@@ -451,71 +452,71 @@ impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaPrimitiveOp
     }
 }
 
-impl SupportsAdd<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+impl SupportsAdd<ArrayType, ShardMapTensor> for XlaOperation {
     fn add_operation() -> Self {
-        XlaPrimitiveOperation::Add
+        XlaOperation::Add
     }
 }
 
-impl SupportsMul<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+impl SupportsMul<ArrayType, ShardMapTensor> for XlaOperation {
     fn mul_operation() -> Self {
-        XlaPrimitiveOperation::Mul
+        XlaOperation::Mul
     }
 }
 
-impl SupportsNeg<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+impl SupportsNeg<ArrayType, ShardMapTensor> for XlaOperation {
     fn neg_operation() -> Self {
-        XlaPrimitiveOperation::Neg
+        XlaOperation::Neg
     }
 }
 
-impl SupportsSin<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+impl SupportsSin<ArrayType, ShardMapTensor> for XlaOperation {
     fn sin_operation() -> Self {
-        XlaPrimitiveOperation::Sin
+        XlaOperation::Sin
     }
 }
 
-impl SupportsCos<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+impl SupportsCos<ArrayType, ShardMapTensor> for XlaOperation {
     fn cos_operation() -> Self {
-        XlaPrimitiveOperation::Cos
+        XlaOperation::Cos
     }
 }
 
-impl SupportsMatMul<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+impl SupportsMatMul<ArrayType, ShardMapTensor> for XlaOperation {
     fn matmul_operation() -> Self {
-        XlaPrimitiveOperation::MatrixMultiply
+        XlaOperation::MatrixMultiply
     }
 }
 
-impl SupportsMatrixTranspose<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+impl SupportsMatrixTranspose<ArrayType, ShardMapTensor> for XlaOperation {
     fn matrix_transpose_operation() -> Self {
-        XlaPrimitiveOperation::Transpose
+        XlaOperation::Transpose
     }
 }
 
-impl SupportsCustom<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+impl SupportsCustom<ArrayType, ShardMapTensor> for XlaOperation {
     fn custom_operation(primitive: Arc<CustomPrimitive<ArrayType, ShardMapTensor>>) -> Self {
-        XlaPrimitiveOperation::Custom(primitive)
+        XlaOperation::Custom(primitive)
     }
 }
 
-impl SupportsRematerialize<ArrayType, ShardMapTensor, XlaLinearOperation> for XlaPrimitiveOperation {
+impl SupportsRematerialize<ArrayType, ShardMapTensor, LinearXlaOperation> for XlaOperation {
     fn rematerialize_operation(
-        op: RematerializeOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation, XlaLinearOperation>,
+        op: RematerializeOperation<ArrayType, ShardMapTensor, XlaOperation, LinearXlaOperation>,
     ) -> Self {
-        XlaPrimitiveOperation::Rematerialize(Box::new(op))
+        XlaOperation::Rematerialize(Box::new(op))
     }
 }
 
-impl SupportsScale<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+impl SupportsScale<ArrayType, ShardMapTensor> for XlaOperation {
     fn scale_operation(factor: ShardMapTensor) -> Self {
-        XlaPrimitiveOperation::Scale { factor }
+        XlaOperation::Scale { factor }
     }
 }
 
-impl SupportsReshape<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
+impl SupportsReshape<ArrayType, ShardMapTensor> for XlaOperation {
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
-        XlaPrimitiveOperation::Reshape { input_shape, output_shape }
+        XlaOperation::Reshape { input_shape, output_shape }
     }
 }
 
@@ -544,11 +545,11 @@ mod tests {
         LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap()
     }
 
-    fn unary_rematerialize_body() -> FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaPrimitiveOperation> {
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
+    fn unary_rematerialize_body() -> FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaOperation> {
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
         let input = builder.add_input(scalar_type());
         let output = builder
-            .add_instruction(XlaPrimitiveOperation::Sin, vec![input])
+            .add_instruction(XlaOperation::Sin, vec![input])
             .expect("rematerialize body should stage one sine op")
             .into_iter()
             .copied()
@@ -562,10 +563,9 @@ mod tests {
 
     #[test]
     fn test_xla_rematerialize_jvp_stages_a_linear_rematerialize() {
-        let operation =
-            XlaPrimitiveOperation::Rematerialize(Box::new(RematerializeOperation::new(unary_rematerialize_body())));
+        let operation = XlaOperation::Rematerialize(Box::new(RematerializeOperation::new(unary_rematerialize_body())));
         let tangent_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaLinearOperation>::new()));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, LinearXlaOperation>::new()));
         let tangent_atom = tangent_builder.borrow_mut().add_input(scalar_type());
         let mut context = JvpContext::new(tangent_builder.clone());
         let outputs = operation
@@ -597,10 +597,10 @@ mod tests {
     fn test_replay_xla_program_with_tracers_uses_custom_replay_extension() {
         let sharding = Sharding::replicated(test_mesh(), 0);
         let custom = WithShardingConstraintOperation::new(sharding).to_tensor_custom_primitive();
-        let mut program_builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
+        let mut program_builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
         let input = program_builder.add_input(scalar_type());
         let output = program_builder
-            .add_instruction(XlaPrimitiveOperation::Custom(Arc::new(custom)), vec![input])
+            .add_instruction(XlaOperation::Custom(Arc::new(custom)), vec![input])
             .expect("custom op should stage")
             .into_iter()
             .copied()
@@ -609,8 +609,7 @@ mod tests {
         let program = program_builder
             .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let tracing_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new()));
+        let tracing_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new()));
         let traced_input_atom = tracing_builder.borrow_mut().add_input(scalar_type());
         let traced_input =
             TracingContext::new(XlaEngine::token(), tracing_builder).tracer(traced_input_atom, Some(scalar_type()));

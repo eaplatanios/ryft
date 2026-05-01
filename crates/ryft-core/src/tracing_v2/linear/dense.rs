@@ -397,8 +397,8 @@ mod tests {
     use crate::tracing::TracingError;
     use crate::tracing_v2::engines::{Engine, TracingEngine};
     use crate::tracing_v2::{
-        DifferentiableEngine, DifferentiableTracingEngine, DifferentiationError, LinearPrimitiveOperation,
-        PrimitiveOperation, Sin, Tracer,
+        ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, DifferentiationError, LinearArrayOperation,
+        Sin, Tracer,
     };
     use crate::types::ArrayType;
 
@@ -425,17 +425,17 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type Operation = PrimitiveOperation<f64>;
+        type Operation = ArrayOperation<f64>;
     }
 
     impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperation = PrimitiveOperation<f64>;
-        type LinearOperation = LinearPrimitiveOperation<f64>;
+        type DifferentiableOperation = ArrayOperation<f64>;
+        type LinearOperation = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperation<'engine>
-            = LinearPrimitiveOperation<Tracer<'engine, Self>>
+            = LinearArrayOperation<Tracer<'engine, Self>>
         where
             Self: 'engine;
     }

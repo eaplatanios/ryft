@@ -244,7 +244,7 @@ where
 /// forward linear program. `output_examples` carries one representative value per primal output
 /// and is only used to validate the output count; cotangent input types come from the program's
 /// own atom metadata. Disconnected primal inputs are emitted as
-/// [`LinearPrimitiveOperation::Zero`](crate::tracing_v2::LinearPrimitiveOperation::Zero) ops, which
+/// [`LinearArrayOperation::Zero`](crate::tracing_v2::LinearArrayOperation::Zero) ops, which
 /// the value type's [`Zero<ArrayType>`](crate::tracing_v2::operations::constants::Zero)
 /// implementation evaluates at interpretation time.
 pub fn transpose_linear_program_with_output_examples<T, V, Input, Output, O>(
@@ -271,7 +271,7 @@ where
 ///
 /// This is the traced analogue of [`transpose_linear_program_with_output_examples`]. The transpose
 /// program itself is staged in a fresh linear-program builder, then any
-/// [`LinearPrimitiveOperation::Zero`](crate::tracing_v2::LinearPrimitiveOperation::Zero) op
+/// [`LinearArrayOperation::Zero`](crate::tracing_v2::LinearArrayOperation::Zero) op
 /// produced for a disconnected primal input is materialized into a
 /// [`Tracer`](crate::tracing_v2::Tracer) constant whose underlying outer-trace atom holds
 /// `engine.zero(t)`. After this materialization the returned pullback contains no `Zero` ops, so
@@ -298,7 +298,7 @@ where
 }
 
 /// Walks a linear program and replaces every
-/// [`LinearPrimitiveOperation::Zero`](crate::tracing_v2::LinearPrimitiveOperation::Zero) op with a
+/// [`LinearArrayOperation::Zero`](crate::tracing_v2::LinearArrayOperation::Zero) op with a
 /// [`Tracer`] constant atom backed by an outer-trace zero.
 ///
 /// This is the post-processing step that the traced reverse-mode pipeline runs after transposition

@@ -7,15 +7,15 @@ use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation, Tracer, TracingEngine};
+use crate::tracing_v2::{DifferentiableEngine, LinearArrayOperation, Tracer, TracingEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
 /// Hidden carrier capability for staging the addition primitive.
 ///
-/// Backend-owned closed op carriers (such as [`PrimitiveOperation`](super::PrimitiveOperation) and the XLA backend's
-/// `XlaPrimitiveOperation`) implement this trait so that generic transform code can stage `AddOperation` without
+/// Backend-owned closed op carriers (such as [`ArrayOperation`](super::ArrayOperation) and the XLA backend's
+/// `XlaOperation`) implement this trait so that generic transform code can stage `AddOperation` without
 /// knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsAdd<T: Type, V: Traceable<T>>: Clone {
@@ -132,12 +132,7 @@ impl<V: Typed<DataType> + Clone + Add<Output = V>> InterpretableOperation<DataTy
 impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for AddOperation {
     fn transpose(
         &self,
-        _context: &mut crate::tracing_v2::operations::TranspositionContext<
-            '_,
-            ArrayType,
-            V,
-            LinearPrimitiveOperation<V>,
-        >,
+        _context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
@@ -154,7 +149,7 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Add<Output = V> + Z
             '_,
             DataType,
             V,
-            LinearPrimitiveOperation<V, DataType>,
+            LinearArrayOperation<V, DataType>,
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {

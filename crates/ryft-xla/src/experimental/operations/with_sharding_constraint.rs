@@ -7,8 +7,8 @@ use ryft_core::tracing::{AtomId, InterpretableOperation, Operation, Traceable, T
 use ryft_core::tracing_v2::forward::JvpTracer;
 use ryft_core::tracing_v2::operations::unary_abstract;
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearCustomPrimitive, LinearOperation,
-    LinearPrimitiveOperation,
+    CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearArrayOperation,
+    LinearCustomPrimitive, LinearOperation,
 };
 use ryft_core::types::{ArrayType, TypeError};
 use ryft_mlir::{Block, Operation as MlirOperation, Value};
@@ -115,7 +115,7 @@ impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperat
             '_,
             ArrayType,
             ShardMapTensor,
-            LinearPrimitiveOperation<ShardMapTensor>,
+            LinearArrayOperation<ShardMapTensor>,
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
@@ -123,7 +123,7 @@ impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperat
         match output_cotangents[0] {
             Some(atom) => {
                 let contribution = context
-                    .apply_operation(&[atom], LinearPrimitiveOperation::custom(self.to_tensor_custom_primitive())?, 1)?
+                    .apply_operation(&[atom], LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, 1)?
                     .into_iter()
                     .next()
                     .expect("sharding constraint should produce one cotangent contribution");
@@ -139,22 +139,18 @@ where
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTensor,
-            LinearOperation = LinearPrimitiveOperation<ShardMapTensor>,
+            LinearOperation = LinearArrayOperation<ShardMapTensor>,
         > + ?Sized,
 {
     fn jvp(
         &self,
         _engine: &E,
-        context: &mut JvpContext<'_, ShardMapTensor, LinearPrimitiveOperation<ShardMapTensor>>,
+        context: &mut JvpContext<'_, ShardMapTensor, LinearArrayOperation<ShardMapTensor>>,
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
         let tangent = context
-            .apply_operation(
-                &[inputs[0].tangent],
-                LinearPrimitiveOperation::custom(self.to_tensor_custom_primitive())?,
-                1,
-            )?
+            .apply_operation(&[inputs[0].tangent], LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, 1)?
             .into_iter()
             .next()
             .expect("with_sharding_constraint jvp should produce one tangent");
@@ -176,7 +172,7 @@ impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperat
             '_,
             ArrayType,
             ShardMapTracer,
-            LinearPrimitiveOperation<ShardMapTracer>,
+            LinearArrayOperation<ShardMapTracer>,
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
@@ -186,7 +182,7 @@ impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperat
                 let contribution = context
                     .apply_operation(
                         &[atom],
-                        LinearPrimitiveOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())),
+                        LinearArrayOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())),
                         1,
                     )?
                     .into_iter()
@@ -227,7 +223,7 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::{Operation, ProgramBuilder, Traceable};
     use ryft_core::tracing_v2::operations::TranspositionContext;
-    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation};
+    use ryft_core::tracing_v2::{LinearArrayOperation, LinearOperation};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -241,8 +237,8 @@ mod tests {
     }
 
     fn test_transposition_context<V: Traceable<ArrayType>>(
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearPrimitiveOperation<V>>>>,
-    ) -> TranspositionContext<'static, ArrayType, V, LinearPrimitiveOperation<V>> {
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearArrayOperation<V>>>>,
+    ) -> TranspositionContext<'static, ArrayType, V, LinearArrayOperation<V>> {
         TranspositionContext::new(builder)
     }
 
@@ -375,7 +371,7 @@ mod tests {
 
         let transpose_builder =
             Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ShardMapTensor>>::new(),
+                ProgramBuilder::<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor>>::new(),
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let mut context = test_transposition_context(transpose_builder.clone());
@@ -412,7 +408,7 @@ mod tests {
 
         let transpose_builder =
             Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>::new(),
+                ProgramBuilder::<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer>>::new(),
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let mut context = test_transposition_context(transpose_builder.clone());

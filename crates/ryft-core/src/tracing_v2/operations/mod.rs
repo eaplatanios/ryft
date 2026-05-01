@@ -74,7 +74,7 @@ pub use matmul::{MatMulOperation, SupportsMatMul};
 pub use matrix_transpose::{MatrixTransposeOperation, SupportsMatrixTranspose};
 pub use mul::{MulOperation, SupportsMul};
 pub use neg::{NegOperation, SupportsNeg};
-pub use primitive::{LinearPrimitiveOperation, PrimitiveOperation};
+pub use primitive::{ArrayOperation, LinearArrayOperation, LinearScalarOperation, ScalarOperation};
 pub use rematerialize::{
     FlatTracedRematerialize, LinearRematerializeOperation, RematerializeOperation, SupportsLinearRematerialize,
     SupportsRematerialize,
@@ -130,7 +130,7 @@ pub fn unary_abstract<T: Type>(inputs: &[T]) -> Result<T, TypeError> {
 /// an operation type must provide in order to participate in tangent and cotangent programs after
 /// one primal program has been linearized. In practice, this trait is implemented both by
 /// primitive semantic op types like [`AddOperation`] and by closed carrier enums such as
-/// [`LinearPrimitiveOperation`], which delegate the rule to the wrapped semantic primitive.
+/// [`LinearArrayOperation`], which delegate the rule to the wrapped semantic primitive.
 ///
 /// For one linear operation `y = L(x)`, the transpose rule builds the reverse linear map `L^T`
 /// that pulls cotangents on `y` back to cotangents on `x`. The rule does not receive concrete
@@ -226,7 +226,7 @@ impl<'a, T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> Transpos
     }
 }
 
-pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primitive::LinearPrimitiveOperation<V, T>>:
+pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primitive::LinearArrayOperation<V, T>>:
     Operation<T>
 {
     /// Applies the transpose rule for reverse-mode differentiation.

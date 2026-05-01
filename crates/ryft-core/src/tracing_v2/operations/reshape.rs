@@ -7,7 +7,7 @@ use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError};
 use crate::tracing_v2::engines::{Tracer, TracingEngine};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation};
+use crate::tracing_v2::{DifferentiableEngine, LinearArrayOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
@@ -301,12 +301,7 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
 impl<V: ReshapeValue> LinearOperation<ArrayType, V> for ReshapeOperation {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<
-            '_,
-            ArrayType,
-            V,
-            LinearPrimitiveOperation<V>,
-        >,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
@@ -320,7 +315,7 @@ impl<V: ReshapeValue> LinearOperation<ArrayType, V> for ReshapeOperation {
             context
                 .apply_operation(
                     &[atom],
-                    LinearPrimitiveOperation::Reshape {
+                    LinearArrayOperation::Reshape {
                         input_shape: self.output_shape().clone(),
                         output_shape: self.input_shape().clone(),
                     },

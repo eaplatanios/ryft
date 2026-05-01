@@ -11,7 +11,7 @@ use crate::experimental::operations::{LinearShardMapEvalMode, LinearShardMapOper
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_program;
-use crate::experimental::ops::XlaPrimitiveOperation;
+use crate::experimental::ops::XlaOperation;
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, fold_xla_program_constants, shard_map, trace,
 };
@@ -65,6 +65,17 @@ fn replicated_2d_sharding(mesh: &LogicalMesh) -> Sharding {
     Sharding::replicated(mesh.clone(), 2)
 }
 
+/// Returns a rank-0 replicated sharding.
+fn scalar_sharding(mesh: &LogicalMesh) -> Sharding {
+    Sharding::replicated(mesh.clone(), 0)
+}
+
+/// Returns a rank-0 benchmark array type.
+fn scalar_type() -> ArrayType {
+    ArrayType::new(DataType::F32, Shape::new(vec![]), None, None)
+        .expect("benchmark scalar types are constructed without sharding")
+}
+
 /// Returns a rank-1 benchmark array type.
 ///
 /// # Parameters
@@ -106,7 +117,7 @@ fn summarize_nested_body(
 ///
 ///   - `program`: Program to summarize.
 fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameterized<ShardMapTensor>>(
-    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Input, Output>,
+    program: &Program<ArrayType, ShardMapTensor, XlaOperation, Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
     fn summarize_linear_eval_mode(
         label: &'static str,
@@ -122,11 +133,11 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
     }
 
     summarize_program(program, |op| {
-        if let XlaPrimitiveOperation::ShardMap(shard_map_op) = op {
+        if let XlaOperation::ShardMap(shard_map_op) = op {
             return Ok(vec![summarize_nested_body("shard_map.body", shard_map_op.body())?]);
         }
 
-        if let XlaPrimitiveOperation::LinearShardMap(shard_map_op) = op {
+        if let XlaOperation::LinearShardMap(shard_map_op) = op {
             let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
             nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.eval_body", shard_map_op.eval_mode())?);
             #[cfg(feature = "benchmarking")]
@@ -139,7 +150,7 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
             return Ok(nested_regions);
         }
 
-        if let XlaPrimitiveOperation::Custom(custom_op) = op {
+        if let XlaOperation::Custom(custom_op) = op {
             if let Some(shard_map_op) = custom_op.extensions().get::<LinearShardMapOperation<ShardMapTensor>>() {
                 let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
                 nested_regions
@@ -242,7 +253,7 @@ fn emit_shard_map_matmul() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 /// Emits the traced reverse-mode-around-`shard_map` benchmark.
 fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let mesh = benchmark_mesh();
-    let sharding = sharded_1d_sharding(&mesh);
+    let sharding = scalar_sharding(&mesh);
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
             let mesh = mesh.clone();
@@ -272,7 +283,7 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
                 })
             }
         },
-        vector_type(8),
+        scalar_type(),
     )
     .map_err(|error| BenchmarkError::External(Box::new(error)))?;
     traced_xla_records("grad_around_shard_map", &traced)
@@ -358,12 +369,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_emit_grad_around_shard_map_matches_compact_single_region_lowering() {
+    fn test_emit_grad_around_shard_map_records_factorized_transpose_regions() {
         let records = emit_grad_around_shard_map().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].raw_ir.matches("sdy.manual_computation").count(), 1);
+        assert_eq!(records[0].raw_ir.matches("sdy.manual_computation").count(), 2);
         assert_eq!(records[0].summary.op_histogram.get("shard_map"), Some(&1));
-        assert_eq!(records[0].summary.nested_regions[0].op_histogram.get("cos"), Some(&1));
-        assert_eq!(records[0].summary.nested_regions[0].op_histogram.get("mul"), Some(&1));
+
+        let nested_region = |label: &str| {
+            records[0]
+                .summary
+                .nested_regions
+                .iter()
+                .find(|region| region.label == label)
+                .unwrap_or_else(|| panic!("expected nested region '{label}'"))
+        };
+        assert_eq!(nested_region("shard_map.body").op_histogram.get("sin"), Some(&1));
+        assert_eq!(nested_region("linear_shard_map.residual_body").op_histogram.get("cos"), Some(&1));
+        assert_eq!(nested_region("linear_shard_map.apply_body").op_histogram.get("mul"), Some(&1));
+        assert_eq!(nested_region("linear_shard_map.transpose_body").op_histogram.get("cos"), Some(&1));
+        assert_eq!(nested_region("linear_shard_map.transpose_body").op_histogram.get("mul"), Some(&1));
     }
 }

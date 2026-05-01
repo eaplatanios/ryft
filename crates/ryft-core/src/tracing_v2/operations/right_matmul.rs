@@ -9,7 +9,7 @@ use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
-use super::primitive::LinearPrimitiveOperation;
+use super::primitive::LinearArrayOperation;
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, TracedLinearizationCarrier};
 
 /// Hidden carrier capability for staging the right matrix-multiplication primitive.
@@ -91,12 +91,7 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for RightMatMulOperati
 impl<V: MatrixValue> LinearOperation<ArrayType, V> for RightMatMulOperation<V> {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<
-            '_,
-            ArrayType,
-            V,
-            LinearPrimitiveOperation<V>,
-        >,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
@@ -105,7 +100,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for RightMatMulOperation<V> {
                 context
                     .apply_operation(
                         &[atom],
-                        LinearPrimitiveOperation::RightMatMul { factor: self.factor.clone().transpose_matrix() },
+                        LinearArrayOperation::RightMatMul { factor: self.factor.clone().transpose_matrix() },
                         1,
                     )?
                     .into_iter()

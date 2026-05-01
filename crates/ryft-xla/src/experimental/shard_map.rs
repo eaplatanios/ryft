@@ -25,7 +25,7 @@ use ryft_core::tracing_v2::operations::{
 use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin, Tracer, TracingEngine};
 
 use crate::experimental::operations::WithShardingConstraintOperation;
-use crate::experimental::ops::XlaPrimitiveOperation;
+use crate::experimental::ops::XlaOperation;
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
@@ -485,20 +485,20 @@ impl MatrixOps for ShardMapTensor {
 pub(crate) type ShardMapTracer = Tracer<'static, XlaEngine<'static>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
-pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Input, Output>;
+pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaOperation, Input, Output>;
 
-fn xla_op_supports_constant_folding(op: &XlaPrimitiveOperation) -> bool {
+fn xla_op_supports_constant_folding(op: &XlaOperation) -> bool {
     matches!(
         op,
-        XlaPrimitiveOperation::Add
-            | XlaPrimitiveOperation::Mul
-            | XlaPrimitiveOperation::Neg
-            | XlaPrimitiveOperation::Sin
-            | XlaPrimitiveOperation::Cos
-            | XlaPrimitiveOperation::MatrixMultiply
-            | XlaPrimitiveOperation::Transpose
-            | XlaPrimitiveOperation::Scale { .. }
-            | XlaPrimitiveOperation::Reshape { .. }
+        XlaOperation::Add
+            | XlaOperation::Mul
+            | XlaOperation::Neg
+            | XlaOperation::Sin
+            | XlaOperation::Cos
+            | XlaOperation::MatrixMultiply
+            | XlaOperation::Transpose
+            | XlaOperation::Scale { .. }
+            | XlaOperation::Reshape { .. }
     )
 }
 
@@ -549,7 +549,7 @@ where
         }
     }
 
-    let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
+    let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
     builder.atoms = atoms;
     builder.input_ids = program.input_ids.clone();
     builder.instructions = instructions;
@@ -660,7 +660,7 @@ where
         }
         let context = input.context.clone();
         Ok(context
-            .trace(XlaPrimitiveOperation::WithShardingConstraint(op), &[&input])?
+            .trace(XlaOperation::WithShardingConstraint(op), &[&input])?
             .into_iter()
             .next()
             .expect("with_sharding_constraint should produce one output per input leaf"))
@@ -1175,7 +1175,7 @@ impl FlatTracedShardMap {
         let input_count = traced.program.input_ids.len();
         let output_count = traced.program.output_ids.len();
         let Program { atoms, input_ids, output_ids, instructions, .. } = traced.program.clone();
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
         builder.atoms = atoms;
         builder.input_ids = input_ids;
         builder.instructions = instructions;

@@ -10,7 +10,7 @@ use ryft_macros::Parameter;
 
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
 use crate::tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::operations::primitive::PrimitiveOperation;
+use crate::tracing_v2::operations::primitive::ScalarOperation;
 use crate::types::{DataType, Type, TypeError, Typed};
 
 /// [`Engine`]s provide backend-specific functionality related to tracing, just-in-time compilation, automatic
@@ -142,7 +142,7 @@ pub trait TracingEngine: Engine {
 /// Stateless [`TracingEngine`] that uses [`DataType`] for scalar metadata and Rust scalar values such as `f32` for
 /// runtime values. [`ScalarEngine`] is the minimal scalar-only backend used throughout tests and examples in
 /// `ryft-core`. It demonstrates the intended role of an [`Engine`] in the smallest possible form: there are no device
-/// handles, no mesh states, and no backend registries; just the built-in scalar primitive carriers plus
+/// handles, no mesh states, and no backend registries; just the built-in [`ScalarOperation`] carriers plus
 /// [`DataType`]-driven construction of scalar values.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ScalarEngine<V> {
@@ -188,7 +188,7 @@ macro_rules! impl_tracing_engine_for_scalar {
         }
 
         impl TracingEngine for ScalarEngine<$ty> {
-            type Operation = PrimitiveOperation<$ty, DataType>;
+            type Operation = ScalarOperation<$ty>;
         }
     };
 }
@@ -467,13 +467,12 @@ mod tests {
     use crate::tracing_v2::differentiation::DifferentiableEngine;
     use crate::tracing_v2::operations::SupportsAdd;
     use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
-    use crate::tracing_v2::{Sin, jvp, test_support};
-    use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
+    use crate::tracing_v2::{Cos, Sin, jvp, test_support};
+    use crate::types::{DataType, TypeError, Typed};
 
     use super::*;
 
-    type F64ProgramBuilder = ProgramBuilder<DataType, f64, PrimitiveOperation<f64, DataType>>;
-    type ArrayF64ProgramBuilder = ProgramBuilder<ArrayType, f64, PrimitiveOperation<f64>>;
+    type F64ProgramBuilder = ProgramBuilder<DataType, f64, ScalarOperation<f64>>;
 
     fn assert_differentiable_engine<E: DifferentiableEngine>() {}
 
@@ -481,16 +480,8 @@ mod tests {
         Rc::new(RefCell::new(ProgramBuilder::new()))
     }
 
-    fn new_array_f64_builder() -> Rc<RefCell<ArrayF64ProgramBuilder>> {
-        Rc::new(RefCell::new(ProgramBuilder::new()))
-    }
-
     fn scalar_f64_type() -> DataType {
         DataType::F64
-    }
-
-    fn array_scalar_f64_type() -> ArrayType {
-        ArrayType::scalar(DataType::F64)
     }
 
     struct TaggedEngine {
@@ -498,33 +489,33 @@ mod tests {
     }
 
     impl Engine for TaggedEngine {
-        type Type = ArrayType;
+        type Type = DataType;
         type Value = f64;
 
-        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+        fn zero(&self, _type: &DataType) -> Result<f64, TracingError> {
             let _ = self.id;
             Ok(0.0)
         }
 
-        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+        fn one(&self, _type: &DataType) -> Result<f64, TracingError> {
             let _ = self.id;
             Ok(1.0)
         }
     }
 
     impl TracingEngine for TaggedEngine {
-        type Operation = PrimitiveOperation<f64>;
+        type Operation = ScalarOperation<f64>;
     }
 
     #[derive(Copy, Clone, Debug)]
     struct NoOutputOperation;
 
-    impl Operation<ArrayType> for NoOutputOperation {
+    impl Operation<DataType> for NoOutputOperation {
         fn name(&self) -> &'static str {
             "no_output"
         }
 
-        fn infer_output_types(&self, _input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        fn infer_output_types(&self, _input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
             Ok(Vec::new())
         }
     }
@@ -532,14 +523,14 @@ mod tests {
     struct NoOutputEngine;
 
     impl Engine for NoOutputEngine {
-        type Type = ArrayType;
+        type Type = DataType;
         type Value = f64;
 
-        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+        fn zero(&self, _type: &DataType) -> Result<f64, TracingError> {
             Ok(0.0)
         }
 
-        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+        fn one(&self, _type: &DataType) -> Result<f64, TracingError> {
             Ok(1.0)
         }
     }
@@ -717,16 +708,16 @@ mod tests {
 
     #[test]
     fn test_trace_rejects_mismatched_program_builders() {
-        let builder_a = new_array_f64_builder();
-        let builder_b = new_array_f64_builder();
-        let atom_a = builder_a.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
-        let atom_b = builder_b.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&2.0f64).into_owned());
+        let builder_a = new_f64_builder();
+        let builder_b = new_f64_builder();
+        let atom_a = builder_a.borrow_mut().add_input(<f64 as Typed<DataType>>::r#type(&1.0f64).into_owned());
+        let atom_b = builder_b.borrow_mut().add_input(<f64 as Typed<DataType>>::r#type(&2.0f64).into_owned());
         let engine = TaggedEngine { id: 1 };
         let tracer_a = TracingContext::new(&engine, builder_a.clone()).tracer(atom_a, None);
         let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
 
         assert!(matches!(
-            TracingContext::new(&engine, builder_a.clone()).trace(PrimitiveOperation::Add, &[&tracer_a, &tracer_b]),
+            TracingContext::new(&engine, builder_a.clone()).trace(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
             Err(TracingError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
@@ -734,25 +725,25 @@ mod tests {
 
     #[test]
     fn test_binary_operator_returns_poisoned_tracer_for_mismatched_program_builders() {
-        let builder_a = new_array_f64_builder();
-        let builder_b = new_array_f64_builder();
-        let atom_a = builder_a.borrow_mut().add_input(array_scalar_f64_type());
-        let atom_b = builder_b.borrow_mut().add_input(array_scalar_f64_type());
+        let builder_a = new_f64_builder();
+        let builder_b = new_f64_builder();
+        let atom_a = builder_a.borrow_mut().add_input(scalar_f64_type());
+        let atom_b = builder_b.borrow_mut().add_input(scalar_f64_type());
         let engine = TaggedEngine { id: 1 };
         let tracer_a = TracingContext::new(&engine, builder_a.clone()).tracer(atom_a, None);
         let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
 
-        let output = tracer_a.binary(tracer_b, PrimitiveOperation::Add);
+        let output = tracer_a.binary(tracer_b, ScalarOperation::Add);
 
         assert!(matches!(&output.state, TracerState::Poison));
-        assert!(matches!(output.r#type(), Cow::Borrowed(r#type) if *r#type == array_scalar_f64_type()));
+        assert!(matches!(output.r#type(), Cow::Borrowed(r#type) if *r#type == scalar_f64_type()));
         assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
     }
 
     #[test]
     fn test_unary_operator_records_invalid_output_count_and_returns_poisoned_tracer() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, NoOutputOperation>::new()));
-        let input_type = array_scalar_f64_type();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, NoOutputOperation>::new()));
+        let input_type = scalar_f64_type();
         let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = NoOutputEngine;
         let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, Some(input_type));
@@ -760,55 +751,55 @@ mod tests {
         let output = tracer.unary(NoOutputOperation);
 
         assert!(matches!(&output.state, TracerState::Poison));
-        assert!(matches!(output.r#type(), Cow::Borrowed(r#type) if *r#type == array_scalar_f64_type()));
+        assert!(matches!(output.r#type(), Cow::Borrowed(r#type) if *r#type == scalar_f64_type()));
         assert_eq!(builder.borrow().error, Some(TracingError::InvalidOutputCount { expected: 1, got: 0 }));
     }
 
     #[test]
     fn test_trace_returns_poisoned_tracers_after_builder_failure() {
-        let builder = new_array_f64_builder();
-        let atom = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
+        let builder = new_f64_builder();
+        let atom = builder.borrow_mut().add_input(<f64 as Typed<DataType>>::r#type(&1.0f64).into_owned());
         builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
         let engine = TaggedEngine { id: 1 };
         let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
 
-        let outputs = TracingContext::new(&engine, builder).trace(PrimitiveOperation::Neg, &[&tracer]).unwrap();
+        let outputs = TracingContext::new(&engine, builder).trace(ScalarOperation::Neg, &[&tracer]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert!(matches!(&outputs[0].state, TracerState::Poison));
-        assert!(matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == array_scalar_f64_type()));
+        assert!(matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == scalar_f64_type()));
     }
 
     #[test]
     fn test_trace_caches_live_output_types() {
-        let builder = new_array_f64_builder();
-        let input_type = array_scalar_f64_type();
+        let builder = new_f64_builder();
+        let input_type = scalar_f64_type();
         let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = TaggedEngine { id: 1 };
         let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, Some(input_type));
 
-        let outputs = TracingContext::new(&engine, builder).trace(PrimitiveOperation::Neg, &[&tracer]).unwrap();
+        let outputs = TracingContext::new(&engine, builder).trace(ScalarOperation::Neg, &[&tracer]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert!(matches!(&outputs[0].state, TracerState::Live(_)));
-        assert!(matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == array_scalar_f64_type()));
+        assert!(matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == scalar_f64_type()));
     }
 
     #[test]
     fn test_poisoned_state_atom_id_returns_poisoned_tracer_error() {
-        let builder = new_array_f64_builder();
+        let builder = new_f64_builder();
         let engine = TaggedEngine { id: 1 };
         let tracing_context = TracingContext::new(&engine, builder);
-        let tracer = Tracer { state: TracerState::Poison, r#type: array_scalar_f64_type(), context: tracing_context };
+        let tracer = Tracer { state: TracerState::Poison, r#type: scalar_f64_type(), context: tracing_context };
 
         assert_eq!(tracer.atom_id(), Err(TracingError::PoisonedTracer));
-        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == array_scalar_f64_type()));
+        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == scalar_f64_type()));
     }
 
     #[test]
     fn test_interpret_and_trace_replays_staged_graphs() {
         let engine = ScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<DataType, f64, PrimitiveOperation<f64, DataType>, f64, f64>) = engine
+        let (output, program): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
             .interpret_and_trace(
                 |x: Tracer<ScalarEngine<f64>>| {
                     let squared = x.clone() * x.clone();
@@ -837,7 +828,7 @@ mod tests {
     #[test]
     fn test_interpret_and_trace_prunes_unused_staged_operations() {
         let engine = ScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<DataType, f64, PrimitiveOperation<f64, DataType>, f64, f64>) = engine
+        let (output, program): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
             .interpret_and_trace(
                 |x: Tracer<ScalarEngine<f64>>| {
                     let _unused = x.clone().sin();
@@ -864,16 +855,15 @@ mod tests {
     fn test_trace_stages_program_from_type_metadata() {
         let engine = ScalarEngine::<f64>::new();
         let input_type = scalar_f64_type();
-        let (output_type, program): (DataType, Program<DataType, f64, PrimitiveOperation<f64, DataType>, f64, f64>) =
-            engine
-                .trace(
-                    |x: Tracer<ScalarEngine<f64>>| {
-                        let squared = x.clone() * x.clone();
-                        Ok(squared + x.one_like())
-                    },
-                    input_type.clone(),
-                )
-                .unwrap();
+        let (output_type, program): (DataType, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
+            .trace(
+                |x: Tracer<ScalarEngine<f64>>| {
+                    let squared = x.clone() * x.clone();
+                    Ok(squared + x.one_like())
+                },
+                input_type.clone(),
+            )
+            .unwrap();
 
         assert_eq!(output_type, input_type);
         assert_eq!(program.interpret(3.0).unwrap(), 10.0);
@@ -894,16 +884,14 @@ mod tests {
     fn test_trace_rejects_escaped_program_builder() {
         let engine = ScalarEngine::<f64>::new();
         let escaped_builder = Rc::new(RefCell::new(None));
-        let result: Result<
-            (DataType, Program<DataType, f64, PrimitiveOperation<f64, DataType>, f64, f64>),
-            TracingError,
-        > = engine.trace(
-            |x: Tracer<ScalarEngine<f64>>| {
-                *escaped_builder.borrow_mut() = Some(x.builder().clone());
-                Ok(x)
-            },
-            scalar_f64_type(),
-        );
+        let result: Result<(DataType, Program<DataType, f64, ScalarOperation<f64>, f64, f64>), TracingError> = engine
+            .trace(
+                |x: Tracer<ScalarEngine<f64>>| {
+                    *escaped_builder.borrow_mut() = Some(x.builder().clone());
+                    Ok(x)
+                },
+                scalar_f64_type(),
+            );
 
         assert!(matches!(result, Err(TracingError::EscapedProgramBuilder)));
     }
@@ -929,16 +917,16 @@ mod tests {
 
     #[test]
     fn test_trace_records_and_returns_abstract_eval_error() {
-        let builder = new_array_f64_builder();
-        let lhs_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
-        let rhs_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
-        let lhs_atom = builder.borrow_mut().add_input(lhs_type.clone());
+        let builder = new_f64_builder();
+        let lhs_type = DataType::F8E3M4;
+        let rhs_type = DataType::F32;
+        let lhs_atom = builder.borrow_mut().add_input(lhs_type);
         let rhs_atom = builder.borrow_mut().add_input(rhs_type);
         let engine = TaggedEngine { id: 1 };
         let lhs = TracingContext::new(&engine, builder.clone()).tracer(lhs_atom, None);
         let rhs = TracingContext::new(&engine, builder.clone()).tracer(rhs_atom, None);
 
-        let result = TracingContext::new(&engine, builder.clone()).trace(PrimitiveOperation::Add, &[&lhs, &rhs]);
+        let result = TracingContext::new(&engine, builder.clone()).trace(ScalarOperation::Add, &[&lhs, &rhs]);
 
         assert!(matches!(
             result,
@@ -954,14 +942,14 @@ mod tests {
 
     #[test]
     fn test_trace_returns_error_when_poisoned_abstract_eval_fails() {
-        let builder = new_array_f64_builder();
-        let input_type = array_scalar_f64_type();
+        let builder = new_f64_builder();
+        let input_type = scalar_f64_type();
         let atom = builder.borrow_mut().add_input(input_type.clone());
         builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
         let engine = TaggedEngine { id: 1 };
         let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
 
-        let result = TracingContext::new(&engine, builder).trace(PrimitiveOperation::Add, &[&tracer]);
+        let result = TracingContext::new(&engine, builder).trace(ScalarOperation::Add, &[&tracer]);
 
         assert!(matches!(
             result,
@@ -974,20 +962,20 @@ mod tests {
         struct FailingOneEngine;
 
         impl Engine for FailingOneEngine {
-            type Type = ArrayType;
+            type Type = DataType;
             type Value = f64;
 
-            fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            fn zero(&self, _type: &DataType) -> Result<f64, TracingError> {
                 Ok(0.0)
             }
 
-            fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            fn one(&self, _type: &DataType) -> Result<f64, TracingError> {
                 Err(TypeError { message: "test engine cannot synthesize one".to_string() }.into())
             }
         }
 
         impl TracingEngine for FailingOneEngine {
-            type Operation = PrimitiveOperation<f64>;
+            type Operation = ScalarOperation<f64>;
         }
 
         let engine = FailingOneEngine;
@@ -1155,19 +1143,15 @@ mod tests {
         use ryft_macros::Parameter;
 
         use crate::tracing::TracingError;
-        use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
-        use crate::tracing_v2::operations::reshape::ReshapeOps;
-        use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
-        use crate::tracing_v2::{Cos, MatrixOps, Sin};
-        use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
+        use crate::types::{DataType, TypeError, Typed};
 
         #[derive(Clone, Debug, Parameter)]
         struct TestAbstractValue {
-            r#type: ArrayType,
+            r#type: DataType,
         }
 
-        impl Typed<ArrayType> for TestAbstractValue {
-            fn r#type(&self) -> Cow<'_, ArrayType> {
+        impl Typed<DataType> for TestAbstractValue {
+            fn r#type(&self) -> Cow<'_, DataType> {
                 Cow::Borrowed(&self.r#type)
             }
         }
@@ -1178,15 +1162,9 @@ mod tests {
             }
         }
 
-        impl Traceable<ArrayType> for TestAbstractValue {}
+        impl Traceable<DataType> for TestAbstractValue {}
 
-        impl crate::tracing::Value<ArrayType> for TestAbstractValue {}
-
-        impl ControlFlowValue for TestAbstractValue {
-            fn control_flow_predicate(&self) -> Result<bool, TracingError> {
-                Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
-            }
-        }
+        impl crate::tracing::Value<DataType> for TestAbstractValue {}
 
         impl Add for TestAbstractValue {
             type Output = Self;
@@ -1236,48 +1214,32 @@ mod tests {
             }
         }
 
-        impl MatrixOps for TestAbstractValue {
-            fn matmul(self, _rhs: Self) -> Self {
-                self
-            }
-
-            fn transpose_matrix(self) -> Self {
-                self
-            }
-        }
-
-        impl ReshapeOps for TestAbstractValue {
-            fn reshape(self, _target_shape: crate::types::Shape) -> Result<Self, TracingError> {
-                Ok(self)
-            }
-        }
-
         struct TestEngine;
 
         impl crate::tracing_v2::engines::Engine for TestEngine {
-            type Type = ArrayType;
+            type Type = DataType;
             type Value = TestAbstractValue;
 
-            fn zero(&self, r#type: &ArrayType) -> Result<TestAbstractValue, TracingError> {
-                Ok(TestAbstractValue { r#type: r#type.clone() })
+            fn zero(&self, r#type: &DataType) -> Result<TestAbstractValue, TracingError> {
+                Ok(TestAbstractValue { r#type: *r#type })
             }
 
-            fn one(&self, r#type: &ArrayType) -> Result<TestAbstractValue, TracingError> {
-                Ok(TestAbstractValue { r#type: r#type.clone() })
+            fn one(&self, r#type: &DataType) -> Result<TestAbstractValue, TracingError> {
+                Ok(TestAbstractValue { r#type: *r#type })
             }
         }
 
         impl crate::tracing_v2::engines::TracingEngine for TestEngine {
-            type Operation = crate::tracing_v2::PrimitiveOperation<TestAbstractValue>;
+            type Operation = ScalarOperation<TestAbstractValue>;
         }
 
         let result: Result<
             (
                 TestAbstractValue,
                 Program<
-                    ArrayType,
+                    DataType,
                     TestAbstractValue,
-                    crate::tracing_v2::PrimitiveOperation<TestAbstractValue>,
+                    ScalarOperation<TestAbstractValue>,
                     (TestAbstractValue, TestAbstractValue),
                     TestAbstractValue,
                 >,
@@ -1285,14 +1247,7 @@ mod tests {
             TracingError,
         > = TestEngine.interpret_and_trace(
             |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| Ok(inputs.0 + inputs.1),
-            (
-                TestAbstractValue {
-                    r#type: ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
-                },
-                TestAbstractValue {
-                    r#type: ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
-                },
-            ),
+            (TestAbstractValue { r#type: DataType::F8E3M4 }, TestAbstractValue { r#type: DataType::F32 }),
         );
 
         assert!(matches!(
@@ -1305,7 +1260,7 @@ mod tests {
     #[test]
     fn test_staged_program_display_renders_the_staged_program() {
         let engine = ScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<DataType, f64, PrimitiveOperation<f64, DataType>, f64, f64>) = engine
+        let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
             .interpret_and_trace(|x: Tracer<ScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()), 2.0f64)
             .unwrap();
 

@@ -37,7 +37,8 @@ pub use operations::matrix::{MatrixOps, MatrixValue};
 pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::{
-    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, Cos, CustomOperationError,
-    CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation, FlatProgram, LinearCustomPrimitive,
-    LinearOperation, LinearPrimitiveOperation, PrimitiveOperation, Sin, WhileOperation,
+    ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, Cos,
+    CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation, FlatProgram,
+    LinearArrayOperation, LinearCustomPrimitive, LinearOperation, LinearScalarOperation, ScalarOperation, Sin,
+    WhileOperation,
 };

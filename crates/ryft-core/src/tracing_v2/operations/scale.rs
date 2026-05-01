@@ -9,7 +9,7 @@ use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value}
 use crate::tracing_v2::engines::Tracer;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearPrimitiveOperation};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{
@@ -101,22 +101,18 @@ impl<T: Type, V: Typed<T> + Display + Clone + Mul<Output = V>> InterpretableOper
 impl<T: Type + PartialEq, V: Traceable<T> + crate::parameters::Parameter + Mul<Output = V> + ZeroLike>
     LinearOperation<T, V> for ScaleOperation<T, V>
 where
-    LinearPrimitiveOperation<V, T>: Operation<T>,
+    LinearArrayOperation<V, T>: Operation<T>,
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearPrimitiveOperation<V, T>>,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
-                    .apply_operation(
-                        &[atom],
-                        LinearPrimitiveOperation::<V, T>::Scale { factor: self.factor().clone() },
-                        1,
-                    )?
+                    .apply_operation(&[atom], LinearArrayOperation::<V, T>::Scale { factor: self.factor().clone() }, 1)?
                     .into_iter()
                     .next()
                     .expect("scale transpose should produce one cotangent contribution"),
@@ -234,14 +230,14 @@ mod tests {
 
     use crate::parameters::Placeholder;
     use crate::tracing::ProgramBuilder;
-    use crate::tracing_v2::LinearPrimitiveOperation;
+    use crate::tracing_v2::LinearArrayOperation;
     use crate::tracing_v2::operations::TranspositionContext;
 
     use super::*;
 
     fn test_transposition_context(
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
-    ) -> TranspositionContext<'static, ArrayType, f64, LinearPrimitiveOperation<f64>> {
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearArrayOperation<f64>>>>,
+    ) -> TranspositionContext<'static, ArrayType, f64, LinearArrayOperation<f64>> {
         TranspositionContext::new(builder)
     }
 
@@ -253,7 +249,7 @@ mod tests {
     #[test]
     fn test_scale_transpose_scales_output_cotangents() {
         let transpose_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new()));
         let output_cotangent_atom =
             transpose_builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
         let mut context = test_transposition_context(transpose_builder.clone());

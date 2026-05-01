@@ -552,7 +552,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone + Operation<Array
 mod tests {
     use crate::parameters::Placeholder;
     use crate::tracing::ProgramBuilder;
-    use crate::tracing_v2::PrimitiveOperation;
+    use crate::tracing_v2::ScalarOperation;
     use crate::tracing_v2::engines::ScalarEngine;
     use crate::types::DataType;
 
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn test_build_traced_gradient_program_handles_nullary_scalar_programs() {
         let engine = ScalarEngine::<f64>::new();
-        let mut builder = ProgramBuilder::<DataType, f64, PrimitiveOperation<f64, DataType>>::new();
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let output_atom = builder.add_constant(3.0f64);
         let traced_program = builder.build(vec![output_atom], Vec::<Placeholder>::new(), vec![Placeholder]).unwrap();
 

@@ -10,7 +10,7 @@ use crate::tracing::{InterpretableOperation, Operation, Program, Traceable, Trac
 use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::{
-    ControlFlowError, ControlFlowValue, Cos, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation, Sin, Tracer,
+    ArrayOperation, ControlFlowError, ControlFlowValue, Cos, LinearArrayOperation, MatrixOps, Sin, Tracer,
 };
 use crate::types::{ArrayType, Size, Type, Typed};
 
@@ -305,7 +305,7 @@ impl<
         + MatrixOps
         + ReshapeOps
         + ControlFlowValue,
-> BatchableOperation<V> for PrimitiveOperation<V>
+> BatchableOperation<V> for ArrayOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
@@ -348,7 +348,7 @@ impl<
         + MatrixOps
         + ReshapeOps
         + ControlFlowValue,
-> BatchableOperation<V> for LinearPrimitiveOperation<V>
+> BatchableOperation<V> for LinearArrayOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
@@ -864,12 +864,12 @@ mod tests {
     }
 
     impl TracingEngine for TestArrayEngine {
-        type Operation = PrimitiveOperation<TestArray>;
+        type Operation = ArrayOperation<TestArray>;
     }
 
     impl DifferentiableEngine for TestArrayEngine {
-        type DifferentiableOperation = PrimitiveOperation<TestArray>;
-        type LinearOperation = LinearPrimitiveOperation<TestArray>;
+        type DifferentiableOperation = ArrayOperation<TestArray>;
+        type LinearOperation = LinearArrayOperation<TestArray>;
     }
 
     #[derive(Clone, Debug)]
@@ -964,14 +964,14 @@ mod tests {
         let right = ArrayBatch::mapped(TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 1).unwrap();
 
         assert!(matches!(
-            PrimitiveOperation::<TestArray>::Add.batch(&[left, right]),
+            ArrayOperation::<TestArray>::Add.batch(&[left, right]),
             Err(TracingError::Batching(BatchingError::UnsupportedBatchAxisAlignment { .. }))
         ));
     }
 
     #[test]
     fn test_custom_primitive_requires_explicit_batching_rule() {
-        let operation = PrimitiveOperation::<TestArray>::Custom(Arc::new(CustomPrimitive::new(TestCustomOp)));
+        let operation = ArrayOperation::<TestArray>::Custom(Arc::new(CustomPrimitive::new(TestCustomOp)));
         let input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 2.0]), 0).unwrap();
 
         assert!(matches!(

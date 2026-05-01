@@ -5,7 +5,7 @@ use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation, Tracer, TracingEngine};
+use crate::tracing_v2::{DifferentiableEngine, LinearArrayOperation, Tracer, TracingEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, unary_abstract};
@@ -75,19 +75,14 @@ impl<V: Typed<DataType> + Clone + Neg<Output = V>> InterpretableOperation<DataTy
 impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for NegOperation {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<
-            '_,
-            ArrayType,
-            V,
-            LinearPrimitiveOperation<V>,
-        >,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
-                    .apply_operation(&[atom], LinearPrimitiveOperation::Neg, 1)?
+                    .apply_operation(&[atom], LinearArrayOperation::Neg, 1)?
                     .into_iter()
                     .next()
                     .expect("neg transpose should produce one cotangent contribution"),
@@ -106,7 +101,7 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + Z
             '_,
             DataType,
             V,
-            LinearPrimitiveOperation<V, DataType>,
+            LinearArrayOperation<V, DataType>,
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
@@ -114,7 +109,7 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + Z
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
-                    .apply_operation(&[atom], LinearPrimitiveOperation::<V, DataType>::Neg, 1)?
+                    .apply_operation(&[atom], LinearArrayOperation::<V, DataType>::Neg, 1)?
                     .into_iter()
                     .next()
                     .expect("neg transpose should produce one cotangent contribution"),

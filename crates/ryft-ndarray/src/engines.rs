@@ -1,19 +1,17 @@
 use std::marker::PhantomData;
 
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing_v2::{
-    DifferentiableEngine, DifferentiableTracingEngine, Engine, LinearPrimitiveOperation, PrimitiveOperation, Tracer,
-    TracingEngine,
-};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, Engine, Tracer, TracingEngine};
 use ryft_core::types::{ArrayType, TypeError};
 
 use crate::arrays::{Array, NdArrayElement};
+use crate::operations::{LinearNdarrayOperation, NdarrayOperation};
 
 /// Stateless `ndarray` backend token for `ryft-core` tracing transforms.
 ///
 /// [`NdArrayEngine`] selects [`ArrayType`] as its abstract metadata, [`Array<T>`] as its concrete
-/// value, and the default `ryft-core` primitive operation carriers. It has no device or runtime
-/// state because all execution happens eagerly on host CPU buffers.
+/// value, and the backend-owned ndarray operation carriers. It has no device or runtime state
+/// because all execution happens eagerly on host CPU buffers.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct NdArrayEngine<T = f64> {
     /// Phantom marker tying the zero-sized engine to its element type.
@@ -42,17 +40,17 @@ impl<T: NdArrayElement> Engine for NdArrayEngine<T> {
 }
 
 impl<T: NdArrayElement> TracingEngine for NdArrayEngine<T> {
-    type Operation = PrimitiveOperation<Array<T>>;
+    type Operation = NdarrayOperation<Array<T>>;
 }
 
 impl<T: NdArrayElement> DifferentiableEngine for NdArrayEngine<T> {
-    type DifferentiableOperation = PrimitiveOperation<Array<T>>;
-    type LinearOperation = LinearPrimitiveOperation<Array<T>>;
+    type DifferentiableOperation = NdarrayOperation<Array<T>>;
+    type LinearOperation = LinearNdarrayOperation<Array<T>>;
 }
 
 impl<T: NdArrayElement> DifferentiableTracingEngine for NdArrayEngine<T> {
     type LinearOperation<'engine>
-        = LinearPrimitiveOperation<Tracer<'engine, Self>>
+        = LinearNdarrayOperation<Tracer<'engine, Self>>
     where
         Self: 'engine;
 }
@@ -111,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn test_symbolic_trace_records_default_primitive_carrier() {
+    fn test_symbolic_trace_records_ndarray_carrier() {
         let engine = NdArrayEngine::<f64>::new();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
 

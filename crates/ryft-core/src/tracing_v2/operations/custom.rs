@@ -12,7 +12,7 @@ use crate::tracing_v2::forward::{Differentiable, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, TracingContext};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::primitive::{LinearPrimitiveOperation, PrimitiveOperation};
+use super::primitive::{ArrayOperation, LinearArrayOperation};
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
 /// Error type for rule-based custom staged operations.
@@ -94,7 +94,7 @@ where
 #[doc(hidden)]
 pub trait CustomTracedLinearizationRule<
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>> + ?Sized + 'static,
+    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>> + ?Sized + 'static,
 >
 {
     /// Applies the custom primitive's traced-linearization JVP rule.
@@ -113,12 +113,12 @@ pub trait CustomTracedLinearizationRule<
 /// Engine-keyed wrapper for one traced-linearization rule stored inside [`CustomPrimitiveExtensions`].
 struct TracedLinearizationRule<
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>> + ?Sized + 'static,
+    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>> + ?Sized + 'static,
 >(Arc<dyn CustomTracedLinearizationRule<V, E>>);
 
 impl<
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>> + ?Sized + 'static,
+    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>> + ?Sized + 'static,
 > TracedLinearizationRule<V, E>
 {
     fn rule(&self) -> &dyn CustomTracedLinearizationRule<V, E> {
@@ -130,7 +130,7 @@ trait CustomBaseOperation<T: Type, V: Typed<T>>: Operation<T> + InterpretableOpe
 
 impl<Ty: Type, V: Traceable<Ty>, O: Operation<Ty> + InterpretableOperation<Ty, V>> CustomBaseOperation<Ty, V> for O {}
 
-/// Rule-based registration object used by [`PrimitiveOperation::Custom`].
+/// Rule-based registration object used by [`ArrayOperation::Custom`].
 ///
 /// [`CustomPrimitive`] is the main extensibility seam for the operation system. The base op always
 /// supplies shape metadata and eager interpretation; optional transform rules are registered using
@@ -224,9 +224,7 @@ impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> Custo
     fn traced_linearization_rule<E>(&self) -> Result<&dyn CustomTracedLinearizationRule<V, E>, TracingError>
     where
         V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-        E: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>>
-            + ?Sized
-            + 'static,
+        E: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>> + ?Sized + 'static,
     {
         self.extensions
             .get::<TracedLinearizationRule<V, E>>()
@@ -242,8 +240,8 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
         E: DifferentiableEngine<
                 Type = ArrayType,
                 Value = V,
-                DifferentiableOperation = PrimitiveOperation<V>,
-                LinearOperation = LinearPrimitiveOperation<V>,
+                DifferentiableOperation = ArrayOperation<V>,
+                LinearOperation = LinearArrayOperation<V>,
             > + 'static,
         V: Differentiable<ArrayType, Tangent = V>,
         Rule: DifferentiableOperation<E> + 'static,
@@ -256,9 +254,7 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
     pub fn with_traced_linearization_rule<E, Rule>(mut self, rule: Rule) -> Self
     where
         V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-        E: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>>
-            + ?Sized
-            + 'static,
+        E: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>> + ?Sized + 'static,
         Rule: CustomTracedLinearizationRule<V, E> + 'static,
     {
         self.extensions.insert(TracedLinearizationRule::<V, E>(Arc::new(rule)));
@@ -281,9 +277,9 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
         E: DifferentiableEngine<
                 Type = ArrayType,
                 Value = V,
-                DifferentiableOperation = PrimitiveOperation<V>,
-                LinearOperation = LinearPrimitiveOperation<V>,
-            > + DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>>
+                DifferentiableOperation = ArrayOperation<V>,
+                LinearOperation = LinearArrayOperation<V>,
+            > + DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>>
             + 'static,
         Rule: Clone + DifferentiableOperation<E> + CustomTracedLinearizationRule<V, E> + 'static,
     {
@@ -330,11 +326,11 @@ impl<T: Type + PartialEq, V: Traceable<T> + Parameter> InterpretableOperation<T,
 impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> LinearOperation<T, V>
     for CustomPrimitive<T, V>
 where
-    LinearPrimitiveOperation<V, T>: Operation<T>,
+    LinearArrayOperation<V, T>: Operation<T>,
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearPrimitiveOperation<V, T>>,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         self.transpose_rule
@@ -364,8 +360,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingConte
     for CustomPrimitive<ArrayType, V>
 where
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + 'static,
-    EInner:
-        DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>> + ?Sized + 'static,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>> + ?Sized + 'static,
 {
     fn jvp(
         &self,
@@ -446,11 +441,11 @@ impl<T: Type + PartialEq, V: Traceable<T> + Parameter> InterpretableOperation<T,
 
 impl<T: Type + PartialEq, V: Traceable<T> + Parameter> LinearOperation<T, V> for LinearCustomPrimitive<T, V>
 where
-    LinearPrimitiveOperation<V, T>: Operation<T>,
+    LinearArrayOperation<V, T>: Operation<T>,
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearPrimitiveOperation<V, T>>,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         self.primitive
@@ -475,8 +470,7 @@ mod tests {
     use crate::tracing_v2::operations::TranspositionContext;
     use crate::tracing_v2::operations::constants::OneLike;
     use crate::tracing_v2::{
-        DifferentiableEngine, DifferentiableTracingEngine, LinearPrimitiveOperation, PrimitiveOperation, Tracer, grad,
-        jvp,
+        ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, Tracer, grad, jvp,
     };
     use crate::types::{ArrayType, DataType, Shape, Typed};
 
@@ -497,17 +491,17 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type Operation = PrimitiveOperation<f64>;
+        type Operation = ArrayOperation<f64>;
     }
 
     impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperation = PrimitiveOperation<f64>;
-        type LinearOperation = LinearPrimitiveOperation<f64>;
+        type DifferentiableOperation = ArrayOperation<f64>;
+        type LinearOperation = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperation<'engine>
-            = LinearPrimitiveOperation<Tracer<'engine, Self>>
+            = LinearArrayOperation<Tracer<'engine, Self>>
         where
             Self: 'engine;
     }
@@ -562,7 +556,7 @@ mod tests {
                 '_,
                 ArrayType,
                 f64,
-                LinearPrimitiveOperation<f64>,
+                LinearArrayOperation<f64>,
             >,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
@@ -577,7 +571,7 @@ mod tests {
         fn jvp(
             &self,
             _engine: &ArrayScalarEngine,
-            _context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearPrimitiveOperation<f64>>,
+            _context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearArrayOperation<f64>>,
             inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
             if inputs.len() != 1 {
@@ -594,7 +588,7 @@ mod tests {
             _context: &mut crate::tracing_v2::JvpContext<
                 '_,
                 Tracer<'engine, ArrayScalarEngine>,
-                LinearPrimitiveOperation<Tracer<'engine, ArrayScalarEngine>>,
+                LinearArrayOperation<Tracer<'engine, ArrayScalarEngine>>,
             >,
             inputs: &[JvpTracer<Tracer<'engine, ArrayScalarEngine>, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<Tracer<'engine, ArrayScalarEngine>, crate::tracing::AtomId>>, TracingError> {
@@ -615,11 +609,11 @@ mod tests {
         primitive: CustomPrimitive<ArrayType, f64>,
     ) -> Result<Tracer<'engine, E>, TracingError>
     where
-        E: TracingEngine<Type = ArrayType, Value = f64, Operation = PrimitiveOperation<f64>> + ?Sized,
+        E: TracingEngine<Type = ArrayType, Value = f64, Operation = ArrayOperation<f64>> + ?Sized,
     {
         let context = input.context.clone();
         Ok(context
-            .trace(PrimitiveOperation::Custom(Arc::new(primitive)), &[&input])?
+            .trace(ArrayOperation::Custom(Arc::new(primitive)), &[&input])?
             .into_iter()
             .next()
             .expect("unary custom primitive should produce one output"))
@@ -631,7 +625,7 @@ mod tests {
         primitive: CustomPrimitive<ArrayType, f64>,
     ) -> Tracer<'engine, E>
     where
-        E: TracingEngine<Type = ArrayType, Value = f64, Operation = PrimitiveOperation<f64>> + ?Sized,
+        E: TracingEngine<Type = ArrayType, Value = f64, Operation = ArrayOperation<f64>> + ?Sized,
     {
         apply_custom_traced_unary(input, primitive).expect("custom primitive staging should succeed")
     }
@@ -642,8 +636,8 @@ mod tests {
     }
 
     fn test_transposition_context(
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
-    ) -> TranspositionContext<'static, ArrayType, f64, LinearPrimitiveOperation<f64>> {
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearArrayOperation<f64>>>>,
+    ) -> TranspositionContext<'static, ArrayType, f64, LinearArrayOperation<f64>> {
         TranspositionContext::new(builder)
     }
 
@@ -664,7 +658,7 @@ mod tests {
     fn test_custom_primitive_base_execution_replays_without_optional_rules() {
         let engine = ArrayScalarEngine;
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+        let (output, compiled): (f64, Program<ArrayType, f64, ArrayOperation<f64>, f64, f64>) = engine
             .interpret_and_trace(
                 {
                     let primitive = primitive.clone();
@@ -681,7 +675,7 @@ mod tests {
     #[test]
     fn test_custom_primitive_missing_transpose_rule_reports_targeted_error() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new()));
         let cotangent_atom = builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&0.0f64).into_owned());
         let mut context = test_transposition_context(builder);
 
@@ -722,7 +716,7 @@ mod tests {
         let engine = ArrayScalarEngine;
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0))
             .with_jvp_rule::<ArrayScalarEngine, _>(ShiftOp::new(2.0));
-        let result: Result<(f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>), TracingError> = engine
+        let result: Result<(f64, Program<ArrayType, f64, ArrayOperation<f64>, f64, f64>), TracingError> = engine
             .interpret_and_trace(
                 {
                     let primitive = primitive.clone();
@@ -769,7 +763,7 @@ mod tests {
             Ok(1.0f64),
         );
 
-        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+        let (output, compiled): (f64, Program<ArrayType, f64, ArrayOperation<f64>, f64, f64>) = engine
             .interpret_and_trace(
                 {
                     let primitive = primitive.clone();

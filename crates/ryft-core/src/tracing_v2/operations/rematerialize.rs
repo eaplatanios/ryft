@@ -7,8 +7,8 @@ use crate::tracing_v2::engines::TracingEngine;
 use crate::tracing_v2::linear::{linearize_program, transpose_linear_program_with_output_examples};
 use crate::tracing_v2::operations::constants::{SupportsZero, Zero, ZeroLike};
 use crate::tracing_v2::{
-    Differentiable, DifferentiableEngine, DifferentiableTracingEngine, DifferentiationError, LinearPrimitiveOperation,
-    PrimitiveOperation, Tracer,
+    ArrayOperation, Differentiable, DifferentiableEngine, DifferentiableTracingEngine, DifferentiationError,
+    LinearArrayOperation, Tracer,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -35,7 +35,7 @@ pub trait SupportsLinearRematerialize<T: Type + PartialEq, V: Traceable<T>>: Clo
 /// This stores a flattened traced body that higher-order op nodes can carry around independently of
 /// the caller's original parameter shapes.
 #[derive(Clone)]
-pub struct FlatTracedRematerialize<T: Type + PartialEq, V: Traceable<T>, O: Clone = PrimitiveOperation<V, T>> {
+pub struct FlatTracedRematerialize<T: Type + PartialEq, V: Traceable<T>, O: Clone = ArrayOperation<V, T>> {
     /// Canonical input types of the body.
     input_types: Vec<T>,
 
@@ -82,8 +82,8 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, 
 pub struct RematerializeOperation<
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
-    O: Clone = PrimitiveOperation<V, T>,
-    L: Clone = LinearPrimitiveOperation<V, T>,
+    O: Clone = ArrayOperation<V, T>,
+    L: Clone = LinearArrayOperation<V, T>,
 > {
     /// The forward body sub-program.
     body: FlatTracedRematerialize<T, V, O>,
@@ -170,10 +170,10 @@ where
 /// the body through
 /// [`linearize_traced_program`] to obtain a pushforward over `Tracer` values, and finally wraps
 /// that pushforward (paired with its transpose) in a
-/// [`LinearPrimitiveOperation::Rematerialize`] variant that the active linear builder can stage
+/// [`LinearArrayOperation::Rematerialize`] variant that the active linear builder can stage
 /// directly.
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
-    for RematerializeOperation<ArrayType, V, EInner::Operation, LinearPrimitiveOperation<V>>
+    for RematerializeOperation<ArrayType, V, EInner::Operation, LinearArrayOperation<V>>
 where
     V: Value<ArrayType>
         + ZeroLike
@@ -183,10 +183,10 @@ where
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
     EInner::Operation: TracedLinearizationCarrier<ArrayType, V>
         + InterpretableOperation<ArrayType, V>
-        + SupportsRematerialize<ArrayType, V, LinearPrimitiveOperation<V>>,
+        + SupportsRematerialize<ArrayType, V, LinearArrayOperation<V>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearPrimitiveOperation<V>:
-        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
+    LinearArrayOperation<V>:
+        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
     EInner::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner>,
     EInner::LinearOperation<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, EInner>>
@@ -273,7 +273,7 @@ impl<
         + crate::tracing_v2::operations::constants::Zero<ArrayType>
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    E: DifferentiableEngine<Type = ArrayType, Value = V, LinearOperation = LinearPrimitiveOperation<V>> + ?Sized + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>> + ?Sized + 'static,
     O: Clone + Operation<ArrayType>,
 > DifferentiableOperation<E> for RematerializeOperation<ArrayType, V, O, E::LinearOperation>
 where
@@ -281,8 +281,8 @@ where
     O: DifferentiableOperation<E>,
     O: InterpretableOperation<ArrayType, V>,
     O: SupportsRematerialize<ArrayType, V, E::LinearOperation> + 'static,
-    LinearPrimitiveOperation<V>:
-        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
+    LinearArrayOperation<V>:
+        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
 {
     fn jvp(
         &self,
@@ -298,7 +298,7 @@ where
         }
         let tangent_outputs = context.apply_operation(
             tangent_inputs.as_slice(),
-            LinearPrimitiveOperation::Rematerialize(Box::new(make_linear_rematerialize(
+            LinearArrayOperation::Rematerialize(Box::new(make_linear_rematerialize(
                 engine,
                 &self.body,
                 primal_inputs,
@@ -344,7 +344,7 @@ where
 pub struct LinearRematerializeOperation<
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
-    O: Clone = LinearPrimitiveOperation<V, T>,
+    O: Clone = LinearArrayOperation<V, T>,
 > {
     /// The forward linear body sub-program.
     body: FlatTracedRematerialize<T, V, O>,
@@ -433,11 +433,11 @@ impl<T, V> LinearOperation<T, V> for LinearRematerializeOperation<T, V>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
-    LinearPrimitiveOperation<V, T>: Operation<T>,
+    LinearArrayOperation<V, T>: Operation<T>,
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearPrimitiveOperation<V, T>>,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         let transpose = self.transpose_op();
@@ -459,7 +459,7 @@ where
         Ok(context
             .apply_operation(
                 materialized.as_slice(),
-                LinearPrimitiveOperation::<V, T>::Rematerialize(Box::new(transpose)),
+                LinearArrayOperation::<V, T>::Rematerialize(Box::new(transpose)),
                 self.body.input_types().len(),
             )?
             .into_iter()
@@ -472,14 +472,14 @@ where
 /// is structurally zero. Linear higher-order rules use this when they must consume all output
 /// cotangents jointly (e.g. a nested transpose program that has a fixed input arity).
 fn materialize_optional_cotangent<T, V>(
-    context: &crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearPrimitiveOperation<V, T>>,
+    context: &crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
     cotangent: Option<crate::tracing::AtomId>,
     input_type: &T,
 ) -> crate::tracing::AtomId
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
-    LinearPrimitiveOperation<V, T>: Operation<T>,
+    LinearArrayOperation<V, T>: Operation<T>,
 {
     if let Some(atom) = cotangent {
         return atom;
@@ -489,7 +489,7 @@ where
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(input_type.clone());
     builder_borrow.instructions.push(Instruction {
-        operation: <LinearPrimitiveOperation<V, T> as SupportsZero<T, V>>::zero_operation(input_type.clone()),
+        operation: <LinearArrayOperation<V, T> as SupportsZero<T, V>>::zero_operation(input_type.clone()),
         inputs: vec![],
         outputs: vec![output],
     });
@@ -508,11 +508,9 @@ where
     V: Traceable<ArrayType> + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType> + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V> + DifferentiableOperation<E> + 'static,
-    LinearPrimitiveOperation<V>:
-        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V, LinearOperation = LinearPrimitiveOperation<V>>
-        + ?Sized
-        + 'static,
+    LinearArrayOperation<V>:
+        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
+    E: DifferentiableEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>> + ?Sized + 'static,
 {
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
@@ -662,7 +660,7 @@ mod tests {
     use crate::tracing_v2::engines::{Engine, TracingEngine};
     use crate::tracing_v2::linear::{compile_grad, grad, value_and_grad};
     use crate::tracing_v2::operations::TranspositionContext;
-    use crate::tracing_v2::{DifferentiationError, JvpTracer, LinearPrimitiveOperation, Sin, Tracer};
+    use crate::tracing_v2::{DifferentiationError, JvpTracer, LinearArrayOperation, Sin, Tracer};
 
     use super::*;
 
@@ -675,7 +673,7 @@ mod tests {
         ArrayType::scalar(crate::types::DataType::F64)
     }
 
-    fn test_transposition_context() -> TranspositionContext<'static, ArrayType, f64, LinearPrimitiveOperation<f64>> {
+    fn test_transposition_context() -> TranspositionContext<'static, ArrayType, f64, LinearArrayOperation<f64>> {
         TranspositionContext::new(Rc::new(RefCell::new(ProgramBuilder::new())))
     }
 
@@ -696,30 +694,30 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type Operation = PrimitiveOperation<f64>;
+        type Operation = ArrayOperation<f64>;
     }
 
     impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperation = PrimitiveOperation<f64>;
-        type LinearOperation = LinearPrimitiveOperation<f64>;
+        type DifferentiableOperation = ArrayOperation<f64>;
+        type LinearOperation = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperation<'engine>
-            = LinearPrimitiveOperation<Tracer<'engine, Self>>
+            = LinearArrayOperation<Tracer<'engine, Self>>
         where
             Self: 'engine;
     }
 
     fn empty_traced_body() -> FlatTracedRematerialize<ArrayType, f64> {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, ArrayOperation<f64>>::new();
         let output = builder.add_constant(0.0f64);
         let program = builder.build(vec![output], Vec::<Placeholder>::new(), vec![Placeholder]).unwrap();
         FlatTracedRematerialize::from_parts(vec![], vec![scalar_type()], program)
     }
 
-    fn empty_linear_body() -> FlatTracedRematerialize<ArrayType, f64, LinearPrimitiveOperation<f64>> {
-        let program = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()
+    fn empty_linear_body() -> FlatTracedRematerialize<ArrayType, f64, LinearArrayOperation<f64>> {
+        let program = ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new()
             .build(vec![], Vec::<Placeholder>::new(), Vec::<Placeholder>::new())
             .unwrap();
         FlatTracedRematerialize::from_parts(vec![scalar_type()], vec![], program)
@@ -737,7 +735,7 @@ mod tests {
         let engine = ArrayScalarEngine;
         let operation = RematerializeOperation::<ArrayType, f64>::new(empty_traced_body());
         let inputs: Vec<JvpTracer<f64, crate::tracing::AtomId>> = Vec::new();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new()));
         let mut context = crate::tracing_v2::JvpContext::new(builder);
 
         assert!(matches!(
@@ -790,7 +788,7 @@ mod tests {
     fn test_rematerialize_jit_produces_traced_op() {
         // When used inside jit, rematerialize should produce a "rematerialize" op in the program.
         let engine = ArrayScalarEngine;
-        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
+        let (output, program): (f64, Program<ArrayType, f64, ArrayOperation<f64>, f64, f64>) =
             engine.interpret_and_trace(|x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         approx_eq(output, 2.0f64.sin());
@@ -802,7 +800,7 @@ mod tests {
     fn test_rematerialize_jit_program_rendering() {
         // Check the exact rendering of the jit-traced program containing a rematerialize op.
         let engine = ArrayScalarEngine;
-        let (_, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
+        let (_, program): (f64, Program<ArrayType, f64, ArrayOperation<f64>, f64, f64>) =
             engine.interpret_and_trace(|x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         assert_eq!(
@@ -890,13 +888,13 @@ mod tests {
         // The forward result with rematerialize should match the result without it.
         let without: f64 = {
             let engine = ArrayScalarEngine;
-            let (output, _): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) =
+            let (output, _): (f64, Program<ArrayType, f64, ArrayOperation<f64>, f64, f64>) =
                 engine.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()), 3.0f64).unwrap();
             output
         };
         let with: f64 = {
             let engine = ArrayScalarEngine;
-            let (output, _): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = engine
+            let (output, _): (f64, Program<ArrayType, f64, ArrayOperation<f64>, f64, f64>) = engine
                 .interpret_and_trace(|x| Ok(rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap()), 3.0f64)
                 .unwrap();
             output

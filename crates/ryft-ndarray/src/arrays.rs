@@ -474,10 +474,10 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::tracing::ProgramBuilder;
     use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation, TranspositionContext};
-    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, MatrixOps, ReshapeOps, TracingEngine};
+    use ryft_core::tracing_v2::{LinearOperation, MatrixOps, ReshapeOps, TracingEngine};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
-    use crate::NdArrayEngine;
+    use crate::{LinearNdarrayOperation, NdArrayEngine};
 
     use super::Array;
 
@@ -552,7 +552,7 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
         let output_value = Array::from_shape_vec([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let transpose_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, Array<f64>, LinearPrimitiveOperation<Array<f64>>>::new()));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, Array<f64>, LinearNdarrayOperation<Array<f64>>>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(output_value.r#type().into_owned());
         let mut context = TranspositionContext::new(transpose_builder.clone());
         let contribution_atom =

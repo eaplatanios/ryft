@@ -180,8 +180,8 @@ mod tests {
     use crate::tracing_v2::engines::ScalarEngine;
     use crate::tracing_v2::operations::TranspositionContext;
     use crate::tracing_v2::{
-        CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearOperation, LinearPrimitiveOperation,
-        PrimitiveOperation, Sin, test_support,
+        ArrayOperation, CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearArrayOperation,
+        LinearOperation, LinearScalarOperation, Sin, test_support,
     };
     use crate::types::{ArrayType, DataType, TypeError, Typed};
     use indoc::indoc;
@@ -216,17 +216,17 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type Operation = PrimitiveOperation<f64>;
+        type Operation = ArrayOperation<f64>;
     }
 
     impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperation = PrimitiveOperation<f64>;
-        type LinearOperation = LinearPrimitiveOperation<f64>;
+        type DifferentiableOperation = ArrayOperation<f64>;
+        type LinearOperation = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperation<'engine>
-            = LinearPrimitiveOperation<Tracer<'engine, Self>>
+            = LinearArrayOperation<Tracer<'engine, Self>>
         where
             Self: 'engine;
     }
@@ -277,7 +277,7 @@ mod tests {
     impl LinearOperation<ArrayType, f64> for PanicReplayOp {
         fn transpose(
             &self,
-            _context: &mut TranspositionContext<'_, ArrayType, f64, LinearPrimitiveOperation<f64>>,
+            _context: &mut TranspositionContext<'_, ArrayType, f64, LinearArrayOperation<f64>>,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
             if output_cotangents.len() != 1 {
@@ -291,7 +291,7 @@ mod tests {
         fn jvp(
             &self,
             _engine: &ArrayScalarEngine,
-            _context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearPrimitiveOperation<f64>>,
+            _context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearArrayOperation<f64>>,
             inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
             if inputs.len() != 1 {
@@ -390,14 +390,14 @@ mod tests {
 
     impl DifferentiableEngine for SplitCarrierEngine {
         type DifferentiableOperation = DifferentiableAddOperation;
-        type LinearOperation = LinearPrimitiveOperation<f64>;
+        type LinearOperation = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableOperation<SplitCarrierEngine> for DifferentiableAddOperation {
         fn jvp(
             &self,
             engine: &SplitCarrierEngine,
-            context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearPrimitiveOperation<f64>>,
+            context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearArrayOperation<f64>>,
             inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
             crate::tracing_v2::operations::AddOperation.jvp(engine, context, inputs)
@@ -477,11 +477,11 @@ mod tests {
     fn linearize_program_does_not_replay_the_forward_program_to_recover_representatives() {
         let primitive =
             CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule::<ArrayScalarEngine, _>(PanicReplayOp);
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, ArrayOperation<f64>>::new();
         let input = builder.add_input(<f64 as Typed<ArrayType>>::r#type(&3.0f64).into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.instructions.push(Instruction {
-            operation: PrimitiveOperation::Custom(Arc::new(primitive)),
+            operation: ArrayOperation::Custom(Arc::new(primitive)),
             inputs: vec![input],
             outputs: vec![output_atom],
         });
@@ -495,11 +495,11 @@ mod tests {
 
     #[test]
     fn transpose_linear_program_does_not_replay_the_forward_linear_program_to_recover_representatives() {
-        let primitive = LinearPrimitiveOperation::custom(
+        let primitive = LinearArrayOperation::custom(
             CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_transpose_rule(PanicReplayOp),
         )
         .unwrap();
-        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new();
         let input = builder.add_input(<f64 as Typed<ArrayType>>::r#type(&0.0f64).into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.instructions.push(Instruction {
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn linear_program_display_delegates_to_the_underlying_program() {
         let engine = ScalarEngine::<f64>::new();
-        let (_, pushforward): (f64, Program<DataType, f64, LinearPrimitiveOperation<f64, DataType>, f64, f64>) =
+        let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
             jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
 
         assert_eq!(

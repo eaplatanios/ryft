@@ -7,7 +7,7 @@ use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::types::{ArrayType, Type, TypeError};
 
 use super::matrix::{MatrixOps, MatrixValue, transpose_abstract};
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, Operation};
+use super::{DifferentiableOperation, InterpretableOperation, LinearArrayOperation, LinearOperation, Operation};
 
 /// Hidden carrier capability for staging the matrix transposition primitive.
 #[doc(hidden)]
@@ -60,19 +60,14 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOpe
 impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOperation {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<
-            '_,
-            ArrayType,
-            V,
-            LinearPrimitiveOperation<V>,
-        >,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
-                    .apply_operation(&[atom], LinearPrimitiveOperation::Transpose, 1)?
+                    .apply_operation(&[atom], LinearArrayOperation::Transpose, 1)?
                     .into_iter()
                     .next()
                     .expect("matrix transpose should produce one cotangent contribution"),

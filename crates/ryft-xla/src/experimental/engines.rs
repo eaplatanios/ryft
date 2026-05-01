@@ -8,11 +8,11 @@ use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing_v2::engines::{Engine, TracingEngine};
-use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearPrimitiveOperation, Tracer};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, Tracer};
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::arrays::{Array, ArrayError};
-use super::ops::XlaPrimitiveOperation;
+use super::ops::{LinearXlaOperation, XlaOperation};
 use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
 
 #[cfg(test)]
@@ -139,17 +139,17 @@ impl<'c> Engine for XlaEngine<'c> {
 }
 
 impl<'c> TracingEngine for XlaEngine<'c> {
-    type Operation = XlaPrimitiveOperation;
+    type Operation = XlaOperation;
 }
 
 impl<'c> DifferentiableEngine for XlaEngine<'c> {
-    type DifferentiableOperation = XlaPrimitiveOperation;
-    type LinearOperation = LinearPrimitiveOperation<ShardMapTensor>;
+    type DifferentiableOperation = XlaOperation;
+    type LinearOperation = LinearXlaOperation;
 }
 
 impl<'c> DifferentiableTracingEngine for XlaEngine<'c> {
     type LinearOperation<'engine>
-        = LinearPrimitiveOperation<Tracer<'engine, Self>>
+        = LinearXlaOperation<Tracer<'engine, Self>>
     where
         Self: 'engine;
 }

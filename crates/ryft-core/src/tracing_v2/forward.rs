@@ -307,7 +307,7 @@ mod tests {
     use crate::tracing::ProgramBuilder;
     use crate::tracing_v2::engines::{ScalarEngine, TracingContext};
     use crate::tracing_v2::operations::{AddOperation, DifferentiableOperation};
-    use crate::tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation, test_support};
+    use crate::tracing_v2::{LinearScalarOperation, ScalarOperation, test_support};
     use crate::types::DataType;
 
     use super::*;
@@ -318,8 +318,7 @@ mod tests {
     #[test]
     fn tracing_context_dispatches_add_jvp_with_traced_primals() {
         let engine = ScalarEngine::<f64>::new();
-        let outer_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, PrimitiveOperation<f64, DataType>>::new()));
+        let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let outer_input_a = outer_builder.borrow_mut().add_input(crate::types::DataType::F64);
         let outer_input_b = outer_builder.borrow_mut().add_input(crate::types::DataType::F64);
         let outer_tracing_context = TracingContext::new(&engine, outer_builder.clone());
@@ -329,7 +328,7 @@ mod tests {
         let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
             DataType,
             Tracer<'_, ScalarEngine<f64>>,
-            LinearPrimitiveOperation<Tracer<'_, ScalarEngine<f64>>, DataType>,
+            LinearScalarOperation<Tracer<'_, ScalarEngine<f64>>>,
         >::new()));
         let tangent_a = linear_builder.borrow_mut().add_input(crate::types::DataType::F64);
         let tangent_b = linear_builder.borrow_mut().add_input(crate::types::DataType::F64);

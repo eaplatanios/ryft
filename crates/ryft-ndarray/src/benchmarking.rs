@@ -9,16 +9,14 @@ use ryft_core::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use ryft_core::tracing_v2::{MatrixOps, Sin, Tracer, TracingEngine, jvp, vjp};
 use ryft_core::types::ArrayType;
 
-use crate::{Array, NdArrayEngine};
+use crate::{Array, LinearNdarrayOperation, NdArrayEngine, NdarrayOperation};
 
 type Matrix = Array<f64>;
 type MatrixPair = (Matrix, Matrix);
 type MatrixQuad = (Matrix, Matrix, Matrix, Matrix);
 type MatrixTracer<'engine> = Tracer<'engine, NdArrayEngine<f64>>;
-type MatrixProgram<Input, Output> =
-    Program<ArrayType, Matrix, ryft_core::tracing_v2::PrimitiveOperation<Matrix>, Input, Output>;
-type MatrixLinearProgram<Input, Output> =
-    Program<ArrayType, Matrix, ryft_core::tracing_v2::LinearPrimitiveOperation<Matrix>, Input, Output>;
+type MatrixProgram<Input, Output> = Program<ArrayType, Matrix, NdarrayOperation<Matrix>, Input, Output>;
+type MatrixLinearProgram<Input, Output> = Program<ArrayType, Matrix, LinearNdarrayOperation<Matrix>, Input, Output>;
 
 /// Returns the `ndarray`-backed IR benchmark cases.
 pub fn cases() -> Vec<BenchmarkCase> {

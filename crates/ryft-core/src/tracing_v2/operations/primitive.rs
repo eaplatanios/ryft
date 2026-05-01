@@ -35,13 +35,12 @@ use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Op
 
 /// Default closed carrier for ordinary staged programs.
 ///
-/// [`PrimitiveOperation`] is the default operation enum used by scalar and external backend engines when a
-/// program stages ordinary primal computation. Most variants are thin tags around one semantic
-/// primitive defined elsewhere in [`super`]. The [`Custom`](Self::Custom) variant is the explicit
-/// escape hatch for operations outside that default set, so the carrier remains closed for normal
-/// dispatch while still allowing user- or backend-defined extensions.
+/// [`ArrayOperation`] is the reusable array operation enum for core tests and backend crates that do not need a fully
+/// custom carrier. Most variants are thin tags around one semantic primitive defined elsewhere in [`super`]. The
+/// [`Custom`](Self::Custom) variant is the explicit escape hatch for operations outside that default set, so the
+/// carrier remains closed for normal dispatch while still allowing user- or backend-defined extensions.
 #[derive(Clone)]
-pub enum PrimitiveOperation<V, T = ArrayType>
+pub enum ArrayOperation<V, T = ArrayType>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -79,17 +78,17 @@ where
             crate::tracing_v2::operations::RematerializeOperation<
                 T,
                 V,
-                PrimitiveOperation<V, T>,
-                LinearPrimitiveOperation<V, T>,
+                ArrayOperation<V, T>,
+                LinearArrayOperation<V, T>,
             >,
         >,
     ),
 
     /// Higher-order conditional carrying true and false branch programs.
-    Condition(Box<ConditionOperation<V, PrimitiveOperation<V, T>, T>>),
+    Condition(Box<ConditionOperation<V, ArrayOperation<V, T>, T>>),
 
     /// Higher-order while loop carrying condition and body programs.
-    While(Box<WhileOperation<V, PrimitiveOperation<V, T>, T>>),
+    While(Box<WhileOperation<V, ArrayOperation<V, T>, T>>),
 
     /// Escape hatch for user- or crate-defined operations outside `ryft-core`.
     Custom(Arc<CustomPrimitive<T, V>>),
@@ -97,12 +96,12 @@ where
 
 /// Default closed carrier for staged linear programs.
 ///
-/// [`LinearPrimitiveOperation`] is the linear-program sibling of [`PrimitiveOperation`]. It contains
+/// [`LinearArrayOperation`] is the linear-program sibling of [`ArrayOperation`]. It contains
 /// operations that can appear in tangent and cotangent programs, including captured-factor linear
 /// maps such as [`LeftMatMul`](Self::LeftMatMul) and [`RightMatMul`](Self::RightMatMul), and the
 /// linearized higher-order operations needed by rematerialization and control flow.
 #[derive(Clone)]
-pub enum LinearPrimitiveOperation<V, T = ArrayType>
+pub enum LinearArrayOperation<V, T = ArrayType>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -138,21 +137,19 @@ where
     Zero(ZeroOperation<T>),
 
     /// Higher-order rematerialization boundary restricted to linear bodies and transpose bodies.
-    Rematerialize(
-        Box<crate::tracing_v2::operations::LinearRematerializeOperation<T, V, LinearPrimitiveOperation<V, T>>>,
-    ),
+    Rematerialize(Box<crate::tracing_v2::operations::LinearRematerializeOperation<T, V, LinearArrayOperation<V, T>>>),
 
     /// Higher-order conditional restricted to linear branch programs.
-    Condition(Box<ConditionOperation<V, LinearPrimitiveOperation<V, T>, T>>),
+    Condition(Box<ConditionOperation<V, LinearArrayOperation<V, T>, T>>),
 
     /// Higher-order while loop restricted to linear condition and body programs.
-    While(Box<WhileOperation<V, LinearPrimitiveOperation<V, T>, T>>),
+    While(Box<WhileOperation<V, LinearArrayOperation<V, T>, T>>),
 
     /// Escape hatch for user- or crate-defined linear custom operations.
     Custom(Arc<LinearCustomPrimitive<T, V>>),
 }
 
-impl<T, V> LinearPrimitiveOperation<V, T>
+impl<T, V> LinearArrayOperation<V, T>
 where
     T: Type + PartialEq + 'static,
     V: Traceable<T> + Parameter + 'static,
@@ -168,134 +165,337 @@ where
     }
 }
 
-impl<T, V> SupportsAdd<T, V> for PrimitiveOperation<V, T>
+/// Closed scalar operation carrier for ordinary staged scalar programs.
+///
+/// [`ScalarOperation`] is intentionally limited to operations that are valid for scalar
+/// [`DataType`] metadata. Array-only primitives such as reshaping and matrix multiplication remain
+/// available as standalone operations and through array backend carriers, but they are not variants
+/// of this enum.
+#[derive(Clone)]
+pub enum ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    /// Scalar addition.
+    Add,
+
+    /// Scalar multiplication.
+    Mul,
+
+    /// Scalar negation.
+    Neg,
+
+    /// Scalar sine.
+    Sin,
+
+    /// Scalar cosine.
+    Cos,
+
+    /// Scalar scaling by a captured factor.
+    Scale { factor: V },
+
+    /// Escape hatch for user- or crate-defined scalar operations.
+    Custom(Arc<CustomPrimitive<DataType, V>>),
+}
+
+/// Closed scalar operation carrier for staged linear scalar programs.
+#[derive(Clone)]
+pub enum LinearScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    /// Scalar addition.
+    Add,
+
+    /// Scalar negation.
+    Neg,
+
+    /// Scalar scaling by a captured factor.
+    Scale { factor: V },
+
+    /// Typed scalar zero with no inputs and one output.
+    Zero(ZeroOperation<DataType>),
+
+    /// Escape hatch for user- or crate-defined linear scalar operations.
+    Custom(Arc<LinearCustomPrimitive<DataType, V>>),
+}
+
+impl<V> LinearScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter + 'static,
+{
+    /// Wraps one custom primitive in the scalar linear operation universe after verifying transpose support.
+    pub fn custom(primitive: CustomPrimitive<DataType, V>) -> Result<Self, TracingError> {
+        Ok(Self::Custom(Arc::new(primitive.into_linear()?)))
+    }
+
+    /// Wraps one shared custom primitive in the scalar linear operation universe after verifying transpose support.
+    pub fn custom_arc(primitive: Arc<CustomPrimitive<DataType, V>>) -> Result<Self, TracingError> {
+        Ok(Self::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
+    }
+}
+
+impl<V> SupportsAdd<DataType, V> for ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn add_operation() -> Self {
+        Self::Add
+    }
+}
+
+impl<V> SupportsMul<DataType, V> for ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn mul_operation() -> Self {
+        Self::Mul
+    }
+}
+
+impl<V> SupportsNeg<DataType, V> for ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn neg_operation() -> Self {
+        Self::Neg
+    }
+}
+
+impl<V> SupportsSin<DataType, V> for ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn sin_operation() -> Self {
+        Self::Sin
+    }
+}
+
+impl<V> SupportsCos<DataType, V> for ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn cos_operation() -> Self {
+        Self::Cos
+    }
+}
+
+impl<V> SupportsScale<DataType, V> for ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn scale_operation(factor: V) -> Self {
+        Self::Scale { factor }
+    }
+}
+
+impl<V> SupportsCustom<DataType, V> for ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn custom_operation(primitive: Arc<CustomPrimitive<DataType, V>>) -> Self {
+        Self::Custom(primitive)
+    }
+}
+
+impl<V> SupportsAdd<DataType, V> for LinearScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn add_operation() -> Self {
+        Self::Add
+    }
+}
+
+impl<V> SupportsZero<DataType, V> for LinearScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn zero_operation(r#type: DataType) -> Self {
+        Self::Zero(ZeroOperation::new(r#type))
+    }
+
+    #[inline]
+    fn as_zero(&self) -> Option<&DataType> {
+        match self {
+            Self::Zero(zero) => Some(zero.output_type()),
+            _ => None,
+        }
+    }
+}
+
+impl<V> SupportsNeg<DataType, V> for LinearScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn neg_operation() -> Self {
+        Self::Neg
+    }
+}
+
+impl<V> SupportsScale<DataType, V> for LinearScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn scale_operation(factor: V) -> Self {
+        Self::Scale { factor }
+    }
+}
+
+impl<V> SupportsLinearCustom<DataType, V> for LinearScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter + 'static,
+{
+    #[inline]
+    fn custom_operation(primitive: CustomPrimitive<DataType, V>) -> Result<Self, TracingError> {
+        Ok(Self::Custom(Arc::new(primitive.into_linear()?)))
+    }
+
+    #[inline]
+    fn custom_arc_operation(primitive: Arc<CustomPrimitive<DataType, V>>) -> Result<Self, TracingError> {
+        Ok(Self::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
+    }
+}
+
+impl<T, V> SupportsAdd<T, V> for ArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
 {
     #[inline]
     fn add_operation() -> Self {
-        PrimitiveOperation::Add
+        ArrayOperation::Add
     }
 }
 
-impl<T, V> SupportsMul<T, V> for PrimitiveOperation<V, T>
+impl<T, V> SupportsMul<T, V> for ArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
 {
     #[inline]
     fn mul_operation() -> Self {
-        PrimitiveOperation::Mul
+        ArrayOperation::Mul
     }
 }
 
-impl<T, V> SupportsNeg<T, V> for PrimitiveOperation<V, T>
+impl<T, V> SupportsNeg<T, V> for ArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
 {
     #[inline]
     fn neg_operation() -> Self {
-        PrimitiveOperation::Neg
+        ArrayOperation::Neg
     }
 }
 
-impl<T, V> SupportsSin<T, V> for PrimitiveOperation<V, T>
+impl<T, V> SupportsSin<T, V> for ArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
 {
     #[inline]
     fn sin_operation() -> Self {
-        PrimitiveOperation::Sin
+        ArrayOperation::Sin
     }
 }
 
-impl<T, V> SupportsCos<T, V> for PrimitiveOperation<V, T>
+impl<T, V> SupportsCos<T, V> for ArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
 {
     #[inline]
     fn cos_operation() -> Self {
-        PrimitiveOperation::Cos
+        ArrayOperation::Cos
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsMatMul<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsMatMul<ArrayType, V> for ArrayOperation<V> {
     #[inline]
     fn matmul_operation() -> Self {
-        PrimitiveOperation::MatrixMultiply
+        ArrayOperation::MatrixMultiply
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> for ArrayOperation<V> {
     #[inline]
     fn matrix_transpose_operation() -> Self {
-        PrimitiveOperation::Transpose
+        ArrayOperation::Transpose
     }
 }
 
-impl<T, V> SupportsScale<T, V> for PrimitiveOperation<V, T>
+impl<T, V> SupportsScale<T, V> for ArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
 {
     #[inline]
     fn scale_operation(factor: V) -> Self {
-        PrimitiveOperation::Scale { factor }
+        ArrayOperation::Scale { factor }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsReshape<ArrayType, V> for PrimitiveOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsReshape<ArrayType, V> for ArrayOperation<V> {
     #[inline]
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
-        PrimitiveOperation::Reshape { input_shape, output_shape }
+        ArrayOperation::Reshape { input_shape, output_shape }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsRematerialize<ArrayType, V, LinearPrimitiveOperation<V>>
-    for PrimitiveOperation<V>
+impl<V: Traceable<ArrayType> + Parameter> SupportsRematerialize<ArrayType, V, LinearArrayOperation<V>>
+    for ArrayOperation<V>
 {
     #[inline]
     fn rematerialize_operation(
-        op: crate::tracing_v2::operations::RematerializeOperation<ArrayType, V, Self, LinearPrimitiveOperation<V>>,
+        op: crate::tracing_v2::operations::RematerializeOperation<ArrayType, V, Self, LinearArrayOperation<V>>,
     ) -> Self {
-        PrimitiveOperation::Rematerialize(Box::new(op))
+        ArrayOperation::Rematerialize(Box::new(op))
     }
 }
 
-impl<T, V> SupportsCustom<T, V> for PrimitiveOperation<V, T>
+impl<T, V> SupportsCustom<T, V> for ArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
 {
     #[inline]
     fn custom_operation(primitive: Arc<CustomPrimitive<T, V>>) -> Self {
-        PrimitiveOperation::Custom(primitive)
+        ArrayOperation::Custom(primitive)
     }
 }
 
-impl<T, V> SupportsAdd<T, V> for LinearPrimitiveOperation<V, T>
+impl<T, V> SupportsAdd<T, V> for LinearArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
 {
     #[inline]
     fn add_operation() -> Self {
-        LinearPrimitiveOperation::Add
+        LinearArrayOperation::Add
     }
 }
 
-impl<T, V> SupportsZero<T, V> for LinearPrimitiveOperation<V, T>
+impl<T, V> SupportsZero<T, V> for LinearArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
 {
     #[inline]
     fn zero_operation(r#type: T) -> Self {
-        LinearPrimitiveOperation::Zero(ZeroOperation::new(r#type))
+        LinearArrayOperation::Zero(ZeroOperation::new(r#type))
     }
 
     #[inline]
@@ -307,91 +507,91 @@ where
     }
 }
 
-impl<T, V> SupportsNeg<T, V> for LinearPrimitiveOperation<V, T>
+impl<T, V> SupportsNeg<T, V> for LinearArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
 {
     #[inline]
     fn neg_operation() -> Self {
-        LinearPrimitiveOperation::Neg
+        LinearArrayOperation::Neg
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> for LinearArrayOperation<V> {
     #[inline]
     fn matrix_transpose_operation() -> Self {
-        LinearPrimitiveOperation::Transpose
+        LinearArrayOperation::Transpose
     }
 }
 
-impl<T, V> SupportsScale<T, V> for LinearPrimitiveOperation<V, T>
+impl<T, V> SupportsScale<T, V> for LinearArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
 {
     #[inline]
     fn scale_operation(factor: V) -> Self {
-        LinearPrimitiveOperation::Scale { factor }
+        LinearArrayOperation::Scale { factor }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsLeftMatMul<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsLeftMatMul<ArrayType, V> for LinearArrayOperation<V> {
     #[inline]
     fn left_matmul_operation(factor: V) -> Self {
-        LinearPrimitiveOperation::LeftMatMul { factor }
+        LinearArrayOperation::LeftMatMul { factor }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsRightMatMul<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsRightMatMul<ArrayType, V> for LinearArrayOperation<V> {
     #[inline]
     fn right_matmul_operation(factor: V) -> Self {
-        LinearPrimitiveOperation::RightMatMul { factor }
+        LinearArrayOperation::RightMatMul { factor }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsReshape<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsReshape<ArrayType, V> for LinearArrayOperation<V> {
     #[inline]
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
-        LinearPrimitiveOperation::Reshape { input_shape, output_shape }
+        LinearArrayOperation::Reshape { input_shape, output_shape }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsLinearRematerialize<ArrayType, V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsLinearRematerialize<ArrayType, V> for LinearArrayOperation<V> {
     #[inline]
     fn rematerialize_operation(
         op: crate::tracing_v2::operations::LinearRematerializeOperation<ArrayType, V, Self>,
     ) -> Self {
-        LinearPrimitiveOperation::Rematerialize(Box::new(op))
+        LinearArrayOperation::Rematerialize(Box::new(op))
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> From<ConditionOperation<V, LinearPrimitiveOperation<V>>>
-    for LinearPrimitiveOperation<V>
+impl<V: Traceable<ArrayType> + Parameter> From<ConditionOperation<V, LinearArrayOperation<V>>>
+    for LinearArrayOperation<V>
 {
     #[inline]
-    fn from(op: ConditionOperation<V, LinearPrimitiveOperation<V>>) -> Self {
-        LinearPrimitiveOperation::Condition(Box::new(op))
+    fn from(op: ConditionOperation<V, LinearArrayOperation<V>>) -> Self {
+        LinearArrayOperation::Condition(Box::new(op))
     }
 }
 
-impl<T, V> SupportsLinearCustom<T, V> for LinearPrimitiveOperation<V, T>
+impl<T, V> SupportsLinearCustom<T, V> for LinearArrayOperation<V, T>
 where
     T: Type + PartialEq + 'static,
     V: Traceable<T> + Parameter + 'static,
 {
     #[inline]
     fn custom_operation(primitive: CustomPrimitive<T, V>) -> Result<Self, TracingError> {
-        Ok(LinearPrimitiveOperation::Custom(Arc::new(primitive.into_linear()?)))
+        Ok(LinearArrayOperation::Custom(Arc::new(primitive.into_linear()?)))
     }
 
     #[inline]
     fn custom_arc_operation(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TracingError> {
-        Ok(LinearPrimitiveOperation::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
+        Ok(LinearArrayOperation::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
     }
 }
 
-impl<T, V> PrimitiveOperation<V, T>
+impl<T, V> ArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -416,7 +616,7 @@ where
     }
 }
 
-impl<T, V> LinearPrimitiveOperation<V, T>
+impl<T, V> LinearArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -440,7 +640,91 @@ where
     }
 }
 
-impl<T, V> Debug for PrimitiveOperation<V, T>
+impl<V> ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn operation_name(&self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Mul => "mul",
+            Self::Neg => "neg",
+            Self::Sin => "sin",
+            Self::Cos => "cos",
+            Self::Scale { .. } => "scale",
+            Self::Custom(op) => op.name(),
+        }
+    }
+}
+
+impl<V> LinearScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn operation_name(&self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Neg => "neg",
+            Self::Scale { .. } => "scale",
+            Self::Zero(zero) => zero.name(),
+            Self::Custom(op) => op.name(),
+        }
+    }
+}
+
+impl<V> Debug for ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Add => write!(formatter, "Add"),
+            Self::Mul => write!(formatter, "Mul"),
+            Self::Neg => write!(formatter, "Neg"),
+            Self::Sin => write!(formatter, "Sin"),
+            Self::Cos => write!(formatter, "Cos"),
+            Self::Scale { .. } => write!(formatter, "Scale"),
+            Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
+        }
+    }
+}
+
+impl<V> Display for ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.operation_name())
+    }
+}
+
+impl<V> Debug for LinearScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Add => write!(formatter, "Add"),
+            Self::Neg => write!(formatter, "Neg"),
+            Self::Scale { .. } => write!(formatter, "Scale"),
+            Self::Zero(zero) => Debug::fmt(zero, formatter),
+            Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
+        }
+    }
+}
+
+impl<V> Display for LinearScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.operation_name())
+    }
+}
+
+impl<T, V> Debug for ArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -466,7 +750,7 @@ where
     }
 }
 
-impl<T, V> Display for PrimitiveOperation<V, T>
+impl<T, V> Display for ArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -479,7 +763,7 @@ where
     }
 }
 
-impl<T, V> Debug for LinearPrimitiveOperation<V, T>
+impl<T, V> Debug for LinearArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -504,7 +788,7 @@ where
     }
 }
 
-impl<T, V> Display for LinearPrimitiveOperation<V, T>
+impl<T, V> Display for LinearArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -521,7 +805,60 @@ fn unsupported_scalar_metadata_operation(operation_name: &'static str) -> TypeEr
     TypeError { message: format!("{operation_name} is not supported for scalar data type metadata") }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for PrimitiveOperation<V> {
+impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ScalarOperation<V> {
+    fn name(&self) -> &'static str {
+        self.operation_name()
+    }
+
+    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        match self {
+            Self::Add => AddOperation.infer_output_types(input_types),
+            Self::Mul => MulOperation.infer_output_types(input_types),
+            Self::Neg => NegOperation.infer_output_types(input_types),
+            Self::Sin => SinOperation.infer_output_types(input_types),
+            Self::Cos => CosOperation.infer_output_types(input_types),
+            Self::Scale { .. } => ScaleOperation::<DataType, V>::abstract_eval_static(input_types),
+            Self::Custom(op) => op.infer_output_types(input_types),
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+                .bracketed(|operation| operation.field("factor", factor)),
+            Self::Custom(op) => op.render(formatter, indentation),
+            _ => Display::fmt(self, formatter),
+        }
+    }
+}
+
+impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearScalarOperation<V> {
+    fn name(&self) -> &'static str {
+        self.operation_name()
+    }
+
+    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        match self {
+            Self::Add => AddOperation.infer_output_types(input_types),
+            Self::Neg => NegOperation.infer_output_types(input_types),
+            Self::Scale { .. } => ScaleOperation::<DataType, V>::abstract_eval_static(input_types),
+            Self::Zero(zero) => zero.infer_output_types(input_types),
+            Self::Custom(op) => op.infer_output_types(input_types),
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+                .bracketed(|operation| operation.field("factor", factor)),
+            Self::Zero(zero) => zero.render(formatter, indentation),
+            Self::Custom(op) => op.render(formatter, indentation),
+            _ => Display::fmt(self, formatter),
+        }
+    }
+}
+
+impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for ArrayOperation<V> {
     fn name(&self) -> &'static str {
         self.operation_name()
     }
@@ -562,7 +899,7 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for PrimitiveOper
     }
 }
 
-impl<V: Traceable<DataType> + Parameter> Operation<DataType> for PrimitiveOperation<V, DataType> {
+impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ArrayOperation<V, DataType> {
     fn name(&self) -> &'static str {
         self.operation_name()
     }
@@ -601,7 +938,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for PrimitiveOperat
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for LinearArrayOperation<V> {
     fn name(&self) -> &'static str {
         self.operation_name()
     }
@@ -652,7 +989,7 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for LinearPrimiti
     }
 }
 
-impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearPrimitiveOperation<V, DataType> {
+impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearArrayOperation<V, DataType> {
     fn name(&self) -> &'static str {
         self.operation_name()
     }
@@ -695,10 +1032,90 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearPrimitive
     }
 }
 
-/// [`InterpretableOperation`] for [`PrimitiveOperation`] requires the full union of value capabilities used by
+impl<
+    V: Traceable<DataType>
+        + Parameter
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike,
+> InterpretableOperation<DataType, V> for ScalarOperation<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+{
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        match self {
+            Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
+            Self::Mul => <MulOperation as InterpretableOperation<DataType, V>>::interpret(&MulOperation, inputs),
+            Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
+            Self::Sin => <SinOperation as InterpretableOperation<DataType, V>>::interpret(&SinOperation, inputs),
+            Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Custom(op) => op.interpret(inputs),
+        }
+    }
+}
+
+impl<
+    V: Traceable<DataType>
+        + Parameter
+        + Add<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
+        + ZeroLike
+        + crate::tracing_v2::operations::constants::Zero<DataType>,
+> InterpretableOperation<DataType, V> for LinearScalarOperation<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+{
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        match self {
+            Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
+            Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Zero(zero) => zero.interpret(inputs),
+            Self::Custom(op) => op.interpret(inputs),
+        }
+    }
+}
+
+impl<'engine, E> InterpretableOperation<DataType, Tracer<'engine, E>> for LinearScalarOperation<Tracer<'engine, E>>
+where
+    E: DifferentiableTracingEngine<Type = DataType> + ?Sized + 'static,
+    Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
+        + Neg<Output = Tracer<'engine, E>>
+        + Mul<Output = Tracer<'engine, E>>
+        + ZeroLike,
+    Vec<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, ParameterStructure: std::fmt::Debug + PartialEq>,
+{
+    fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
+        match self {
+            Self::Add => {
+                <AddOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&AddOperation, inputs)
+            }
+            Self::Neg => {
+                <NegOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&NegOperation, inputs)
+            }
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Zero(zero) => Err(TypeError {
+                message: format!(
+                    "linear zero operation over tracer values was not materialized before interpretation for {}",
+                    zero.output_type()
+                ),
+            }
+            .into()),
+            Self::Custom(op) => op.interpret(inputs),
+        }
+    }
+}
+
+/// [`InterpretableOperation`] for [`ArrayOperation`] requires the full union of value capabilities used by
 /// the closed default ordinary-op carrier.
 ///
-/// That broad union is local to [`PrimitiveOperation`] itself. The higher-level tracing APIs avoid
+/// That broad union is local to [`ArrayOperation`] itself. The higher-level tracing APIs avoid
 /// exposing it as one public value-bundle trait and instead express their requirements through the
 /// specific staged op carrier bounds they actually exercise.
 impl<
@@ -714,7 +1131,7 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-> InterpretableOperation<ArrayType, V> for PrimitiveOperation<V>
+> InterpretableOperation<ArrayType, V> for ArrayOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -749,7 +1166,7 @@ impl<
         + Cos
         + ZeroLike
         + OneLike,
-> InterpretableOperation<DataType, V> for PrimitiveOperation<V, DataType>
+> InterpretableOperation<DataType, V> for ArrayOperation<V, DataType>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -783,7 +1200,7 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-> InterpretableOperation<ArrayType, V> for LinearPrimitiveOperation<V>
+> InterpretableOperation<ArrayType, V> for LinearArrayOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -815,7 +1232,7 @@ impl<
         + Mul<Output = V>
         + ZeroLike
         + crate::tracing_v2::operations::constants::Zero<DataType>,
-> InterpretableOperation<DataType, V> for LinearPrimitiveOperation<V, DataType>
+> InterpretableOperation<DataType, V> for LinearArrayOperation<V, DataType>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -837,7 +1254,7 @@ where
     }
 }
 
-impl<'engine, E> InterpretableOperation<ArrayType, Tracer<'engine, E>> for LinearPrimitiveOperation<Tracer<'engine, E>>
+impl<'engine, E> InterpretableOperation<ArrayType, Tracer<'engine, E>> for LinearArrayOperation<Tracer<'engine, E>>
 where
     E: DifferentiableTracingEngine<Type = ArrayType> + ?Sized + 'static,
     Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
@@ -882,7 +1299,7 @@ where
 }
 
 impl<'engine, E> InterpretableOperation<DataType, Tracer<'engine, E>>
-    for LinearPrimitiveOperation<Tracer<'engine, E>, DataType>
+    for LinearArrayOperation<Tracer<'engine, E>, DataType>
 where
     E: DifferentiableTracingEngine<Type = DataType> + ?Sized + 'static,
     Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
@@ -919,6 +1336,57 @@ where
     }
 }
 
+impl<V: Traceable<DataType> + Parameter + Add<Output = V> + Neg<Output = V> + ZeroLike>
+    LinearOperation<DataType, V, LinearScalarOperation<V>> for LinearScalarOperation<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+{
+    fn transpose(
+        &self,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, DataType, V, LinearScalarOperation<V>>,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        match self {
+            Self::Add => {
+                if output_cotangents.len() != 1 {
+                    return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
+                }
+                Ok(vec![output_cotangents[0], output_cotangents[0]])
+            }
+            Self::Neg => {
+                if output_cotangents.len() != 1 {
+                    return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
+                }
+                output_cotangents[0]
+                    .map(|atom| context.apply_operation(&[atom], Self::Neg, 1).map(|outputs| vec![Some(outputs[0])]))
+                    .unwrap_or_else(|| Ok(vec![None]))
+            }
+            Self::Scale { factor } => {
+                if output_cotangents.len() != 1 {
+                    return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
+                }
+                output_cotangents[0]
+                    .map(|atom| {
+                        context
+                            .apply_operation(&[atom], Self::Scale { factor: factor.clone() }, 1)
+                            .map(|outputs| vec![Some(outputs[0])])
+                    })
+                    .unwrap_or_else(|| Ok(vec![None]))
+            }
+            Self::Zero(_) => {
+                if output_cotangents.len() != 1 {
+                    return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
+                }
+                Ok(Vec::new())
+            }
+            Self::Custom(_) => Err(TypeError {
+                message: "custom scalar linear transpose requires a carrier-specific transpose rule".to_string(),
+            }
+            .into()),
+        }
+    }
+}
+
 impl<
     V: Traceable<ArrayType>
         + Parameter
@@ -930,18 +1398,13 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-> LinearOperation<ArrayType, V> for LinearPrimitiveOperation<V>
+> LinearOperation<ArrayType, V> for LinearArrayOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<
-            '_,
-            ArrayType,
-            V,
-            LinearPrimitiveOperation<V>,
-        >,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         match self {
@@ -968,7 +1431,7 @@ where
 }
 
 impl<V: Traceable<DataType> + Parameter + Add<Output = V> + Neg<Output = V> + Mul<Output = V> + ZeroLike + OneLike>
-    LinearOperation<DataType, V> for LinearPrimitiveOperation<V, DataType>
+    LinearOperation<DataType, V> for LinearArrayOperation<V, DataType>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -978,7 +1441,7 @@ where
             '_,
             DataType,
             V,
-            LinearPrimitiveOperation<V, DataType>,
+            LinearArrayOperation<V, DataType>,
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
@@ -995,6 +1458,135 @@ where
             | Self::Rematerialize(_)
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
+        }
+    }
+}
+
+impl<
+    V: Value<DataType>
+        + Traceable<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + crate::tracing_v2::operations::constants::Zero<DataType>
+        + Parameterized<V>
+        + Differentiable<DataType, Tangent = V>
+        + 'static,
+    E: DifferentiableEngine<
+            Type = DataType,
+            Value = V,
+            DifferentiableOperation = ScalarOperation<V>,
+            LinearOperation = LinearScalarOperation<V>,
+        > + 'static,
+> DifferentiableOperation<E> for ScalarOperation<V>
+where
+    V::ParameterStructure: std::fmt::Debug + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    LinearScalarOperation<V>:
+        super::SupportsAdd<DataType, V> + super::SupportsNeg<DataType, V> + super::SupportsScale<DataType, V>,
+{
+    fn jvp(
+        &self,
+        engine: &E,
+        context: &mut JvpContext<'_, V, E::LinearOperation, DataType>,
+        inputs: &[JvpTracer<V, AtomId>],
+    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
+        match self {
+            Self::Add => AddOperation.jvp(engine, context, inputs),
+            Self::Mul => MulOperation.jvp(engine, context, inputs),
+            Self::Neg => NegOperation.jvp(engine, context, inputs),
+            Self::Sin => SinOperation.jvp(engine, context, inputs),
+            Self::Cos => CosOperation.jvp(engine, context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::Custom(_) => {
+                Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
+                    .into())
+            }
+        }
+    }
+}
+
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
+    for ScalarOperation<V>
+where
+    V: Value<DataType>
+        + Traceable<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + crate::tracing_v2::operations::constants::Zero<DataType>
+        + Parameterized<V>
+        + Differentiable<DataType, Tangent = V>
+        + 'static,
+    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, Operation = ScalarOperation<V>> + ?Sized + 'static,
+    V::ParameterStructure: std::fmt::Debug + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    LinearScalarOperation<V>: super::SupportsAdd<DataType, V>
+        + super::SupportsNeg<DataType, V>
+        + super::SupportsScale<DataType, V>
+        + Clone
+        + InterpretableOperation<DataType, V>
+        + LinearOperation<DataType, V, LinearScalarOperation<V>>,
+    Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
+        + Mul<Output = Tracer<'engine, EInner>>
+        + Neg<Output = Tracer<'engine, EInner>>
+        + Sin
+        + Cos,
+    EInner::LinearOperation<'engine>: Clone
+        + InterpretableOperation<DataType, Tracer<'engine, EInner>>
+        + LinearOperation<DataType, Tracer<'engine, EInner>, EInner::LinearOperation<'engine>>
+        + SupportsScale<DataType, Tracer<'engine, EInner>>
+        + SupportsZero<DataType, Tracer<'engine, EInner>>,
+{
+    fn jvp(
+        &self,
+        engine: &crate::tracing_v2::TracingContext<'engine, EInner>,
+        context: &mut JvpContext<
+            '_,
+            Tracer<'engine, EInner>,
+            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
+            DataType,
+        >,
+        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
+        match self {
+            Self::Add => AddOperation.jvp(engine, context, inputs),
+            Self::Mul => MulOperation.jvp(engine, context, inputs),
+            Self::Neg => NegOperation.jvp(engine, context, inputs),
+            Self::Sin => SinOperation.jvp(engine, context, inputs),
+            Self::Cos => CosOperation.jvp(engine, context, inputs),
+            Self::Scale { factor } => {
+                if inputs.len() != 1 {
+                    return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
+                }
+                let input = &inputs[0];
+                let factor_tracer = engine.lift(factor.clone());
+                let tangent = context
+                    .apply_operation(
+                        &[input.tangent],
+                        <EInner::LinearOperation<'engine> as SupportsScale<
+                            DataType,
+                            Tracer<'engine, EInner>,
+                        >>::scale_operation(factor_tracer.clone()),
+                        1,
+                    )?
+                    .into_iter()
+                    .next()
+                    .expect("scale jvp should produce one tangent");
+                Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent }])
+            }
+            Self::Custom(_) => {
+                Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
+                    .into())
+            }
         }
     }
 }
@@ -1018,15 +1610,15 @@ impl<
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = V,
-            DifferentiableOperation = PrimitiveOperation<V>,
-            LinearOperation = LinearPrimitiveOperation<V>,
+            DifferentiableOperation = ArrayOperation<V>,
+            LinearOperation = LinearArrayOperation<V>,
         > + 'static,
-> DifferentiableOperation<E> for PrimitiveOperation<V>
+> DifferentiableOperation<E> for ArrayOperation<V>
 where
     V: Differentiable<ArrayType, Tangent = V>,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearPrimitiveOperation<V>: super::SupportsAdd<ArrayType, V>
+    LinearArrayOperation<V>: super::SupportsAdd<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
@@ -1077,14 +1669,14 @@ impl<
     E: DifferentiableEngine<
             Type = DataType,
             Value = V,
-            DifferentiableOperation = PrimitiveOperation<V, DataType>,
-            LinearOperation = LinearPrimitiveOperation<V, DataType>,
+            DifferentiableOperation = ArrayOperation<V, DataType>,
+            LinearOperation = LinearArrayOperation<V, DataType>,
         > + 'static,
-> DifferentiableOperation<E> for PrimitiveOperation<V, DataType>
+> DifferentiableOperation<E> for ArrayOperation<V, DataType>
 where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearPrimitiveOperation<V, DataType>:
+    LinearArrayOperation<V, DataType>:
         super::SupportsAdd<DataType, V> + super::SupportsNeg<DataType, V> + super::SupportsScale<DataType, V>,
 {
     fn jvp(
@@ -1114,7 +1706,7 @@ where
     }
 }
 
-/// Linearization-engine dispatcher for [`PrimitiveOperation`] under the traced-linearization path.
+/// Linearization-engine dispatcher for [`ArrayOperation`] under the traced-linearization path.
 ///
 /// Forwards each variant to the per-op JVP rule, picking up the
 /// [`TracingContext`](crate::tracing_v2::TracingContext)-keyed impl for captured
@@ -1124,7 +1716,7 @@ where
 /// not work at trace time), and the [`Custom`](Self::Custom) bridge to the registered traced
 /// linearization rule.
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
-    for PrimitiveOperation<V>
+    for ArrayOperation<V>
 where
     V: Value<ArrayType>
         + Add<Output = V>
@@ -1141,11 +1733,10 @@ where
         + ControlFlowValue
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    EInner:
-        DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>> + ?Sized + 'static,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>> + ?Sized + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearPrimitiveOperation<V>: super::SupportsAdd<ArrayType, V>
+    LinearArrayOperation<V>: super::SupportsAdd<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
@@ -1154,7 +1745,7 @@ where
         + super::SupportsReshape<ArrayType, V>
         + Clone
         + InterpretableOperation<ArrayType, V>
-        + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
+        + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
         + Mul<Output = Tracer<'engine, EInner>>
         + Neg<Output = Tracer<'engine, EInner>>
@@ -1202,7 +1793,7 @@ where
 }
 
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
-    for PrimitiveOperation<V, DataType>
+    for ArrayOperation<V, DataType>
 where
     V: Value<DataType>
         + Traceable<ArrayType>
@@ -1217,17 +1808,17 @@ where
         + Parameterized<V>
         + Differentiable<DataType, Tangent = V>
         + 'static,
-    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, Operation = PrimitiveOperation<V, DataType>>
+    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, Operation = ArrayOperation<V, DataType>>
         + ?Sized
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearPrimitiveOperation<V, DataType>: super::SupportsAdd<DataType, V>
+    LinearArrayOperation<V, DataType>: super::SupportsAdd<DataType, V>
         + super::SupportsNeg<DataType, V>
         + super::SupportsScale<DataType, V>
         + Clone
         + InterpretableOperation<DataType, V>
-        + LinearOperation<DataType, V, LinearPrimitiveOperation<V, DataType>>,
+        + LinearOperation<DataType, V, LinearArrayOperation<V, DataType>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
         + Mul<Output = Tracer<'engine, EInner>>
         + Neg<Output = Tracer<'engine, EInner>>
@@ -1290,13 +1881,11 @@ where
     }
 }
 
-impl<'engine, V, EInner> crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner>
-    for PrimitiveOperation<V>
+impl<'engine, V, EInner> crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner> for ArrayOperation<V>
 where
     V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V> + Parameter + 'static,
-    EInner:
-        DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>> + ?Sized + 'engine,
-    PrimitiveOperation<V>: DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>> + ?Sized + 'engine,
+    ArrayOperation<V>: DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>,
 {
     fn jvp_traced_linearization(
         &self,
@@ -1314,14 +1903,37 @@ where
     }
 }
 
-impl<'engine, V, EInner> crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner>
-    for PrimitiveOperation<V, DataType>
+impl<'engine, V, EInner> crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner> for ScalarOperation<V>
 where
     V: Traceable<DataType> + Differentiable<DataType, Tangent = V> + Parameter + 'static,
-    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, Operation = PrimitiveOperation<V, DataType>>
+    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, Operation = ScalarOperation<V>> + ?Sized + 'engine,
+    ScalarOperation<V>: DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>,
+{
+    fn jvp_traced_linearization(
+        &self,
+        engine: &crate::tracing_v2::TracingContext<'engine, EInner>,
+        context: &mut JvpContext<
+            '_,
+            Tracer<'engine, EInner>,
+            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
+            DataType,
+        >,
+        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
+        <Self as DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>>::jvp(
+            self, engine, context, inputs,
+        )
+    }
+}
+
+impl<'engine, V, EInner> crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner>
+    for ArrayOperation<V, DataType>
+where
+    V: Traceable<DataType> + Differentiable<DataType, Tangent = V> + Parameter + 'static,
+    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, Operation = ArrayOperation<V, DataType>>
         + ?Sized
         + 'engine,
-    PrimitiveOperation<V, DataType>: DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>,
+    ArrayOperation<V, DataType>: DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>,
 {
     fn jvp_traced_linearization(
         &self,

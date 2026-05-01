@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use half::{bf16, f16};
 
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
-use crate::tracing_v2::operations::primitive::LinearPrimitiveOperation;
+use crate::tracing_v2::operations::primitive::LinearArrayOperation;
 use crate::tracing_v2::{Engine, Tracer, TracerState, TracingEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -198,11 +198,11 @@ impl<T: Type, V: Typed<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperat
 
 impl<T: Type + PartialEq, V: Traceable<T> + crate::parameters::Parameter> LinearOperation<T, V> for ZeroOperation<T>
 where
-    LinearPrimitiveOperation<V, T>: Operation<T>,
+    LinearArrayOperation<V, T>: Operation<T>,
 {
     fn transpose(
         &self,
-        _context: &mut TranspositionContext<'_, T, V, LinearPrimitiveOperation<V, T>>,
+        _context: &mut TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
         if output_cotangents.len() != 1 {
