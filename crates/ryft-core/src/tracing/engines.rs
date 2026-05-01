@@ -462,6 +462,7 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+    use ryft_macros::Parameter;
 
     use crate::parameters::Placeholder;
     use crate::tracing_v2::differentiation::DifferentiableEngine;
@@ -473,27 +474,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_scalar_engine_is_zero_sized() {
-        assert_eq!(size_of::<ScalarEngine<bool>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<i8>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<u64>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<bf16>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<f16>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<f64>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<f32>>(), 0);
-    }
-
-    #[test]
-    fn test_scalar_engine_produces_canonical_zero_and_one() {
+    fn test_engine() {
         let bool_type = DataType::Boolean;
         let bool_engine = ScalarEngine::<bool>::new();
         assert_eq!(Engine::zero(&bool_engine, &bool_type), Ok(false));
         assert_eq!(Engine::one(&bool_engine, &bool_type), Ok(true));
 
+        let i8_type = DataType::I8;
+        let i8_engine = ScalarEngine::<i8>::new();
+        assert_eq!(Engine::zero(&i8_engine, &i8_type), Ok(0i8));
+        assert_eq!(Engine::one(&i8_engine, &i8_type), Ok(1i8));
+
+        let i16_type = DataType::I16;
+        let i16_engine = ScalarEngine::<i16>::new();
+        assert_eq!(Engine::zero(&i16_engine, &i16_type), Ok(0i16));
+        assert_eq!(Engine::one(&i16_engine, &i16_type), Ok(1i16));
+
         let i32_type = DataType::I32;
         let i32_engine = ScalarEngine::<i32>::new();
         assert_eq!(Engine::zero(&i32_engine, &i32_type), Ok(0i32));
         assert_eq!(Engine::one(&i32_engine, &i32_type), Ok(1i32));
+
+        let i64_type = DataType::I64;
+        let i64_engine = ScalarEngine::<i64>::new();
+        assert_eq!(Engine::zero(&i64_engine, &i64_type), Ok(0i64));
+        assert_eq!(Engine::one(&i64_engine, &i64_type), Ok(1i64));
+
+        let u8_type = DataType::U8;
+        let u8_engine = ScalarEngine::<u8>::new();
+        assert_eq!(Engine::zero(&u8_engine, &u8_type), Ok(0u8));
+        assert_eq!(Engine::one(&u8_engine, &u8_type), Ok(1u8));
+
+        let u16_type = DataType::U16;
+        let u16_engine = ScalarEngine::<u16>::new();
+        assert_eq!(Engine::zero(&u16_engine, &u16_type), Ok(0u16));
+        assert_eq!(Engine::one(&u16_engine, &u16_type), Ok(1u16));
+
+        let u32_type = DataType::U32;
+        let u32_engine = ScalarEngine::<u32>::new();
+        assert_eq!(Engine::zero(&u32_engine, &u32_type), Ok(0u32));
+        assert_eq!(Engine::one(&u32_engine, &u32_type), Ok(1u32));
 
         let u64_type = DataType::U64;
         let u64_engine = ScalarEngine::<u64>::new();
@@ -519,250 +539,74 @@ mod tests {
         let f64_engine = ScalarEngine::<f64>::new();
         assert_eq!(Engine::zero(&f64_engine, &f64_type), Ok(0.0f64));
         assert_eq!(Engine::one(&f64_engine, &f64_type), Ok(1.0f64));
+        assert!(matches!(
+            Engine::zero(&f64_engine, &DataType::F32),
+            Err(TracingError::Type(TypeError { message }))
+                if message == "scalar engine for f64 cannot synthesize zero for f32",
+        ));
+        assert!(matches!(
+            Engine::one(&f64_engine, &DataType::F32),
+            Err(TracingError::Type(TypeError { message }))
+                if message == "scalar engine for f64 cannot synthesize one for f32",
+        ));
     }
 
     #[test]
-    fn test_scalar_engine_rejects_mismatched_identity_type() {
+    fn test_tracing_engine() {
         let engine = ScalarEngine::<f64>::new();
-
-        assert_eq!(
-            Engine::zero(&engine, &DataType::F32).unwrap_err().to_string(),
-            "scalar engine for f64 cannot synthesize zero for f32",
-        );
-        assert_eq!(
-            Engine::one(&engine, &DataType::F32).unwrap_err().to_string(),
-            "scalar engine for f64 cannot synthesize one for f32",
-        );
-    }
-
-    #[test]
-    fn test_half_and_float_scalar_engines_are_differentiable() {
-        let _: Option<<ScalarEngine<bf16> as DifferentiableEngine>::DifferentiableOperation> = None;
-        let _: Option<<ScalarEngine<f16> as DifferentiableEngine>::DifferentiableOperation> = None;
-        let _: Option<<ScalarEngine<f32> as DifferentiableEngine>::DifferentiableOperation> = None;
-        let _: Option<<ScalarEngine<f64> as DifferentiableEngine>::DifferentiableOperation> = None;
-    }
-
-    #[test]
-    fn test_half_scalar_engines_run_jvp() {
-        let bf16_engine = ScalarEngine::<bf16>::new();
-        assert_eq!(
-            jvp(&bf16_engine, |x| x.clone() + x, bf16::from_f32(3.0), bf16::ONE),
-            Ok((bf16::from_f32(6.0), bf16::from_f32(2.0)))
-        );
-
-        let f16_engine = ScalarEngine::<f16>::new();
-        assert_eq!(
-            jvp(&f16_engine, |x| x.clone() + x, f16::from_f32(3.0), f16::ONE),
-            Ok((f16::from_f32(6.0), f16::from_f32(2.0)))
-        );
-    }
-
-    #[test]
-    fn test_tracing_context_zero_and_one_lift_atoms() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let engine = ScalarEngine::<f64>::new();
-        let tracing_context = TracingContext::new(&engine, builder.clone());
-        let r#type = DataType::F64;
-
-        let zero = Engine::zero(&tracing_context, &r#type).unwrap();
-        let one = Engine::one(&tracing_context, &r#type).unwrap();
-
-        assert_eq!(zero.r#type().into_owned(), r#type);
-        assert_eq!(one.r#type().into_owned(), DataType::F64);
-        let zero_atom = zero.atom_id().expect("zero tracer should remain live");
-        let one_atom = one.atom_id().expect("one tracer should remain live");
-        assert_eq!(zero_atom.index, 0);
-        assert_eq!(one_atom.index, 1);
-
-        let program = builder
-            .borrow()
-            .clone()
-            .build::<Vec<f64>, Vec<f64>>(
-                vec![zero_atom, one_atom],
-                Vec::<Placeholder>::new(),
-                vec![Placeholder, Placeholder],
+        let (output_type, program): (DataType, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
+            .trace(
+                |x: Tracer<ScalarEngine<f64>>| {
+                    let squared = x.clone() * x.clone();
+                    Ok(squared + x.one_like())
+                },
+                DataType::F64,
             )
             .unwrap();
-        assert_eq!(program.interpret(Vec::new()).unwrap(), vec![0.0, 1.0]);
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda  .
-                let %0:f64 = const
-                    %1:f64 = const
-                in (%0, %1)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_tracer_zero_like_adds_constant_atoms() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let atom = builder.borrow_mut().add_input(<f64 as Typed<DataType>>::r#type(&3.0f64).into_owned());
-        let engine = ScalarEngine::<f64>::new();
-        let tracer: Tracer<ScalarEngine<f64>> = TracingContext::new(&engine, builder).tracer(atom, None);
-        let zero = tracer.zero_like();
-        assert_eq!(zero.r#type().into_owned(), DataType::F64);
-        let zero_atom = match &zero.state {
-            TracerState::Live(atom) => *atom,
-            TracerState::Poison => panic!("zero-like tracer should remain live"),
-        };
-        assert!(zero_atom > atom);
-
-        let program = zero
-            .builder()
-            .borrow()
-            .clone()
-            .build::<f64, f64>(vec![zero_atom], Placeholder, Placeholder)
-            .unwrap();
+        assert_eq!(output_type, DataType::F64);
+        assert_eq!(program.interpret(3.0), Ok(10.0));
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f64 .
-                let %1:f64 = const
-                in (%1)
+                let %1:f64 = mul %0 %0
+                    %2:f64 = const
+                    %3:f64 = add %1 %2
+                in (%3)
             "}
             .trim_end(),
         );
-    }
 
-    #[test]
-    fn test_live_tracer_type_borrows_cached_type() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let input_type = DataType::F64;
-        let atom = builder.borrow_mut().add_input(input_type.clone());
-        let engine = ScalarEngine::<f64>::new();
-        let tracer: Tracer<ScalarEngine<f64>> = TracingContext::new(&engine, builder).tracer(atom, Some(input_type));
+        // Test using an escaped [`ProgramBuilder`].
+        let escaped_builder = Rc::new(RefCell::new(None));
+        let result: Result<(DataType, Program<DataType, f64, ScalarOperation<f64>, f64, f64>), TracingError> = engine
+            .trace(
+                |x: Tracer<ScalarEngine<f64>>| {
+                    *escaped_builder.borrow_mut() = Some(x.builder().clone());
+                    Ok(x)
+                },
+                DataType::F64,
+            );
 
-        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
-    }
+        assert!(matches!(result, Err(TracingError::EscapedProgramBuilder)));
 
-    #[test]
-    fn test_trace_rejects_mismatched_program_builders() {
-        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let atom_a = builder_a.borrow_mut().add_input(<f64 as Typed<DataType>>::r#type(&1.0f64).into_owned());
-        let atom_b = builder_b.borrow_mut().add_input(<f64 as Typed<DataType>>::r#type(&2.0f64).into_owned());
-        let engine = ScalarEngine::<f64>::new();
-        let tracer_a = TracingContext::new(&engine, builder_a.clone()).tracer(atom_a, None);
-        let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
-
+        // Test that [`TypeError`]s are returned in certain cases.
+        let result: Result<(DataType, Program<DataType, f64, ScalarOperation<f64>, (f64, f64), f64>), TracingError> =
+            engine.trace(
+                |inputs: (Tracer<ScalarEngine<f64>>, Tracer<ScalarEngine<f64>>)| Ok(inputs.0 + inputs.1),
+                (DataType::F8E3M4, DataType::F32),
+            );
         assert!(matches!(
-            TracingContext::new(&engine, builder_a.clone()).trace(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
-            Err(TracingError::MismatchedProgramBuilders),
+            result,
+            Err(TracingError::Type(TypeError { message }))
+                if message == "add input types are not broadcast-compatible"
         ));
-        assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
     }
 
-    #[test]
-    fn test_binary_operator_returns_poisoned_tracer_for_mismatched_program_builders() {
-        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
-        let atom_b = builder_b.borrow_mut().add_input(DataType::F64);
-        let engine = ScalarEngine::<f64>::new();
-        let tracer_a = TracingContext::new(&engine, builder_a.clone()).tracer(atom_a, None);
-        let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
-
-        let output = tracer_a.binary(tracer_b, ScalarOperation::Add);
-
-        assert!(matches!(&output.state, TracerState::Poison));
-        assert!(matches!(output.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
-        assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
     #[test]
-    fn test_unary_operator_records_invalid_output_count_and_returns_poisoned_tracer() {
-        #[derive(Copy, Clone, Debug)]
-        struct NoOutputOperation;
-
-        impl Operation<DataType> for NoOutputOperation {
-            fn name(&self) -> &'static str {
-                "no_output"
-            }
-
-            fn infer_output_types(&self, _input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-                Ok(Vec::new())
-            }
-        }
-
-        struct NoOutputEngine;
-
-        impl Engine for NoOutputEngine {
-            type Type = DataType;
-            type Value = f64;
-
-            fn zero(&self, _type: &DataType) -> Result<f64, TracingError> {
-                Ok(0.0)
-            }
-
-            fn one(&self, _type: &DataType) -> Result<f64, TracingError> {
-                Ok(1.0)
-            }
-        }
-
-        impl TracingEngine for NoOutputEngine {
-            type Operation = NoOutputOperation;
-        }
-
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, NoOutputOperation>::new()));
-        let input_type = DataType::F64;
-        let atom = builder.borrow_mut().add_input(input_type.clone());
-        let engine = NoOutputEngine;
-        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, Some(input_type));
-
-        let output = tracer.unary(NoOutputOperation);
-
-        assert!(matches!(&output.state, TracerState::Poison));
-        assert!(matches!(output.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
-        assert_eq!(builder.borrow().error, Some(TracingError::InvalidOutputCount { expected: 1, got: 0 }));
-    }
-
-    #[test]
-    fn test_trace_returns_poisoned_tracers_after_builder_failure() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let atom = builder.borrow_mut().add_input(<f64 as Typed<DataType>>::r#type(&1.0f64).into_owned());
-        builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
-        let engine = ScalarEngine::<f64>::new();
-        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
-
-        let outputs = TracingContext::new(&engine, builder).trace(ScalarOperation::Neg, &[&tracer]).unwrap();
-
-        assert_eq!(outputs.len(), 1);
-        assert!(matches!(&outputs[0].state, TracerState::Poison));
-        assert!(matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
-    }
-
-    #[test]
-    fn test_trace_caches_live_output_types() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let input_type = DataType::F64;
-        let atom = builder.borrow_mut().add_input(input_type.clone());
-        let engine = ScalarEngine::<f64>::new();
-        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, Some(input_type));
-
-        let outputs = TracingContext::new(&engine, builder).trace(ScalarOperation::Neg, &[&tracer]).unwrap();
-
-        assert_eq!(outputs.len(), 1);
-        assert!(matches!(&outputs[0].state, TracerState::Live(_)));
-        assert!(matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
-    }
-
-    #[test]
-    fn test_poisoned_state_atom_id_returns_poisoned_tracer_error() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let engine = ScalarEngine::<f64>::new();
-        let tracing_context = TracingContext::new(&engine, builder);
-        let tracer = Tracer { state: TracerState::Poison, r#type: DataType::F64, context: tracing_context };
-
-        assert_eq!(tracer.atom_id(), Err(TracingError::PoisonedTracer));
-        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
-    }
-
-    #[test]
-    fn test_interpret_and_trace_replays_staged_graphs() {
+    fn test_tracing_engine_interpret_and_trace_replays_staged_graphs() {
         let engine = ScalarEngine::<f64>::new();
         let (output, program): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
             .interpret_and_trace(
@@ -775,7 +619,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
-        assert_eq!(program.interpret(0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
+        assert_eq!(program.interpret(0.5f64), Ok(0.5f64 * 0.5f64 + 0.5f64.sin()));
         assert_eq!(program.input_ids.len(), 1);
         assert_eq!(
             program.to_string(),
@@ -788,10 +632,11 @@ mod tests {
             "}
             .trim_end(),
         );
+        test_support::assert_bilinear_jit_rendering();
     }
 
     #[test]
-    fn test_interpret_and_trace_prunes_unused_staged_operations() {
+    fn test_tracing_engine_interpret_and_trace_prunes_unused_staged_operations() {
         let engine = ScalarEngine::<f64>::new();
         let (output, program): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
             .interpret_and_trace(
@@ -804,7 +649,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, 4.0);
-        assert_eq!(program.interpret(0.5f64).unwrap(), 0.25);
+        assert_eq!(program.interpret(0.5f64), Ok(0.25));
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -817,149 +662,8 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_stages_program_from_type_metadata() {
-        let engine = ScalarEngine::<f64>::new();
-        let input_type = DataType::F64;
-        let (output_type, program): (DataType, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
-            .trace(
-                |x: Tracer<ScalarEngine<f64>>| {
-                    let squared = x.clone() * x.clone();
-                    Ok(squared + x.one_like())
-                },
-                input_type.clone(),
-            )
-            .unwrap();
-
-        assert_eq!(output_type, input_type);
-        assert_eq!(program.interpret(3.0).unwrap(), 10.0);
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = mul %0 %0
-                    %2:f64 = const
-                    %3:f64 = add %1 %2
-                in (%3)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_trace_rejects_escaped_program_builder() {
-        let engine = ScalarEngine::<f64>::new();
-        let escaped_builder = Rc::new(RefCell::new(None));
-        let result: Result<(DataType, Program<DataType, f64, ScalarOperation<f64>, f64, f64>), TracingError> = engine
-            .trace(
-                |x: Tracer<ScalarEngine<f64>>| {
-                    *escaped_builder.borrow_mut() = Some(x.builder().clone());
-                    Ok(x)
-                },
-                DataType::F64,
-            );
-
-        assert!(matches!(result, Err(TracingError::EscapedProgramBuilder)));
-    }
-
-    #[test]
-    fn test_tracer_display_and_debug_render_live_and_poisoned_states() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let atom = builder.borrow_mut().add_input(DataType::F64);
-        let engine = ScalarEngine::<f64>::new();
-        let live = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
-        let poison = Tracer {
-            state: TracerState::Poison,
-            r#type: DataType::F64,
-            context: TracingContext::new(&engine, builder),
-        };
-
-        assert_eq!(live.to_string(), "%0");
-        assert_eq!(format!("{live:?}"), "Tracer { state: Live(AtomId { index: 0 }), type: F64, .. }");
-        assert_eq!(poison.to_string(), "<poison:f64>");
-        assert_eq!(format!("{poison:?}"), "Tracer { state: Poison, type: F64, .. }");
-        assert_eq!(format!("{:?}", live.context), "TracingContext { .. }");
-    }
-
-    #[test]
-    fn test_trace_records_and_returns_abstract_eval_error() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let lhs_type = DataType::F8E3M4;
-        let rhs_type = DataType::F32;
-        let lhs_atom = builder.borrow_mut().add_input(lhs_type);
-        let rhs_atom = builder.borrow_mut().add_input(rhs_type);
-        let engine = ScalarEngine::<f64>::new();
-        let lhs = TracingContext::new(&engine, builder.clone()).tracer(lhs_atom, None);
-        let rhs = TracingContext::new(&engine, builder.clone()).tracer(rhs_atom, None);
-
-        let result = TracingContext::new(&engine, builder.clone()).trace(ScalarOperation::Add, &[&lhs, &rhs]);
-
-        assert!(matches!(
-            result,
-            Err(TracingError::Type(TypeError { message }))
-                if message == "add input types are not broadcast-compatible"
-        ));
-        assert!(matches!(
-            builder.borrow().error.clone(),
-            Some(TracingError::Type(TypeError { message }))
-                if message == "add input types are not broadcast-compatible"
-        ));
-    }
-
-    #[test]
-    fn test_trace_returns_error_when_poisoned_abstract_eval_fails() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let input_type = DataType::F64;
-        let atom = builder.borrow_mut().add_input(input_type.clone());
-        builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
-        let engine = ScalarEngine::<f64>::new();
-        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
-
-        let result = TracingContext::new(&engine, builder).trace(ScalarOperation::Add, &[&tracer]);
-
-        assert!(matches!(
-            result,
-            Err(TracingError::Type(TypeError { message })) if message == "add expected 2 input types but got 1"
-        ));
-    }
-
-    #[test]
-    fn test_tracer_one_like_records_engine_identity_error() {
-        struct FailingOneEngine;
-
-        impl Engine for FailingOneEngine {
-            type Type = DataType;
-            type Value = f64;
-
-            fn zero(&self, _type: &DataType) -> Result<f64, TracingError> {
-                Ok(0.0)
-            }
-
-            fn one(&self, _type: &DataType) -> Result<f64, TracingError> {
-                Err(TypeError { message: "test engine cannot synthesize one".to_string() }.into())
-            }
-        }
-
-        impl TracingEngine for FailingOneEngine {
-            type Operation = ScalarOperation<f64>;
-        }
-
-        let engine = FailingOneEngine;
-
-        assert!(matches!(
-            TracingEngine::interpret_and_trace::<_, f64, f64>(
-                &engine,
-                |x: Tracer<FailingOneEngine>| Ok(x.one_like()),
-                1.0f64,
-            ),
-            Err(TracingError::Type(TypeError { message })) if message == "test engine cannot synthesize one"
-        ));
-    }
-
-    #[test]
-    fn test_interpret_and_trace_supports_non_array_types() {
+    fn test_tracing_engine_interpret_and_trace_supports_non_array_types() {
         use std::fmt;
-
-        use ryft_macros::Parameter;
 
         #[derive(Clone, Debug, PartialEq, Eq)]
         struct TestType(&'static str);
@@ -1096,20 +800,13 @@ mod tests {
 
         assert_eq!(output, TestValue::new(scalar_type.clone(), 6));
         assert_eq!(
-            program
-                .interpret((TestValue::new(scalar_type.clone(), 4), TestValue::new(scalar_type.clone(), 5)))
-                .unwrap(),
-            TestValue::new(scalar_type, 10),
+            program.interpret((TestValue::new(scalar_type.clone(), 4), TestValue::new(scalar_type.clone(), 5))),
+            Ok(TestValue::new(scalar_type, 10)),
         );
     }
 
     #[test]
-    fn test_interpret_and_trace_returns_abstract_eval_errors_instead_of_panicking() {
-        use ryft_macros::Parameter;
-
-        use crate::tracing::TracingError;
-        use crate::types::{DataType, TypeError, Typed};
-
+    fn test_tracing_engine_interpret_and_trace_returns_abstract_eval_errors() {
         #[derive(Clone, Debug, Parameter)]
         struct TestAbstractValue {
             r#type: DataType,
@@ -1181,7 +878,7 @@ mod tests {
 
         struct TestEngine;
 
-        impl crate::tracing::engines::Engine for TestEngine {
+        impl Engine for TestEngine {
             type Type = DataType;
             type Value = TestAbstractValue;
 
@@ -1194,7 +891,7 @@ mod tests {
             }
         }
 
-        impl crate::tracing::engines::TracingEngine for TestEngine {
+        impl TracingEngine for TestEngine {
             type Operation = ScalarOperation<TestAbstractValue>;
         }
 
@@ -1223,23 +920,508 @@ mod tests {
     }
 
     #[test]
-    fn test_staged_program_display_renders_the_staged_program() {
-        let engine = ScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
-            .interpret_and_trace(|x: Tracer<ScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()), 2.0f64)
-            .unwrap();
+    fn test_scalar_engine_is_zero_sized() {
+        assert_eq!(size_of::<ScalarEngine<bool>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<i8>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<i16>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<i32>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<i64>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<u8>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<u16>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<u32>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<u64>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<bf16>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<f16>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<f32>>(), 0);
+        assert_eq!(size_of::<ScalarEngine<f64>>(), 0);
+        assert_eq!(ScalarEngine::<f64>::new().zero(&DataType::F64), Ok(0.0));
+        assert_eq!(ScalarEngine::<f64>::default().one(&DataType::F64), Ok(1.0));
+    }
 
+    #[test]
+    fn test_scalar_engine_half_and_float_engines_are_differentiable() {
+        let _: Option<<ScalarEngine<bf16> as DifferentiableEngine>::DifferentiableOperation> = None;
+        let _: Option<<ScalarEngine<f16> as DifferentiableEngine>::DifferentiableOperation> = None;
+        let _: Option<<ScalarEngine<f32> as DifferentiableEngine>::DifferentiableOperation> = None;
+        let _: Option<<ScalarEngine<f64> as DifferentiableEngine>::DifferentiableOperation> = None;
+    }
+
+    #[test]
+    fn test_scalar_engine_half_engines_run_jvp() {
+        let bf16_engine = ScalarEngine::<bf16>::new();
         assert_eq!(
-            compiled.to_string(),
+            jvp(&bf16_engine, |x| x.clone() + x, bf16::from_f32(3.0), bf16::ONE),
+            Ok((bf16::from_f32(6.0), bf16::from_f32(2.0)))
+        );
+
+        let f16_engine = ScalarEngine::<f16>::new();
+        assert_eq!(
+            jvp(&f16_engine, |x| x.clone() + x, f16::from_f32(3.0), f16::ONE),
+            Ok((f16::from_f32(6.0), f16::from_f32(2.0)))
+        );
+    }
+
+    #[test]
+    fn test_tracing_context_new_borrows_engine_and_builder() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder.clone());
+
+        assert!(std::ptr::eq(tracing_context.engine, &engine));
+        assert!(Rc::ptr_eq(&tracing_context.builder, &builder));
+    }
+
+    #[test]
+    fn test_tracing_context_lift_adds_constant_atom() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder.clone());
+
+        let lifted = tracing_context.lift(2.5f64);
+
+        assert_eq!(lifted.r#type().into_owned(), DataType::F64);
+        let atom = lifted.atom_id().expect("lifted tracer should remain live");
+        assert_eq!(atom.index, 0);
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<Vec<f64>, f64>(vec![atom], Vec::<Placeholder>::new(), Placeholder)
+            .unwrap();
+        assert_eq!(program.interpret(Vec::new()), Ok(2.5));
+        assert_eq!(
+            program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = mul %0 %0
-                    %2:f64 = sin %0
-                    %3:f64 = add %1 %2
-                in (%3)
+                lambda  .
+                let %0:f64 = const
+                in (%0)
             "}
             .trim_end(),
         );
-        test_support::assert_bilinear_jit_rendering();
+    }
+
+    #[test]
+    fn test_tracing_context_tracer_uses_cached_or_builder_atom_type() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder);
+
+        let builder_typed = tracing_context.tracer(atom, None);
+        let cached_typed = tracing_context.tracer(atom, Some(DataType::F64));
+
+        assert!(matches!(builder_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
+        assert!(matches!(cached_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
+    }
+
+    #[test]
+    fn test_tracing_context_error_records_first_error() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder.clone());
+
+        let first_error = TracingError::InvalidInputCount { expected: 1, got: 0 };
+        let second_error = TracingError::InvalidOutputCount { expected: 1, got: 0 };
+
+        assert_eq!(tracing_context.error(first_error.clone()), first_error);
+        assert_eq!(tracing_context.error(second_error), TracingError::InvalidOutputCount { expected: 1, got: 0 });
+        assert_eq!(builder.borrow().error, Some(first_error));
+    }
+
+    #[test]
+    fn test_tracing_context_trace_stages_instruction() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let lhs_atom = builder.borrow_mut().add_input(DataType::F64);
+        let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let lhs = tracing_context.tracer(lhs_atom, None);
+        let rhs = tracing_context.tracer(rhs_atom, None);
+
+        let outputs = tracing_context.trace(ScalarOperation::Add, &[&lhs, &rhs]).unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(&outputs[0].state, TracerState::Live(AtomId { index: 2 })));
+        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
+        let output_atom = outputs[0].atom_id().expect("output tracer should remain live");
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(f64, f64), f64>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        assert_eq!(program.interpret((2.0, 3.0)), Ok(5.0));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracing_context_trace_rejects_mismatched_program_builders() {
+        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
+        let atom_b = builder_b.borrow_mut().add_input(DataType::F64);
+        let engine = ScalarEngine::<f64>::new();
+        let tracer_a = TracingContext::new(&engine, builder_a.clone()).tracer(atom_a, None);
+        let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
+
+        assert!(matches!(
+            TracingContext::new(&engine, builder_a.clone()).trace(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
+            Err(TracingError::MismatchedProgramBuilders),
+        ));
+        assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
+    }
+
+    #[test]
+    fn test_tracing_context_trace_returns_poisoned_tracers_after_builder_failure() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let builder_error = TracingError::InvalidInputCount { expected: 1, got: 0 };
+        builder.borrow_mut().error = Some(builder_error.clone());
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let tracer = tracing_context.tracer(atom, None);
+
+        let outputs = tracing_context.trace(ScalarOperation::Neg, &[&tracer]).unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(&outputs[0].state, TracerState::Poison));
+        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
+        assert_eq!(builder.borrow().error, Some(builder_error));
+    }
+
+    #[test]
+    fn test_tracing_context_trace_returns_abstract_eval_error() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let lhs_atom = builder.borrow_mut().add_input(DataType::F8E3M4);
+        let rhs_atom = builder.borrow_mut().add_input(DataType::F32);
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let lhs = tracing_context.tracer(lhs_atom, None);
+        let rhs = tracing_context.tracer(rhs_atom, None);
+
+        let result = tracing_context.trace(ScalarOperation::Add, &[&lhs, &rhs]);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Type(TypeError { message }))
+                if message == "add input types are not broadcast-compatible"
+        ));
+        assert!(matches!(
+            builder.borrow().error.clone(),
+            Some(TracingError::Type(TypeError { message }))
+                if message == "add input types are not broadcast-compatible"
+        ));
+    }
+
+    #[test]
+    fn test_tracing_context_trace_returns_error_when_poisoned_abstract_eval_fails() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let builder_error = TracingError::InvalidInputCount { expected: 1, got: 0 };
+        builder.borrow_mut().error = Some(builder_error.clone());
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let tracer = tracing_context.tracer(atom, None);
+
+        let result = tracing_context.trace(ScalarOperation::Add, &[&tracer]);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Type(TypeError { message })) if message == "add expected 2 input types but got 1"
+        ));
+        assert_eq!(builder.borrow().error, Some(builder_error));
+    }
+
+    #[test]
+    fn test_tracing_context_clone_shares_engine_and_builder() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder.clone());
+
+        let cloned_context = tracing_context.clone();
+
+        assert!(std::ptr::eq(cloned_context.engine, &engine));
+        assert!(Rc::ptr_eq(&cloned_context.builder, &builder));
+    }
+
+    #[test]
+    fn test_tracing_context_debug_renders_non_exhaustive_context() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder);
+
+        assert_eq!(format!("{tracing_context:?}"), "TracingContext { .. }");
+    }
+
+    #[test]
+    fn test_tracing_context_engine_zero_and_one_lift_atoms() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder.clone());
+
+        let zero = Engine::zero(&tracing_context, &DataType::F64).unwrap();
+        let one = Engine::one(&tracing_context, &DataType::F64).unwrap();
+
+        assert_eq!(zero.r#type().into_owned(), DataType::F64);
+        assert_eq!(one.r#type().into_owned(), DataType::F64);
+        let zero_atom = zero.atom_id().expect("zero tracer should remain live");
+        let one_atom = one.atom_id().expect("one tracer should remain live");
+        assert_eq!(zero_atom.index, 0);
+        assert_eq!(one_atom.index, 1);
+
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<Vec<f64>, Vec<f64>>(
+                vec![zero_atom, one_atom],
+                Vec::<Placeholder>::new(),
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.interpret(Vec::new()), Ok(vec![0.0, 1.0]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f64 = const
+                    %1:f64 = const
+                in (%0, %1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracer_state_clone_debug_and_equality() {
+        let live = TracerState::Live(AtomId { index: 3 });
+
+        assert_eq!(live.clone(), TracerState::Live(AtomId { index: 3 }));
+        assert_eq!(TracerState::Poison.clone(), TracerState::Poison);
+        assert_ne!(live, TracerState::Poison);
+        assert_eq!(format!("{live:?}"), "Live(AtomId { index: 3 })");
+        assert_eq!(format!("{:?}", TracerState::Poison), "Poison");
+    }
+
+    #[test]
+    fn test_tracer_engine_and_builder_return_context_handles() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let engine = ScalarEngine::<f64>::new();
+        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
+
+        assert!(std::ptr::eq(tracer.engine(), &engine));
+        assert!(Rc::ptr_eq(tracer.builder(), &builder));
+    }
+
+    #[test]
+    fn test_tracer_atom_id_returns_live_atom_or_poisoned_error() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder);
+        let live = tracing_context.tracer(atom, None);
+        let poison = Tracer { state: TracerState::Poison, r#type: DataType::F64, context: tracing_context };
+
+        assert_eq!(live.atom_id(), Ok(atom));
+        assert_eq!(poison.atom_id(), Err(TracingError::PoisonedTracer));
+    }
+
+    #[test]
+    fn test_tracer_unary_stages_single_output_operation() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let engine = ScalarEngine::<f64>::new();
+        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
+
+        let output = tracer.unary(ScalarOperation::Neg);
+
+        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        let output_atom = output.atom_id().expect("unary output should remain live");
+        let program = builder.borrow().clone().build::<f64, f64>(vec![output_atom], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.interpret(2.0), Ok(-2.0));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = neg %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracer_unary_records_invalid_output_count_and_returns_poisoned_tracer() {
+        #[derive(Copy, Clone, Debug)]
+        struct NoOutputOperation;
+
+        impl Operation<DataType> for NoOutputOperation {
+            fn name(&self) -> &'static str {
+                "no_output"
+            }
+
+            fn infer_output_types(&self, _input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+                Ok(Vec::new())
+            }
+        }
+
+        struct NoOutputEngine;
+
+        impl Engine for NoOutputEngine {
+            type Type = DataType;
+            type Value = f64;
+
+            fn zero(&self, _type: &DataType) -> Result<f64, TracingError> {
+                Ok(0.0)
+            }
+
+            fn one(&self, _type: &DataType) -> Result<f64, TracingError> {
+                Ok(1.0)
+            }
+        }
+
+        impl TracingEngine for NoOutputEngine {
+            type Operation = NoOutputOperation;
+        }
+
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, NoOutputOperation>::new()));
+        let input_type = DataType::F64;
+        let atom = builder.borrow_mut().add_input(input_type.clone());
+        let engine = NoOutputEngine;
+        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, Some(input_type));
+
+        let output = tracer.unary(NoOutputOperation);
+
+        assert!(matches!(&output.state, TracerState::Poison));
+        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        assert_eq!(builder.borrow().error, Some(TracingError::InvalidOutputCount { expected: 1, got: 0 }));
+    }
+
+    #[test]
+    fn test_tracer_binary_stages_single_output_operation() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let lhs_atom = builder.borrow_mut().add_input(DataType::F64);
+        let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let lhs = tracing_context.tracer(lhs_atom, None);
+        let rhs = tracing_context.tracer(rhs_atom, None);
+
+        let output = lhs.binary(rhs, ScalarOperation::Add);
+
+        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        let output_atom = output.atom_id().expect("binary output should remain live");
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(f64, f64), f64>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        assert_eq!(program.interpret((2.0, 3.0)), Ok(5.0));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracer_binary_returns_poisoned_tracer_for_mismatched_program_builders() {
+        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
+        let atom_b = builder_b.borrow_mut().add_input(DataType::F64);
+        let engine = ScalarEngine::<f64>::new();
+        let tracer_a = TracingContext::new(&engine, builder_a.clone()).tracer(atom_a, None);
+        let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
+
+        let output = tracer_a.binary(tracer_b, ScalarOperation::Add);
+
+        assert!(matches!(&output.state, TracerState::Poison));
+        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
+    }
+
+    #[test]
+    fn test_tracer_clone_preserves_state_type_and_context() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let engine = ScalarEngine::<f64>::new();
+        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
+
+        let cloned_tracer = tracer.clone();
+
+        assert_eq!(cloned_tracer.state, tracer.state);
+        assert_eq!(cloned_tracer.r#type, tracer.r#type);
+        assert!(Rc::ptr_eq(cloned_tracer.builder(), &builder));
+    }
+
+    #[test]
+    fn test_tracer_debug_and_display_render_live_and_poisoned_states() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let engine = ScalarEngine::<f64>::new();
+        let tracing_context = TracingContext::new(&engine, builder);
+        let live = tracing_context.tracer(atom, None);
+        let poison = Tracer { state: TracerState::Poison, r#type: DataType::F64, context: tracing_context };
+
+        assert_eq!(live.to_string(), "%0");
+        assert_eq!(format!("{live:?}"), "Tracer { state: Live(AtomId { index: 0 }), type: F64, .. }");
+        assert_eq!(poison.to_string(), "<poison:f64>");
+        assert_eq!(format!("{poison:?}"), "Tracer { state: Poison, type: F64, .. }");
+    }
+
+    #[test]
+    fn test_tracer_typed_returns_borrowed_type() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let engine = ScalarEngine::<f64>::new();
+        let tracer = TracingContext::new(&engine, builder).tracer(atom, None);
+        let _: ProgramBuilder<DataType, Tracer<'_, ScalarEngine<f64>>, ScalarOperation<Tracer<'_, ScalarEngine<f64>>>> =
+            ProgramBuilder::new();
+
+        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
+    }
+
+    #[test]
+    fn test_tracer_one_like_records_engine_identity_error() {
+        struct FailingOneEngine;
+
+        impl Engine for FailingOneEngine {
+            type Type = DataType;
+            type Value = f64;
+
+            fn zero(&self, _type: &DataType) -> Result<f64, TracingError> {
+                Ok(0.0)
+            }
+
+            fn one(&self, _type: &DataType) -> Result<f64, TracingError> {
+                Err(TypeError { message: "test engine cannot synthesize one".to_string() }.into())
+            }
+        }
+
+        impl TracingEngine for FailingOneEngine {
+            type Operation = ScalarOperation<f64>;
+        }
+
+        let engine = FailingOneEngine;
+
+        assert!(matches!(
+            TracingEngine::interpret_and_trace::<_, f64, f64>(
+                &engine,
+                |x: Tracer<FailingOneEngine>| Ok(x.one_like()),
+                1.0f64,
+            ),
+            Err(TracingError::Type(TypeError { message })) if message == "test engine cannot synthesize one"
+        ));
     }
 }
