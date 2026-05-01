@@ -165,8 +165,8 @@ where
 /// JVP rule for `RematerializeOperation` under
 /// [`TracingEngine`](crate::tracing_v2::TracingEngine).
 ///
-/// Stages the primal effect by applying the rematerialize op in the outer trace via
-/// [`TracingEngine::apply_staged_op`](crate::tracing_v2::TracingEngine::apply_staged_op), then recursively linearizes
+/// Stages the primal effect by tracing the rematerialize op in the outer trace via
+/// [`TracingEngine::trace_operation`](crate::tracing_v2::TracingEngine::trace_operation), then recursively linearizes
 /// the body through
 /// [`linearize_traced_program`] to obtain a pushforward over `Tracer` values, and finally wraps
 /// that pushforward (paired with its transpose) in a
@@ -216,7 +216,7 @@ where
             let exemplar = primal_inputs[0].clone();
             exemplar
                 .engine
-                .apply_staged_op(primal_inputs.as_slice(), EInner::Operation::rematerialize_operation(self.clone()))?
+                .trace_operation(EInner::Operation::rematerialize_operation(self.clone()), primal_inputs.as_slice())?
         };
 
         if tangent_inputs.is_empty() && !self.body.output_types.is_empty() {
@@ -331,7 +331,7 @@ where
             };
         }
         let exemplar_input = inputs[0].clone();
-        exemplar_input.engine.apply_staged_op(inputs, E::Operation::rematerialize_operation(self.clone()))
+        exemplar_input.engine.trace_operation(E::Operation::rematerialize_operation(self.clone()), inputs)
     }
 }
 
@@ -610,9 +610,9 @@ where
             builder.build(output_ids, vec![Placeholder; input_leaf_count], vec![Placeholder; output_leaf_count])?,
         );
 
-        let staged_outputs = exemplar_traced_input.engine.apply_staged_op(
-            traced_inputs.as_slice(),
+        let staged_outputs = exemplar_traced_input.engine.trace_operation(
             E::Operation::rematerialize_operation(RematerializeOperation::new(body)),
+            traced_inputs.as_slice(),
         )?;
         Output::from_parameters(output_structure, staged_outputs).map_err(TracingError::from)
     }

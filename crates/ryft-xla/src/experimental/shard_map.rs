@@ -657,7 +657,7 @@ where
         }
         let engine = input.engine.clone();
         Ok(engine
-            .apply_staged_op(std::slice::from_ref(&input), XlaPrimitiveOperation::WithShardingConstraint(op))?
+            .trace_operation(XlaPrimitiveOperation::WithShardingConstraint(op), std::slice::from_ref(&input))?
             .into_iter()
             .next()
             .expect("with_sharding_constraint should produce one output per input leaf"))

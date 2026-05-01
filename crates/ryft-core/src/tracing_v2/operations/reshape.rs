@@ -201,9 +201,9 @@ where
         }
         let engine = self.engine.clone();
         Ok(engine
-            .apply_staged_op(
-                std::slice::from_ref(&self),
+            .trace_operation(
                 E::Operation::reshape_operation(input_type.shape.clone(), output_type.shape.clone()),
+                std::slice::from_ref(&self),
             )?
             .into_iter()
             .next()

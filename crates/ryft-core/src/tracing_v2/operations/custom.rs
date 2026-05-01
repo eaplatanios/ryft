@@ -619,7 +619,7 @@ mod tests {
     {
         let engine = input.engine.clone();
         Ok(engine
-            .apply_staged_op(std::slice::from_ref(&input), PrimitiveOperation::Custom(Arc::new(primitive)))?
+            .trace_operation(PrimitiveOperation::Custom(Arc::new(primitive)), std::slice::from_ref(&input))?
             .into_iter()
             .next()
             .expect("unary custom primitive should produce one output"))

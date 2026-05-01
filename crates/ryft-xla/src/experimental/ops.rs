@@ -305,11 +305,11 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaPrimitiveOperation
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                exemplar.engine.apply_staged_op(inputs, XlaPrimitiveOperation::Condition(condition.clone()))
+                exemplar.engine.trace_operation(XlaPrimitiveOperation::Condition(condition.clone()), inputs)
             }
             Self::While(while_operation) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                exemplar.engine.apply_staged_op(inputs, XlaPrimitiveOperation::While(while_operation.clone()))
+                exemplar.engine.trace_operation(XlaPrimitiveOperation::While(while_operation.clone()), inputs)
             }
             Self::ShardMap(op) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
@@ -427,9 +427,9 @@ impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaPrimitiveOp
                 let primal = input
                     .primal
                     .engine
-                    .apply_staged_op(
-                        std::slice::from_ref(&input.primal),
+                    .trace_operation(
                         XlaPrimitiveOperation::WithShardingConstraint(op.clone()),
+                        std::slice::from_ref(&input.primal),
                     )?
                     .into_iter()
                     .next()

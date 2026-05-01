@@ -98,9 +98,8 @@ where
     E::Operation: Clone,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, V, E::Operation>::new()));
     trace_flat_program_from_trace_result::<E::Type, Input, Output, V, E::Operation>(
-        TracingEngine::new(tracing_engine.engine, builder).trace(function, input_types)?,
+        tracing_engine.engine.trace(function, input_types)?,
     )
 }
 
