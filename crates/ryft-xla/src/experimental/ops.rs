@@ -15,7 +15,7 @@ use ryft_core::tracing_v2::operations::{
 };
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableEngine, DifferentiableOperation, DifferentiationError,
-    JvpContext, LinearPrimitiveOperation, TracingEngine,
+    JvpContext, LinearPrimitiveOperation, TracingContext,
 };
 use ryft_core::types::{ArrayType, Shape, TypeError};
 
@@ -305,11 +305,11 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaPrimitiveOperation
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                exemplar.engine.trace_operation(XlaPrimitiveOperation::Condition(condition.clone()), inputs)
+                exemplar.context.trace_operation(XlaPrimitiveOperation::Condition(condition.clone()), inputs)
             }
             Self::While(while_operation) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                exemplar.engine.trace_operation(XlaPrimitiveOperation::While(while_operation.clone()), inputs)
+                exemplar.context.trace_operation(XlaPrimitiveOperation::While(while_operation.clone()), inputs)
             }
             Self::ShardMap(op) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
@@ -398,7 +398,7 @@ where
 impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaPrimitiveOperation {
     fn jvp_traced_linearization(
         &self,
-        engine: &TracingEngine<'static, XlaEngine<'static>>,
+        engine: &TracingContext<'static, XlaEngine<'static>>,
         context: &mut JvpContext<'_, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>,
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
@@ -426,7 +426,7 @@ impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaPrimitiveOp
                 let input = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 let primal = input
                     .primal
-                    .engine
+                    .context
                     .trace_operation(
                         XlaPrimitiveOperation::WithShardingConstraint(op.clone()),
                         std::slice::from_ref(&input.primal),

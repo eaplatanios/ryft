@@ -2321,8 +2321,8 @@ mod tests {
     use ryft_core::tracing_v2::engines::Engine;
     use ryft_core::tracing_v2::operations::constants::{OneLike, ZeroLike};
     use ryft_core::tracing_v2::{
-        Cos, CustomPrimitive, DifferentiableEngine, DifferentiableStagingEngine, LinearPrimitiveOperation, MatrixOps,
-        PrimitiveOperation, Sin, StagingEngine, Tracer,
+        Cos, CustomPrimitive, DifferentiableEngine, DifferentiableTracingEngine, LinearPrimitiveOperation, MatrixOps,
+        PrimitiveOperation, Sin, Tracer, TracingEngine,
     };
     use ryft_core::types::{Shape, TypeError};
     #[cfg(feature = "ndarray")]
@@ -2625,7 +2625,7 @@ mod tests {
         }
     }
 
-    impl StagingEngine for ArrayScalarEngine {
+    impl TracingEngine for ArrayScalarEngine {
         type Operation = PrimitiveOperation<f64>;
     }
 
@@ -2634,7 +2634,7 @@ mod tests {
         type LinearOperation = LinearPrimitiveOperation<f64>;
     }
 
-    impl DifferentiableStagingEngine for ArrayScalarEngine {
+    impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperation<'engine>
             = LinearPrimitiveOperation<Tracer<'engine, Self>>
         where

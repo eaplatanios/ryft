@@ -22,7 +22,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::ArrayType;
     use ryft_core::tracing::TracingError;
-    use ryft_core::tracing_v2::engines::{Engine, StagingEngine};
+    use ryft_core::tracing_v2::engines::{Engine, TracingEngine};
     use ryft_core::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation, PrimitiveOperation, Sin, jacfwd};
 
     use super::DenseJacobianNdArrayExt;
@@ -43,7 +43,7 @@ mod tests {
         }
     }
 
-    impl StagingEngine for ArrayScalarEngine {
+    impl TracingEngine for ArrayScalarEngine {
         type Operation = PrimitiveOperation<f64>;
     }
 

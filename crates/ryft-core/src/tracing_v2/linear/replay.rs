@@ -1,5 +1,5 @@
 use super::*;
-use crate::tracing_v2::{JvpContext, TracingEngine};
+use crate::tracing_v2::{JvpContext, TracingContext};
 
 /// Operation-level capability required by traced program linearization.
 ///
@@ -10,16 +10,16 @@ use crate::tracing_v2::{JvpContext, TracingEngine};
 #[doc(hidden)]
 pub trait TracedLinearizableOperation<'engine, E>: Clone + Operation<E::Type>
 where
-    E: crate::tracing_v2::DifferentiableStagingEngine + ?Sized,
+    E: crate::tracing_v2::DifferentiableTracingEngine + ?Sized,
 {
     /// Applies this operation's JVP rule to traced primals inside the active linearization pass.
     fn jvp_traced_linearization(
         &self,
-        engine: &TracingEngine<'engine, E>,
+        engine: &TracingContext<'engine, E>,
         context: &mut JvpContext<
             '_,
             Tracer<'engine, E>,
-            <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+            <E as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
             E::Type,
         >,
         inputs: &[JvpTracer<Tracer<'engine, E>, AtomId>],
@@ -34,7 +34,7 @@ where
 /// pushforward symbolically.
 #[doc(hidden)]
 pub fn linearize_traced_program<'engine, V, E>(
-    tracing_engine: TracingEngine<'engine, E>,
+    tracing_context: TracingContext<'engine, E>,
     program: &Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>,
     primals: Vec<Tracer<'engine, E>>,
 ) -> Result<
@@ -43,7 +43,7 @@ pub fn linearize_traced_program<'engine, V, E>(
         Program<
             E::Type,
             Tracer<'engine, E>,
-            <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+            <E as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
             Vec<Tracer<'engine, E>>,
             Vec<Tracer<'engine, E>>,
         >,
@@ -52,7 +52,7 @@ pub fn linearize_traced_program<'engine, V, E>(
 >
 where
     V: Traceable<E::Type>,
-    E: crate::tracing_v2::DifferentiableStagingEngine<Value = V> + ?Sized + 'static,
+    E: crate::tracing_v2::DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
     E::Operation: TracedLinearizableOperation<'engine, E> + 'static,
 {
     fn tangent_for_atom<'engine, V, E>(
@@ -62,7 +62,7 @@ where
                 ProgramBuilder<
                     E::Type,
                     Tracer<'engine, E>,
-                    <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+                    <E as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
                 >,
             >,
         >,
@@ -71,7 +71,7 @@ where
     ) -> Result<AtomId, TracingError>
     where
         V: Traceable<E::Type>,
-        E: crate::tracing_v2::DifferentiableStagingEngine<Value = V> + ?Sized,
+        E: crate::tracing_v2::DifferentiableTracingEngine<Value = V> + ?Sized,
     {
         if let Some(atom) = tangents[atom_id.index] {
             return Ok(atom);
@@ -89,7 +89,7 @@ where
     let builder = Rc::new(RefCell::new(ProgramBuilder::<
         E::Type,
         Tracer<'engine, E>,
-        <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+        <E as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
     >::new()));
     let mut primal_values: Vec<Option<Tracer<'engine, E>>> = vec![None; program.atoms.len()];
     let mut tangents: Vec<Option<AtomId>> = vec![None; program.atoms.len()];
@@ -101,7 +101,7 @@ where
     }
     for (atom_index, atom) in program.atoms.iter().enumerate() {
         if let Atom::Constant(value) = atom {
-            primal_values[atom_index] = Some(tracing_engine.lift(value.clone()));
+            primal_values[atom_index] = Some(tracing_context.lift(value.clone()));
         }
     }
 
@@ -128,7 +128,7 @@ where
         let output_duals =
             instruction
                 .operation
-                .jvp_traced_linearization(&tracing_engine, &mut context, input_duals.as_slice())?;
+                .jvp_traced_linearization(&tracing_context, &mut context, input_duals.as_slice())?;
         if output_duals.len() != instruction.outputs.len() {
             return Err(TracingError::InvalidOutputCount {
                 expected: instruction.outputs.len(),

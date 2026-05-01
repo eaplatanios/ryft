@@ -6,7 +6,7 @@ use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
 use ryft_core::tracing_v2::operations::constants::{OneLike, ZeroLike};
-use ryft_core::tracing_v2::{MatrixOps, Sin, StagingEngine, Tracer, jvp, vjp};
+use ryft_core::tracing_v2::{MatrixOps, Sin, Tracer, TracingEngine, jvp, vjp};
 use ryft_core::types::ArrayType;
 
 use crate::{Array, NdArrayEngine};

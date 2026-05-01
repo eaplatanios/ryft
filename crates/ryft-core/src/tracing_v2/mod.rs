@@ -25,9 +25,9 @@ pub(crate) mod test_support;
 
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
-    DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine, DifferentiationError,
+    DifferentiableEngine, DifferentiableOperationTracingEngine, DifferentiableTracingEngine, DifferentiationError,
 };
-pub use engines::{Engine, StagingEngine, Tracer, TracerState, TracingEngine};
+pub use engines::{Engine, Tracer, TracerState, TracingContext, TracingEngine};
 pub use forward::{Differentiable, JvpContext, JvpTracer, jvp};
 pub use linear::{
     CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad,

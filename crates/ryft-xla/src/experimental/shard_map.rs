@@ -22,7 +22,7 @@ use ryft_core::tracing_v2::operations::constants::{One, OneLike, ZeroLike};
 use ryft_core::tracing_v2::operations::{
     AddOperation, ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
 };
-use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin, StagingEngine, Tracer};
+use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin, Tracer, TracingEngine};
 
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::XlaPrimitiveOperation;
@@ -131,7 +131,7 @@ pub enum ShardMapTraceError {
     ParameterError(#[from] ParameterError),
 
     /// Error returned when traced `shard_map` staging has non-empty outputs but no traced input
-    /// leaf is available to supply the outer tracing engine.
+    /// leaf is available to supply the outer tracing context.
     #[error("traced shard_map with non-empty outputs requires at least one traced input leaf")]
     MissingTracedInvocationEngine,
 
@@ -655,8 +655,8 @@ where
             }
             .into());
         }
-        let engine = input.engine.clone();
-        Ok(engine
+        let context = input.context.clone();
+        Ok(context
             .trace_operation(XlaPrimitiveOperation::WithShardingConstraint(op), std::slice::from_ref(&input))?
             .into_iter()
             .next()
@@ -1000,7 +1000,7 @@ impl ShardMap {
         context.shardy_manual_axes(self.manual_axes())
     }
 
-    /// Traces a shard-map body over local body tensor types using [`StagingEngine::trace`].
+    /// Traces a shard-map body over local body tensor types using [`TracingEngine::trace`].
     ///
     /// # Parameters
     ///

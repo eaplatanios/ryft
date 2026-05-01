@@ -4,10 +4,10 @@ use crate::tracing::{Program, Traceable, TracingError};
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::tracing_v2::engines::{Engine, StagingEngine};
+use crate::tracing_v2::engines::{Engine, TracingEngine};
 use crate::tracing_v2::operations::constants::OneLike;
 use crate::tracing_v2::{
-    DifferentiableEngine, DifferentiableStagingEngine, LinearPrimitiveOperation, PrimitiveOperation, Sin, Tracer, grad,
+    DifferentiableEngine, DifferentiableTracingEngine, LinearPrimitiveOperation, PrimitiveOperation, Sin, Tracer, grad,
     jvp, jvp_program, value_and_grad, vjp,
 };
 use crate::types::ArrayType;
@@ -28,7 +28,7 @@ impl Engine for ArrayScalarEngine {
     }
 }
 
-impl StagingEngine for ArrayScalarEngine {
+impl TracingEngine for ArrayScalarEngine {
     type Operation = PrimitiveOperation<f64>;
 }
 
@@ -37,7 +37,7 @@ impl DifferentiableEngine for ArrayScalarEngine {
     type LinearOperation = LinearPrimitiveOperation<f64>;
 }
 
-impl DifferentiableStagingEngine for ArrayScalarEngine {
+impl DifferentiableTracingEngine for ArrayScalarEngine {
     type LinearOperation<'engine>
         = LinearPrimitiveOperation<Tracer<'engine, Self>>
     where

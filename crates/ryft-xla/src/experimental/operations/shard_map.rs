@@ -13,7 +13,7 @@ use ryft_core::tracing_v2::forward::{Differentiable, JvpTracer};
 use ryft_core::tracing_v2::linear::{linearize_traced_program, transpose_traced_linear_program};
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearCustomPrimitive, LinearOperation,
-    LinearPrimitiveOperation, TracingEngine,
+    LinearPrimitiveOperation, TracingContext,
 };
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
@@ -354,7 +354,7 @@ impl LinearShardMapOperation<ShardMapTracer> {
     ) -> Result<Vec<ShardMapTracer>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        TracingEngine::new(XlaEngine::token(), tracing_builder)
+        TracingContext::new(XlaEngine::token(), tracing_builder)
             .trace_operation(XlaPrimitiveOperation::LinearShardMap(Box::new(self.to_tensor_xla_op())), inputs)
     }
 }
@@ -368,7 +368,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_outputs = TracingEngine::new(XlaEngine::token(), tracing_builder)
+        let primal_outputs = TracingContext::new(XlaEngine::token(), tracing_builder)
             .trace_operation(XlaPrimitiveOperation::LinearShardMap(Box::new(self.clone())), primal_inputs.as_slice())?;
         let traced_op = self.to_tracer_linear_op(primal_inputs.as_slice())?;
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
@@ -1275,7 +1275,7 @@ fn apply_flat_traced_shard_map(
     body: FlatTracedShardMap,
     traced_inputs: Vec<ShardMapTracer>,
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
-    TracingEngine::new(XlaEngine::token(), tracing_builder)
+    TracingContext::new(XlaEngine::token(), tracing_builder)
         .trace_operation(
             XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(body.clone()))),
             traced_inputs.as_slice(),
@@ -1382,7 +1382,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
 
     let pushforward_compiled_builder =
         Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new()));
-    let pushforward_compiled_context = TracingEngine::new(XlaEngine::token(), pushforward_compiled_builder.clone());
+    let pushforward_compiled_context = TracingContext::new(XlaEngine::token(), pushforward_compiled_builder.clone());
     let pushforward_compiled_outputs = {
         let combined_inputs = pushforward_local_input_types
             .iter()
@@ -1408,7 +1408,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
 
     let pullback_compiled_builder =
         Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new()));
-    let pullback_compiled_context = TracingEngine::new(XlaEngine::token(), pullback_compiled_builder.clone());
+    let pullback_compiled_context = TracingContext::new(XlaEngine::token(), pullback_compiled_builder.clone());
     let pullback_compiled_outputs = {
         let combined_inputs = pullback_local_input_types
             .iter()
@@ -1489,7 +1489,7 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     traced_inputs: Vec<ShardMapTracer>,
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError> {
-    let staged_outputs = TracingEngine::new(XlaEngine::token(), tracing_builder).trace_operation(
+    let staged_outputs = TracingContext::new(XlaEngine::token(), tracing_builder).trace_operation(
         XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))),
         traced_inputs.as_slice(),
     )?;

@@ -5,7 +5,7 @@ use half::{bf16, f16};
 use crate::macros::check_input_count;
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError};
-use crate::tracing_v2::engines::{StagingEngine, Tracer};
+use crate::tracing_v2::engines::{Tracer, TracingEngine};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, LinearPrimitiveOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
@@ -190,7 +190,7 @@ impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
 impl<'engine, V: Traceable<ArrayType>, E> ReshapeOps for Tracer<'engine, E>
 where
-    E: StagingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
     E::Operation: SupportsReshape<ArrayType, V>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
@@ -199,8 +199,8 @@ where
         if input_type == output_type {
             return Ok(self);
         }
-        let engine = self.engine.clone();
-        Ok(engine
+        let context = self.context.clone();
+        Ok(context
             .trace_operation(
                 E::Operation::reshape_operation(input_type.shape.clone(), output_type.shape.clone()),
                 std::slice::from_ref(&self),

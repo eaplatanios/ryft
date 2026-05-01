@@ -9,7 +9,7 @@ use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value}
 use crate::tracing_v2::engines::Tracer;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableStagingEngine, LinearPrimitiveOperation};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearPrimitiveOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{
@@ -181,29 +181,29 @@ where
 }
 
 /// JVP rule for `ScaleOperation` under the
-/// [`TracingEngine`](crate::tracing_v2::TracingEngine) wrapper.
+/// [`TracingContext`](crate::tracing_v2::TracingContext) wrapper.
 ///
 /// The operation's captured factor is `V_inner` (the underlying engine's value type), but the
 /// wrapper engine's [`Value`](crate::tracing_v2::engines::Engine::Value) is
 /// [`Tracer`](crate::tracing_v2::Tracer). The rule lifts the captured
 /// factor into a `Tracer` constant in the outer trace and then stages both the primal product
 /// and the tangent scale on traced primals.
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingEngine<'engine, EInner>>
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
     for ScaleOperation<ArrayType, V>
 where
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    EInner: DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized,
     EInner::Operation: TracedLinearizationCarrier<ArrayType, V>,
     Tracer<'engine, EInner>: Mul<Output = Tracer<'engine, EInner>>,
     EInner::LinearOperation<'engine>: SupportsScale<ArrayType, Tracer<'engine, EInner>>,
 {
     fn jvp(
         &self,
-        engine: &crate::tracing_v2::TracingEngine<'engine, EInner>,
+        engine: &crate::tracing_v2::TracingContext<'engine, EInner>,
         context: &mut JvpContext<
             '_,
             Tracer<'engine, EInner>,
-            <EInner as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
         >,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {

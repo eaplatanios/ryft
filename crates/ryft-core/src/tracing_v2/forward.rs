@@ -9,11 +9,11 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::tracing::{
     AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
 };
-use crate::tracing_v2::engines::{Engine, StagingEngine, Tracer};
+use crate::tracing_v2::engines::{Engine, Tracer, TracingEngine};
 use crate::tracing_v2::linear::{jvp_program, jvp_traced};
 use crate::tracing_v2::operations::constants::Zero;
 use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperationTracingEngine, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, Typed};
 
 /// Concrete state threaded through forward-mode JVP rules.
@@ -97,7 +97,7 @@ pub trait Differentiable<T: Type>: Traceable<T> {
 
 impl<'engine, E> Differentiable<E::Type> for Tracer<'engine, E>
 where
-    E: StagingEngine + ?Sized,
+    E: TracingEngine + ?Sized,
     E::Value: Differentiable<E::Type>,
 {
     type Tangent = Self;
@@ -191,8 +191,8 @@ impl<
 > JvpInvocationLeaf<E, Input, Output, ConcreteJvpInvocation> for V
 where
     E: DifferentiableEngine<Value = V> + 'static,
-    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
-    Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<E::Type, V>
         + SupportsAdd<E::Type, V>
@@ -200,11 +200,11 @@ where
         + SupportsScale<E::Type, V>,
 {
     type FunctionInput<'engine>
-        = Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>
+        = Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>
     where
         E: 'engine;
     type FunctionOutput<'engine>
-        = Output::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>
+        = Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>
     where
         E: 'engine;
 
@@ -245,13 +245,13 @@ impl<
     Output: Parameterized<Tracer<'engine, E>, To<Tracer<'engine, E>> = Output>,
 > JvpInvocationLeaf<E, Input, Output, TracedJvpInvocation> for Tracer<'engine, E>
 where
-    E: DifferentiableEngine<Value = V> + DifferentiableStagingEngine<Value = V> + StagingEngine + 'static,
+    E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + TracingEngine + 'static,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
     Output::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Output>,
     E::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, E>,
-    <E as DifferentiableStagingEngine>::LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     type FunctionInput<'call>
         = Input
@@ -305,26 +305,26 @@ where
 mod tests {
     use crate::parameters::{ParameterError, Parameterized};
     use crate::tracing::ProgramBuilder;
-    use crate::tracing_v2::engines::{ScalarEngine, TracingEngine};
+    use crate::tracing_v2::engines::{ScalarEngine, TracingContext};
     use crate::tracing_v2::operations::{AddOperation, DifferentiableOperation};
     use crate::tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation, test_support};
     use crate::types::DataType;
 
     use super::*;
 
-    /// Validates that [`TracingEngine`] can host a JVP rule like [`AddOperation`] when its
+    /// Validates that [`TracingContext`] can host a JVP rule like [`AddOperation`] when its
     /// `Value` is `Tracer<E>`: the rule stages its primal effect through the underlying engine and
     /// its tangent effect through the context's `LinearOperation` carrier.
     #[test]
-    fn tracing_engine_dispatches_add_jvp_with_traced_primals() {
+    fn tracing_context_dispatches_add_jvp_with_traced_primals() {
         let engine = ScalarEngine::<f64>::new();
         let outer_builder =
             Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, PrimitiveOperation<f64, DataType>>::new()));
         let outer_input_a = outer_builder.borrow_mut().add_input(crate::types::DataType::F64);
         let outer_input_b = outer_builder.borrow_mut().add_input(crate::types::DataType::F64);
-        let outer_tracing_engine = TracingEngine::new(&engine, outer_builder.clone());
-        let primal_a = outer_tracing_engine.tracer(outer_input_a, None);
-        let primal_b = outer_tracing_engine.tracer(outer_input_b, None);
+        let outer_tracing_context = TracingContext::new(&engine, outer_builder.clone());
+        let primal_a = outer_tracing_context.tracer(outer_input_a, None);
+        let primal_b = outer_tracing_context.tracer(outer_input_b, None);
 
         let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
             DataType,
@@ -337,14 +337,14 @@ mod tests {
 
         let outputs = AddOperation
             .jvp(
-                &outer_tracing_engine,
+                &outer_tracing_context,
                 &mut context,
                 &[
                     JvpTracer { primal: primal_a, tangent: tangent_a },
                     JvpTracer { primal: primal_b, tangent: tangent_b },
                 ],
             )
-            .expect("AddOperation::jvp should run on a TracingEngine");
+            .expect("AddOperation::jvp should run on a TracingContext");
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(linear_builder.borrow().instructions.len(), 1);

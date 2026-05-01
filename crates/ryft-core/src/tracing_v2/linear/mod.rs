@@ -7,13 +7,13 @@ use crate::tracing::{
     Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
     Value,
 };
-use crate::tracing_v2::engines::{Engine, StagingEngine, Tracer, TracingEngine};
+use crate::tracing_v2::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing_v2::forward::JvpTracer;
 use crate::tracing_v2::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
 use crate::tracing_v2::operations::rematerialize::{FlatTracedRematerialize, RematerializeOperation};
 use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsRematerialize};
 use crate::tracing_v2::{
-    Differentiable, DifferentiableEngine, DifferentiableOperationStagingEngine, DifferentiableStagingEngine,
+    Differentiable, DifferentiableEngine, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,
     DifferentiationError, LinearOperation,
 };
 use crate::types::{ArrayType, Type, Typed};
@@ -74,7 +74,7 @@ where
     Output: Parameterized<E::Type>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
-    E: StagingEngine<Value = V> + ?Sized + 'static,
+    E: TracingEngine<Value = V> + ?Sized + 'static,
     E::Operation: Clone,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
@@ -84,7 +84,7 @@ where
 }
 
 pub(crate) fn trace_flat_program_from_input_engine<'engine, Input, Output, V, E, F>(
-    tracing_engine: &TracingEngine<'engine, E>,
+    tracing_context: &TracingContext<'engine, E>,
     function: F,
     input_types: Input,
 ) -> Result<(Output, Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>), TracingError>
@@ -94,12 +94,12 @@ where
     Output: Parameterized<E::Type>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
-    E: StagingEngine<Value = V> + ?Sized + 'static,
+    E: TracingEngine<Value = V> + ?Sized + 'static,
     E::Operation: Clone,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
     trace_flat_program_from_trace_result::<E::Type, Input, Output, V, E::Operation>(
-        tracing_engine.engine.trace(function, input_types)?,
+        tracing_context.engine.trace(function, input_types)?,
     )
 }
 
@@ -140,29 +140,29 @@ where
 /// it into a pullback, seeds that pullback with a symbolic one, and returns both the traced scalar
 /// output and the traced gradient leaves.
 fn reverse_mode_scalar_traced_program<'engine, V, E>(
-    tracing_engine: TracingEngine<'engine, E>,
+    tracing_context: TracingContext<'engine, E>,
     traced_program: &Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>,
     traced_primals: Vec<Tracer<'engine, E>>,
 ) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
 where
     V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
-    E: DifferentiableStagingEngine<Value = V> + ?Sized + 'static,
+    E: DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
     E::Operation: TracedLinearizableOperation<'engine, E> + 'static,
-    <E as DifferentiableStagingEngine>::LinearOperation<'engine>: Clone
+    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
-        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableStagingEngine>::LinearOperation<'engine>>
+        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>
         + SupportsZero<E::Type, Tracer<'engine, E>>,
 {
-    let (outputs, pushforward) = linearize_traced_program(tracing_engine.clone(), traced_program, traced_primals)?;
+    let (outputs, pushforward) = linearize_traced_program(tracing_context.clone(), traced_program, traced_primals)?;
     ensure_single_gradient_output::<E::Type, _>(outputs.as_slice())?;
     let traced_output = outputs[0].clone();
     let tracing_builder = traced_output.builder().clone();
-    let pullback = transpose_traced_linear_program(tracing_engine.clone(), &pushforward)?;
+    let pullback = transpose_traced_linear_program(tracing_context.clone(), &pushforward)?;
     let seed_type = traced_output.r#type().into_owned();
     let _ = <V as One<E::Type>>::one(&seed_type)?;
-    let seed_value = tracing_engine.engine.one(&seed_type)?;
+    let seed_value = tracing_context.engine.one(&seed_type)?;
     let seed_atom = tracing_builder.borrow_mut().add_constant(seed_value);
-    let seed = traced_output.engine.tracer(seed_atom, Some(seed_type));
+    let seed = traced_output.context.tracer(seed_atom, Some(seed_type));
     let traced_gradient = pullback.interpret(vec![seed])?;
     Ok((traced_output, traced_gradient))
 }
@@ -213,7 +213,7 @@ mod tests {
         }
     }
 
-    impl StagingEngine for ArrayScalarEngine {
+    impl TracingEngine for ArrayScalarEngine {
         type Operation = PrimitiveOperation<f64>;
     }
 
@@ -222,7 +222,7 @@ mod tests {
         type LinearOperation = LinearPrimitiveOperation<f64>;
     }
 
-    impl DifferentiableStagingEngine for ArrayScalarEngine {
+    impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperation<'engine>
             = LinearPrimitiveOperation<Tracer<'engine, Self>>
         where
@@ -382,7 +382,7 @@ mod tests {
         }
     }
 
-    impl StagingEngine for SplitCarrierEngine {
+    impl TracingEngine for SplitCarrierEngine {
         type Operation = OrdinaryAddOperation;
     }
 
@@ -409,11 +409,11 @@ mod tests {
             engine.interpret_and_trace(|x: Tracer<SplitCarrierEngine>| Ok(x.clone() + x), 2.0f64).unwrap();
         assert_eq!(traced_program.instructions[0].operation.name(), "ordinary_add");
 
-        let differentiable_staging_engine = DifferentiableOperationStagingEngine::new(&engine);
+        let differentiable_tracing_engine = DifferentiableOperationTracingEngine::new(&engine);
         let (_, differentiable_program): (f64, Program<ArrayType, f64, DifferentiableAddOperation, f64, f64>) =
-            differentiable_staging_engine
+            differentiable_tracing_engine
                 .interpret_and_trace(
-                    |x: Tracer<'_, DifferentiableOperationStagingEngine<SplitCarrierEngine>>| Ok(x.clone() + x),
+                    |x: Tracer<'_, DifferentiableOperationTracingEngine<SplitCarrierEngine>>| Ok(x.clone() + x),
                     2.0f64,
                 )
                 .unwrap();

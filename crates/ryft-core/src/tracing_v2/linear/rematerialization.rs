@@ -6,27 +6,27 @@ fn build_traced_gradient_program<'engine, E, Input, V>(
     traced_program: &Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>,
 ) -> Result<Program<E::Type, V, E::Operation, Input, Input>, TracingError>
 where
-    E: DifferentiableEngine<Value = V> + DifferentiableStagingEngine<Value = V> + 'static,
+    E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
     V: Value<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
     E::Operation: InterpretableOperation<E::Type, V> + TracedLinearizableOperation<'engine, E> + 'static,
-    <E as DifferentiableStagingEngine>::LinearOperation<'engine>: Clone
+    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
-        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableStagingEngine>::LinearOperation<'engine>>,
+        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
     Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, V, E::Operation>::new()));
-    let tracing_engine = TracingEngine::new(engine, traced_primal_builder.clone());
+    let tracing_context = TracingContext::new(engine, traced_primal_builder.clone());
     let traced_primals = traced_program
         .input_ids
         .iter()
         .map(|input_atom| {
             let input_type = traced_program.atoms[input_atom.index].r#type().into_owned();
             let atom = traced_primal_builder.borrow_mut().add_input(input_type.clone());
-            tracing_engine.tracer(atom, Some(input_type))
+            tracing_context.tracer(atom, Some(input_type))
         })
         .collect::<Vec<_>>();
     let (_, traced_gradient) =
-        reverse_mode_scalar_traced_program::<V, E>(tracing_engine, traced_program, traced_primals)?;
+        reverse_mode_scalar_traced_program::<V, E>(tracing_context, traced_program, traced_primals)?;
     if let Some(tracing_error) = traced_primal_builder.borrow_mut().error.take() {
         return Err(tracing_error);
     }
@@ -57,12 +57,12 @@ pub fn compile_grad<'engine, E, F, Input, V>(
     example_primals: Input,
 ) -> Result<Program<E::Type, V, E::Operation, Input, Input>, TracingError>
 where
-    E: DifferentiableEngine<Value = V> + DifferentiableStagingEngine<Value = V> + 'static,
+    E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
     V: Value<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
     E::Operation: InterpretableOperation<E::Type, V> + TracedLinearizableOperation<'engine, E>,
-    <E as DifferentiableStagingEngine>::LinearOperation<'engine>: Clone
+    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
-        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableStagingEngine>::LinearOperation<'engine>>,
+        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<E::Type> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -132,15 +132,15 @@ pub fn compile_grad_with_policy<'engine, E, F, Input, V>(
 ) -> Result<Program<ArrayType, V, E::Operation, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V>
-        + DifferentiableStagingEngine<Type = ArrayType, Value = V>
+        + DifferentiableTracingEngine<Type = ArrayType, Value = V>
         + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
     E::Operation: InterpretableOperation<ArrayType, V>
         + TracedLinearizableOperation<'engine, E>
         + SupportsRematerialize<ArrayType, V, <E as DifferentiableEngine>::LinearOperation>,
-    <E as DifferentiableStagingEngine>::LinearOperation<'engine>: Clone
+    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E>>
-        + LinearOperation<ArrayType, Tracer<'engine, E>, <E as DifferentiableStagingEngine>::LinearOperation<'engine>>,
+        + LinearOperation<ArrayType, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -179,15 +179,15 @@ fn compile_grad_segmented<'engine, E, F, Input, V>(
 ) -> Result<Program<ArrayType, V, E::Operation, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V>
-        + DifferentiableStagingEngine<Type = ArrayType, Value = V>
+        + DifferentiableTracingEngine<Type = ArrayType, Value = V>
         + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
     E::Operation: InterpretableOperation<ArrayType, V>
         + TracedLinearizableOperation<'engine, E>
         + SupportsRematerialize<ArrayType, V, <E as DifferentiableEngine>::LinearOperation>,
-    <E as DifferentiableStagingEngine>::LinearOperation<'engine>: Clone
+    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E>>
-        + LinearOperation<ArrayType, Tracer<'engine, E>, <E as DifferentiableStagingEngine>::LinearOperation<'engine>>,
+        + LinearOperation<ArrayType, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,

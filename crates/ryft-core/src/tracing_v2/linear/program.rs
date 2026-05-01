@@ -278,7 +278,7 @@ where
 /// the standard interpret path applies.
 #[allow(private_bounds)]
 pub fn transpose_traced_linear_program<'engine, Input, Output, V, O, E>(
-    tracing_engine: TracingEngine<'engine, E>,
+    tracing_context: TracingContext<'engine, E>,
     program: &Program<E::Type, Tracer<'engine, E>, O, Input, Output>,
 ) -> Result<Program<E::Type, Tracer<'engine, E>, O, Output, Input>, TracingError>
 where
@@ -289,12 +289,12 @@ where
         + LinearOperation<E::Type, Tracer<'engine, E>, O>
         + SupportsAdd<E::Type, Tracer<'engine, E>>
         + SupportsZero<E::Type, Tracer<'engine, E>>,
-    E: StagingEngine<Value = V> + ?Sized + 'static,
+    E: TracingEngine<Value = V> + ?Sized + 'static,
 {
     let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new()));
     let mut context = TranspositionContext::new(builder);
     let pullback = transpose_linear_program_with_context(&mut context, program)?;
-    materialize_tracer_zero_ops(pullback, tracing_engine)
+    materialize_tracer_zero_ops(pullback, tracing_context)
 }
 
 /// Walks a linear program and replaces every
@@ -307,7 +307,7 @@ where
 /// so traced pullbacks must be materialized away from `Zero` ops before being interpreted.
 fn materialize_tracer_zero_ops<'engine, Input, Output, V, O, E>(
     program: Program<E::Type, Tracer<'engine, E>, O, Input, Output>,
-    tracing_engine: TracingEngine<'engine, E>,
+    tracing_context: TracingContext<'engine, E>,
 ) -> Result<Program<E::Type, Tracer<'engine, E>, O, Input, Output>, TracingError>
 where
     V: Traceable<E::Type>,
@@ -317,7 +317,7 @@ where
         + LinearOperation<E::Type, Tracer<'engine, E>, O>
         + SupportsAdd<E::Type, Tracer<'engine, E>>
         + SupportsZero<E::Type, Tracer<'engine, E>>,
-    E: StagingEngine<Value = V> + ?Sized + 'static,
+    E: TracingEngine<Value = V> + ?Sized + 'static,
 {
     let mut builder = ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new();
     builder.atoms = program.atoms.clone();
@@ -329,9 +329,9 @@ where
             && instruction.outputs.len() == 1
             && instruction.inputs.is_empty()
         {
-            let zero_value = tracing_engine.engine.zero(zero_type)?;
-            let outer_atom = tracing_engine.builder.borrow_mut().add_constant(zero_value);
-            let zero_tracer = tracing_engine.tracer(outer_atom, Some(zero_type.clone()));
+            let zero_value = tracing_context.engine.zero(zero_type)?;
+            let outer_atom = tracing_context.builder.borrow_mut().add_constant(zero_value);
+            let zero_tracer = tracing_context.tracer(outer_atom, Some(zero_type.clone()));
             let constant_atom = builder.add_constant(zero_tracer);
             atom_remapping[instruction.outputs[0].index] = Some(constant_atom);
         } else {

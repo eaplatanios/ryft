@@ -17,19 +17,19 @@ where
     V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
     Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Output: Parameterized<V>,
-    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
-    Output::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    Output::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     F: FnOnce(
-        Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
-    ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>, TracingError>,
+        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
 {
     let input_structure = primals.parameter_structure();
     let input_primals: Vec<V> = primals.into_parameters().collect();
     let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
-    let differentiable_staging_engine = DifferentiableOperationStagingEngine::new(engine);
+    let differentiable_tracing_engine = DifferentiableOperationTracingEngine::new(engine);
     let (primal_output, program) =
-        differentiable_staging_engine.interpret_and_trace(function, reconstructed_primals)?;
+        differentiable_tracing_engine.interpret_and_trace(function, reconstructed_primals)?;
     Ok((primal_output, linearize_program(engine, &program, input_primals)?))
 }
 
@@ -48,13 +48,13 @@ where
     V: Traceable<E::Type> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: std::fmt::Debug + PartialEq>,
     Output: Parameterized<Tracer<'engine, E>>,
-    E: DifferentiableStagingEngine<Value = V> + ?Sized + 'static,
+    E: DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
     Output::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Output>,
     E::Operation: TracedLinearizableOperation<'engine, E>,
-    <E as DifferentiableStagingEngine>::LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
     F: FnOnce(Input) -> Result<Output, TracingError>,
 {
     let primal_structure = primals.parameter_structure();
@@ -79,13 +79,13 @@ where
     )?;
     let (primal_output_types, traced_program) =
         trace_flat_program_from_input_engine::<Input::To<E::Type>, Output::To<E::Type>, V, E, _>(
-            &exemplar_traced_primal.engine,
+            &exemplar_traced_primal.context,
             move |staged_input| function(staged_input),
             staged_input_types,
         )?;
     let output_structure = primal_output_types.parameter_structure();
     let (traced_primal_output, pushforward) =
-        linearize_traced_program(exemplar_traced_primal.engine.clone(), &traced_program, traced_primals)?;
+        linearize_traced_program(exemplar_traced_primal.context.clone(), &traced_program, traced_primals)?;
     let traced_tangent_output = pushforward.interpret(traced_tangents)?;
     Ok((
         Output::from_parameters(output_structure.clone(), traced_primal_output)?,
@@ -109,12 +109,12 @@ where
     V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
     Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Output: Parameterized<V>,
-    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
-    Output::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    Output::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     F: FnOnce(
-        Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
-    ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>, TracingError>,
+        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
     E::LinearOperation: Clone
         + InterpretableOperation<E::Type, V>
         + LinearOperation<E::Type, V, E::LinearOperation>
@@ -185,13 +185,13 @@ where
     E: DifferentiableEngine<Value = V> + 'static,
     V: for<'engine> Parameterized<
             V,
-            To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>> = Tracer<
+            To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>> = Tracer<
                 'engine,
-                DifferentiableOperationStagingEngine<E>,
+                DifferentiableOperationTracingEngine<E>,
             >,
         >,
-    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
-    V::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    V::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: Clone
         + InterpretableOperation<E::Type, V>
@@ -201,11 +201,11 @@ where
     type Value = V;
 
     type FunctionInput<'engine>
-        = Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>
+        = Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>
     where
         E: 'engine;
     type FunctionOutput<'engine>
-        = Tracer<'engine, DifferentiableOperationStagingEngine<E>>
+        = Tracer<'engine, DifferentiableOperationTracingEngine<E>>
     where
         E: 'engine;
 
@@ -232,16 +232,16 @@ impl<
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: std::fmt::Debug + PartialEq>,
 > ValueAndGradInvocationLeaf<E, Input, TracedValueAndGradInvocation> for Tracer<'engine, E>
 where
-    E: DifferentiableEngine<Value = V> + DifferentiableStagingEngine<Value = V> + 'static,
+    E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<E::Type> + ParameterizedFamily<Tracer<'engine, E>>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
     V::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
     E::Operation: TracedLinearizableOperation<'engine, E>,
-    <E as DifferentiableStagingEngine>::LinearOperation<'engine>: Clone
+    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
-        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableStagingEngine>::LinearOperation<'engine>>,
+        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
 {
     type Value = Tracer<'engine, E>;
 
@@ -267,14 +267,14 @@ where
             input_structure.clone(),
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
-        let tracing_engine = traced_primals[0].engine.clone();
+        let tracing_context = traced_primals[0].context.clone();
         let (_, traced_program) = trace_flat_program_from_input_engine::<Input::To<E::Type>, V::To<E::Type>, V, E, _>(
-            &tracing_engine,
+            &tracing_context,
             |staged_input| Ok(function(staged_input)),
             staged_input_types,
         )?;
         let (traced_output, traced_gradient) =
-            reverse_mode_scalar_traced_program::<V, E>(tracing_engine, &traced_program, traced_primals)?;
+            reverse_mode_scalar_traced_program::<V, E>(tracing_context, &traced_program, traced_primals)?;
         Ok((traced_output, Input::from_parameters(input_structure, traced_gradient)?))
     }
 }
@@ -324,28 +324,28 @@ where
         + Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     V: Parameterized<
             V,
-            To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>> = Tracer<
+            To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>> = Tracer<
                 'engine,
-                DifferentiableOperationStagingEngine<E>,
+                DifferentiableOperationTracingEngine<E>,
             >,
         >,
     Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Aux: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Aux::Family: ParameterizedFamily<
-            Tracer<'engine, DifferentiableOperationStagingEngine<E>>,
-            To = Aux::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+            Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+            To = Aux::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
         >,
     V::Family: ParameterizedFamily<
-            Tracer<'engine, DifferentiableOperationStagingEngine<E>>,
-            To = Tracer<'engine, DifferentiableOperationStagingEngine<E>>,
+            Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+            To = Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
         >,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     F: FnOnce(
-        Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> (
-        Tracer<'engine, DifferentiableOperationStagingEngine<E>>,
-        Aux::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+        Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+        Aux::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ),
     E::LinearOperation: Clone
         + InterpretableOperation<E::Type, V>
@@ -407,28 +407,28 @@ where
         + Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     V: Parameterized<
             V,
-            To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>> = Tracer<
+            To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>> = Tracer<
                 'engine,
-                DifferentiableOperationStagingEngine<E>,
+                DifferentiableOperationTracingEngine<E>,
             >,
         >,
     Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Aux: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Aux::Family: ParameterizedFamily<
-            Tracer<'engine, DifferentiableOperationStagingEngine<E>>,
-            To = Aux::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+            Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+            To = Aux::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
         >,
     V::Family: ParameterizedFamily<
-            Tracer<'engine, DifferentiableOperationStagingEngine<E>>,
-            To = Tracer<'engine, DifferentiableOperationStagingEngine<E>>,
+            Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+            To = Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
         >,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     F: FnOnce(
-        Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> (
-        Tracer<'engine, DifferentiableOperationStagingEngine<E>>,
-        Aux::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+        Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+        Aux::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ),
     E::LinearOperation: Clone
         + InterpretableOperation<E::Type, V>
@@ -682,7 +682,7 @@ mod tests {
         }
     }
 
-    impl StagingEngine for TestEngine {
+    impl TracingEngine for TestEngine {
         type Operation = AddOperation;
     }
 
@@ -696,7 +696,7 @@ mod tests {
         let engine = TestEngine;
         let (output, pushforward) = jvp_program(
             &engine,
-            |x: Tracer<'_, DifferentiableOperationStagingEngine<TestEngine>>| Ok(x.clone() + x),
+            |x: Tracer<'_, DifferentiableOperationTracingEngine<TestEngine>>| Ok(x.clone() + x),
             TestValue(3.0),
         )
         .unwrap();

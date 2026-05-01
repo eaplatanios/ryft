@@ -403,7 +403,7 @@ pub fn vmap<'engine, E, F, Input, Output, V>(
     batch_axis: usize,
 ) -> Result<Output, TracingError>
 where
-    E: crate::tracing_v2::StagingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: crate::tracing_v2::TracingEngine<Type = ArrayType, Value = V> + ?Sized,
     V: Traceable<ArrayType>,
     Input: Parameterized<
             V,
@@ -662,7 +662,7 @@ mod tests {
     use super::*;
     use crate::broadcasting::Broadcastable;
     use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue, CustomPrimitive};
-    use crate::tracing_v2::{DifferentiableEngine, Engine, StagingEngine};
+    use crate::tracing_v2::{DifferentiableEngine, Engine, TracingEngine};
     use crate::types::{DataType, Shape};
 
     #[derive(Clone, Debug, PartialEq)]
@@ -862,7 +862,7 @@ mod tests {
         }
     }
 
-    impl StagingEngine for TestArrayEngine {
+    impl TracingEngine for TestArrayEngine {
         type Operation = PrimitiveOperation<TestArray>;
     }
 

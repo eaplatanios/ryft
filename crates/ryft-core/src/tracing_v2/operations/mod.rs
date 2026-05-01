@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::tracing::{AtomId, Instruction, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableEngine;
-use crate::tracing_v2::engines::{StagingEngine, Tracer};
+use crate::tracing_v2::engines::{Tracer, TracingEngine};
 use crate::tracing_v2::forward::{JvpContext, JvpTracer};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -84,7 +84,7 @@ pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
 pub use scale::{ScaleOperation, SupportsScale};
 pub use sin::{Sin, SinOperation, SupportsSin};
 
-/// Carrier capability required by [`TracingEngine`](crate::tracing_v2::TracingEngine).
+/// Carrier capability required by [`TracingContext`](crate::tracing_v2::TracingContext).
 ///
 /// Traced linearization runs ordinary JVP rules with [`Tracer`] primals. Those rules may stage the
 /// primal side of built-in arithmetic through the outer operation carrier, so the carrier must know
@@ -106,14 +106,14 @@ where
 }
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
-pub fn lift_jit_constant<'engine, V: Traceable<ArrayType>, E: StagingEngine<Type = ArrayType, Value = V> + ?Sized>(
+pub fn lift_jit_constant<'engine, V: Traceable<ArrayType>, E: TracingEngine<Type = ArrayType, Value = V> + ?Sized>(
     constant: &V,
     exemplar: &Tracer<'engine, E>,
 ) -> Tracer<'engine, E> {
     let builder = exemplar.builder().clone();
     let r#type = constant.r#type().into_owned();
     let atom = builder.borrow_mut().add_constant(constant.clone());
-    exemplar.engine.tracer(atom, Some(r#type))
+    exemplar.context.tracer(atom, Some(r#type))
 }
 
 /// Propagates one unary input type through a shape-preserving staged op.

@@ -5,7 +5,7 @@ use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value}
 use crate::tracing_v2::engines::Tracer;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableStagingEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
@@ -147,23 +147,23 @@ where
 }
 
 /// JVP rule for `RightMatMulOperation` under
-/// [`TracingEngine`](crate::tracing_v2::TracingEngine).
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingEngine<'engine, EInner>>
+/// [`TracingContext`](crate::tracing_v2::TracingContext).
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
     for RightMatMulOperation<V>
 where
     V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    EInner: DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized,
     EInner::Operation: TracedLinearizationCarrier<ArrayType, V>,
     EInner::LinearOperation<'engine>: SupportsRightMatMul<ArrayType, Tracer<'engine, EInner>>,
     Tracer<'engine, EInner>: MatrixOps,
 {
     fn jvp(
         &self,
-        engine: &crate::tracing_v2::TracingEngine<'engine, EInner>,
+        engine: &crate::tracing_v2::TracingContext<'engine, EInner>,
         context: &mut JvpContext<
             '_,
             Tracer<'engine, EInner>,
-            <EInner as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
         >,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {

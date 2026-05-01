@@ -306,7 +306,7 @@ mod tests {
 
     use crate::tracing::Program;
     use crate::tracing_v2::Sin;
-    use crate::tracing_v2::engines::{Engine, StagingEngine};
+    use crate::tracing_v2::engines::{Engine, TracingEngine};
     use crate::tracing_v2::operations::constants::OneLike;
 
     use super::*;
@@ -327,7 +327,7 @@ mod tests {
         }
     }
 
-    impl StagingEngine for ArrayScalarEngine {
+    impl TracingEngine for ArrayScalarEngine {
         type Operation = crate::tracing_v2::PrimitiveOperation<f64>;
     }
 

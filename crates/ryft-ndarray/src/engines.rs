@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing_v2::{
-    DifferentiableEngine, DifferentiableStagingEngine, Engine, LinearPrimitiveOperation, PrimitiveOperation,
-    StagingEngine, Tracer,
+    DifferentiableEngine, DifferentiableTracingEngine, Engine, LinearPrimitiveOperation, PrimitiveOperation, Tracer,
+    TracingEngine,
 };
 use ryft_core::types::{ArrayType, TypeError};
 
@@ -41,7 +41,7 @@ impl<T: NdArrayElement> Engine for NdArrayEngine<T> {
     }
 }
 
-impl<T: NdArrayElement> StagingEngine for NdArrayEngine<T> {
+impl<T: NdArrayElement> TracingEngine for NdArrayEngine<T> {
     type Operation = PrimitiveOperation<Array<T>>;
 }
 
@@ -50,7 +50,7 @@ impl<T: NdArrayElement> DifferentiableEngine for NdArrayEngine<T> {
     type LinearOperation = LinearPrimitiveOperation<Array<T>>;
 }
 
-impl<T: NdArrayElement> DifferentiableStagingEngine for NdArrayEngine<T> {
+impl<T: NdArrayElement> DifferentiableTracingEngine for NdArrayEngine<T> {
     type LinearOperation<'engine>
         = LinearPrimitiveOperation<Tracer<'engine, Self>>
     where
@@ -66,7 +66,7 @@ mod tests {
     use ndarray::{arr1, arr2};
     use pretty_assertions::assert_eq;
     use ryft_core::tracing::{Operation, TracingError};
-    use ryft_core::tracing_v2::{DifferentiationError, Engine, MatrixOps, Sin, StagingEngine, compile_grad, grad, jvp};
+    use ryft_core::tracing_v2::{DifferentiationError, Engine, MatrixOps, Sin, TracingEngine, compile_grad, grad, jvp};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::Array;

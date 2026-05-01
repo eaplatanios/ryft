@@ -7,8 +7,8 @@ use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing_v2::engines::{Engine, StagingEngine};
-use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableStagingEngine, LinearPrimitiveOperation, Tracer};
+use ryft_core::tracing_v2::engines::{Engine, TracingEngine};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearPrimitiveOperation, Tracer};
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::arrays::{Array, ArrayError};
@@ -138,7 +138,7 @@ impl<'c> Engine for XlaEngine<'c> {
     }
 }
 
-impl<'c> StagingEngine for XlaEngine<'c> {
+impl<'c> TracingEngine for XlaEngine<'c> {
     type Operation = XlaPrimitiveOperation;
 }
 
@@ -147,7 +147,7 @@ impl<'c> DifferentiableEngine for XlaEngine<'c> {
     type LinearOperation = LinearPrimitiveOperation<ShardMapTensor>;
 }
 
-impl<'c> DifferentiableStagingEngine for XlaEngine<'c> {
+impl<'c> DifferentiableTracingEngine for XlaEngine<'c> {
     type LinearOperation<'engine>
         = LinearPrimitiveOperation<Tracer<'engine, Self>>
     where

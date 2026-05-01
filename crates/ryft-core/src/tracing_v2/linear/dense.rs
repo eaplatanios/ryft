@@ -279,12 +279,12 @@ where
     Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: PartialEq>,
     Input::Family: ParameterizedFamily<ReferenceBatch<V>>
-        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Output::Family: ParameterizedFamily<ReferenceBatch<V>>
-        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     F: FnOnce(
-        Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
-    ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>, TracingError>,
+        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>,
 {
@@ -332,12 +332,12 @@ where
     Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<ReferenceBatch<V>>
-        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Output::Family: ParameterizedFamily<ReferenceBatch<V>>
-        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     F: FnOnce(
-        Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
-    ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>, TracingError>,
+        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: Clone
         + InterpretableOperation<ArrayType, V>
@@ -381,10 +381,10 @@ where
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<ReferenceBatch<V>>
-        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
+        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     F: FnOnce(
-        Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>,
-    ) -> Result<Input::To<Tracer<'engine, DifferentiableOperationStagingEngine<E>>>, TracingError>,
+        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    ) -> Result<Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>,
 {
@@ -395,9 +395,9 @@ where
 mod tests {
     use crate::parameters::Placeholder;
     use crate::tracing::TracingError;
-    use crate::tracing_v2::engines::{Engine, StagingEngine};
+    use crate::tracing_v2::engines::{Engine, TracingEngine};
     use crate::tracing_v2::{
-        DifferentiableEngine, DifferentiableStagingEngine, DifferentiationError, LinearPrimitiveOperation,
+        DifferentiableEngine, DifferentiableTracingEngine, DifferentiationError, LinearPrimitiveOperation,
         PrimitiveOperation, Sin, Tracer,
     };
     use crate::types::ArrayType;
@@ -424,7 +424,7 @@ mod tests {
         }
     }
 
-    impl StagingEngine for ArrayScalarEngine {
+    impl TracingEngine for ArrayScalarEngine {
         type Operation = PrimitiveOperation<f64>;
     }
 
@@ -433,7 +433,7 @@ mod tests {
         type LinearOperation = LinearPrimitiveOperation<f64>;
     }
 
-    impl DifferentiableStagingEngine for ArrayScalarEngine {
+    impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperation<'engine>
             = LinearPrimitiveOperation<Tracer<'engine, Self>>
         where

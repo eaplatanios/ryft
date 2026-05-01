@@ -474,7 +474,7 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::tracing::ProgramBuilder;
     use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation, TranspositionContext};
-    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, MatrixOps, ReshapeOps, StagingEngine};
+    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, MatrixOps, ReshapeOps, TracingEngine};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
     use crate::NdArrayEngine;
