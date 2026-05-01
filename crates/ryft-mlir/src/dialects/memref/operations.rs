@@ -1,8 +1,10 @@
+use crate::dialects::arith::{AtomicRmwKind, AtomicRmwKindAttributeRef};
 use crate::{
-    Attribute, AttributeRef, BooleanAttributeRef, DenseInteger32ArrayAttributeRef, DenseInteger64ArrayAttributeRef,
-    DetachedOp, DetachedRegion, DialectHandle, FlatSymbolRefAttributeRef, IntegerAttributeRef, IntoWithContext,
-    Location, OneRegion, OneResult, Operation, OperationBuilder, RegionRef, Size, StringAttributeRef, Symbol,
-    SymbolVisibility, Type, TypeAttributeRef, TypeRef, Value, ValueRef, mlir_op, mlir_op_trait,
+    AffineMap, AffineMapAttributeRef, ArrayAttributeRef, Attribute, AttributeRef, BooleanAttributeRef,
+    DenseInteger32ArrayAttributeRef, DenseInteger64ArrayAttributeRef, DetachedOp, DetachedRegion, DialectHandle,
+    FlatSymbolRefAttributeRef, IntegerAttributeRef, IntoWithContext, Location, MemRefTypeRef, OneRegion, OneResult,
+    Operation, OperationBuilder, RegionRef, Size, StringAttributeRef, Symbol, SymbolVisibility, Type, TypeAttributeRef,
+    TypeRef, Value, ValueRef, mlir_op, mlir_op_trait,
 };
 use crate::{SYMBOL_NAME_ATTRIBUTE, SYMBOL_VISIBILITY_ATTRIBUTE};
 
@@ -494,6 +496,155 @@ pub fn dim<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `memref::dim`")
 }
 
+/// Operation trait for the `memref.dma_start` operation.
+pub trait DmaStartOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the source memref.
+    fn source(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the source memref indices.
+    fn source_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+        let source_rank = self.source().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        (1..1 + source_rank).map(|index| self.operand_value(index).unwrap()).collect()
+    }
+
+    /// Returns the destination memref.
+    fn destination(&self) -> ValueRef<'o, 'c, 't> {
+        let source_rank = self.source().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        self.operand_value(1 + source_rank).unwrap()
+    }
+
+    /// Returns the destination memref indices.
+    fn destination_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+        let source_rank = self.source().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        let destination_rank = self.destination().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        let start = 2 + source_rank;
+        (start..start + destination_rank).map(|index| self.operand_value(index).unwrap()).collect()
+    }
+
+    /// Returns the number of elements transferred by this DMA operation.
+    fn num_elements(&self) -> ValueRef<'o, 'c, 't> {
+        let source_rank = self.source().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        let destination_rank = self.destination().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        self.operand_value(2 + source_rank + destination_rank).unwrap()
+    }
+
+    /// Returns the tag memref used to synchronize with the matching `memref.dma_wait`.
+    fn tag(&self) -> ValueRef<'o, 'c, 't> {
+        let source_rank = self.source().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        let destination_rank = self.destination().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        self.operand_value(3 + source_rank + destination_rank).unwrap()
+    }
+
+    /// Returns the tag memref indices.
+    fn tag_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+        let source_rank = self.source().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        let destination_rank = self.destination().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        let tag_rank = self.tag().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        let start = 4 + source_rank + destination_rank;
+        (start..start + tag_rank).map(|index| self.operand_value(index).unwrap()).collect()
+    }
+
+    /// Returns `true` if this DMA operation has explicit stride operands.
+    fn is_strided(&self) -> bool {
+        let source_rank = self.source().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        let destination_rank = self.destination().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        let tag_rank = self.tag().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        self.operand_count() != 4 + source_rank + destination_rank + tag_rank
+    }
+
+    /// Returns the optional stride operand.
+    fn stride(&self) -> Option<ValueRef<'o, 'c, 't>> {
+        if self.is_strided() { self.operand_value(self.operand_count() - 2) } else { None }
+    }
+
+    /// Returns the optional elements-per-stride operand.
+    fn elements_per_stride(&self) -> Option<ValueRef<'o, 'c, 't>> {
+        if self.is_strided() { self.operand_value(self.operand_count() - 1) } else { None }
+    }
+}
+
+mlir_op!(DmaStart);
+mlir_op_trait!(DmaStart, ZeroRegions);
+mlir_op_trait!(DmaStart, ZeroSuccessors);
+
+/// Constructs a new detached [`DmaStartOperation`].
+pub fn dma_start<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    source: ValueRef<'v, 'c, 't>,
+    source_indices: &[ValueRef<'v, 'c, 't>],
+    destination: ValueRef<'v, 'c, 't>,
+    destination_indices: &[ValueRef<'v, 'c, 't>],
+    num_elements: ValueRef<'v, 'c, 't>,
+    tag: ValueRef<'v, 'c, 't>,
+    tag_indices: &[ValueRef<'v, 'c, 't>],
+    stride: Option<ValueRef<'v, 'c, 't>>,
+    elements_per_stride: Option<ValueRef<'v, 'c, 't>>,
+    location: L,
+) -> DetachedDmaStartOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::memref());
+    let builder = OperationBuilder::new("memref.dma_start", location)
+        .add_operand(source)
+        .add_operands(source_indices)
+        .add_operand(destination)
+        .add_operands(destination_indices)
+        .add_operand(num_elements)
+        .add_operand(tag)
+        .add_operands(tag_indices);
+    let builder = match (stride, elements_per_stride) {
+        (Some(stride), Some(elements_per_stride)) => builder.add_operand(stride).add_operand(elements_per_stride),
+        (None, None) => builder,
+        _ => panic!("`memref::dma_start` requires either both stride operands or neither"),
+    };
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `memref::dma_start`")
+}
+
+/// Operation trait for the `memref.dma_wait` operation.
+pub trait DmaWaitOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the tag memref.
+    fn tag(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the tag memref indices.
+    fn tag_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+        let tag_rank = self.tag().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        (1..1 + tag_rank).map(|index| self.operand_value(index).unwrap()).collect()
+    }
+
+    /// Returns the number of elements associated with the DMA operation.
+    fn num_elements(&self) -> ValueRef<'o, 'c, 't> {
+        let tag_rank = self.tag().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        self.operand_value(1 + tag_rank).unwrap()
+    }
+}
+
+mlir_op!(DmaWait);
+mlir_op_trait!(DmaWait, ZeroRegions);
+mlir_op_trait!(DmaWait, ZeroSuccessors);
+
+/// Constructs a new detached [`DmaWaitOperation`].
+pub fn dma_wait<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    tag: ValueRef<'v, 'c, 't>,
+    tag_indices: &[ValueRef<'v, 'c, 't>],
+    num_elements: ValueRef<'v, 'c, 't>,
+    location: L,
+) -> DetachedDmaWaitOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::memref());
+    OperationBuilder::new("memref.dma_wait", location)
+        .add_operand(tag)
+        .add_operands(tag_indices)
+        .add_operand(num_elements)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `memref::dma_wait`")
+}
+
 /// Operation trait for the `memref.extract_aligned_pointer_as_index` operation.
 pub trait ExtractAlignedPointerAsIndexOperation<'o, 'c: 'o, 't: 'c>:
     Operation<'o, 'c, 't> + OneResult<'o, 'c, 't>
@@ -530,6 +681,143 @@ pub fn extract_aligned_pointer_as_index<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>
         .build()
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `memref::extract_aligned_pointer_as_index`")
+}
+
+/// Operation trait for the `memref.extract_strided_metadata` operation.
+pub trait ExtractStridedMetadataOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the source memref.
+    fn source(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the extracted zero-rank base buffer.
+    fn base_buffer(&self) -> ValueRef<'o, 'c, 't> {
+        self.result(0).unwrap().as_ref()
+    }
+
+    /// Returns the extracted offset.
+    fn offset(&self) -> ValueRef<'o, 'c, 't> {
+        self.result(1).unwrap().as_ref()
+    }
+
+    /// Returns the extracted dynamic size results.
+    fn sizes(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+        let rank = self.source().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        (2..2 + rank).map(|index| self.result(index).unwrap().as_ref()).collect()
+    }
+
+    /// Returns the extracted dynamic stride results.
+    fn strides(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+        let rank = self.source().r#type().cast::<MemRefTypeRef>().unwrap().rank();
+        (2 + rank..2 + 2 * rank).map(|index| self.result(index).unwrap().as_ref()).collect()
+    }
+}
+
+mlir_op!(ExtractStridedMetadata);
+mlir_op_trait!(ExtractStridedMetadata, AlwaysSpeculatable);
+mlir_op_trait!(ExtractStridedMetadata, NoMemoryEffect);
+mlir_op_trait!(ExtractStridedMetadata, Pure);
+mlir_op_trait!(ExtractStridedMetadata, ZeroRegions);
+mlir_op_trait!(ExtractStridedMetadata, ZeroSuccessors);
+
+/// Constructs a new detached [`ExtractStridedMetadataOperation`].
+pub fn extract_strided_metadata<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    source: ValueRef<'v, 'c, 't>,
+    base_buffer_type: T,
+    location: L,
+) -> DetachedExtractStridedMetadataOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::memref());
+    let rank = source.r#type().cast::<MemRefTypeRef>().unwrap().rank();
+    let index_types = vec![context.index_type(); 1 + 2 * rank];
+    OperationBuilder::new("memref.extract_strided_metadata", location)
+        .add_operand(source)
+        .add_result(base_buffer_type)
+        .add_results(&index_types)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `memref::extract_strided_metadata`")
+}
+
+/// Operation trait for the `memref.generic_atomic_rmw` operation.
+pub trait GenericAtomicRmwOperation<'o, 'c: 'o, 't: 'c>:
+    Operation<'o, 'c, 't> + OneRegion<'o, 'c, 't> + OneResult<'o, 'c, 't>
+{
+    /// Returns the memref being read and updated atomically.
+    fn memref(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the index operands used to access the memref.
+    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+        (1..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    }
+
+    /// Returns the atomic read-modify-write body.
+    fn atomic_body(&self) -> RegionRef<'o, 'c, 't> {
+        self.body_region()
+    }
+
+    /// Returns the latest stored value.
+    fn latest_value(&self) -> ValueRef<'o, 'c, 't> {
+        self.output()
+    }
+}
+
+mlir_op!(GenericAtomicRmw);
+mlir_op_trait!(GenericAtomicRmw, OneRegion);
+mlir_op_trait!(GenericAtomicRmw, OneResult);
+mlir_op_trait!(GenericAtomicRmw, SingleBlockRegions);
+mlir_op_trait!(GenericAtomicRmw, ZeroSuccessors);
+
+/// Constructs a new detached [`GenericAtomicRmwOperation`].
+pub fn generic_atomic_rmw<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    memref: ValueRef<'v, 'c, 't>,
+    indices: &[ValueRef<'v, 'c, 't>],
+    result_type: T,
+    atomic_body: DetachedRegion<'c, 't>,
+    location: L,
+) -> DetachedGenericAtomicRmwOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::memref());
+    OperationBuilder::new("memref.generic_atomic_rmw", location)
+        .add_operand(memref)
+        .add_operands(indices)
+        .add_result(result_type)
+        .add_region(atomic_body)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `memref::generic_atomic_rmw`")
+}
+
+/// Operation trait for the `memref.atomic_yield` operation.
+pub trait AtomicYieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the yielded value.
+    fn value(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+}
+
+mlir_op!(AtomicYield);
+mlir_op_trait!(AtomicYield, AlwaysSpeculatable);
+mlir_op_trait!(AtomicYield, NoMemoryEffect);
+mlir_op_trait!(AtomicYield, Pure);
+mlir_op_trait!(AtomicYield, ReturnLike);
+mlir_op_trait!(AtomicYield, ZeroRegions);
+mlir_op_trait!(AtomicYield, ZeroSuccessors);
+
+/// Constructs a new detached [`AtomicYieldOperation`].
+pub fn atomic_yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    value: ValueRef<'v, 'c, 't>,
+    location: L,
+) -> DetachedAtomicYieldOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::memref());
+    OperationBuilder::new("memref.atomic_yield", location)
+        .add_operand(value)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `memref::atomic_yield`")
 }
 
 /// Name of the [`Attribute`] that stores the referenced global symbol name.
@@ -846,6 +1134,152 @@ pub fn prefetch<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `memref::prefetch`")
 }
 
+/// Name of the [`Attribute`] that stores static offset entries for view-like operations.
+pub const STATIC_OFFSETS_ATTRIBUTE: &str = "static_offsets";
+
+/// Name of the [`Attribute`] that stores static size entries for view-like operations.
+pub const STATIC_SIZES_ATTRIBUTE: &str = "static_sizes";
+
+/// Name of the [`Attribute`] that stores static stride entries for view-like operations.
+pub const STATIC_STRIDES_ATTRIBUTE: &str = "static_strides";
+
+/// Operation trait for the `memref.reinterpret_cast` operation.
+pub trait ReinterpretCastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
+    /// Returns the source memref.
+    fn source(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the mixed static or dynamic offset.
+    fn offset(&self) -> StaticOrDynamicIndex<'o, 'c, 't> {
+        let segment_sizes = operand_segment_sizes(self, "memref::reinterpret_cast");
+        let dynamic_offsets = (1..1 + segment_sizes[1] as usize)
+            .map(|index| self.operand_value(index).unwrap())
+            .collect::<Vec<_>>();
+        let static_offsets = self
+            .attribute(STATIC_OFFSETS_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<i64>>())
+            .unwrap_or_else(|| panic!("invalid '{STATIC_OFFSETS_ATTRIBUTE}' attribute in `memref::reinterpret_cast`"));
+        let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
+        let mut dynamic_offsets = dynamic_offsets.into_iter();
+        static_offsets
+            .into_iter()
+            .map(|index| {
+                (index == dynamic_index)
+                    .then(|| dynamic_offsets.next().expect("missing dynamic offset operand"))
+                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+            })
+            .next()
+            .expect("missing reinterpret-cast offset")
+    }
+
+    /// Returns the mixed static and dynamic sizes.
+    fn sizes(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
+        let segment_sizes = operand_segment_sizes(self, "memref::reinterpret_cast");
+        let dynamic_start = 1 + segment_sizes[1] as usize;
+        let dynamic_end = dynamic_start + segment_sizes[2] as usize;
+        let dynamic_sizes =
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
+        let static_sizes = self
+            .attribute(STATIC_SIZES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<i64>>())
+            .unwrap_or_else(|| panic!("invalid '{STATIC_SIZES_ATTRIBUTE}' attribute in `memref::reinterpret_cast`"));
+        let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
+        let mut dynamic_sizes = dynamic_sizes.into_iter();
+        static_sizes
+            .into_iter()
+            .map(|index| {
+                (index == dynamic_index)
+                    .then(|| dynamic_sizes.next().expect("missing dynamic size operand"))
+                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+            })
+            .collect()
+    }
+
+    /// Returns the mixed static and dynamic strides.
+    fn strides(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
+        let segment_sizes = operand_segment_sizes(self, "memref::reinterpret_cast");
+        let dynamic_start = 1 + segment_sizes[1] as usize + segment_sizes[2] as usize;
+        let dynamic_end = dynamic_start + segment_sizes[3] as usize;
+        let dynamic_strides =
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
+        let static_strides = self
+            .attribute(STATIC_STRIDES_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<i64>>())
+            .unwrap_or_else(|| panic!("invalid '{STATIC_STRIDES_ATTRIBUTE}' attribute in `memref::reinterpret_cast`"));
+        let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
+        let mut dynamic_strides = dynamic_strides.into_iter();
+        static_strides
+            .into_iter()
+            .map(|index| {
+                (index == dynamic_index)
+                    .then(|| dynamic_strides.next().expect("missing dynamic stride operand"))
+                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+            })
+            .collect()
+    }
+
+    /// Returns the reinterpreted memref.
+    fn reinterpreted(&self) -> ValueRef<'o, 'c, 't> {
+        self.output()
+    }
+}
+
+mlir_op!(ReinterpretCast);
+mlir_op_trait!(ReinterpretCast, AlwaysSpeculatable);
+mlir_op_trait!(ReinterpretCast, MemRefsNormalizable);
+mlir_op_trait!(ReinterpretCast, NoMemoryEffect);
+mlir_op_trait!(ReinterpretCast, OneResult);
+mlir_op_trait!(ReinterpretCast, Pure);
+mlir_op_trait!(ReinterpretCast, ZeroRegions);
+mlir_op_trait!(ReinterpretCast, ZeroSuccessors);
+
+/// Constructs a new detached [`ReinterpretCastOperation`].
+pub fn reinterpret_cast<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    source: ValueRef<'v, 'c, 't>,
+    offset: StaticOrDynamicIndex<'v, 'c, 't>,
+    sizes: &[StaticOrDynamicIndex<'v, 'c, 't>],
+    strides: &[StaticOrDynamicIndex<'v, 'c, 't>],
+    result_type: T,
+    location: L,
+) -> DetachedReinterpretCastOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::memref());
+    let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
+    let static_offsets = [offset.static_value().unwrap_or(dynamic_index)];
+    let dynamic_offsets = offset.dynamic_value().into_iter().collect::<Vec<_>>();
+    let static_sizes = sizes.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
+    let dynamic_sizes = sizes.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
+    let static_strides = strides.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
+    let dynamic_strides = strides.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
+    OperationBuilder::new("memref.reinterpret_cast", location)
+        .add_attribute(
+            OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+            context
+                .dense_i32_array_attribute(&[
+                    1,
+                    dynamic_offsets.len() as i32,
+                    dynamic_sizes.len() as i32,
+                    dynamic_strides.len() as i32,
+                ])
+                .unwrap(),
+        )
+        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets).unwrap())
+        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes).unwrap())
+        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides).unwrap())
+        .add_operand(source)
+        .add_operands(&dynamic_offsets)
+        .add_operands(&dynamic_sizes)
+        .add_operands(&dynamic_strides)
+        .add_result(result_type)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `memref::reinterpret_cast`")
+}
+
 /// Operation trait for the `memref.rank` operation.
 pub trait RankOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the source memref.
@@ -921,6 +1355,142 @@ pub fn reshape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         .expect("invalid arguments to `memref::reshape`")
 }
 
+/// Name of the [`Attribute`] that stores reassociation groups for MemRef reshape operations.
+pub const REASSOCIATION_ATTRIBUTE: &str = "reassociation";
+
+/// Name of the [`Attribute`] that stores static output shape entries for `memref.expand_shape`.
+pub const STATIC_OUTPUT_SHAPE_ATTRIBUTE: &str = "static_output_shape";
+
+/// Operation trait shared by `memref.expand_shape` and `memref.collapse_shape`.
+pub trait ReassociativeReshapeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
+    /// Returns the source memref.
+    fn source(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the reassociation groups.
+    fn reassociation(&self) -> ArrayAttributeRef<'c, 't> {
+        self.attribute(REASSOCIATION_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<ArrayAttributeRef>())
+            .unwrap_or_else(|| panic!("invalid '{REASSOCIATION_ATTRIBUTE}' attribute in `{}`", self.name()))
+    }
+
+    /// Returns the resulting memref.
+    fn reshaped(&self) -> ValueRef<'o, 'c, 't> {
+        self.output()
+    }
+}
+
+/// Operation trait for the `memref.expand_shape` operation.
+pub trait ExpandShapeOperation<'o, 'c: 'o, 't: 'c>: ReassociativeReshapeOperation<'o, 'c, 't> {
+    /// Returns the mixed static and dynamic output shape entries.
+    fn output_shape(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
+        let dynamic_shape =
+            (1..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
+        let static_shape = self
+            .attribute(STATIC_OUTPUT_SHAPE_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
+            .map(|attribute| attribute.values().collect::<Vec<i64>>())
+            .unwrap_or_else(|| panic!("invalid '{STATIC_OUTPUT_SHAPE_ATTRIBUTE}' attribute in `memref::expand_shape`"));
+        let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
+        let mut dynamic_shape = dynamic_shape.into_iter();
+        static_shape
+            .into_iter()
+            .map(|index| {
+                (index == dynamic_index)
+                    .then(|| dynamic_shape.next().expect("missing dynamic output shape operand"))
+                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+            })
+            .collect()
+    }
+}
+
+mlir_op!(ExpandShape);
+mlir_op_trait!(ExpandShape, AlwaysSpeculatable);
+mlir_op_trait!(ExpandShape, NoMemoryEffect);
+mlir_op_trait!(ExpandShape, OneResult);
+mlir_op_trait!(ExpandShape, Pure);
+mlir_op_trait!(ExpandShape, ZeroRegions);
+mlir_op_trait!(ExpandShape, ZeroSuccessors);
+mlir_op_trait!(ExpandShape, @local ReassociativeReshapeOperation);
+
+/// Constructs a new detached [`ExpandShapeOperation`].
+pub fn expand_shape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    source: ValueRef<'v, 'c, 't>,
+    reassociation: &[&[i64]],
+    output_shape: &[StaticOrDynamicIndex<'v, 'c, 't>],
+    result_type: T,
+    location: L,
+) -> DetachedExpandShapeOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::memref());
+    let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
+    let index_attribute_type = context.signless_integer_type(64);
+    let reassociation = reassociation
+        .iter()
+        .map(|group| {
+            let group = group
+                .iter()
+                .map(|index| context.integer_attribute(index_attribute_type, *index))
+                .collect::<Vec<_>>();
+            context.array_attribute(&group).as_ref()
+        })
+        .collect::<Vec<_>>();
+    let static_output_shape =
+        output_shape.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
+    let dynamic_output_shape = output_shape.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
+    OperationBuilder::new("memref.expand_shape", location)
+        .add_operand(source)
+        .add_operands(&dynamic_output_shape)
+        .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))
+        .add_attribute(STATIC_OUTPUT_SHAPE_ATTRIBUTE, context.dense_i64_array_attribute(&static_output_shape).unwrap())
+        .add_result(result_type)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `memref::expand_shape`")
+}
+
+/// Operation trait for the `memref.collapse_shape` operation.
+pub trait CollapseShapeOperation<'o, 'c: 'o, 't: 'c>: ReassociativeReshapeOperation<'o, 'c, 't> {}
+
+mlir_op!(CollapseShape);
+mlir_op_trait!(CollapseShape, AlwaysSpeculatable);
+mlir_op_trait!(CollapseShape, NoMemoryEffect);
+mlir_op_trait!(CollapseShape, OneResult);
+mlir_op_trait!(CollapseShape, Pure);
+mlir_op_trait!(CollapseShape, ZeroRegions);
+mlir_op_trait!(CollapseShape, ZeroSuccessors);
+mlir_op_trait!(CollapseShape, @local ReassociativeReshapeOperation);
+
+/// Constructs a new detached [`CollapseShapeOperation`].
+pub fn collapse_shape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    source: ValueRef<'v, 'c, 't>,
+    reassociation: &[&[i64]],
+    result_type: T,
+    location: L,
+) -> DetachedCollapseShapeOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::memref());
+    let index_attribute_type = context.signless_integer_type(64);
+    let reassociation = reassociation
+        .iter()
+        .map(|group| {
+            let group = group
+                .iter()
+                .map(|index| context.integer_attribute(index_attribute_type, *index))
+                .collect::<Vec<_>>();
+            context.array_attribute(&group).as_ref()
+        })
+        .collect::<Vec<_>>();
+    OperationBuilder::new("memref.collapse_shape", location)
+        .add_operand(source)
+        .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))
+        .add_result(result_type)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `memref::collapse_shape`")
+}
+
 /// Operation trait for the `memref.store` operation.
 pub trait StoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the stored value.
@@ -988,15 +1558,6 @@ pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `memref::store`")
 }
-
-/// Name of the [`Attribute`] that stores static offset entries for view-like operations.
-pub const STATIC_OFFSETS_ATTRIBUTE: &str = "static_offsets";
-
-/// Name of the [`Attribute`] that stores static size entries for view-like operations.
-pub const STATIC_SIZES_ATTRIBUTE: &str = "static_sizes";
-
-/// Name of the [`Attribute`] that stores static stride entries for view-like operations.
-pub const STATIC_STRIDES_ATTRIBUTE: &str = "static_strides";
 
 /// Operation trait for the `memref.subview` operation.
 pub trait SubViewOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
@@ -1134,6 +1695,167 @@ pub fn subview<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         .expect("invalid arguments to `memref::subview`")
 }
 
+/// Name of the [`Attribute`] that stores the affine-map permutation for `memref.transpose`.
+pub const PERMUTATION_ATTRIBUTE: &str = "permutation";
+
+/// Operation trait for the `memref.transpose` operation.
+pub trait TransposeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
+    /// Returns the input memref.
+    fn input(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the affine-map permutation.
+    fn permutation(&self) -> AffineMap<'c, 't> {
+        self.attribute(PERMUTATION_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<AffineMapAttributeRef>())
+            .map(|attribute| attribute.affine_map())
+            .unwrap_or_else(|| panic!("invalid '{PERMUTATION_ATTRIBUTE}' attribute in `memref::transpose`"))
+    }
+
+    /// Returns the transposed memref.
+    fn transposed(&self) -> ValueRef<'o, 'c, 't> {
+        self.output()
+    }
+}
+
+mlir_op!(Transpose);
+mlir_op_trait!(Transpose, AlwaysSpeculatable);
+mlir_op_trait!(Transpose, NoMemoryEffect);
+mlir_op_trait!(Transpose, OneResult);
+mlir_op_trait!(Transpose, Pure);
+mlir_op_trait!(Transpose, ZeroRegions);
+mlir_op_trait!(Transpose, ZeroSuccessors);
+
+/// Constructs a new detached [`TransposeOperation`].
+pub fn transpose<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    input: ValueRef<'v, 'c, 't>,
+    permutation: AffineMap<'c, 't>,
+    result_type: T,
+    location: L,
+) -> DetachedTransposeOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::memref());
+    OperationBuilder::new("memref.transpose", location)
+        .add_operand(input)
+        .add_attribute(PERMUTATION_ATTRIBUTE, context.affine_map_attribute(permutation))
+        .add_result(result_type)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `memref::transpose`")
+}
+
+/// Operation trait for the `memref.view` operation.
+pub trait ViewOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
+    /// Returns the source byte buffer.
+    fn source(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the dynamic byte-shift operand.
+    fn byte_shift(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(1).unwrap()
+    }
+
+    /// Returns the dynamic size operands.
+    fn sizes(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+        (2..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    }
+
+    /// Returns the viewed memref.
+    fn viewed(&self) -> ValueRef<'o, 'c, 't> {
+        self.output()
+    }
+}
+
+mlir_op!(View);
+mlir_op_trait!(View, AlwaysSpeculatable);
+mlir_op_trait!(View, NoMemoryEffect);
+mlir_op_trait!(View, OneResult);
+mlir_op_trait!(View, Pure);
+mlir_op_trait!(View, ZeroRegions);
+mlir_op_trait!(View, ZeroSuccessors);
+
+/// Constructs a new detached [`ViewOperation`].
+pub fn view<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
+    source: ValueRef<'v, 'c, 't>,
+    byte_shift: ValueRef<'v, 'c, 't>,
+    sizes: &[ValueRef<'v, 'c, 't>],
+    result_type: T,
+    location: L,
+) -> DetachedViewOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::memref());
+    OperationBuilder::new("memref.view", location)
+        .add_operand(source)
+        .add_operand(byte_shift)
+        .add_operands(sizes)
+        .add_result(result_type)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `memref::view`")
+}
+
+/// Name of the [`Attribute`] that stores an atomic read-modify-write kind.
+pub const KIND_ATTRIBUTE: &str = "kind";
+
+/// Operation trait for the `memref.atomic_rmw` operation.
+pub trait AtomicRmwOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
+    /// Returns the atomic read-modify-write kind.
+    fn kind(&self) -> AtomicRmwKind {
+        self.attribute(KIND_ATTRIBUTE)
+            .and_then(|attribute| attribute.cast::<AtomicRmwKindAttributeRef>())
+            .map(|attribute| attribute.value())
+            .unwrap_or_else(|| panic!("invalid '{KIND_ATTRIBUTE}' attribute in `memref::atomic_rmw`"))
+    }
+
+    /// Returns the value applied by the read-modify-write operation.
+    fn value(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the memref being read and updated atomically.
+    fn memref(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(1).unwrap()
+    }
+
+    /// Returns the index operands used to access the memref.
+    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+        (2..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    }
+
+    /// Returns the latest stored value.
+    fn latest_value(&self) -> ValueRef<'o, 'c, 't> {
+        self.output()
+    }
+}
+
+mlir_op!(AtomicRmw);
+mlir_op_trait!(AtomicRmw, OneResult);
+mlir_op_trait!(AtomicRmw, ZeroRegions);
+mlir_op_trait!(AtomicRmw, ZeroSuccessors);
+
+/// Constructs a new detached [`AtomicRmwOperation`].
+pub fn atomic_rmw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    kind: AtomicRmwKind,
+    value: ValueRef<'v, 'c, 't>,
+    memref: ValueRef<'v, 'c, 't>,
+    indices: &[ValueRef<'v, 'c, 't>],
+    location: L,
+) -> DetachedAtomicRmwOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::memref());
+    OperationBuilder::new("memref.atomic_rmw", location)
+        .add_attribute(KIND_ATTRIBUTE, context.arith_atomic_rmw_kind_attribute(kind))
+        .add_operand(value)
+        .add_operand(memref)
+        .add_operands(indices)
+        .add_result(value.r#type())
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `memref::atomic_rmw`")
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -1143,6 +1865,91 @@ mod tests {
     use crate::{Block, Context, Operation, Symbol, Type, Value};
 
     use super::*;
+
+    #[test]
+    fn test_dma_start_and_dma_wait() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        let i32_type = context.signless_integer_type(32);
+        let index_type = context.index_type();
+        let destination_memory_space = context.integer_attribute(index_type, 1);
+        let tag_memory_space = context.integer_attribute(index_type, 2);
+        let source_type = context.mem_ref_type(f32_type, &[Size::Static(16)], None, None, location).unwrap();
+        let destination_type = context
+            .mem_ref_type(f32_type, &[Size::Static(16)], None, Some(destination_memory_space.as_ref()), location)
+            .unwrap();
+        let tag_type = context
+            .mem_ref_type(i32_type, &[Size::Static(1)], None, Some(tag_memory_space.as_ref()), location)
+            .unwrap();
+
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (source_type.as_ref(), location),
+                (destination_type.as_ref(), location),
+                (tag_type.as_ref(), location),
+                (index_type.as_ref(), location),
+                (index_type.as_ref(), location),
+            ]);
+            let source = block.argument(0).unwrap().as_ref();
+            let destination = block.argument(1).unwrap().as_ref();
+            let tag = block.argument(2).unwrap().as_ref();
+            let num_elements = block.argument(3).unwrap().as_ref();
+            let index = block.argument(4).unwrap().as_ref();
+
+            let dma_start_op =
+                dma_start(source, &[index], destination, &[index], num_elements, tag, &[index], None, None, location);
+            assert_eq!(dma_start_op.source(), source);
+            assert_eq!(dma_start_op.source_indices(), vec![index]);
+            assert_eq!(dma_start_op.destination(), destination);
+            assert_eq!(dma_start_op.destination_indices(), vec![index]);
+            assert_eq!(dma_start_op.num_elements(), num_elements);
+            assert_eq!(dma_start_op.tag(), tag);
+            assert_eq!(dma_start_op.tag_indices(), vec![index]);
+            assert!(!dma_start_op.is_strided());
+            assert_eq!(dma_start_op.stride(), None);
+            assert_eq!(dma_start_op.elements_per_stride(), None);
+            block.append_operation(dma_start_op);
+
+            let dma_wait_op = dma_wait(tag, &[index], num_elements, location);
+            assert_eq!(dma_wait_op.tag(), tag);
+            assert_eq!(dma_wait_op.tag_indices(), vec![index]);
+            assert_eq!(dma_wait_op.num_elements(), num_elements);
+            block.append_operation(dma_wait_op);
+
+            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
+            func::func(
+                "memref_dma",
+                func::FuncAttributes {
+                    arguments: vec![
+                        source_type.into(),
+                        destination_type.into(),
+                        tag_type.into(),
+                        index_type.into(),
+                        index_type.into(),
+                    ],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @memref_dma(%arg0: memref<16xf32>, %arg1: memref<16xf32, 1 : index>, %arg2: memref<1xi32, 2 : index>, %arg3: index, %arg4: index) {
+                    memref.dma_start %arg0[%arg4], %arg1[%arg4], %arg3, %arg2[%arg4] : memref<16xf32>, memref<16xf32, 1 : index>, memref<1xi32, 2 : index>
+                    memref.dma_wait %arg2[%arg4], %arg3 : memref<1xi32, 2 : index>
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
     #[test]
     fn test_alloc_load_store_dealloc_and_prefetch() {
@@ -1303,6 +2110,175 @@ mod tests {
                     %0 = memref.rank %cast : memref<?x?xf32>
                     %intptr = memref.extract_aligned_pointer_as_index %cast : memref<?x?xf32> -> index
                     return %cast, %dim, %0, %intptr : memref<?x?xf32>, index, index, index
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_metadata_reinterpret_expand_collapse_transpose_and_view() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let index_type = context.index_type();
+        let f32_type = context.float32_type();
+        let i8_type = context.signless_integer_type(8);
+        let source_type =
+            context.mem_ref_type(f32_type, &[Size::Dynamic, Size::Dynamic], None, None, location).unwrap();
+        let base_buffer_type = context.mem_ref_type(f32_type, &[], None, None, location).unwrap();
+        let reinterpret_type = context
+            .parse_type("memref<?x?xf32, strided<[?, ?], offset: ?>>")
+            .unwrap()
+            .cast::<MemRefTypeRef>()
+            .unwrap();
+        let expand_source_type =
+            context.mem_ref_type(f32_type, &[Size::Dynamic, Size::Static(32)], None, None, location).unwrap();
+        let expanded_type = context
+            .mem_ref_type(f32_type, &[Size::Dynamic, Size::Dynamic, Size::Static(32)], None, None, location)
+            .unwrap();
+        let transposed_type =
+            context.parse_type("memref<?x?xf32, strided<[1, ?]>>").unwrap().cast::<MemRefTypeRef>().unwrap();
+        let byte_buffer_type = context.mem_ref_type(i8_type, &[Size::Static(2048)], None, None, location).unwrap();
+        let view_type =
+            context.mem_ref_type(f32_type, &[Size::Dynamic, Size::Static(4)], None, None, location).unwrap();
+
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (source_type.as_ref(), location),
+                (expand_source_type.as_ref(), location),
+                (byte_buffer_type.as_ref(), location),
+                (index_type.as_ref(), location),
+            ]);
+            let source = block.argument(0).unwrap().as_ref();
+            let reshape_source = block.argument(1).unwrap().as_ref();
+            let byte_buffer = block.argument(2).unwrap().as_ref();
+            let dynamic_size = block.argument(3).unwrap().as_ref();
+
+            let metadata_op = extract_strided_metadata(source, base_buffer_type, location);
+            assert_eq!(metadata_op.source(), source);
+            assert_eq!(metadata_op.base_buffer().r#type(), base_buffer_type);
+            assert_eq!(metadata_op.offset().r#type(), index_type);
+            assert_eq!(metadata_op.sizes().len(), 2);
+            assert_eq!(metadata_op.strides().len(), 2);
+            let metadata_op = block.append_operation(metadata_op);
+            let base_buffer = metadata_op.result(0).unwrap().as_ref();
+            let offset = metadata_op.result(1).unwrap().as_ref();
+            let size_0 = metadata_op.result(2).unwrap().as_ref();
+            let size_1 = metadata_op.result(3).unwrap().as_ref();
+            let stride_0 = metadata_op.result(4).unwrap().as_ref();
+            let stride_1 = metadata_op.result(5).unwrap().as_ref();
+
+            let reinterpret_op = reinterpret_cast(
+                base_buffer,
+                StaticOrDynamicIndex::Dynamic(offset),
+                &[StaticOrDynamicIndex::Dynamic(size_0), StaticOrDynamicIndex::Dynamic(size_1)],
+                &[StaticOrDynamicIndex::Dynamic(stride_0), StaticOrDynamicIndex::Dynamic(stride_1)],
+                reinterpret_type,
+                location,
+            );
+            assert_eq!(reinterpret_op.source(), base_buffer);
+            assert_eq!(reinterpret_op.offset(), StaticOrDynamicIndex::Dynamic(offset));
+            assert_eq!(
+                reinterpret_op.sizes(),
+                vec![StaticOrDynamicIndex::Dynamic(size_0), StaticOrDynamicIndex::Dynamic(size_1)],
+            );
+            assert_eq!(
+                reinterpret_op.strides(),
+                vec![StaticOrDynamicIndex::Dynamic(stride_0), StaticOrDynamicIndex::Dynamic(stride_1)],
+            );
+            assert_eq!(reinterpret_op.reinterpreted().r#type(), reinterpret_type);
+            let reinterpret_op = block.append_operation(reinterpret_op);
+
+            let expand_op = expand_shape(
+                reshape_source,
+                &[&[0, 1], &[2]],
+                &[
+                    StaticOrDynamicIndex::Dynamic(dynamic_size),
+                    StaticOrDynamicIndex::Dynamic(dynamic_size),
+                    StaticOrDynamicIndex::Static(32),
+                ],
+                expanded_type,
+                location,
+            );
+            assert_eq!(expand_op.source(), reshape_source);
+            assert_eq!(expand_op.reassociation().len(), 2);
+            assert_eq!(
+                expand_op.output_shape(),
+                vec![
+                    StaticOrDynamicIndex::Dynamic(dynamic_size),
+                    StaticOrDynamicIndex::Dynamic(dynamic_size),
+                    StaticOrDynamicIndex::Static(32),
+                ],
+            );
+            assert_eq!(expand_op.reshaped().r#type(), expanded_type);
+            let expand_op = block.append_operation(expand_op);
+
+            let collapse_op =
+                collapse_shape(expand_op.result(0).unwrap().as_ref(), &[&[0, 1], &[2]], expand_source_type, location);
+            assert_eq!(collapse_op.source(), expand_op.result(0).unwrap().as_ref());
+            assert_eq!(collapse_op.reassociation().len(), 2);
+            assert_eq!(collapse_op.reshaped().r#type(), expand_source_type);
+            let collapse_op = block.append_operation(collapse_op);
+
+            let permutation = context.permutation_affine_map(2, &[1, 0]);
+            let transpose_op = transpose(source, permutation, transposed_type, location);
+            assert_eq!(transpose_op.input(), source);
+            assert_eq!(transpose_op.permutation(), permutation);
+            assert_eq!(transpose_op.transposed().r#type(), transposed_type);
+            let transpose_op = block.append_operation(transpose_op);
+
+            let view_op = view(byte_buffer, dynamic_size, &[dynamic_size], view_type, location);
+            assert_eq!(view_op.source(), byte_buffer);
+            assert_eq!(view_op.byte_shift(), dynamic_size);
+            assert_eq!(view_op.sizes(), vec![dynamic_size]);
+            assert_eq!(view_op.viewed().r#type(), view_type);
+            let view_op = block.append_operation(view_op);
+
+            block.append_operation(func::r#return(
+                &[
+                    reinterpret_op.result(0).unwrap().as_ref(),
+                    collapse_op.result(0).unwrap().as_ref(),
+                    transpose_op.result(0).unwrap().as_ref(),
+                    view_op.result(0).unwrap().as_ref(),
+                ],
+                location,
+            ));
+            func::func(
+                "memref_views",
+                func::FuncAttributes {
+                    arguments: vec![
+                        source_type.into(),
+                        expand_source_type.into(),
+                        byte_buffer_type.into(),
+                        index_type.into(),
+                    ],
+                    results: vec![
+                        reinterpret_type.into(),
+                        expand_source_type.into(),
+                        transposed_type.into(),
+                        view_type.into(),
+                    ],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @memref_views(%arg0: memref<?x?xf32>, %arg1: memref<?x32xf32>, %arg2: memref<2048xi8>, %arg3: index) -> (memref<?x?xf32, strided<[?, ?], offset: ?>>, memref<?x32xf32>, memref<?x?xf32, strided<[1, ?]>>, memref<?x4xf32>) {
+                    %base_buffer, %offset, %sizes:2, %strides:2 = memref.extract_strided_metadata %arg0 : memref<?x?xf32> -> memref<f32>, index, index, index, index, index
+                    %reinterpret_cast = memref.reinterpret_cast %base_buffer to offset: [%offset], sizes: [%sizes#0, %sizes#1], strides: [%strides#0, %strides#1] : memref<f32> to memref<?x?xf32, strided<[?, ?], offset: ?>>
+                    %expand_shape = memref.expand_shape %arg1 [[0, 1], [2]] output_shape [%arg3, %arg3, 32] : memref<?x32xf32> into memref<?x?x32xf32>
+                    %collapse_shape = memref.collapse_shape %expand_shape [[0, 1], [2]] : memref<?x?x32xf32> into memref<?x32xf32>
+                    %transpose = memref.transpose %arg0 (d0, d1) -> (d1, d0) : memref<?x?xf32> to memref<?x?xf32, strided<[1, ?]>>
+                    %view = memref.view %arg2[%arg3][%arg3] : memref<2048xi8> to memref<?x4xf32>
+                    return %reinterpret_cast, %collapse_shape, %transpose, %view : memref<?x?xf32, strided<[?, ?], offset: ?>>, memref<?x32xf32>, memref<?x?xf32, strided<[1, ?]>>, memref<?x4xf32>
                   }
                 }
             "},
@@ -1571,6 +2547,80 @@ mod tests {
                   func.func @memref_subview(%arg0: memref<8x16xf32>) -> memref<4x8xf32, strided<[16, 1], offset: 18>> {
                     %subview = memref.subview %arg0[1, 2] [4, 8] [1, 1] : memref<8x16xf32> to memref<4x8xf32, strided<[16, 1], offset: 18>>
                     return %subview : memref<4x8xf32, strided<[16, 1], offset: 18>>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_atomic_rmw_operations() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let index_type = context.index_type();
+        let f32_type = context.float32_type();
+        let memref_type = context.mem_ref_type(f32_type, &[Size::Static(10)], None, None, location).unwrap();
+
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (memref_type.as_ref(), location),
+                (index_type.as_ref(), location),
+                (f32_type.as_ref(), location),
+            ]);
+            let memref = block.argument(0).unwrap().as_ref();
+            let index = block.argument(1).unwrap().as_ref();
+            let value = block.argument(2).unwrap().as_ref();
+
+            let atomic_rmw_op = atomic_rmw(AtomicRmwKind::AddFloat, value, memref, &[index], location);
+            assert_eq!(atomic_rmw_op.kind(), AtomicRmwKind::AddFloat);
+            assert_eq!(atomic_rmw_op.value(), value);
+            assert_eq!(atomic_rmw_op.memref(), memref);
+            assert_eq!(atomic_rmw_op.indices(), vec![index]);
+            assert_eq!(atomic_rmw_op.latest_value().r#type(), f32_type);
+            let atomic_rmw_op = block.append_operation(atomic_rmw_op);
+
+            let mut atomic_block = context.block(&[(f32_type.as_ref(), location)]);
+            let current_value = atomic_block.argument(0).unwrap().as_ref();
+            let atomic_yield_op = atomic_yield(current_value, location);
+            assert_eq!(atomic_yield_op.value(), current_value);
+            atomic_block.append_operation(atomic_yield_op);
+
+            let generic_atomic_rmw_op = generic_atomic_rmw(memref, &[index], f32_type, atomic_block.into(), location);
+            assert_eq!(generic_atomic_rmw_op.memref(), memref);
+            assert_eq!(generic_atomic_rmw_op.indices(), vec![index]);
+            assert_eq!(generic_atomic_rmw_op.latest_value().r#type(), f32_type);
+            assert_eq!(generic_atomic_rmw_op.region_count(), 1);
+            let generic_atomic_rmw_op = block.append_operation(generic_atomic_rmw_op);
+
+            block.append_operation(func::r#return(
+                &[atomic_rmw_op.result(0).unwrap().as_ref(), generic_atomic_rmw_op.result(0).unwrap().as_ref()],
+                location,
+            ));
+            func::func(
+                "memref_atomics",
+                func::FuncAttributes {
+                    arguments: vec![memref_type.into(), index_type.into(), f32_type.into()],
+                    results: vec![f32_type.into(), f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @memref_atomics(%arg0: memref<10xf32>, %arg1: index, %arg2: f32) -> (f32, f32) {
+                    %0 = memref.atomic_rmw addf %arg2, %arg0[%arg1] : (f32, memref<10xf32>) -> f32
+                    %1 = memref.generic_atomic_rmw %arg0[%arg1] : memref<10xf32> {
+                    ^bb0(%arg3: f32):
+                      memref.atomic_yield %arg3 : f32
+                    }
+                    return %0, %1 : f32, f32
                   }
                 }
             "},

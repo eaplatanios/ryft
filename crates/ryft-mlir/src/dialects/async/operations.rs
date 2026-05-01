@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    Attribute, CALLEE_ATTRIBUTE, Call, Callee, DenseInteger32ArrayAttributeRef, DetachedOp, DetachedRegion,
+    Attribute, BlockRef, CALLEE_ATTRIBUTE, Call, Callee, DenseInteger32ArrayAttributeRef, DetachedOp, DetachedRegion,
     DialectHandle, FUNCTION_TYPE_ATTRIBUTE, FlatSymbolRefAttributeRef, Function,
     HasCallableArgumentAndResultAttributes, IntoWithContext, Location, Operation, OperationBuilder, RegionRef,
     SYMBOL_NAME_ATTRIBUTE, SYMBOL_VISIBILITY_ATTRIBUTE, StringAttributeRef, StringRef, SymbolVisibility, Type,
@@ -618,6 +618,21 @@ pub trait CoroSuspendOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the saved coroutine state operand.
     fn state(&self) -> ValueRef<'o, 'c, 't> {
         self.operand_value(0).unwrap()
+    }
+
+    /// Returns the successor reached when the coroutine suspends.
+    fn suspend_destination(&self) -> BlockRef<'o, 'c, 't> {
+        self.successor(0).unwrap()
+    }
+
+    /// Returns the successor reached when the coroutine resumes.
+    fn resume_destination(&self) -> BlockRef<'o, 'c, 't> {
+        self.successor(1).unwrap()
+    }
+
+    /// Returns the successor reached when the coroutine is destroyed.
+    fn cleanup_destination(&self) -> BlockRef<'o, 'c, 't> {
+        self.successor(2).unwrap()
     }
 }
 
@@ -1376,6 +1391,9 @@ mod tests {
 
             let suspend_op = coro_suspend(state, &suspend_block, &resume_block, &cleanup_block, location);
             assert_eq!(suspend_op.state(), state.as_ref());
+            assert_eq!(suspend_op.suspend_destination(), suspend_block);
+            assert_eq!(suspend_op.resume_destination(), resume_block);
+            assert_eq!(suspend_op.cleanup_destination(), cleanup_block);
             entry_block.append_operation(suspend_op);
 
             func_dialect::func(
