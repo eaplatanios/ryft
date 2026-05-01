@@ -110,7 +110,7 @@ fn main() {
     - [ ] `llvm`
         - [ ] Add support for types: `LLVMPointerType`, `LLVMStructType`.
         - [ ] Add support for operations.
-    - [ ] `memref`
+    - [x] `memref`
     - [ ] `mhlo`
     - [x] [`mosaic_gpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
     - [x] [`mosaic_tpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/tpu/tpu.td)

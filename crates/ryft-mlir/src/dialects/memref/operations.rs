@@ -34,16 +34,6 @@ impl<'v, 'c: 'v, 't: 'c> StaticOrDynamicIndex<'v, 'c, 't> {
     }
 }
 
-fn split_static_or_dynamic_indices<'v, 'c: 'v, 't: 'c>(
-    indices: &[StaticOrDynamicIndex<'v, 'c, 't>],
-) -> (Vec<i64>, Vec<ValueRef<'v, 'c, 't>>) {
-    let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
-    (
-        indices.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect(),
-        indices.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect(),
-    )
-}
-
 fn join_static_or_dynamic_indices<'o, 'c: 'o, 't: 'c>(
     static_indices: Vec<i64>,
     dynamic_indices: Vec<ValueRef<'o, 'c, 't>>,
@@ -1103,9 +1093,13 @@ pub fn subview<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
 ) -> DetachedSubViewOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::memref());
-    let (static_offsets, dynamic_offsets) = split_static_or_dynamic_indices(offsets);
-    let (static_sizes, dynamic_sizes) = split_static_or_dynamic_indices(sizes);
-    let (static_strides, dynamic_strides) = split_static_or_dynamic_indices(strides);
+    let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
+    let static_offsets = offsets.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
+    let dynamic_offsets = offsets.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
+    let static_sizes = sizes.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
+    let dynamic_sizes = sizes.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
+    let static_strides = strides.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
+    let dynamic_strides = strides.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
     OperationBuilder::new("memref.subview", location)
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
