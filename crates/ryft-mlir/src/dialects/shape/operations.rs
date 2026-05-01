@@ -1560,30 +1560,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func as func_dialect;
-    use crate::{
-        Block, Context, DenseIntegerElementsAttributeRef, FromWithContext, OneResult, Operation, Region, Size, Type,
-        ValueRef,
-    };
+    use crate::{Block, Context, DenseIntegerElementsAttributeRef, FromWithContext, OneResult, Region, Size, Type};
 
     use super::*;
-
-    fn shape_attribute<'c, 't>(
-        context: &'c Context<'t>,
-        extents: &[usize],
-    ) -> DenseIntegerElementsAttributeRef<'c, 't> {
-        DenseIntegerElementsAttributeRef::from_with_context(extents, context)
-    }
-
-    fn operation_result<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(
-        operation: &O,
-        index: usize,
-    ) -> ValueRef<'o, 'c, 't> {
-        operation.result(index).unwrap().as_ref()
-    }
-
-    fn operation_output<'o, 'c: 'o, 't: 'c, O: Operation<'o, 'c, 't>>(operation: &O) -> ValueRef<'o, 'c, 't> {
-        operation_result(operation, 0)
-    }
 
     #[test]
     fn test_size_arithmetic_operations() {
@@ -1596,33 +1575,33 @@ mod tests {
 
             let size_2_op = const_size(2, location);
             assert_eq!(size_2_op.value(), 2);
-            assert_eq!(operation_output(&size_2_op).r#type(), size_type);
+            assert_eq!(size_2_op.output().r#type(), size_type);
             let size_2 = block.append_operation(size_2_op);
-            let size_2 = operation_output(&size_2);
+            let size_2 = size_2.result(0).unwrap().as_ref();
 
             let size_3_op = const_size(3, location);
             assert_eq!(size_3_op.value(), 3);
             let size_3 = block.append_operation(size_3_op);
-            let size_3 = operation_output(&size_3);
+            let size_3 = size_3.result(0).unwrap().as_ref();
 
             let add_op = add(size_2, size_3, size_type, location);
             assert_eq!(add_op.lhs(), size_2);
             assert_eq!(add_op.rhs(), size_3);
             assert_eq!(add_op.output_type(), size_type);
             let add_op = block.append_operation(add_op);
-            let add_value = operation_output(&add_op);
+            let add_value = add_op.result(0).unwrap().as_ref();
 
             let div_op = div(size_3, size_2, size_type, location);
             assert_eq!(div_op.lhs(), size_3);
             assert_eq!(div_op.rhs(), size_2);
             let div_op = block.append_operation(div_op);
-            let div_value = operation_output(&div_op);
+            let div_value = div_op.result(0).unwrap().as_ref();
 
             let max_op = max(add_value, div_value, size_type, location);
             assert_eq!(max_op.lhs(), add_value);
             assert_eq!(max_op.rhs(), div_value);
             let max_op = block.append_operation(max_op);
-            let max_value = operation_output(&max_op);
+            let max_value = max_op.result(0).unwrap().as_ref();
 
             let meet_error = context.string_attribute("size mismatch");
             let meet_op = meet(max_value, size_3, size_type, Some(meet_error), location);
@@ -1630,29 +1609,29 @@ mod tests {
             assert_eq!(meet_op.second_argument(), size_3);
             assert_eq!(meet_op.error().unwrap().string().as_str().unwrap(), "size mismatch");
             let meet_op = block.append_operation(meet_op);
-            let meet_value = operation_output(&meet_op);
+            let meet_value = meet_op.result(0).unwrap().as_ref();
 
             let min_op = min(meet_value, size_2, size_type, location);
             assert_eq!(min_op.lhs(), meet_value);
             assert_eq!(min_op.rhs(), size_2);
             let min_op = block.append_operation(min_op);
-            let min_value = operation_output(&min_op);
+            let min_value = min_op.result(0).unwrap().as_ref();
 
             let mul_op = mul(min_value, size_3, size_type, location);
             assert_eq!(mul_op.lhs(), min_value);
             assert_eq!(mul_op.rhs(), size_3);
             let mul_op = block.append_operation(mul_op);
-            let mul_value = operation_output(&mul_op);
+            let mul_value = mul_op.result(0).unwrap().as_ref();
 
             let size_to_index_op = size_to_index(mul_value, location);
             assert_eq!(size_to_index_op.argument(), mul_value);
             let size_to_index_op = block.append_operation(size_to_index_op);
-            let index_value = operation_output(&size_to_index_op);
+            let index_value = size_to_index_op.result(0).unwrap().as_ref();
 
             let index_to_size_op = index_to_size(index_value, location);
             assert_eq!(index_to_size_op.argument(), index_value);
             let index_to_size_op = block.append_operation(index_to_size_op);
-            let result = operation_output(&index_to_size_op);
+            let result = index_to_size_op.result(0).unwrap().as_ref();
 
             block.append_operation(func_dialect::r#return(&[result], location));
             func_dialect::func(
@@ -1695,71 +1674,71 @@ mod tests {
             let mut block = context.block_with_no_arguments();
 
             let size_2 = block.append_operation(const_size(2, location));
-            let size_2 = operation_output(&size_2);
+            let size_2 = size_2.result(0).unwrap().as_ref();
             let size_3 = block.append_operation(const_size(3, location));
-            let size_3 = operation_output(&size_3);
+            let size_3 = size_3.result(0).unwrap().as_ref();
 
-            let shape_0_attribute = shape_attribute(&context, &[2, 3]);
+            let shape_0_attribute = DenseIntegerElementsAttributeRef::from_with_context(&[2usize, 3][..], &context);
             let shape_0 = const_shape(shape_0_attribute, shape_type, location);
             assert_eq!(shape_0.shape(), shape_0_attribute);
             assert_eq!(shape_0.output_type(), shape_type);
             let shape_0 = block.append_operation(shape_0);
-            let shape_0 = operation_output(&shape_0);
+            let shape_0 = shape_0.result(0).unwrap().as_ref();
 
-            let shape_1_attribute = shape_attribute(&context, &[1, 3]);
+            let shape_1_attribute = DenseIntegerElementsAttributeRef::from_with_context(&[1usize, 3][..], &context);
             let shape_1 = const_shape(shape_1_attribute, shape_type, location);
             assert_eq!(shape_1.shape(), shape_1_attribute);
             let shape_1 = block.append_operation(shape_1);
-            let shape_1 = operation_output(&shape_1);
+            let shape_1 = shape_1.result(0).unwrap().as_ref();
 
             let from_extents_op = from_extents(&[size_2, size_3], location);
             assert_eq!(from_extents_op.extents().collect::<Vec<_>>(), vec![size_2, size_3]);
             let from_extents_op = block.append_operation(from_extents_op);
-            let from_extents_value = operation_output(&from_extents_op);
+            let from_extents_value = from_extents_op.result(0).unwrap().as_ref();
 
             let broadcast_error = context.string_attribute("cannot broadcast");
             let broadcast_op = broadcast(&[shape_0, from_extents_value], shape_type, Some(broadcast_error), location);
             assert_eq!(broadcast_op.shapes().collect::<Vec<_>>(), vec![shape_0, from_extents_value],);
             assert_eq!(broadcast_op.error().unwrap().string().as_str().unwrap(), "cannot broadcast");
             let broadcast_op = block.append_operation(broadcast_op);
-            let broadcast_value = operation_output(&broadcast_op);
+            let broadcast_value = broadcast_op.result(0).unwrap().as_ref();
 
             let shape_eq_op = shape_eq(&[broadcast_value, shape_1], location);
             assert_eq!(shape_eq_op.shapes().collect::<Vec<_>>(), vec![broadcast_value, shape_1]);
             let shape_eq_op = block.append_operation(shape_eq_op);
-            let shape_eq_value = operation_output(&shape_eq_op);
+            let shape_eq_value = shape_eq_op.result(0).unwrap().as_ref();
 
             let is_broadcastable_op = is_broadcastable(&[shape_0, shape_1], location);
             assert_eq!(is_broadcastable_op.shapes().collect::<Vec<_>>(), vec![shape_0, shape_1]);
             let is_broadcastable_op = block.append_operation(is_broadcastable_op);
-            let is_broadcastable_value = operation_output(&is_broadcastable_op);
+            let is_broadcastable_value = is_broadcastable_op.result(0).unwrap().as_ref();
 
             let concat_op = concat(shape_0, shape_1, shape_type, location);
             assert_eq!(concat_op.lhs(), shape_0);
             assert_eq!(concat_op.rhs(), shape_1);
             let concat_op = block.append_operation(concat_op);
-            let concat_value = operation_output(&concat_op);
+            let concat_value = concat_op.result(0).unwrap().as_ref();
 
             let any_op = any(&[shape_0, shape_1, concat_value], shape_type, location);
             assert_eq!(any_op.inputs().collect::<Vec<_>>(), vec![shape_0, shape_1, concat_value]);
             let any_op = block.append_operation(any_op);
-            let any_value = operation_output(&any_op);
+            let any_value = any_op.result(0).unwrap().as_ref();
 
             let assuming_all_inputs = {
                 let cstr_broadcastable_op = cstr_broadcastable(&[shape_0, shape_1], location);
                 assert_eq!(cstr_broadcastable_op.shapes().collect::<Vec<_>>(), vec![shape_0, shape_1]);
                 let cstr_broadcastable_op = block.append_operation(cstr_broadcastable_op);
-                let cstr_broadcastable_value = operation_output(&cstr_broadcastable_op);
+                let cstr_broadcastable_value = cstr_broadcastable_op.result(0).unwrap().as_ref();
 
                 let cstr_eq_op = cstr_eq(&[shape_0, shape_1, from_extents_value], location);
                 assert_eq!(cstr_eq_op.shapes().collect::<Vec<_>>(), vec![shape_0, shape_1, from_extents_value]);
                 let cstr_eq_op = block.append_operation(cstr_eq_op);
-                let cstr_eq_value = operation_output(&cstr_eq_op);
+                let cstr_eq_value = cstr_eq_op.result(0).unwrap().as_ref();
 
                 let const_witness_op = const_witness(true, location);
                 assert!(const_witness_op.passing());
                 let const_witness_op = block.append_operation(const_witness_op);
-                let const_witness_value = operation_output(&const_witness_op);
+                let const_witness_value = const_witness_op.result(0).unwrap().as_ref();
 
                 vec![cstr_broadcastable_value, cstr_eq_value, const_witness_value]
             };
@@ -1767,13 +1746,13 @@ mod tests {
             let assuming_all_op = assuming_all(&assuming_all_inputs, location);
             assert_eq!(assuming_all_op.inputs().collect::<Vec<_>>(), assuming_all_inputs);
             let assuming_all_op = block.append_operation(assuming_all_op);
-            let assuming_all_value = operation_output(&assuming_all_op);
+            let assuming_all_value = assuming_all_op.result(0).unwrap().as_ref();
 
             let cstr_require_op = cstr_require(shape_eq_value, context.string_attribute("shapes must match"), location);
             assert_eq!(cstr_require_op.predicate(), shape_eq_value);
             assert_eq!(cstr_require_op.message().string().as_str().unwrap(), "shapes must match");
             let cstr_require_op = block.append_operation(cstr_require_op);
-            let cstr_require_value = operation_output(&cstr_require_op);
+            let cstr_require_value = cstr_require_op.result(0).unwrap().as_ref();
 
             block.append_operation(func_dialect::r#return(
                 &[is_broadcastable_value, any_value, assuming_all_value, cstr_require_value],
@@ -1848,60 +1827,60 @@ mod tests {
             let from_extent_tensor_op = from_extent_tensor(extent_tensor, location);
             assert_eq!(from_extent_tensor_op.input(), extent_tensor);
             let from_extent_tensor_op = block.append_operation(from_extent_tensor_op);
-            let from_extent_tensor_value = operation_output(&from_extent_tensor_op);
+            let from_extent_tensor_value = from_extent_tensor_op.result(0).unwrap().as_ref();
 
             let rank_op = rank(from_extent_tensor_value, size_type, location);
             assert_eq!(rank_op.shape(), from_extent_tensor_value);
             let rank_op = block.append_operation(rank_op);
-            let rank_value = operation_output(&rank_op);
+            let rank_value = rank_op.result(0).unwrap().as_ref();
 
             let to_extent_tensor_op = to_extent_tensor(from_extent_tensor_value, extent_tensor_type, location);
             assert_eq!(to_extent_tensor_op.input(), from_extent_tensor_value);
             let to_extent_tensor_op = block.append_operation(to_extent_tensor_op);
-            let to_extent_tensor_value = operation_output(&to_extent_tensor_op);
+            let to_extent_tensor_value = to_extent_tensor_op.result(0).unwrap().as_ref();
 
             let dim_op = dim(tensor_value, index, size_type, location);
             assert_eq!(dim_op.value(), tensor_value);
             assert_eq!(dim_op.index(), index);
             let dim_op = block.append_operation(dim_op);
-            let dim_value = operation_output(&dim_op);
+            let dim_value = dim_op.result(0).unwrap().as_ref();
 
             let get_extent_op = get_extent(from_extent_tensor_value, index, size_type, location);
             assert_eq!(get_extent_op.shape(), from_extent_tensor_value);
             assert_eq!(get_extent_op.dimension(), index);
             let get_extent_op = block.append_operation(get_extent_op);
-            let get_extent_value = operation_output(&get_extent_op);
+            let get_extent_value = get_extent_op.result(0).unwrap().as_ref();
 
             let num_elements_op = num_elements(from_extent_tensor_value, size_type, location);
             assert_eq!(num_elements_op.shape(), from_extent_tensor_value);
             let num_elements_op = block.append_operation(num_elements_op);
-            let num_elements_value = operation_output(&num_elements_op);
+            let num_elements_value = num_elements_op.result(0).unwrap().as_ref();
 
             let shape_of_op = shape_of(tensor_value, shape_type, location);
             assert_eq!(shape_of_op.argument(), tensor_value);
             let shape_of_op = block.append_operation(shape_of_op);
-            let shape_of_value = operation_output(&shape_of_op);
+            let shape_of_value = shape_of_op.result(0).unwrap().as_ref();
 
             let value_of_op = value_of(value_shape, shaped_tensor_type, location);
             assert_eq!(value_of_op.argument(), value_shape);
             let value_of_op = block.append_operation(value_of_op);
-            let value_of_value = operation_output(&value_of_op);
+            let value_of_value = value_of_op.result(0).unwrap().as_ref();
 
             let value_as_shape_op = value_as_shape(extent_tensor, shape_type, location);
             assert_eq!(value_as_shape_op.argument(), extent_tensor);
             let value_as_shape_op = block.append_operation(value_as_shape_op);
-            let value_as_shape_value = operation_output(&value_as_shape_op);
+            let value_as_shape_value = value_as_shape_op.result(0).unwrap().as_ref();
 
             let with_shape_op = with_shape(tensor_value, shape_of_value, location);
             assert_eq!(WithOperation::operand(&with_shape_op), tensor_value);
             assert_eq!(with_shape_op.shape(), shape_of_value);
             let with_shape_op = block.append_operation(with_shape_op);
-            let with_shape_value = operation_output(&with_shape_op);
+            let with_shape_value = with_shape_op.result(0).unwrap().as_ref();
 
             let debug_print_op = debug_print(from_extent_tensor_value, location);
             assert_eq!(debug_print_op.input(), from_extent_tensor_value);
             let debug_print_op = block.append_operation(debug_print_op);
-            let debug_print_value = operation_output(&debug_print_op);
+            let debug_print_value = debug_print_op.result(0).unwrap().as_ref();
 
             let split_at_op =
                 split_at(from_extent_tensor_value, index, [shape_type.as_ref(), shape_type.as_ref()], location);
@@ -1910,8 +1889,8 @@ mod tests {
             assert_eq!(split_at_op.head().r#type(), shape_type);
             assert_eq!(split_at_op.tail().r#type(), shape_type);
             let split_at_op = block.append_operation(split_at_op);
-            let split_at_head = operation_result(&split_at_op, 0);
-            let split_at_tail = operation_result(&split_at_op, 1);
+            let split_at_head = split_at_op.result(0).unwrap().as_ref();
+            let split_at_tail = split_at_op.result(1).unwrap().as_ref();
 
             block.append_operation(func_dialect::r#return(
                 &[
@@ -1994,7 +1973,7 @@ mod tests {
             let mut block = context.block(&[(shape_type.as_ref(), location)]);
             let shape = block.argument(0).unwrap();
             let initial_value = block.append_operation(const_size(1, location));
-            let initial_value = operation_output(&initial_value);
+            let initial_value = initial_value.result(0).unwrap().as_ref();
 
             let mut reduce_block = context.block(&[
                 (index_type.as_ref(), location),
@@ -2004,7 +1983,7 @@ mod tests {
             let dimension = reduce_block.argument(1).unwrap();
             let accumulator = reduce_block.argument(2).unwrap();
             let updated_accumulator = reduce_block.append_operation(mul(dimension, accumulator, size_type, location));
-            let updated_accumulator = operation_output(&updated_accumulator);
+            let updated_accumulator = updated_accumulator.result(0).unwrap().as_ref();
             let yield_op = r#yield(&[updated_accumulator], location);
             assert_eq!(yield_op.values().collect::<Vec<_>>(), vec![updated_accumulator]);
             reduce_block.append_operation(yield_op);
@@ -2014,13 +1993,13 @@ mod tests {
             assert_eq!(reduce_op.initial_values().collect::<Vec<_>>(), vec![initial_value]);
             assert_eq!(ReduceOperation::region(&reduce_op).blocks().count(), 1);
             let reduce_op = block.append_operation(reduce_op);
-            let reduce_value = operation_output(&reduce_op);
+            let reduce_value = reduce_op.result(0).unwrap().as_ref();
 
             let witness = block.append_operation(const_witness(true, location));
-            let witness = operation_output(&witness);
+            let witness = witness.result(0).unwrap().as_ref();
             let mut assuming_block = context.block_with_no_arguments();
             let assumed_value = assuming_block.append_operation(const_size(7, location));
-            let assumed_value = operation_output(&assumed_value);
+            let assumed_value = assumed_value.result(0).unwrap().as_ref();
             let assuming_yield_op = assuming_yield(&[assumed_value], location);
             assert_eq!(assuming_yield_op.values().collect::<Vec<_>>(), vec![assumed_value]);
             assuming_block.append_operation(assuming_yield_op);
@@ -2030,7 +2009,7 @@ mod tests {
             assert_eq!(AssumingOperation::region(&assuming_op).blocks().count(), 1);
             assert_eq!(assuming_op.results().count(), 1);
             let assuming_op = block.append_operation(assuming_op);
-            let assuming_value = operation_output(&assuming_op);
+            let assuming_value = assuming_op.result(0).unwrap().as_ref();
 
             block.append_operation(func_dialect::r#return(&[reduce_value, assuming_value], location));
             func_dialect::func(
@@ -2081,7 +2060,7 @@ mod tests {
         let shape_of_op = shape_of(value_shape, shape_type, location);
         assert_eq!(shape_of_op.argument(), value_shape);
         let shape_of_op = function_body.append_operation(shape_of_op);
-        let shape = operation_output(&shape_of_op);
+        let shape = shape_of_op.result(0).unwrap().as_ref();
         let return_op = r#return(&[shape], location);
         assert_eq!(return_op.values().collect::<Vec<_>>(), vec![shape]);
         function_body.append_operation(return_op);
