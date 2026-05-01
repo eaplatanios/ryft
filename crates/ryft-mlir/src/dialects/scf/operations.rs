@@ -878,14 +878,14 @@ mod tests {
             block.append_operation(for_all_op);
             let return_values = Vec::<ValueRef<'_, '_, '_>>::new();
             block.append_operation(func::r#return(&return_values, location));
-            func::func("forall_test", func::FuncAttributes::default(), block.into(), location)
+            func::func("for_all_test", func::FuncAttributes::default(), block.into(), location)
         });
         assert!(module.verify());
         assert_eq!(
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @forall_test() {
+                  func.func @for_all_test() {
                     scf.forall (%arg0) in (4) {
                     }
                     return
@@ -1091,23 +1091,23 @@ mod tests {
         assert!(module.verify());
         assert_eq!(
             module.to_string(),
-            concat!(
-                "module {\n",
-                "  func.func @index_switch_test(%arg0: index, %arg1: i32, %arg2: i32, %arg3: i32) -> i32 {\n",
-                "    %0 = scf.index_switch %arg0 -> i32 \n",
-                "    case 0 {\n",
-                "      scf.yield %arg2 : i32\n",
-                "    }\n",
-                "    case 1 {\n",
-                "      scf.yield %arg3 : i32\n",
-                "    }\n",
-                "    default {\n",
-                "      scf.yield %arg1 : i32\n",
-                "    }\n",
-                "    return %0 : i32\n",
-                "  }\n",
-                "}\n",
-            ),
+            indoc! {"
+                module {
+                  func.func @index_switch_test(%arg0: index, %arg1: i32, %arg2: i32, %arg3: i32) -> i32 {
+                    %0 = scf.index_switch %arg0 -> i32
+                    case 0 {
+                      scf.yield %arg2 : i32
+                    }
+                    case 1 {
+                      scf.yield %arg3 : i32
+                    }
+                    default {
+                      scf.yield %arg1 : i32
+                    }
+                    return %0 : i32
+                  }
+                }
+            "},
         );
     }
 }
