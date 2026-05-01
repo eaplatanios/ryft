@@ -269,33 +269,27 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
                 }
             }
         } else {
-            let input_atoms = inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>()?;
-            let add_result = {
+            let input_atom_ids = inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>()?;
+            let output_atom_ids = {
                 let mut builder = self.builder.borrow_mut();
-                match builder.add_instruction(operation, input_atoms) {
-                    Ok(outputs) => Ok(outputs.to_vec()),
+                match builder.add_instruction(operation, input_atom_ids) {
+                    Ok(outputs) => outputs.to_vec(),
                     Err(error) => {
                         if builder.error.is_none() {
                             builder.error = Some(error.clone());
                         }
-                        Err(error)
+                        let poison_type = match inputs.first() {
+                            Some(input) => input.state.r#type().clone(),
+                            None => return Err(error),
+                        };
+                        return Ok(vec![Tracer { state: TracerState::Poison(poison_type), context: self.clone() }]);
                     }
-                }
-            };
-            let output_atoms = match add_result {
-                Ok(output_atoms) => output_atoms,
-                Err(error) => {
-                    let poison_type = match inputs.first() {
-                        Some(input) => input.state.r#type().clone(),
-                        None => return Err(error),
-                    };
-                    return Ok(vec![Tracer { state: TracerState::Poison(poison_type), context: self.clone() }]);
                 }
             };
 
             let output_states = {
                 let builder = self.builder.borrow();
-                output_atoms
+                output_atom_ids
                     .into_iter()
                     .map(|atom| TracerState::Live(atom, builder.atoms[atom.index].r#type().into_owned()))
                     .collect::<Vec<_>>()
