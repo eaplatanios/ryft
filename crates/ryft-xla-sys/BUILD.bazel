@@ -87,6 +87,7 @@ XLA_DEPENDENCIES = [
     "@llvm-project//mlir:FuncDialect",
     "@llvm-project//mlir:GPUDialect",
     "@llvm-project//mlir:IR",
+    "@llvm-project//mlir:ShapeDialect",
     "@llvm-project//mlir:Support",
     "@shardy//shardy/integrations/c:sdy_capi",
     "@stablehlo//:chlo_capi",
@@ -182,6 +183,7 @@ cc_library(
         "src/c++/mlir/dialects/mosaic_gpu.h",
         "src/c++/mlir/dialects/mosaic_tpu.h",
         "src/c++/mlir/dialects/nvgpu.h",
+        "src/c++/mlir/dialects/shape.h",
         "src/c++/mlir/dialects/triton.h",
     ],
     srcs = [
@@ -192,6 +194,7 @@ cc_library(
         "src/c++/mlir/dialects/mosaic_gpu.cc",
         "src/c++/mlir/dialects/mosaic_tpu.cc",
         "src/c++/mlir/dialects/nvgpu.cc",
+        "src/c++/mlir/dialects/shape.cc",
         "src/c++/mlir/dialects/triton.cc",
     ],
     copts = tsl_copts() + [

@@ -478,13 +478,13 @@ impl BuildConfiguration {
     /// Returns a directory containing the requested [`Artifact`] by attempting to find it using the following
     /// approaches, in this order, and returning an [`Err`] if it is not found:
     ///
-    ///   1. If the extracted archive containing the artifact is found in a local cache (e.g., from an earlier build),
-    ///      return it. Otherwise, move on to step 2. Note that steps 2 and 3, if successful, will update the local
-    ///      cache so that the extracted [`Artifact`] can be reused in subsequent builds.
-    ///   2. If a path is provided via the appropriate environment variable (e.g., `RYFT_XLA_SYS_ARCHIVE` or
+    ///   1. If a path is provided via the appropriate environment variable (e.g., `RYFT_XLA_SYS_ARCHIVE` or
     ///      `PJRT_PLUGIN_*_LIB`), extract the archive pointed to by that path, if it is a `.tar.gz` or `.whl` archive,
     ///      and return the extracted path. Note that the archive will be extracted into a local cache directory
     ///      so that it can be reused in subsequent builds.
+    ///   2. If the extracted archive containing the artifact is found in a local cache (e.g., from an earlier build),
+    ///      return it. Otherwise, move on to step 3. Note that steps 1 and 3, if successful, will update the local
+    ///      cache so that the extracted [`Artifact`] can be reused in subsequent builds.
     ///   3. Otherwise, try to download and extract a precompiled archive and return the extracted path if successful.
     ///      Note that the downloaded archive will be extracted into a local cache directory so that it can be reused
     ///      in subsequent builds.
@@ -514,29 +514,28 @@ impl BuildConfiguration {
             .join("extracted")
             .join(archive_name.as_str());
 
-        // Check if the extracted artifact already exists in the cache and return immediately if it does.
-        let cached_artifact_found = match artifact {
-            Artifact::RyftXlaSys => fs::exists(extracted_path.join("lib").join(format!(
-                "{}ryft-xla-sys.{}",
-                self.operating_system.library_prefix(),
-                self.operating_system.static_library_extension()
-            )))
-            .unwrap_or(false),
-            Artifact::PjrtPlugin => {
-                fs::exists(extracted_path.join(self.pjrt_plugin_library_file_name())).unwrap_or(false)
-            }
-        };
-        if cached_artifact_found {
-            return Ok(extracted_path);
-        }
+        let artifact_path = match self.artifact_path_from_environment(artifact)? {
+            Some(artifact_path) => artifact_path,
+            None => {
+                // Check if the extracted artifact already exists in the cache and return immediately if it does.
+                let cached_artifact_found = match artifact {
+                    Artifact::RyftXlaSys => fs::exists(extracted_path.join("lib").join(format!(
+                        "{}ryft-xla-sys.{}",
+                        self.operating_system.library_prefix(),
+                        self.operating_system.static_library_extension()
+                    )))
+                    .unwrap_or(false),
+                    Artifact::PjrtPlugin => {
+                        fs::exists(extracted_path.join(self.pjrt_plugin_library_file_name())).unwrap_or(false)
+                    }
+                };
 
-        // Check if a path to the archive has already been provided via the corresponding environment variable.
-        let artifact_path = match self.artifact_path_from_environment(artifact) {
-            Ok(artifact_path) => artifact_path,
-            Err(error) => {
-                println!("cargo::warning={error}\nAttempting to download a precompiled artifact instead.");
+                if cached_artifact_found {
+                    return Ok(extracted_path);
+                }
 
                 // Try to download a precompiled build artifact if one exists.
+                println!("cargo::warning=Attempting to download a precompiled artifact instead.");
                 match self.download_precompiled_artifact_archive(artifact) {
                     Ok(artifact_path) => artifact_path,
                     Err(error) => {
@@ -629,11 +628,8 @@ impl BuildConfiguration {
         format!("{}-{}-{}", self.operating_system, self.architecture, self.device)
     }
 
-    /// Returns the path to the requested [`Artifact`] for this [`BuildConfiguration`] set via environment variables,
-    /// if present. Specifically, this function looks for environment variables like [`RYFT_XLA_SYS_ARCHIVE`],
-    /// [`PJRT_PLUGIN_CUDA_12_LIB`], [`PJRT_PLUGIN_CUDA_13_LIB`], [`PJRT_PLUGIN_ROCM_7_LIB`], [`PJRT_PLUGIN_TPU_LIB`],
-    /// [`PJRT_PLUGIN_NEURON_LIB`], [`PJRT_PLUGIN_METAL_LIB`] and returns the appropriate path, if present.
-    fn artifact_path_from_environment(&self, artifact: Artifact) -> Result<PathBuf> {
+    /// Returns the path to the requested [`Artifact`] set via environment variables, if present.
+    fn artifact_path_from_environment(&self, artifact: Artifact) -> Result<Option<PathBuf>> {
         let artifact_name = artifact.name();
 
         let environment_variable = match (artifact, self.device) {
@@ -648,22 +644,18 @@ impl BuildConfiguration {
         };
 
         if let Some(environment_variable) = environment_variable {
-            let path = env::var(environment_variable).ok().map(PathBuf::from);
-            if let Some(path) = path {
+            if let Some(path) = env::var_os(environment_variable).map(PathBuf::from) {
                 println!(
                     "cargo:warning=Using the `{artifact_name}` artifact specified \
                     in the `{environment_variable}` environment variable: {}.",
                     path.display(),
                 );
-                Ok(path)
+                Ok(Some(path))
             } else {
-                Err(anyhow!(
-                    "no path provided for the `{artifact_name}` artifact via \
-                    the `{environment_variable}` environment variable",
-                ))
+                Ok(None)
             }
         } else {
-            Err(anyhow!("failed to obtain the `{artifact_name}` artifact from the current environment"))
+            Ok(None)
         }
     }
 
@@ -730,6 +722,8 @@ impl BuildConfiguration {
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_tpu.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("nvgpu.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("nvgpu.h"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("shape.cc"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("shape.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.h"),
             PathBuf::from("WORKSPACE"),
