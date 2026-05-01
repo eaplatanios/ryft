@@ -387,43 +387,37 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
         }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-    /// Stages a single-input operation application and returns its unique output.
-    ///
-    /// Convenience wrapper for operator trait implementations whose staged operation should produce one output.
+    /// Applies the provided _unary_ [`Operation`] to this [`Tracer`] returning the resulting [`Tracer`].
+    /// _Unary_ operations are operations that have a single input and a single output. If the provided operation is not
+    /// a unary operation then the resulting [`Tracer`] will contain a [`TracerState::Poison`].
     pub fn unary(self, operation: E::Operation) -> Self {
-        let context = self.context.clone();
-        let poison_type = self.r#type.clone();
-        let inputs = [&self];
-        match context.trace(operation, &inputs) {
+        match self.context.trace(operation, &[&self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
-                context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
-                Tracer { state: TracerState::Poison, r#type: poison_type, context }
+                self.context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
+                Tracer { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
             Err(error) => {
-                context.error(error);
-                Tracer { state: TracerState::Poison, r#type: poison_type, context }
+                self.context.error(error);
+                Tracer { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
         }
     }
 
-    /// Stages a two-input operation application and returns its unique output.
-    ///
-    /// Convenience wrapper for operator trait implementations whose staged operation should produce one output.
+    /// Applies the provided _binary_ [`Operation`] to this [`Tracer`] and the provided [`Tracer`] returning the
+    /// resulting [`Tracer`]. _Binary_ operations are operations that have two inputs and a single output. If the
+    /// provided operation is not a binary operation then the resulting [`Tracer`] will contain a
+    /// [`TracerState::Poison`].
     pub fn binary(self, rhs: Self, operation: E::Operation) -> Self {
-        let context = self.context.clone();
-        let poison_type = self.r#type.clone();
-        let inputs = [&self, &rhs];
-        match context.trace(operation, &inputs) {
+        match self.context.trace(operation, &[&self, &rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
-                context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
-                Tracer { state: TracerState::Poison, r#type: poison_type, context }
+                self.context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
+                Tracer { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
             Err(error) => {
-                context.error(error);
-                Tracer { state: TracerState::Poison, r#type: poison_type, context }
+                self.context.error(error);
+                Tracer { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
         }
     }
@@ -448,7 +442,7 @@ impl<'engine, E: TracingEngine<Type: Debug> + ?Sized> Debug for Tracer<'engine, 
 impl<'engine, E: TracingEngine + ?Sized> Display for Tracer<'engine, E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.state {
-            TracerState::Live(atom) => Display::fmt(atom, formatter),
+            TracerState::Live(atom) => write!(formatter, "{atom}"),
             TracerState::Poison => write!(formatter, "<poison:{}>", self.r#type),
         }
     }
@@ -463,6 +457,7 @@ impl<'engine, E: TracingEngine + ?Sized> Typed<E::Type> for Tracer<'engine, E> {
 
 impl<'engine, E: TracingEngine + ?Sized> Traceable<E::Type> for Tracer<'engine, E> {}
 
+// TODO(eaplatanios): Review from here onwards.
 impl<'engine, E: TracingEngine + ?Sized> ZeroLike for Tracer<'engine, E> {
     #[inline]
     fn zero_like(&self) -> Self {
