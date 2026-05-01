@@ -114,9 +114,7 @@ fn main() {
     - [ ] `mhlo`
     - [x] [`mosaic_gpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
     - [x] [`mosaic_tpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/tpu/tpu.td)
-    - [ ] `nvgpu`
-        - [ ] Add support for types: `NVGPUTensorMapDescriptorType`.
-        - [ ] Add support for operations.
+    - [x] `nvgpu`
     - [ ] `pdl`
         - [ ] Add support for types: `PDLAttributeType`, `PDLOperationType`, `PDLRangeType`, `PDLType`,
           `PDLTypeType`, `PDLValueType`.

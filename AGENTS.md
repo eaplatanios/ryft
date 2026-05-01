@@ -289,12 +289,13 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
   regions, segment-size traits, and builders; do not stop at empty marker traits unless the operation definition itself
   has no named API surface.
 - In MLIR dialect operation modules, colocate public operation attribute-name constants immediately above the first
-  operation trait or macro-generated operation group that references them. Do not collect operation attribute-name
-  constants in a module-level block at the top of the operations file.
+  operation trait, constructor, or macro-generated operation group that references them. Do not collect operation
+  attribute-name constants in a module-level block at the top of the operations file; when a constant is shared across
+  several operations, place it before the first operation group that uses it.
 - In MLIR dialect operation modules, inline operation-specific attribute, segment, and async-token access logic
   in the owning trait or constructor instead of adding module-level helper functions, unless the helper is genuinely
   shared across dialect modules. Do not add tiny private wrappers for one-line attribute casts, attribute value
-  extraction, or operand slicing.
+  extraction, operand segment-size extraction, operand slicing, or scalar/array attribute construction.
 - In MLIR dialect operation modules, write operation traits and their `mlir_op!` / `mlir_op_trait!` declarations
   explicitly instead of adding dialect-local macros that generate the wrapper trait definitions.
 - Prefix MLIR-dialect-local declarative macros with the dialect or module prefix (for example, `gpu_`) unless they
