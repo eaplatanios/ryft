@@ -77,13 +77,10 @@ pub trait TracingEngine: Engine {
             })
             .map_err(TracingError::from)?;
         let output = function(input)?;
+        let _ = builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
         let output_structure = output.parameter_structure();
-        let outputs = output.parameters().map(|output| output.atom_id()).collect::<Vec<_>>();
-        let output_types = output.map_parameters(|o| o.r#type().into_owned()).map_err(TracingError::from)?;
-        if let Some(tracing_error) = builder.borrow_mut().error.take() {
-            return Err(tracing_error);
-        }
-        let outputs = outputs.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let outputs = output.parameters().map(|output| output.atom_id()).collect::<Result<Vec<_>, _>>()?;
+        let output_types = output.map_parameters(|output| output.r#type().into_owned()).map_err(TracingError::from)?;
         let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
         let program = builder.build(outputs, input_structure, output_structure)?;
         Ok((output_types, program))
