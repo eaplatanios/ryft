@@ -7,6 +7,12 @@ use ryft_xla_sys::bindings::mlirGetDialectHandle__shape__;
 
 use crate::DialectHandle;
 
+pub mod operations;
+pub mod types;
+
+pub use operations::*;
+pub use types::*;
+
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `shape` [`Dialect`](crate::Dialect).
     pub fn shape() -> Self {
