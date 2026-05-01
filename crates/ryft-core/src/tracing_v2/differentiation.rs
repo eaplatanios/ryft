@@ -211,3 +211,37 @@ impl_differentiable_engine_for_scalar!(bf16);
 impl_differentiable_engine_for_scalar!(f16);
 impl_differentiable_engine_for_scalar!(f32);
 impl_differentiable_engine_for_scalar!(f64);
+
+#[cfg(test)]
+mod tests {
+    use half::{bf16, f16};
+    use pretty_assertions::assert_eq;
+
+    use crate::tracing::engines::ScalarEngine;
+    use crate::tracing_v2::jvp;
+
+    use super::DifferentiableEngine;
+
+    #[test]
+    fn test_scalar_engine_half_and_float_engines_are_differentiable() {
+        let _: Option<<ScalarEngine<bf16> as DifferentiableEngine>::DifferentiableOperation> = None;
+        let _: Option<<ScalarEngine<f16> as DifferentiableEngine>::DifferentiableOperation> = None;
+        let _: Option<<ScalarEngine<f32> as DifferentiableEngine>::DifferentiableOperation> = None;
+        let _: Option<<ScalarEngine<f64> as DifferentiableEngine>::DifferentiableOperation> = None;
+    }
+
+    #[test]
+    fn test_scalar_engine_half_engines_run_jvp() {
+        let bf16_engine = ScalarEngine::<bf16>::new();
+        assert_eq!(
+            jvp(&bf16_engine, |x| x.clone() + x, bf16::from_f32(3.0), bf16::ONE),
+            Ok((bf16::from_f32(6.0), bf16::from_f32(2.0)))
+        );
+
+        let f16_engine = ScalarEngine::<f16>::new();
+        assert_eq!(
+            jvp(&f16_engine, |x| x.clone() + x, f16::from_f32(3.0), f16::ONE),
+            Ok((f16::from_f32(6.0), f16::from_f32(2.0)))
+        );
+    }
+}

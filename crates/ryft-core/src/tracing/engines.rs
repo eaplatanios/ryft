@@ -454,17 +454,14 @@ impl<'engine, E: TracingEngine + ?Sized> Traceable<E::Type> for Tracer<'engine, 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::ops::{Add, Mul, Neg};
     use std::rc::Rc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_macros::Parameter;
 
     use crate::parameters::Placeholder;
-    use crate::tracing_v2::differentiation::DifferentiableEngine;
+    use crate::tracing_v2::Sin;
     use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
-    use crate::tracing_v2::{Cos, Sin, jvp};
     use crate::types::{DataType, TypeError, Typed};
 
     use super::*;
@@ -643,114 +640,29 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    #[test]
-    fn test_tracing_engine_interpret_and_trace_returns_abstract_eval_errors() {
-        #[derive(Clone, Debug, Parameter)]
-        struct TestAbstractValue {
-            r#type: DataType,
-        }
-
-        impl Typed<DataType> for TestAbstractValue {
-            fn r#type(&self) -> Cow<'_, DataType> {
-                Cow::Borrowed(&self.r#type)
-            }
-        }
-
-        impl std::fmt::Display for TestAbstractValue {
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                std::fmt::Display::fmt(&self.r#type, formatter)
-            }
-        }
-
-        impl Traceable<DataType> for TestAbstractValue {}
-
-        impl crate::tracing::Value<DataType> for TestAbstractValue {}
-
-        impl Add for TestAbstractValue {
-            type Output = Self;
-
-            fn add(self, _rhs: Self) -> Self::Output {
-                self
-            }
-        }
-
-        impl Mul for TestAbstractValue {
-            type Output = Self;
-
-            fn mul(self, _rhs: Self) -> Self::Output {
-                self
-            }
-        }
-
-        impl Neg for TestAbstractValue {
-            type Output = Self;
-
-            fn neg(self) -> Self::Output {
-                self
-            }
-        }
-
-        impl Sin for TestAbstractValue {
-            fn sin(self) -> Self {
-                self
-            }
-        }
-
-        impl Cos for TestAbstractValue {
-            fn cos(self) -> Self {
-                self
-            }
-        }
-
-        impl ZeroLike for TestAbstractValue {
-            fn zero_like(&self) -> Self {
-                self.clone()
-            }
-        }
-
-        impl OneLike for TestAbstractValue {
-            fn one_like(&self) -> Self {
-                self.clone()
-            }
-        }
-
-        struct TestEngine;
-
-        impl Engine for TestEngine {
-            type Type = DataType;
-            type Value = TestAbstractValue;
-
-            fn zero(&self, r#type: &DataType) -> Result<TestAbstractValue, TracingError> {
-                Ok(TestAbstractValue { r#type: *r#type })
-            }
-
-            fn one(&self, r#type: &DataType) -> Result<TestAbstractValue, TracingError> {
-                Ok(TestAbstractValue { r#type: *r#type })
-            }
-        }
-
-        impl TracingEngine for TestEngine {
-            type Operation = ScalarOperation<TestAbstractValue>;
-        }
-
-        let result = TestEngine.interpret_and_trace(
-            |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| Ok(inputs.0 + inputs.1),
-            (TestAbstractValue { r#type: DataType::F8E3M4 }, TestAbstractValue { r#type: DataType::F32 }),
-        );
-
+        // Test that [`TypeError`]s are returned in certain cases.
         assert!(matches!(
-            result,
+            engine.interpret_and_trace(
+                |x| Ok(Tracer { r#type: DataType::F32, ..x }.zero_like()),
+                2.0f64,
+            ),
             Err(TracingError::Type(TypeError { message }))
-                if message == "add input types are not broadcast-compatible"
+                if message == "scalar engine for f64 cannot synthesize zero for f32",
+        ));
+        assert!(matches!(
+            engine.interpret_and_trace(
+                |x| Ok(Tracer { r#type: DataType::F32, ..x }.one_like()),
+                2.0f64,
+            ),
+            Err(TracingError::Type(TypeError { message }))
+                if message == "scalar engine for f64 cannot synthesize one for f32",
         ));
     }
 
     #[test]
-    fn test_scalar_engine_is_zero_sized() {
+    fn test_scalar_engine() {
+        // Check that [`ScalarEngine`] is zero-sized.
         assert_eq!(size_of::<ScalarEngine<bool>>(), 0);
         assert_eq!(size_of::<ScalarEngine<i8>>(), 0);
         assert_eq!(size_of::<ScalarEngine<i16>>(), 0);
@@ -764,32 +676,13 @@ mod tests {
         assert_eq!(size_of::<ScalarEngine<f16>>(), 0);
         assert_eq!(size_of::<ScalarEngine<f32>>(), 0);
         assert_eq!(size_of::<ScalarEngine<f64>>(), 0);
+
+        // Check that [`ScalarEngine`] is an [`Engine`].
         assert_eq!(ScalarEngine::<f64>::new().zero(&DataType::F64), Ok(0.0));
         assert_eq!(ScalarEngine::<f64>::default().one(&DataType::F64), Ok(1.0));
     }
 
-    #[test]
-    fn test_scalar_engine_half_and_float_engines_are_differentiable() {
-        let _: Option<<ScalarEngine<bf16> as DifferentiableEngine>::DifferentiableOperation> = None;
-        let _: Option<<ScalarEngine<f16> as DifferentiableEngine>::DifferentiableOperation> = None;
-        let _: Option<<ScalarEngine<f32> as DifferentiableEngine>::DifferentiableOperation> = None;
-        let _: Option<<ScalarEngine<f64> as DifferentiableEngine>::DifferentiableOperation> = None;
-    }
-
-    #[test]
-    fn test_scalar_engine_half_engines_run_jvp() {
-        let bf16_engine = ScalarEngine::<bf16>::new();
-        assert_eq!(
-            jvp(&bf16_engine, |x| x.clone() + x, bf16::from_f32(3.0), bf16::ONE),
-            Ok((bf16::from_f32(6.0), bf16::from_f32(2.0)))
-        );
-
-        let f16_engine = ScalarEngine::<f16>::new();
-        assert_eq!(
-            jvp(&f16_engine, |x| x.clone() + x, f16::from_f32(3.0), f16::ONE),
-            Ok((f16::from_f32(6.0), f16::from_f32(2.0)))
-        );
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
     #[test]
     fn test_tracing_context_new_borrows_engine_and_builder() {
