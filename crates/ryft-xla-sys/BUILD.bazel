@@ -50,6 +50,7 @@ XLA_DEPENDENCIES = [
     "@jax//jaxlib/mosaic:tpu_dialect_capi_objects",
     "@llvm-project//llvm:Support",
     "@llvm-project//mlir:AffineDialect",
+    "@llvm-project//mlir:ArithDialect",
     "@llvm-project//mlir:CAPIAMDGPU",
     "@llvm-project//mlir:CAPIArith",
     "@llvm-project//mlir:CAPIAsync",
@@ -176,6 +177,7 @@ cc_library(
         "src/c++/common.h",
         "src/c++/distributed.h",
         "src/c++/mlir/dialects/affine.h",
+        "src/c++/mlir/dialects/arith.h",
         "src/c++/mlir/dialects/gpu.h",
         "src/c++/mlir/dialects/mosaic_gpu.h",
         "src/c++/mlir/dialects/mosaic_tpu.h",
@@ -184,6 +186,7 @@ cc_library(
     srcs = [
         "src/c++/distributed.cc",
         "src/c++/mlir/dialects/affine.cc",
+        "src/c++/mlir/dialects/arith.cc",
         "src/c++/mlir/dialects/gpu.cc",
         "src/c++/mlir/dialects/mosaic_gpu.cc",
         "src/c++/mlir/dialects/mosaic_tpu.cc",

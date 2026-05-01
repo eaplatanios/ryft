@@ -1,4 +1,4 @@
-use crate::dialects::arith::{AtomicRmwKind, atomic_rmw_kind_attribute, atomic_rmw_kind_from_attribute};
+use crate::dialects::arith::{AtomicRmwKind, AtomicRmwKindAttributeRef};
 use crate::{
     AffineMap, AffineMapAttributeRef, ArrayAttributeRef, Attribute, BooleanAttributeRef,
     DenseInteger32ArrayAttributeRef, DenseInteger64ArrayAttributeRef, DenseIntegerElementsAttributeRef, DetachedOp,
@@ -379,10 +379,7 @@ pub trait ParallelOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             .cast::<ArrayAttributeRef>()
             .unwrap()
             .elements()
-            .map(|attribute| {
-                atomic_rmw_kind_from_attribute(attribute.cast::<IntegerAttributeRef>().unwrap())
-                    .expect("invalid `arith::AtomicRmwKind` attribute")
-            })
+            .map(|attribute| attribute.cast::<AtomicRmwKindAttributeRef>().unwrap().value())
             .collect()
     }
 
@@ -493,7 +490,7 @@ pub fn parallel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let step_attributes = steps.iter().map(|step| context.integer_attribute(step_type, *step)).collect::<Vec<_>>();
     let reduction_attributes = reductions
         .iter()
-        .map(|reduction| atomic_rmw_kind_attribute(context, *reduction))
+        .map(|reduction| context.arith_atomic_rmw_kind_attribute(*reduction))
         .collect::<Vec<_>>();
     let builder = OperationBuilder::new("affine.parallel", location)
         .add_attribute(REDUCTIONS_ATTRIBUTE, context.array_attribute(&reduction_attributes))
