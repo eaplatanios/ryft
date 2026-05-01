@@ -290,7 +290,6 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
 impl<'engine, E: TracingEngine + ?Sized> Clone for TracingContext<'engine, E> {
     fn clone(&self) -> Self {
         Self { engine: self.engine, builder: self.builder.clone() }
@@ -322,39 +321,19 @@ impl<'engine, E: TracingEngine + ?Sized> Engine for TracingContext<'engine, E> {
     }
 }
 
-/// Execution state carried by a [`Tracer`] leaf.
-///
-/// Live tracers point at a concrete staged atom in the shared program builder. Poisoned tracers arise only after the
-/// active tracing context has already recorded an error and can no longer stage new instructions safely.
-#[derive(Clone, PartialEq, Eq)]
+/// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
+/// [`Atom`](crate::tracing::Atom) or _poisoned_, meaning that it corresponds to an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TracerState {
-    /// Normal traced leaf backed by a concrete atom in the staged program.
+    /// The corresponding [`Tracer`] is _live_ and has a corresponding [`Atom`](crate::tracing::Atom).
     Live(AtomId),
 
-    /// Poisoned traced leaf that is no longer backed by a staged atom.
+    /// The corresponding [`Tracer`] has been _poisoned_, meaning that it corresponds to an error, and will propagate
+    /// that error wherever it is used (i.e., it will _poison_ those corresponding downstream [`Tracer`]s too).
     Poison,
 }
 
-impl TracerState {
-    /// Returns the staged atom id for live tracers, if one exists.
-    #[inline]
-    pub fn live_atom(&self) -> Option<AtomId> {
-        match self {
-            Self::Live(atom) => Some(*atom),
-            Self::Poison => None,
-        }
-    }
-}
-
-impl Debug for TracerState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Live(atom) => formatter.debug_tuple("Live").field(atom).finish(),
-            Self::Poison => formatter.write_str("Poison"),
-        }
-    }
-}
-
+// TODO(eaplatanios): Review from here onwards.
 /// Symbolic leaf used while staging ordinary traced programs.
 ///
 /// A [`Tracer`] is the value-level facade for one staged traced leaf. Primitive trait impls on [`Tracer`] stage
@@ -409,7 +388,10 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
 
     /// Returns the staged atom id for this tracer when it is still live.
     pub fn atom_id(&self) -> Result<AtomId, TracingError> {
-        self.state.live_atom().ok_or(TracingError::PoisonedTracer)
+        match &self.state {
+            TracerState::Live(atom) => Ok(*atom),
+            TracerState::Poison => Err(TracingError::PoisonedTracer),
+        }
     }
 
     /// Stages a single-input operation application and returns its unique output.
@@ -741,7 +723,10 @@ mod tests {
         let tracer: Tracer<ScalarEngine<f64>> = TracingContext::new(&engine, builder).tracer(atom, None);
         let zero = tracer.zero_like();
         assert_eq!(zero.r#type().into_owned(), scalar_f64_type());
-        let zero_atom = zero.state().live_atom().expect("zero-like tracer should remain live");
+        let zero_atom = match zero.state() {
+            TracerState::Live(atom) => *atom,
+            TracerState::Poison => panic!("zero-like tracer should remain live"),
+        };
         assert!(zero_atom > atom);
 
         let program = zero
