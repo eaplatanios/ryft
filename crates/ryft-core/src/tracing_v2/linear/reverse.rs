@@ -19,6 +19,8 @@ where
     Output: Parameterized<V>,
     Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
+        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
@@ -111,6 +113,8 @@ where
     Output: Parameterized<V>,
     Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
+        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,

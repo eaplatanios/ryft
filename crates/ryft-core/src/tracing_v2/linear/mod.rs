@@ -79,7 +79,7 @@ where
     E::Operation: Clone,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
-    trace_flat_program_from_trace_result::<E::Type, Input, Output, V, E::Operation>(
+    trace_flat_program_from_trace_result::<E::Type, Input, Output, V, E::Operation, _>(
         engine.trace(function, input_types)?,
     )
 }
@@ -100,21 +100,21 @@ where
     E::Operation: Clone,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
-    trace_flat_program_from_trace_result::<E::Type, Input, Output, V, E::Operation>(
+    trace_flat_program_from_trace_result::<E::Type, Input, Output, V, E::Operation, _>(
         tracing_context.engine.trace(function, input_types)?,
     )
 }
 
-fn trace_flat_program_from_trace_result<T, Input, Output, V, O>(
-    trace_result: (Output, Program<T, V, O, Input::To<V>, Output::To<V>>),
+fn trace_flat_program_from_trace_result<T, Input, Output, V, O, ProgramOutput>(
+    trace_result: (Output, Program<T, V, O, Input::To<V>, ProgramOutput>),
 ) -> Result<(Output, Program<T, V, O, Vec<V>, Vec<V>>), TracingError>
 where
     T: Type + Parameter,
     V: Traceable<T> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<T>,
     Output: Parameterized<T>,
+    ProgramOutput: Parameterized<V>,
     Input::Family: ParameterizedFamily<V>,
-    Output::Family: ParameterizedFamily<V>,
     O: Clone + Operation<T>,
 {
     let (output_types, traced_program) = trace_result;

@@ -282,6 +282,8 @@ where
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Output::Family: ParameterizedFamily<ReferenceBatch<V>>
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
+        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
@@ -335,6 +337,8 @@ where
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Output::Family: ParameterizedFamily<ReferenceBatch<V>>
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
+        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
@@ -382,6 +386,8 @@ where
     Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<ReferenceBatch<V>>
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
+        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Input>,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,

@@ -1470,7 +1470,8 @@ where
         ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
     Output::Family:
         ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
+    Output::To<ShardMapTracer>:
+        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
 {
     let shard_map = ShardMap::new(
         mesh,
@@ -1525,7 +1526,8 @@ impl ShardMapInvocationLeaf for ArrayType {
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family:
             ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>;
+        Output::To<ShardMapTracer>:
+            Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>;
 
     fn invoke<F, Input, Output>(
         function: F,
@@ -1545,7 +1547,8 @@ impl ShardMapInvocationLeaf for ArrayType {
         Output: Parameterized<ArrayType>,
         Output::Family:
             ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
+        Output::To<ShardMapTracer>:
+            Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
         F: FnOnce(ShardMapLocalTraceInput<Input::To<ArrayType>>) -> ShardMapLocalTraceOutput<Output>,
     {
         let shard_map = ShardMap::new(
@@ -1579,7 +1582,8 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family:
             ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>;
+        Output::To<ShardMapTracer>:
+            Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>;
 
     fn invoke<F, Input, Output>(
         function: F,
@@ -1599,7 +1603,8 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
         Output: Parameterized<ArrayType>,
         Output::Family:
             ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
+        Output::To<ShardMapTracer>:
+            Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
         F: FnOnce(ShardMapLocalTraceInput<Input::To<ArrayType>>) -> ShardMapLocalTraceOutput<Output>,
     {
         let output_structure = out_specs.parameter_structure();

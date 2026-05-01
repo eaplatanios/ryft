@@ -423,7 +423,8 @@ where
         Parameterized<ArrayType, To<V> = Input, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
     Output::To<ArrayType>:
         Parameterized<ArrayType, To<V> = Output, To<Tracer<'engine, E>> = Output::To<Tracer<'engine, E>>>,
-    Output::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, To<ArrayType> = Output::To<ArrayType>>,
+    Output::To<Tracer<'engine, E>>:
+        Parameterized<Tracer<'engine, E>, To<ArrayType> = Output::To<ArrayType>, To<V> = Output>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     E::Operation: Clone + BatchableOperation<V>,
 {
@@ -453,7 +454,7 @@ where
 
     let input_types = Input::To::<ArrayType>::from_parameters(structure.clone(), logical_types)?;
     let (_, program): (Output::To<ArrayType>, Program<ArrayType, V, E::Operation, Input, Output>) =
-        engine.trace::<F, Input::To<ArrayType>, Output::To<ArrayType>>(function, input_types)?;
+        engine.trace(function, input_types)?;
     let batched_input = Input::To::<ArrayBatch<V>>::from_parameters(structure, batched_inputs)?;
     let batched_output = interpret_batched_program(&program, batched_input)?;
     let output_structure = batched_output.parameter_structure();

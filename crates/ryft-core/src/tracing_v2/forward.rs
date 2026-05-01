@@ -193,6 +193,8 @@ where
     E: DifferentiableEngine<Value = V> + 'static,
     Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+    for<'engine> Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
+        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
     E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<E::Type, V>
         + SupportsAdd<E::Type, V>

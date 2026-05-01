@@ -49,19 +49,15 @@ pub trait TracingEngine: Engine {
     #[inline]
     fn trace<
         'engine,
-        F: FnOnce(I::To<Tracer<'engine, Self>>) -> Result<O::To<Tracer<'engine, Self>>, TracingError>,
+        F: FnOnce(I::To<Tracer<'engine, Self>>) -> Result<O, TracingError>,
         I: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>>,
-        O: Parameterized<
-                Self::Type,
-                Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>,
-                To<Tracer<'engine, Self>>: Parameterized<Tracer<'engine, Self>, To<Self::Type> = O>,
-            >,
+        O: Parameterized<Tracer<'engine, Self>, Family: ParameterFamily<Self::Type> + ParameterFamily<Self::Value>>,
     >(
         &'engine self,
         function: F,
         input_types: I,
     ) -> Result<
-        (O, Program<Self::Type, Self::Value, Self::Operation, I::To<Self::Value>, O::To<Self::Value>>),
+        (O::To<Self::Type>, Program<Self::Type, Self::Value, Self::Operation, I::To<Self::Value>, O::To<Self::Value>>),
         TracingError,
     > {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
@@ -92,18 +88,21 @@ pub trait TracingEngine: Engine {
     /// same time.
     fn interpret_and_trace<
         'engine,
-        F: FnOnce(I::To<Tracer<'engine, Self>>) -> Result<O::To<Tracer<'engine, Self>>, TracingError>,
+        F: FnOnce(I::To<Tracer<'engine, Self>>) -> Result<O, TracingError>,
         I: Parameterized<
                 Self::Value,
                 Family: ParameterFamily<Tracer<'engine, Self>>,
                 ParameterStructure: Debug + PartialEq,
             >,
-        O: Parameterized<Self::Value, Family: ParameterFamily<Tracer<'engine, Self>>>,
+        O: Parameterized<Tracer<'engine, Self>, Family: ParameterFamily<Self::Value>>,
     >(
         &'engine self,
         function: F,
         input: I,
-    ) -> Result<(O, Program<Self::Type, Self::Value, Self::Operation, I, O>), TracingError>
+    ) -> Result<
+        (O::To<Self::Value>, Program<Self::Type, Self::Value, Self::Operation, I, O::To<Self::Value>>),
+        TracingError,
+    >
     where
         Self::Operation: Clone + InterpretableOperation<Self::Type, Self::Value>,
     {
@@ -111,10 +110,7 @@ pub trait TracingEngine: Engine {
         let input_values = input.into_parameters().collect::<Vec<_>>();
         let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
         let mut output_structure = None;
-        let (_, flat_program): (
-            Vec<Self::Type>,
-            Program<Self::Type, Self::Value, Self::Operation, Vec<Self::Value>, Vec<Self::Value>>,
-        ) = self.trace(
+        let (_, flat_program) = self.trace(
             |flat_input| {
                 let input = I::To::<Tracer<'engine, Self>>::from_parameters(input_structure.clone(), flat_input)?;
                 let output = function(input)?;
@@ -125,7 +121,8 @@ pub trait TracingEngine: Engine {
         )?;
         let output_structure = output_structure.expect("the function being traced should have been invoked");
         let flat_program = flat_program.into_simplified()?;
-        let output = O::from_parameters(output_structure.clone(), flat_program.interpret(input_values)?)?;
+        let output =
+            O::To::<Self::Value>::from_parameters(output_structure.clone(), flat_program.interpret(input_values)?)?;
         let program = Program {
             atoms: flat_program.atoms,
             input_ids: flat_program.input_ids,
@@ -554,7 +551,7 @@ mod tests {
     #[test]
     fn test_tracing_engine() {
         let engine = ScalarEngine::<f64>::new();
-        let (output_type, program): (DataType, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
+        let (output_type, program) = engine
             .trace(
                 |x: Tracer<ScalarEngine<f64>>| {
                     let squared = x.clone() * x.clone();
@@ -579,27 +576,25 @@ mod tests {
 
         // Test using an escaped [`ProgramBuilder`].
         let escaped_builder = Rc::new(RefCell::new(None));
-        let result: Result<(DataType, Program<DataType, f64, ScalarOperation<f64>, f64, f64>), TracingError> = engine
-            .trace(
+        assert!(matches!(
+            engine.trace(
                 |x: Tracer<ScalarEngine<f64>>| {
                     *escaped_builder.borrow_mut() = Some(x.builder().clone());
                     Ok(x)
                 },
                 DataType::F64,
-            );
-
-        assert!(matches!(result, Err(TracingError::EscapedProgramBuilder)));
+            ),
+            Err(TracingError::EscapedProgramBuilder),
+        ));
 
         // Test that [`TypeError`]s are returned in certain cases.
-        let result: Result<(DataType, Program<DataType, f64, ScalarOperation<f64>, (f64, f64), f64>), TracingError> =
+        assert!(matches!(
             engine.trace(
                 |inputs: (Tracer<ScalarEngine<f64>>, Tracer<ScalarEngine<f64>>)| Ok(inputs.0 + inputs.1),
                 (DataType::F8E3M4, DataType::F32),
-            );
-        assert!(matches!(
-            result,
+            ),
             Err(TracingError::Type(TypeError { message }))
-                if message == "add input types are not broadcast-compatible"
+                if message == "add input types are not broadcast-compatible",
         ));
     }
 
@@ -608,7 +603,7 @@ mod tests {
     #[test]
     fn test_tracing_engine_interpret_and_trace_replays_staged_graphs() {
         let engine = ScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
+        let (output, program) = engine
             .interpret_and_trace(
                 |x: Tracer<ScalarEngine<f64>>| {
                     let squared = x.clone() * x.clone();
@@ -638,7 +633,7 @@ mod tests {
     #[test]
     fn test_tracing_engine_interpret_and_trace_prunes_unused_staged_operations() {
         let engine = ScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
+        let (output, program) = engine
             .interpret_and_trace(
                 |x: Tracer<ScalarEngine<f64>>| {
                     let _unused = x.clone().sin();
@@ -786,17 +781,16 @@ mod tests {
         }
 
         let scalar_type = TestType("test_scalar");
-        let (output, program): (TestValue, Program<TestType, TestValue, TestAddOp, (TestValue, TestValue), TestValue>) =
-            TestEngine
-                .interpret_and_trace(
-                    |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| {
-                        let sum = inputs.0.clone() + inputs.1;
-                        let stabilized = sum + inputs.0.zero_like();
-                        Ok(stabilized + inputs.0.one_like())
-                    },
-                    (TestValue::new(scalar_type.clone(), 2), TestValue::new(scalar_type.clone(), 3)),
-                )
-                .unwrap();
+        let (output, program) = TestEngine
+            .interpret_and_trace(
+                |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| {
+                    let sum = inputs.0.clone() + inputs.1;
+                    let stabilized = sum + inputs.0.zero_like();
+                    Ok(stabilized + inputs.0.one_like())
+                },
+                (TestValue::new(scalar_type.clone(), 2), TestValue::new(scalar_type.clone(), 3)),
+            )
+            .unwrap();
 
         assert_eq!(output, TestValue::new(scalar_type.clone(), 6));
         assert_eq!(
@@ -895,19 +889,7 @@ mod tests {
             type Operation = ScalarOperation<TestAbstractValue>;
         }
 
-        let result: Result<
-            (
-                TestAbstractValue,
-                Program<
-                    DataType,
-                    TestAbstractValue,
-                    ScalarOperation<TestAbstractValue>,
-                    (TestAbstractValue, TestAbstractValue),
-                    TestAbstractValue,
-                >,
-            ),
-            TracingError,
-        > = TestEngine.interpret_and_trace(
+        let result = TestEngine.interpret_and_trace(
             |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| Ok(inputs.0 + inputs.1),
             (TestAbstractValue { r#type: DataType::F8E3M4 }, TestAbstractValue { r#type: DataType::F32 }),
         );
@@ -1416,7 +1398,7 @@ mod tests {
         let engine = FailingOneEngine;
 
         assert!(matches!(
-            TracingEngine::interpret_and_trace::<_, f64, f64>(
+            TracingEngine::interpret_and_trace(
                 &engine,
                 |x: Tracer<FailingOneEngine>| Ok(x.one_like()),
                 1.0f64,
