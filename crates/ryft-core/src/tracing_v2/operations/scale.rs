@@ -5,8 +5,8 @@ use std::ops::Mul;
 use indoc::indoc;
 
 use crate::macros::check_input_count;
+use crate::tracing::engines::Tracer;
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
-use crate::tracing_v2::engines::Tracer;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation};
@@ -177,14 +177,14 @@ where
 }
 
 /// JVP rule for `ScaleOperation` under the
-/// [`TracingContext`](crate::tracing_v2::TracingContext) wrapper.
+/// [`TracingContext`](crate::tracing::engines::TracingContext) wrapper.
 ///
 /// The operation's captured factor is `V_inner` (the underlying engine's value type), but the
-/// wrapper engine's [`Value`](crate::tracing_v2::engines::Engine::Value) is
-/// [`Tracer`](crate::tracing_v2::Tracer). The rule lifts the captured
+/// wrapper engine's [`Value`](crate::tracing::engines::Engine::Value) is
+/// [`Tracer`](crate::tracing::engines::Tracer). The rule lifts the captured
 /// factor into a `Tracer` constant in the outer trace and then stages both the primal product
 /// and the tangent scale on traced primals.
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
     for ScaleOperation<ArrayType, V>
 where
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
@@ -195,7 +195,7 @@ where
 {
     fn jvp(
         &self,
-        engine: &crate::tracing_v2::TracingContext<'engine, EInner>,
+        engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
         context: &mut JvpContext<
             '_,
             Tracer<'engine, EInner>,

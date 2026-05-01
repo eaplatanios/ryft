@@ -305,8 +305,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::tracing::Program;
+    use crate::tracing::engines::{Engine, TracingEngine};
     use crate::tracing_v2::Sin;
-    use crate::tracing_v2::engines::{Engine, TracingEngine};
     use crate::tracing_v2::operations::constants::OneLike;
 
     use super::*;

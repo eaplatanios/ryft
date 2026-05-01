@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
+use ryft_core::tracing::engines::{Tracer, TracingEngine};
 use ryft_core::tracing::{
     Atom, AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
 };
@@ -22,7 +23,7 @@ use ryft_core::tracing_v2::operations::constants::{One, OneLike, ZeroLike};
 use ryft_core::tracing_v2::operations::{
     AddOperation, ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
 };
-use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin, Tracer, TracingEngine};
+use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin};
 
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::XlaOperation;

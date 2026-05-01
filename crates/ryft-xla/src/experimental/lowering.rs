@@ -2311,12 +2311,12 @@ mod tests {
 
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
     use ryft_core::tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError};
-    use ryft_core::tracing_v2::engines::Engine;
     use ryft_core::tracing_v2::operations::constants::{OneLike, ZeroLike};
     use ryft_core::tracing_v2::{
         ArrayOperation, Cos, CustomPrimitive, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation,
-        MatrixOps, Sin, Tracer, TracingEngine,
+        MatrixOps, Sin,
     };
     use ryft_core::types::{Shape, TypeError};
     #[cfg(feature = "ndarray")]

@@ -1,13 +1,13 @@
 use std::ops::{Add, Mul, Neg};
 
+use crate::tracing::engines::{Engine, Tracer, TracingEngine};
 use crate::tracing::{Program, Traceable, TracingError};
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::tracing_v2::engines::{Engine, TracingEngine};
 use crate::tracing_v2::operations::constants::OneLike;
 use crate::tracing_v2::{
-    ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, Sin, Tracer, grad, jvp,
+    ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, Sin, grad, jvp,
     jvp_program, value_and_grad, vjp,
 };
 use crate::types::ArrayType;

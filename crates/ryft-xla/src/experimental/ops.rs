@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
+use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{AtomId, InterpretableOperation, Operation, TracingError};
 use ryft_core::tracing_v2::forward::{Differentiable, JvpTracer};
 use ryft_core::tracing_v2::linear::{
@@ -15,7 +16,7 @@ use ryft_core::tracing_v2::operations::{
 };
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableEngine, DifferentiableOperation, DifferentiationError,
-    JvpContext, LinearArrayOperation, TracingContext,
+    JvpContext, LinearArrayOperation,
 };
 use ryft_core::types::{ArrayType, Shape, TypeError};
 

@@ -1,8 +1,8 @@
 use std::fmt::{Debug, Display};
 
 use crate::macros::check_input_count;
+use crate::tracing::engines::Tracer;
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
-use crate::tracing_v2::engines::Tracer;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine};
@@ -142,8 +142,8 @@ where
 }
 
 /// JVP rule for `RightMatMulOperation` under
-/// [`TracingContext`](crate::tracing_v2::TracingContext).
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
+/// [`TracingContext`](crate::tracing::engines::TracingContext).
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
     for RightMatMulOperation<V>
 where
     V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
@@ -154,7 +154,7 @@ where
 {
     fn jvp(
         &self,
-        engine: &crate::tracing_v2::TracingContext<'engine, EInner>,
+        engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
         context: &mut JvpContext<
             '_,
             Tracer<'engine, EInner>,

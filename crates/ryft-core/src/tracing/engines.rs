@@ -1216,7 +1216,7 @@ mod tests {
 
         struct TestEngine;
 
-        impl crate::tracing_v2::engines::Engine for TestEngine {
+        impl crate::tracing::engines::Engine for TestEngine {
             type Type = DataType;
             type Value = TestAbstractValue;
 
@@ -1229,7 +1229,7 @@ mod tests {
             }
         }
 
-        impl crate::tracing_v2::engines::TracingEngine for TestEngine {
+        impl crate::tracing::engines::TracingEngine for TestEngine {
             type Operation = ScalarOperation<TestAbstractValue>;
         }
 

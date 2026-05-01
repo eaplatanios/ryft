@@ -8,8 +8,6 @@ pub(crate) mod benchmark_support;
 pub mod benchmarking;
 /// Errors raised while materializing dense Jacobian- and Hessian-style differentiation results.
 pub mod differentiation;
-/// Backend token interfaces for metadata-driven value synthesis and active carrier selection.
-pub mod engines;
 /// Forward-mode automatic differentiation over paired primal/tangent leaves.
 pub mod forward;
 /// Linearization, transposition, dense Jacobians, and reverse-mode APIs over staged linear programs.
@@ -27,7 +25,6 @@ pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batc
 pub use differentiation::{
     DifferentiableEngine, DifferentiableOperationTracingEngine, DifferentiableTracingEngine, DifferentiationError,
 };
-pub use engines::{Engine, Tracer, TracerState, TracingContext, TracingEngine};
 pub use forward::{Differentiable, JvpContext, JvpTracer, jvp};
 pub use linear::{
     CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad,

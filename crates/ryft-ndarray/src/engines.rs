@@ -1,7 +1,8 @@
 use std::marker::PhantomData;
 
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, Engine, Tracer, TracingEngine};
+use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine};
 use ryft_core::types::{ArrayType, TypeError};
 
 use crate::arrays::{Array, NdArrayElement};
@@ -63,8 +64,9 @@ fn array_error_to_tracing_error(error: crate::arrays::ArrayError) -> TracingErro
 mod tests {
     use ndarray::{arr1, arr2};
     use pretty_assertions::assert_eq;
+    use ryft_core::tracing::engines::{Engine, TracingEngine};
     use ryft_core::tracing::{Operation, TracingError};
-    use ryft_core::tracing_v2::{DifferentiationError, Engine, MatrixOps, Sin, TracingEngine, compile_grad, grad, jvp};
+    use ryft_core::tracing_v2::{DifferentiationError, MatrixOps, Sin, compile_grad, grad, jvp};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::Array;

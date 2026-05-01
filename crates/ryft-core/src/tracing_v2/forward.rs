@@ -6,10 +6,10 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use crate::tracing::engines::{Engine, Tracer, TracingEngine};
 use crate::tracing::{
     AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
 };
-use crate::tracing_v2::engines::{Engine, Tracer, TracingEngine};
 use crate::tracing_v2::linear::{jvp_program, jvp_traced};
 use crate::tracing_v2::operations::constants::Zero;
 use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale};
@@ -105,7 +105,7 @@ where
 
 /// Forward-mode tracer carrying both a primal and a tangent.
 ///
-/// [`JvpTracer`] is to forward-mode AD what [`Tracer`](crate::tracing_v2::Tracer) is to ordinary
+/// [`JvpTracer`] is to forward-mode AD what [`Tracer`](crate::tracing::engines::Tracer) is to ordinary
 /// staging: it is the leaf wrapper that primitive operations see when a function is being evaluated
 /// in JVP mode. The `primal` field carries the usual runtime value, while the `tangent` field
 /// carries the directional derivative information flowing alongside it.
@@ -305,7 +305,7 @@ where
 mod tests {
     use crate::parameters::{ParameterError, Parameterized};
     use crate::tracing::ProgramBuilder;
-    use crate::tracing_v2::engines::{ScalarEngine, TracingContext};
+    use crate::tracing::engines::{ScalarEngine, TracingContext};
     use crate::tracing_v2::operations::{AddOperation, DifferentiableOperation};
     use crate::tracing_v2::{LinearScalarOperation, ScalarOperation, test_support};
     use crate::types::DataType;

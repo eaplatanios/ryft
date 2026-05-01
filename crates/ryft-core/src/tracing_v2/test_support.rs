@@ -3,8 +3,8 @@ use std::ops::{Add, Mul, Neg};
 use indoc::indoc;
 
 use crate::parameters::Placeholder;
+use crate::tracing::engines::{ScalarEngine, TracingEngine};
 use crate::tracing::{Program, ProgramBuilder};
-use crate::tracing_v2::engines::ScalarEngine;
 use crate::tracing_v2::*;
 use crate::types::{DataType, Typed};
 

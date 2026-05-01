@@ -4,8 +4,8 @@ use half::{bf16, f16};
 
 use crate::macros::check_input_count;
 use crate::sharding::{Sharding, ShardingDimension};
+use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError};
-use crate::tracing_v2::engines::{Tracer, TracingEngine};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, LinearArrayOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};

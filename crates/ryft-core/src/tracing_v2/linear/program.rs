@@ -273,7 +273,7 @@ where
 /// program itself is staged in a fresh linear-program builder, then any
 /// [`LinearArrayOperation::Zero`](crate::tracing_v2::LinearArrayOperation::Zero) op
 /// produced for a disconnected primal input is materialized into a
-/// [`Tracer`](crate::tracing_v2::Tracer) constant whose underlying outer-trace atom holds
+/// [`Tracer`](crate::tracing::engines::Tracer) constant whose underlying outer-trace atom holds
 /// `engine.zero(t)`. After this materialization the returned pullback contains no `Zero` ops, so
 /// the standard interpret path applies.
 #[allow(private_bounds)]

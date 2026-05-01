@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
+use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{
     Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
 };
@@ -13,7 +14,7 @@ use ryft_core::tracing_v2::forward::{Differentiable, JvpTracer};
 use ryft_core::tracing_v2::linear::{linearize_traced_program, transpose_traced_linear_program};
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearArrayOperation,
-    LinearCustomPrimitive, LinearOperation, TracingContext,
+    LinearCustomPrimitive, LinearOperation,
 };
 use ryft_core::types::{ArrayType, TypeError, Typed};
 

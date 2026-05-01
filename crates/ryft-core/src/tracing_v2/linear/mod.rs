@@ -3,11 +3,11 @@ use std::fmt::Debug;
 use std::rc::Rc;
 
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
+use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::{
     Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
     Value,
 };
-use crate::tracing_v2::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing_v2::forward::JvpTracer;
 use crate::tracing_v2::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
 use crate::tracing_v2::operations::rematerialize::{FlatTracedRematerialize, RematerializeOperation};
@@ -176,8 +176,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::parameters::Placeholder;
+    use crate::tracing::engines::ScalarEngine;
     use crate::tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError};
-    use crate::tracing_v2::engines::ScalarEngine;
     use crate::tracing_v2::operations::TranspositionContext;
     use crate::tracing_v2::{
         ArrayOperation, CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearArrayOperation,

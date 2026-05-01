@@ -4,7 +4,7 @@ use half::{bf16, f16};
 
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::Traceable;
-use crate::tracing_v2::engines::Tracer;
+use crate::tracing::engines::Tracer;
 use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 use super::{SupportsMatMul, SupportsMatrixTranspose};
@@ -150,7 +150,7 @@ fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
 
 impl<'engine, V: Traceable<ArrayType>, E> MatrixOps for Tracer<'engine, E>
 where
-    E: crate::tracing_v2::TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: crate::tracing::engines::TracingEngine<Type = ArrayType, Value = V> + ?Sized,
     E::Operation: SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
 {
     #[inline]

@@ -395,10 +395,10 @@ where
 mod tests {
     use crate::parameters::Placeholder;
     use crate::tracing::TracingError;
-    use crate::tracing_v2::engines::{Engine, TracingEngine};
+    use crate::tracing::engines::{Engine, Tracer, TracingEngine};
     use crate::tracing_v2::{
         ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, DifferentiationError, LinearArrayOperation,
-        Sin, Tracer,
+        Sin,
     };
     use crate::types::ArrayType;
 

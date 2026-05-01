@@ -1,5 +1,6 @@
 use super::*;
-use crate::tracing_v2::{JvpContext, TracingContext};
+use crate::tracing::engines::TracingContext;
+use crate::tracing_v2::JvpContext;
 
 /// Operation-level capability required by traced program linearization.
 ///

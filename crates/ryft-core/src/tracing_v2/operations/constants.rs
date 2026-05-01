@@ -2,9 +2,9 @@ use std::fmt::{Debug, Display};
 
 use half::{bf16, f16};
 
+use crate::tracing::engines::{Engine, Tracer, TracerState, TracingEngine};
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
 use crate::tracing_v2::operations::primitive::LinearArrayOperation;
-use crate::tracing_v2::{Engine, Tracer, TracerState, TracingEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{InterpretableOperation, LinearOperation, Operation, TranspositionContext};
@@ -12,9 +12,9 @@ use super::{InterpretableOperation, LinearOperation, Operation, TranspositionCon
 /// Returns a zero value with the same structure as an existing value.
 ///
 /// [`ZeroLike`] is the local, value-level counterpart to
-/// [`Engine::zero`](crate::tracing_v2::Engine::zero). When a transform already has an exemplar in
+/// [`Engine::zero`](crate::tracing::engines::Engine::zero). When a transform already has an exemplar in
 /// hand, it uses this trait instead of going back through abstract metadata. That is especially
-/// important for wrappers like [`Tracer`](crate::tracing_v2::Tracer) and
+/// important for wrappers like [`Tracer`](crate::tracing::engines::Tracer) and
 /// [`JvpTracer`](crate::tracing_v2::JvpTracer), which can stage or derive a zero from their
 /// existing state even when abstract synthesis alone would be insufficient. This module also ships
 /// the built-in scalar implementations of [`Traceable`](crate::tracing::Traceable),

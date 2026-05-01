@@ -6,11 +6,12 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
+use crate::tracing::engines::Tracer;
 use crate::tracing::{InterpretableOperation, Operation, Program, Traceable, TracingError, Value};
 use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::{
-    ArrayOperation, ControlFlowError, ControlFlowValue, Cos, LinearArrayOperation, MatrixOps, Sin, Tracer,
+    ArrayOperation, ControlFlowError, ControlFlowValue, Cos, LinearArrayOperation, MatrixOps, Sin,
 };
 use crate::types::{ArrayType, Size, Type, Typed};
 
@@ -403,7 +404,7 @@ pub fn vmap<'engine, E, F, Input, Output, V>(
     batch_axis: usize,
 ) -> Result<Output, TracingError>
 where
-    E: crate::tracing_v2::TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: crate::tracing::engines::TracingEngine<Type = ArrayType, Value = V> + ?Sized,
     V: Traceable<ArrayType>,
     Input: Parameterized<
             V,
@@ -662,8 +663,9 @@ mod tests {
 
     use super::*;
     use crate::broadcasting::Broadcastable;
+    use crate::tracing::engines::{Engine, TracingEngine};
+    use crate::tracing_v2::DifferentiableEngine;
     use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue, CustomPrimitive};
-    use crate::tracing_v2::{DifferentiableEngine, Engine, TracingEngine};
     use crate::types::{DataType, Shape};
 
     #[derive(Clone, Debug, PartialEq)]

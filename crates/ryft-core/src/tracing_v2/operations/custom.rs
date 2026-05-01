@@ -6,10 +6,10 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::parameters::Parameter;
+use crate::tracing::engines::{Tracer, TracingContext};
 use crate::tracing::{Traceable, TracingError, Value};
-use crate::tracing_v2::engines::Tracer;
 use crate::tracing_v2::forward::{Differentiable, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, TracingContext};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::primitive::{ArrayOperation, LinearArrayOperation};
@@ -356,7 +356,7 @@ where
 }
 
 /// JVP rule for `CustomPrimitive` under [`TracingContext`].
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
     for CustomPrimitive<ArrayType, V>
 where
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + 'static,
@@ -364,7 +364,7 @@ where
 {
     fn jvp(
         &self,
-        _engine: &crate::tracing_v2::TracingContext<'engine, EInner>,
+        _engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
         context: &mut crate::tracing_v2::JvpContext<
             '_,
             Tracer<'engine, EInner>,
@@ -465,12 +465,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::tracing::engines::Tracer;
+    use crate::tracing::engines::{Engine, TracingEngine};
     use crate::tracing::{Program, ProgramBuilder};
-    use crate::tracing_v2::engines::{Engine, TracingEngine};
     use crate::tracing_v2::operations::TranspositionContext;
     use crate::tracing_v2::operations::constants::OneLike;
     use crate::tracing_v2::{
-        ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, Tracer, grad, jvp,
+        ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, grad, jvp,
     };
     use crate::types::{ArrayType, DataType, Shape, Typed};
 

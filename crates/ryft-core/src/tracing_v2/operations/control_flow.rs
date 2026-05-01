@@ -4,16 +4,15 @@ use half::{bf16, f16};
 use thiserror::Error;
 
 use crate::parameters::Parameterized;
+use crate::tracing::engines::Tracer;
+use crate::tracing::engines::TracingEngine;
 use crate::tracing::{
     Instruction, InterpretableOperation, Operation, OperationFormatter, Program, Traceable, TracingError, Value,
 };
-use crate::tracing_v2::engines::TracingEngine;
 use crate::tracing_v2::forward::Differentiable;
 use crate::tracing_v2::linear::linearize_program;
 use crate::tracing_v2::operations::constants::{Zero, ZeroLike};
-use crate::tracing_v2::{
-    ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, JvpContext, JvpTracer, Tracer,
-};
+use crate::tracing_v2::{ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, JvpContext, JvpTracer};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{DifferentiableOperation, LinearOperation, SupportsAdd, TracedLinearizationCarrier, TranspositionContext};
@@ -531,12 +530,12 @@ where
 }
 
 /// JVP rule for `ConditionOperation` under
-/// [`TracingContext`](crate::tracing_v2::TracingContext).
+/// [`TracingContext`](crate::tracing::engines::TracingContext).
 ///
 /// Predicate extraction does not work at trace time (the wrapper engine's `Value` is `Tracer`,
 /// whose `control_flow_predicate` always errors), so this impl reports
 /// [`ControlFlowError::MissingTransformRule`] for any traced JVP attempt.
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
     for ConditionOperation<V, EInner::Operation>
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
@@ -546,14 +545,15 @@ where
 {
     fn jvp(
         &self,
-        _engine: &crate::tracing_v2::TracingContext<'engine, EInner>,
+        _engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
         _context: &mut crate::tracing_v2::JvpContext<
             '_,
-            crate::tracing_v2::Tracer<'engine, EInner>,
+            crate::tracing::engines::Tracer<'engine, EInner>,
             <EInner as DifferentiableTracingEngine>::LinearOperation<'engine>,
         >,
-        _inputs: &[JvpTracer<crate::tracing_v2::Tracer<'engine, EInner>, crate::tracing::AtomId>],
-    ) -> Result<Vec<JvpTracer<crate::tracing_v2::Tracer<'engine, EInner>, crate::tracing::AtomId>>, TracingError> {
+        _inputs: &[JvpTracer<crate::tracing::engines::Tracer<'engine, EInner>, crate::tracing::AtomId>],
+    ) -> Result<Vec<JvpTracer<crate::tracing::engines::Tracer<'engine, EInner>, crate::tracing::AtomId>>, TracingError>
+    {
         Err(ControlFlowError::MissingTransformRule { transform: "linearization engine traced JVP" }.into())
     }
 }
@@ -695,9 +695,9 @@ where
 }
 
 /// JVP rule for `WhileOperation` under
-/// [`TracingContext`](crate::tracing_v2::TracingContext). See the matching
+/// [`TracingContext`](crate::tracing::engines::TracingContext). See the matching
 /// [`ConditionOperation`] impl for rationale; predicate extraction does not work at trace time.
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
     for WhileOperation<V, EInner::Operation>
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
@@ -707,14 +707,15 @@ where
 {
     fn jvp(
         &self,
-        _engine: &crate::tracing_v2::TracingContext<'engine, EInner>,
+        _engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
         _context: &mut crate::tracing_v2::JvpContext<
             '_,
-            crate::tracing_v2::Tracer<'engine, EInner>,
+            crate::tracing::engines::Tracer<'engine, EInner>,
             <EInner as DifferentiableTracingEngine>::LinearOperation<'engine>,
         >,
-        _inputs: &[JvpTracer<crate::tracing_v2::Tracer<'engine, EInner>, crate::tracing::AtomId>],
-    ) -> Result<Vec<JvpTracer<crate::tracing_v2::Tracer<'engine, EInner>, crate::tracing::AtomId>>, TracingError> {
+        _inputs: &[JvpTracer<crate::tracing::engines::Tracer<'engine, EInner>, crate::tracing::AtomId>],
+    ) -> Result<Vec<JvpTracer<crate::tracing::engines::Tracer<'engine, EInner>, crate::tracing::AtomId>>, TracingError>
+    {
         Err(ControlFlowError::MissingTransformRule { transform: "linearization engine traced JVP" }.into())
     }
 }
@@ -779,8 +780,8 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::parameters::{Parameter, Placeholder};
+    use crate::tracing::engines::{Engine, TracingEngine};
     use crate::tracing::{ProgramBuilder, Traceable, Value};
-    use crate::tracing_v2::engines::{Engine, TracingEngine};
     use crate::tracing_v2::operations::constants::{One, OneLike, Zero};
     use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
     use crate::tracing_v2::{Differentiable, LinearArrayOperation};

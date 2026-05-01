@@ -446,13 +446,13 @@ mod tests {
 
     use ryft_macros::Parameter;
 
+    use crate::tracing::engines::{ScalarEngine, Tracer};
     use crate::tracing::{InterpretableOperation, Operation, Traceable, TracingError, Value};
-    use crate::tracing_v2::engines::ScalarEngine;
     use crate::tracing_v2::operations::add::{AddOperation, SupportsAdd};
     use crate::tracing_v2::operations::constants::{One, OneLike, Zero, ZeroLike};
     use crate::tracing_v2::operations::neg::SupportsNeg;
     use crate::tracing_v2::operations::scale::SupportsScale;
-    use crate::tracing_v2::{Differentiable, DifferentiationError, Tracer};
+    use crate::tracing_v2::{Differentiable, DifferentiationError};
     use crate::types::{Type, TypeError, Typed};
 
     use super::*;

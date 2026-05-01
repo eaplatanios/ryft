@@ -1,9 +1,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Instruction, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableEngine;
-use crate::tracing_v2::engines::{Tracer, TracingEngine};
 use crate::tracing_v2::forward::{JvpContext, JvpTracer};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -84,7 +84,7 @@ pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
 pub use scale::{ScaleOperation, SupportsScale};
 pub use sin::{Sin, SinOperation, SupportsSin};
 
-/// Carrier capability required by [`TracingContext`](crate::tracing_v2::TracingContext).
+/// Carrier capability required by [`TracingContext`](crate::tracing::engines::TracingContext).
 ///
 /// Traced linearization runs ordinary JVP rules with [`Tracer`] primals. Those rules may stage the
 /// primal side of built-in arithmetic through the outer operation carrier, so the carrier must know

@@ -19,8 +19,8 @@ pub use sharding::{
     ShardingDimension, ShardingError, ShardingVisualization,
 };
 pub use tracing::{
-    Atom, AtomId, Instruction, InterpretableOperation, Operation, OperationFormatter, Program, ProgramBuilder,
-    Traceable, TracingError, Value,
+    Atom, AtomId, Engine, Instruction, InterpretableOperation, Operation, OperationFormatter, Program, ProgramBuilder,
+    ScalarEngine, Traceable, Tracer, TracerState, TracingContext, TracingEngine, TracingError, Value,
 };
 pub use types::{
     ArrayType, DataType, DataTypeError, Layout, LayoutError, Shape, Size, StridedLayout, Tile, TileDimension,

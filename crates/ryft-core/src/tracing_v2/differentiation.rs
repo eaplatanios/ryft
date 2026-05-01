@@ -1,9 +1,9 @@
 use half::{bf16, f16};
 use thiserror::Error;
 
+use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::{InterpretableOperation, TracingError};
 use crate::tracing_v2::LinearOperation as LinearOperationTrait;
-use crate::tracing_v2::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
 use crate::tracing_v2::operations::{
     SupportsAdd, SupportsNeg, SupportsScale, SupportsZero, TracedLinearizationCarrier,
 };
@@ -63,7 +63,7 @@ pub enum DifferentiationError {
 /// Optional extension for tracing engines that support differentiation inside an active trace.
 ///
 /// Plain tracing engines do not need to choose any linear carrier. This trait is the additional
-/// contract required when a [`TracingContext`](crate::tracing_v2::TracingContext) itself needs to act
+/// contract required when a [`TracingContext`](crate::tracing::engines::TracingContext) itself needs to act
 /// as a differentiable engine: tangent and cotangent programs then operate on
 /// [`Tracer`] values, so the underlying tracing engine must select a linear operation carrier for
 /// those traced leaves.

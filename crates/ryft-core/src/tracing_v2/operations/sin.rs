@@ -3,9 +3,9 @@ use std::fmt::{Debug, Display};
 use half::{bf16, f16};
 
 use crate::macros::check_input_count;
+use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableEngine;
-use crate::tracing_v2::engines::{Tracer, TracingEngine};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 

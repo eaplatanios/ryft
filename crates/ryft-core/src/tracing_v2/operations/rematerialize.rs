@@ -2,13 +2,13 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
+use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{Instruction, OperationFormatter, Program, ProgramBuilder, Traceable, TracingError, Value};
-use crate::tracing_v2::engines::TracingEngine;
 use crate::tracing_v2::linear::{linearize_program, transpose_linear_program_with_output_examples};
 use crate::tracing_v2::operations::constants::{SupportsZero, Zero, ZeroLike};
 use crate::tracing_v2::{
     ArrayOperation, Differentiable, DifferentiableEngine, DifferentiableTracingEngine, DifferentiationError,
-    LinearArrayOperation, Tracer,
+    LinearArrayOperation,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -163,16 +163,16 @@ where
 }
 
 /// JVP rule for `RematerializeOperation` under
-/// [`TracingContext`](crate::tracing_v2::TracingContext).
+/// [`TracingContext`](crate::tracing::engines::TracingContext).
 ///
 /// Stages the primal effect by tracing the rematerialize op in the outer trace via
-/// [`TracingContext::trace`](crate::tracing_v2::TracingContext::trace), then recursively linearizes
+/// [`TracingContext::trace`](crate::tracing::engines::TracingContext::trace), then recursively linearizes
 /// the body through
 /// [`linearize_traced_program`] to obtain a pushforward over `Tracer` values, and finally wraps
 /// that pushforward (paired with its transpose) in a
 /// [`LinearArrayOperation::Rematerialize`] variant that the active linear builder can stage
 /// directly.
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingContext<'engine, EInner>>
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
     for RematerializeOperation<ArrayType, V, EInner::Operation, LinearArrayOperation<V>>
 where
     V: Value<ArrayType>
@@ -196,7 +196,7 @@ where
 {
     fn jvp(
         &self,
-        engine: &crate::tracing_v2::TracingContext<'engine, EInner>,
+        engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
         context: &mut crate::tracing_v2::JvpContext<
             '_,
             Tracer<'engine, EInner>,
@@ -656,11 +656,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::tracing::engines::{Engine, Tracer, TracingEngine};
     use crate::tracing::{Program, ProgramBuilder};
-    use crate::tracing_v2::engines::{Engine, TracingEngine};
     use crate::tracing_v2::linear::{compile_grad, grad, value_and_grad};
     use crate::tracing_v2::operations::TranspositionContext;
-    use crate::tracing_v2::{DifferentiationError, JvpTracer, LinearArrayOperation, Sin, Tracer};
+    use crate::tracing_v2::{DifferentiationError, JvpTracer, LinearArrayOperation, Sin};
 
     use super::*;
 
