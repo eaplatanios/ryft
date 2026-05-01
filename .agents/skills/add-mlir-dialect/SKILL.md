@@ -22,6 +22,10 @@ When adding operation wrappers, keep public operation attribute-name constants c
 operation trait or macro-generated operation group that references them. Do not collect operation attribute-name
 constants in a module-level block at the top of the operations file.
 
+When adding or claiming complete support for an MLIR dialect's operations, first enumerate every concrete operation in
+the pinned upstream TableGen file, explicitly exclude only abstract/base classes, and do not treat a useful core subset
+as complete coverage.
+
 Inline operation-specific attribute, segment, and operand access logic directly in the owning operation trait or
 constructor. Do not introduce tiny private wrappers for one-line attribute casts, attribute value extraction, or operand
 slicing unless that helper is genuinely shared across dialect modules.
