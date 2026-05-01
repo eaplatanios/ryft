@@ -184,6 +184,7 @@ cc_library(
         "src/c++/mlir/dialects/mosaic_tpu.h",
         "src/c++/mlir/dialects/nvgpu.h",
         "src/c++/mlir/dialects/shape.h",
+        "src/c++/mlir/dialects/sparse_tensor.h",
         "src/c++/mlir/dialects/triton.h",
     ],
     srcs = [
@@ -195,6 +196,7 @@ cc_library(
         "src/c++/mlir/dialects/mosaic_tpu.cc",
         "src/c++/mlir/dialects/nvgpu.cc",
         "src/c++/mlir/dialects/shape.cc",
+        "src/c++/mlir/dialects/sparse_tensor.cc",
         "src/c++/mlir/dialects/triton.cc",
     ],
     copts = tsl_copts() + [

@@ -4,4 +4,5 @@ pub mod gpu;
 pub mod mosaic;
 pub mod nvgpu;
 pub mod shape;
+pub mod sparse_tensor;
 pub mod triton;
