@@ -720,6 +720,8 @@ impl BuildConfiguration {
             PathBuf::from("src").join("c++").join("common.h"),
             PathBuf::from("src").join("c++").join("distributed.cc"),
             PathBuf::from("src").join("c++").join("distributed.h"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("arith.cc"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("arith.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_gpu.cc"),
