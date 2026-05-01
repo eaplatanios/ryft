@@ -243,6 +243,18 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
         Tracer { state: TracerState::Live(atom), r#type, context: self.clone() }
     }
 
+    /// Records the provided [`TracingError`] in the underlying [`ProgramBuilder`] and returns it. If the underlying
+    /// [`ProgramBuilder`] already has an error recorded, then it is left unchanged and this function acts simply as
+    /// an identity function.
+    #[inline]
+    pub fn error(&self, error: TracingError) -> TracingError {
+        let mut builder = self.builder.borrow_mut();
+        if builder.error.is_none() {
+            builder.error = Some(error.clone());
+        }
+        error
+    }
+
     /// Traces one [`Operation`] application in this [`TracingContext`] and returns [`Tracer`]s for its outputs.
     /// This function validates that all provided `inputs` belong to this [`TracingContext`] and then delegates normal
     /// [`Instruction`](crate::tracing::Instruction) construction to [`ProgramBuilder::add_instruction`]. If the builder
@@ -254,7 +266,7 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
         inputs: &[Tracer<'engine, E>],
     ) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         if inputs.iter().any(|input| !Rc::ptr_eq(&self.builder, &input.context.builder)) {
-            return Err(TracingError::MismatchedProgramBuilders);
+            return Err(self.error(TracingError::MismatchedProgramBuilders));
         }
         if self.builder.borrow().error.is_some() {
             let input_types = inputs.iter().map(|input| input.r#type.clone()).collect::<Vec<_>>();
@@ -264,7 +276,10 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
                 .map(|r#type| Tracer { state: TracerState::Poison, r#type, context: self.clone() })
                 .collect())
         } else {
-            let input_atom_ids = inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>()?;
+            let input_atom_ids = match inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>() {
+                Ok(input_atom_ids) => input_atom_ids,
+                Err(error) => return Err(self.error(error)),
+            };
             let output_atom_ids = {
                 let mut builder = self.builder.borrow_mut();
                 match builder.add_instruction(operation, input_atom_ids) {
@@ -377,12 +392,18 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
     ///
     /// Convenience wrapper for operator trait implementations whose staged operation should produce one output.
     pub fn unary(self, operation: E::Operation) -> Self {
-        match self.context.trace(operation, std::slice::from_ref(&self)) {
-            Ok(outputs) => outputs.into_iter().next().expect("unary traced staging should produce one output"),
-            Err(_) if self.context.builder.borrow().error.is_some() => {
-                Tracer { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
+        let context = self.context.clone();
+        let poison_type = self.r#type.clone();
+        match context.trace(operation, std::slice::from_ref(&self)) {
+            Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
+            Ok(outputs) => {
+                context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
+                Tracer { state: TracerState::Poison, r#type: poison_type, context }
             }
-            Err(error) => panic!("unary traced staging failed before recording a builder error: {error}"),
+            Err(error) => {
+                context.error(error);
+                Tracer { state: TracerState::Poison, r#type: poison_type, context }
+            }
         }
     }
 
@@ -390,15 +411,18 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
     ///
     /// Convenience wrapper for operator trait implementations whose staged operation should produce one output.
     pub fn binary(self, rhs: Self, operation: E::Operation) -> Self {
-        debug_assert!(Rc::ptr_eq(self.builder(), rhs.builder()));
         let context = self.context.clone();
         let poison_type = self.r#type.clone();
         match context.trace(operation, &[self, rhs]) {
-            Ok(outputs) => outputs.into_iter().next().expect("binary traced staging should produce one output"),
-            Err(_error) if context.builder.borrow().error.is_some() => {
+            Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
+            Ok(outputs) => {
+                context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
                 Tracer { state: TracerState::Poison, r#type: poison_type, context }
             }
-            Err(error) => panic!("binary traced staging failed before recording a builder error: {error}"),
+            Err(error) => {
+                context.error(error);
+                Tracer { state: TracerState::Poison, r#type: poison_type, context }
+            }
         }
     }
 }
@@ -566,6 +590,38 @@ mod tests {
 
     impl TracingEngine for TaggedEngine {
         type Operation = PrimitiveOperation<f64>;
+    }
+
+    #[derive(Copy, Clone, Debug)]
+    struct NoOutputOperation;
+
+    impl Operation<ArrayType> for NoOutputOperation {
+        fn name(&self) -> &'static str {
+            "no_output"
+        }
+
+        fn infer_output_types(&self, _input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct NoOutputEngine;
+
+    impl Engine for NoOutputEngine {
+        type Type = ArrayType;
+        type Value = f64;
+
+        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(0.0)
+        }
+
+        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(1.0)
+        }
+    }
+
+    impl TracingEngine for NoOutputEngine {
+        type Operation = NoOutputOperation;
     }
 
     #[test]
@@ -746,9 +802,42 @@ mod tests {
         let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
 
         assert!(matches!(
-            TracingContext::new(&engine, builder_a).trace(PrimitiveOperation::Add, &[tracer_a, tracer_b]),
+            TracingContext::new(&engine, builder_a.clone()).trace(PrimitiveOperation::Add, &[tracer_a, tracer_b]),
             Err(TracingError::MismatchedProgramBuilders),
         ));
+        assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
+    }
+
+    #[test]
+    fn test_binary_operator_returns_poisoned_tracer_for_mismatched_program_builders() {
+        let builder_a = new_array_f64_builder();
+        let builder_b = new_array_f64_builder();
+        let atom_a = builder_a.borrow_mut().add_input(array_scalar_f64_type());
+        let atom_b = builder_b.borrow_mut().add_input(array_scalar_f64_type());
+        let engine = TaggedEngine { id: 1 };
+        let tracer_a = TracingContext::new(&engine, builder_a.clone()).tracer(atom_a, None);
+        let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
+
+        let output = tracer_a.binary(tracer_b, PrimitiveOperation::Add);
+
+        assert!(matches!(&output.state, TracerState::Poison));
+        assert!(matches!(output.r#type(), Cow::Borrowed(r#type) if *r#type == array_scalar_f64_type()));
+        assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
+    }
+
+    #[test]
+    fn test_unary_operator_records_invalid_output_count_and_returns_poisoned_tracer() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, NoOutputOperation>::new()));
+        let input_type = array_scalar_f64_type();
+        let atom = builder.borrow_mut().add_input(input_type.clone());
+        let engine = NoOutputEngine;
+        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, Some(input_type));
+
+        let output = tracer.unary(NoOutputOperation);
+
+        assert!(matches!(&output.state, TracerState::Poison));
+        assert!(matches!(output.r#type(), Cow::Borrowed(r#type) if *r#type == array_scalar_f64_type()));
+        assert_eq!(builder.borrow().error, Some(TracingError::InvalidOutputCount { expected: 1, got: 0 }));
     }
 
     #[test]
@@ -912,9 +1001,9 @@ mod tests {
         };
 
         assert_eq!(live.to_string(), "%0");
-        assert_eq!(format!("{live:?}"), "Tracer { state: Live(AtomId { index: 0 }), .. }");
+        assert_eq!(format!("{live:?}"), "Tracer { state: Live(AtomId { index: 0 }), type: F64, .. }");
         assert_eq!(poison.to_string(), "<poison:f64>");
-        assert_eq!(format!("{poison:?}"), "Tracer { state: Poison, .. }");
+        assert_eq!(format!("{poison:?}"), "Tracer { state: Poison, type: F64, .. }");
         assert_eq!(format!("{:?}", live.context), "TracingContext { .. }");
     }
 
