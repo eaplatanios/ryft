@@ -3,6 +3,7 @@ use std::ops::{Add, Mul, Neg};
 use std::sync::Arc;
 
 use crate::macros::check_input_count;
+use crate::operations::arithmetic::{AddOperation, SupportsAdd};
 use crate::operations::constants::{
     One, OneLike, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike, Zero,
     ZeroLike, ZeroLikeOperation, ZeroOperation,
@@ -17,15 +18,14 @@ use crate::tracing_v2::operations::control_flow::{ConditionOperation, ControlFlo
 use crate::tracing_v2::operations::left_matmul::left_matmul_abstract_eval;
 use crate::tracing_v2::operations::right_matmul::right_matmul_abstract_eval;
 use crate::tracing_v2::operations::{
-    AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
-    NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
+    CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
+    ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
 };
 use crate::tracing_v2::{
     Cos, DifferentiableOperation, DifferentiableTracingEngine, LinearizableEngine, MatrixOps, Sin,
 };
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
-use super::add::SupportsAdd;
 use super::cos::SupportsCos;
 use super::custom::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, SupportsLinearCustom};
 use super::left_matmul::SupportsLeftMatMul;
@@ -1730,7 +1730,7 @@ impl<
 where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearScalarOperation<V>: super::SupportsAdd<DataType, V>
+    LinearScalarOperation<V>: SupportsAdd<DataType, V>
         + super::SupportsNeg<DataType, V>
         + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>
@@ -1781,7 +1781,7 @@ where
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearScalarOperation<V>: super::SupportsAdd<DataType, V>
+    LinearScalarOperation<V>: SupportsAdd<DataType, V>
         + super::SupportsNeg<DataType, V>
         + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>
@@ -1869,7 +1869,7 @@ where
     V: Differentiable<ArrayType, Tangent = V>,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V, ArrayType>: super::SupportsAdd<ArrayType, V>
+    LinearArrayOperation<V, ArrayType>: SupportsAdd<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
@@ -1928,7 +1928,7 @@ impl<
 where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V, DataType>: super::SupportsAdd<DataType, V>
+    LinearArrayOperation<V, DataType>: SupportsAdd<DataType, V>
         + super::SupportsNeg<DataType, V>
         + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>
@@ -1997,7 +1997,7 @@ where
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V, ArrayType>: super::SupportsAdd<ArrayType, V>
+    LinearArrayOperation<V, ArrayType>: SupportsAdd<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
@@ -2078,7 +2078,7 @@ where
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V, DataType>: super::SupportsAdd<DataType, V>
+    LinearArrayOperation<V, DataType>: SupportsAdd<DataType, V>
         + super::SupportsNeg<DataType, V>
         + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>

@@ -10,9 +10,9 @@ use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiableTracingEngine, LinearizableEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::SupportsAdd;
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
 use super::primitive::LinearArrayOperation;
+use crate::operations::arithmetic::SupportsAdd;
 
 /// Trait that represents [`Operation`] carrier types that support/include [`RightMatMulOperation`]. Backend-owned
 /// closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this

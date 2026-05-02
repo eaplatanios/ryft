@@ -8,13 +8,14 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::macros::check_input_count;
+use crate::operations::arithmetic::{AddOperation, SupportsAdd};
 use crate::operations::constants::{SupportsZero, Zero};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
+use crate::tracing_v2::operations::{SupportsNeg, SupportsScale};
 use crate::tracing_v2::{LinearScalarOperation, ScalarOperation};
 use crate::types::{ArrayType, Type, Typed};
 
@@ -483,9 +484,9 @@ where
     E: DifferentiableTracingEngine + ?Sized,
     E::Value: Differentiable<E::Type, Tangent = E::Value>,
     E::OperationCarrier: SupportsAdd<E::Type, E::Value>,
-    crate::tracing_v2::operations::AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+    AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
-    type DifferentiableOperationCarrier = crate::tracing_v2::operations::AddOperation;
+    type DifferentiableOperationCarrier = AddOperation;
 }
 
 macro_rules! impl_differentiable_engine_for_scalar {

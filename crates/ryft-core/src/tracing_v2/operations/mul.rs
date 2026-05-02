@@ -1,17 +1,17 @@
-use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::ops::Mul;
 
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_input_count;
-use crate::operations::{InterpretableOperation, Operation};
+use crate::operations::arithmetic::SupportsAdd;
+use crate::operations::{ElementwiseArrayOperation, InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-use super::{SupportsAdd, SupportsScale};
+use super::SupportsScale;
 
 /// Trait that represents [`Operation`] carrier types that support/include [`MulOperation`]. Backend-owned closed
 /// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
@@ -47,46 +47,15 @@ impl Display for MulOperation {
     }
 }
 
-impl Operation<ArrayType> for MulOperation {
+impl ElementwiseArrayOperation for MulOperation {
     #[inline]
     fn name(&self) -> &'static str {
         "mul"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        check_input_count!(input_types, 2, TypeError);
-        match input_types[0].broadcast(&input_types[1]) {
-            Ok(output) => Ok(vec![output]),
-            Err(_) => {
-                // As with `add`, keep generic `ArrayType` broadcasting strict and apply the
-                // JAX-like implicit `pvary` behavior only at the primitive boundary. We retry
-                // after clearing VMA metadata, then conservatively mark the result as varying over
-                // every manual axis that either input may vary across.
-                let original_varying_manual_axes = match (&input_types[0].sharding, &input_types[1].sharding) {
-                    (None, None) => BTreeSet::new(),
-                    (Some(left), None) => left.varying_manual_axes.clone(),
-                    (None, Some(right)) => right.varying_manual_axes.clone(),
-                    (Some(left), Some(right)) => {
-                        left.varying_manual_axes.union(&right.varying_manual_axes).cloned().collect::<BTreeSet<_>>()
-                    }
-                };
-                let mut left = input_types[0].clone();
-                let mut right = input_types[1].clone();
-                if let Some(sharding) = &mut left.sharding {
-                    sharding.varying_manual_axes.clear();
-                }
-                if let Some(sharding) = &mut right.sharding {
-                    sharding.varying_manual_axes.clear();
-                }
-                let mut output = left
-                    .broadcast(&right)
-                    .map_err(|_| TypeError { message: "mul input types are not broadcast-compatible".to_string() })?;
-                if let Some(sharding) = &mut output.sharding {
-                    sharding.varying_manual_axes = original_varying_manual_axes;
-                }
-                Ok(vec![output])
-            }
-        }
+    #[inline]
+    fn input_count(&self) -> usize {
+        2
     }
 }
 
@@ -167,6 +136,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 

@@ -318,7 +318,7 @@ where
         match self {
             Self::Zero(zero) => batch_by_interpreting_physical_operation(zero, inputs),
             Self::One(one) => batch_by_interpreting_physical_operation(one, inputs),
-            Self::Add => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::AddOperation, inputs),
+            Self::Add => batch_by_interpreting_physical_operation(&crate::operations::arithmetic::AddOperation, inputs),
             Self::Mul => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::MulOperation, inputs),
             Self::Neg => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::NegOperation, inputs),
             Self::Sin => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::SinOperation, inputs),

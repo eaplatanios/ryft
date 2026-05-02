@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 
 use crate::operations::InterpretableOperation;
+use crate::operations::arithmetic::{AddOperation, SupportsAdd};
 use crate::operations::constants::SupportsZeroLike;
 use crate::operations::constants::Zero;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
@@ -8,7 +9,7 @@ use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
 use crate::tracing_v2::linear::linearize;
-use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
+use crate::tracing_v2::operations::{SupportsNeg, SupportsScale};
 use crate::tracing_v2::{
     DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,
     DifferentiationError,
@@ -144,7 +145,7 @@ impl<
         >,
 > JvpDispatch<E, Input, Output, TracedJvp> for Tracer<'engine, E>
 where
-    crate::tracing_v2::operations::AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+    AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     type FunctionInput<'call>
         = Input
@@ -231,7 +232,6 @@ mod tests {
     use crate::tracing::{Program, ProgramBuilder};
     use crate::tracing_v2::DifferentiableOperation;
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-    use crate::tracing_v2::operations::AddOperation;
     use crate::tracing_v2::{LinearScalarOperation, ScalarOperation, Sin};
     use crate::types::DataType;
 

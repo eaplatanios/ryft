@@ -17,7 +17,7 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-use super::SupportsAdd;
+use crate::operations::arithmetic::SupportsAdd;
 
 /// Flat nested program shape used by control-flow operations.
 pub type FlatProgram<V, O, T = ArrayType> = Program<T, V, O, Vec<V>, Vec<V>>;
@@ -703,6 +703,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::operations::arithmetic::SupportsAdd;
     use crate::operations::constants::OneLike;
     use crate::operations::constants::{One, Zero};
     use crate::parameters::{Parameter, Placeholder};
@@ -710,7 +711,7 @@ mod tests {
     use crate::tracing::{ProgramBuilder, Traceable, Value};
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::Differentiable;
-    use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
+    use crate::tracing_v2::operations::{SupportsNeg, SupportsScale};
     use crate::types::DataType;
 
     use super::*;

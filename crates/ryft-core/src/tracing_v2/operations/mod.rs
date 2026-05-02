@@ -1,4 +1,4 @@
-/// Elementwise addition.
+/// Elementwise addition linearization and differentiation rules.
 pub mod add;
 
 /// Elementwise cosine.
@@ -49,7 +49,6 @@ pub mod scale;
 /// Elementwise sine.
 pub mod sin;
 
-pub use add::{AddOperation, SupportsAdd};
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
     flat_program_input_types, flat_program_output_types,

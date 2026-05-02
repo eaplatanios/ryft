@@ -2,11 +2,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::operations::Operation;
+use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::SupportsZero;
 use crate::parameters::Parameterized;
 use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
 use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::operations::SupportsAdd;
 use crate::types::{Type, Typed};
 
 /// Context that is used while _transposing_ [`Program`](crate::Program)s. This context is threaded through the
@@ -55,10 +55,8 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> TranspositionContext<T, 
 /// A [`LinearOperation`] is the capability an operation carrier provides after a primal program has
 /// been linearized. Implementors describe how one staged linear instruction contributes to the
 /// reverse linear program used by VJP and reverse-mode gradient transforms. The trait is
-/// implemented by primitive operation types, such as
-/// [`AddOperation`](crate::tracing_v2::operations::AddOperation), and by carrier enums, such as
-/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation), that delegate to primitive
-/// rules.
+/// implemented by primitive operation types, such as [`AddOperation`](crate::AddOperation), and by carrier enums,
+/// such as [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation), that delegate to primitive rules.
 ///
 /// For a linear instruction `y = L(x)`, [`transpose`](Self::transpose) receives symbolic cotangent
 /// atoms for `y` and returns symbolic cotangent contributions for `x`. Rules may reuse existing

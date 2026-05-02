@@ -15,7 +15,7 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::SupportsAdd;
+use crate::operations::arithmetic::SupportsAdd;
 
 /// Trait that represents [`Operation`] carrier types that support/include [`RematerializeOperation`]. Backend-owned
 /// closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this

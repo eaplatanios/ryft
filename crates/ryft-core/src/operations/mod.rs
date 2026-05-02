@@ -1,13 +1,20 @@
+use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
+
+/// Elementwise arithmetic operations and carrier capability traits.
+pub mod arithmetic;
 
 /// Type-driven constant operations and carrier capability traits.
 pub mod constants;
 
+pub use arithmetic::*;
 pub use constants::*;
 
+use crate::broadcasting::Broadcastable;
+use crate::macros::check_input_count;
 use crate::parameters::Parameterized;
 use crate::tracing::{Program, Traceable, TracingError};
-use crate::types::{Type, TypeError, Typed};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
 /// If the length exceeds this value, then the section contents will be rendered over multiple lines.
@@ -142,15 +149,76 @@ pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError>;
 }
 
+/// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.
+/// [`ElementwiseArrayOperation`] captures the shared type inference behavior of elementwise array operations:
+/// implementations declare their fixed input count and operation name, while the default type inference implementation
+/// checks the input count, broadcasts all input [`ArrayType`]s while tolerating shardings that differ only by
+/// [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes).
+pub trait ElementwiseArrayOperation: Debug {
+    /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
+    fn name(&self) -> &'static str;
+
+    /// Returns the number of input arrays consumed by this elementwise [`Operation`].
+    fn input_count(&self) -> usize;
+
+    /// Infers the broadcasted output [`ArrayType`] for this elementwise [`Operation`].
+    #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        check_input_count!(input_types, self.input_count(), TypeError);
+        let input_type_refs = input_types.iter().collect::<Vec<_>>();
+        match ArrayType::broadcasted(&input_type_refs) {
+            Ok(output) => Ok(vec![output]),
+            Err(_) => {
+                // Ryft keeps generic [`ArrayType`] broadcasting conservative. Here we make binary primitives tolerate
+                // differing varying manual axis (VMA) annotations by retrying type inference after erasing only the
+                // VMA metadata, and then restoring the union of that metadata on the result, instead of weakening
+                // generic `ArrayType` broadcasting everywhere.
+                let original_varying_manual_axes = input_types
+                    .iter()
+                    .filter_map(|input_type| input_type.sharding.as_ref())
+                    .flat_map(|sharding| sharding.varying_manual_axes.iter().cloned())
+                    .collect::<BTreeSet<_>>();
+                let mut input_types = input_types.to_vec();
+                for sharding in input_types.iter_mut().filter_map(|input_type| input_type.sharding.as_mut()) {
+                    sharding.varying_manual_axes.clear();
+                }
+                let input_types = input_types.iter().collect::<Vec<_>>();
+                let mut output = ArrayType::broadcasted(&input_types).map_err(|_| TypeError {
+                    message: format!("{} input types are not broadcast-compatible", self.name()),
+                })?;
+                if let Some(sharding) = &mut output.sharding {
+                    sharding.varying_manual_axes = original_varying_manual_axes;
+                }
+                Ok(vec![output])
+            }
+        }
+    }
+}
+
+impl<O: ElementwiseArrayOperation> Operation<ArrayType> for O {
+    #[inline]
+    fn name(&self) -> &'static str {
+        ElementwiseArrayOperation::name(self)
+    }
+
+    #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        ElementwiseArrayOperation::infer_output_types(self, input_types)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::macros::check_input_count;
     use crate::parameters::Placeholder;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::{Program, ProgramBuilder};
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 
@@ -322,6 +390,112 @@ mod tests {
                 ]
             "}
             .trim_end()
+        );
+    }
+
+    #[test]
+    fn elementwise_array_operation() {
+        #[derive(Clone, Debug)]
+        struct TestElementwiseArrayOperation {
+            input_count: usize,
+        }
+
+        impl ElementwiseArrayOperation for TestElementwiseArrayOperation {
+            #[inline]
+            fn name(&self) -> &'static str {
+                "elementwise_test"
+            }
+
+            #[inline]
+            fn input_count(&self) -> usize {
+                self.input_count
+            }
+        }
+
+        let operation = TestElementwiseArrayOperation { input_count: 1 };
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[input_type.clone()]), Ok(vec![input_type]));
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[]),
+            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
+        );
+
+        let operation = TestElementwiseArrayOperation { input_count: 3 };
+        let output = Operation::<ArrayType>::infer_output_types(
+            &operation,
+            &[
+                ArrayType::scalar(DataType::F32),
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap(),
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(3)]), None, None).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            vec![
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None,).unwrap()
+            ],
+        );
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let first = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(
+                Sharding::with_manual_axes(
+                    mesh.clone(),
+                    vec![ShardingDimension::sharded(["x"])],
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                    ["x"],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let second = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(
+                Sharding::with_manual_axes(
+                    mesh.clone(),
+                    vec![ShardingDimension::sharded(["x"])],
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                    ["y"],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let third = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(
+                Sharding::with_manual_axes(
+                    mesh,
+                    vec![ShardingDimension::sharded(["x"])],
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                    ["z"],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let output = Operation::<ArrayType>::infer_output_types(&operation, &[first, second, third]).unwrap();
+        assert_eq!(
+            output[0].sharding.as_ref().unwrap().varying_manual_axes,
+            BTreeSet::from(["x".to_string(), "y".to_string(), "z".to_string()]),
         );
     }
 }

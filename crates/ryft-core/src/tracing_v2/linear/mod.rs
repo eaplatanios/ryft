@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
+use crate::operations::arithmetic::{AddOperation, SupportsAdd};
 use crate::operations::constants::{One, SupportsZero, Zero};
 use crate::operations::constants::{OneLike, SupportsZeroLike, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
@@ -10,8 +11,8 @@ use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::JvpTracer;
+use crate::tracing_v2::operations::SupportsRematerialize;
 use crate::tracing_v2::operations::rematerialize::{FlatTracedRematerialize, RematerializeOperation};
-use crate::tracing_v2::operations::{AddOperation, SupportsAdd, SupportsRematerialize};
 use crate::tracing_v2::{
     Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
     DifferentiableTracingEngine,
