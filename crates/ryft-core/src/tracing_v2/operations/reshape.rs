@@ -282,10 +282,14 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
     }
 }
 
-impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for ReshapeOperation {
+impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for ReshapeOperation {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<
+            ArrayType,
+            V,
+            LinearArrayOperation<V, ArrayType>,
+        >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1, TracingError);

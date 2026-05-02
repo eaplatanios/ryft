@@ -28,10 +28,14 @@ use crate::experimental::operations::{
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 
 /// Linear staged operation carrier used by the XLA backend.
-pub type LinearXlaOperation<V = ShardMapTensor> = LinearArrayOperation<V>;
+pub type LinearXlaOperation<V> = LinearArrayOperation<V, ArrayType>;
 
 fn make_linear_xla_rematerialize<
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperationCarrier = LinearXlaOperation>,
+    E: DifferentiableEngine<
+            Type = ArrayType,
+            Value = ShardMapTensor,
+            LinearOperationCarrier = LinearXlaOperation<ShardMapTensor>,
+        >,
 >(
     engine: &E,
     body: &FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaOperation>,
@@ -96,9 +100,13 @@ fn replay_xla_program_with_tracers(
 }
 
 fn interpret_xla_condition_jvp<
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperationCarrier = LinearXlaOperation>,
+    E: DifferentiableEngine<
+            Type = ArrayType,
+            Value = ShardMapTensor,
+            LinearOperationCarrier = LinearXlaOperation<ShardMapTensor>,
+        >,
 >(
-    condition: &ConditionOperation<ShardMapTensor, XlaOperation>,
+    condition: &ConditionOperation<ShardMapTensor, XlaOperation, ArrayType>,
     context: &mut JvpContext<'_, E>,
     inputs: &[JvpTracer<ShardMapTensor, AtomId>],
 ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError>
@@ -176,13 +184,15 @@ pub enum XlaOperation {
     Reshape { input_shape: Shape, output_shape: Shape },
 
     /// Higher-order rematerialization.
-    Rematerialize(Box<RematerializeOperation<ArrayType, ShardMapTensor, XlaOperation, LinearXlaOperation>>),
+    Rematerialize(
+        Box<RematerializeOperation<ArrayType, ShardMapTensor, XlaOperation, LinearXlaOperation<ShardMapTensor>>>,
+    ),
 
     /// Higher-order conditional.
-    Condition(Box<ConditionOperation<ShardMapTensor, XlaOperation>>),
+    Condition(Box<ConditionOperation<ShardMapTensor, XlaOperation, ArrayType>>),
 
     /// Higher-order while loop.
-    While(Box<WhileOperation<ShardMapTensor, XlaOperation>>),
+    While(Box<WhileOperation<ShardMapTensor, XlaOperation, ArrayType>>),
 
     /// XLA-specific `shard_map`.
     ShardMap(Box<ShardMapOperation<ShardMapTensor>>),
@@ -553,9 +563,9 @@ impl SupportsCustom<ArrayType, ShardMapTensor> for XlaOperation {
     }
 }
 
-impl SupportsRematerialize<ArrayType, ShardMapTensor, LinearXlaOperation> for XlaOperation {
+impl SupportsRematerialize<ArrayType, ShardMapTensor, LinearXlaOperation<ShardMapTensor>> for XlaOperation {
     fn rematerialize_operation(
-        op: RematerializeOperation<ArrayType, ShardMapTensor, XlaOperation, LinearXlaOperation>,
+        op: RematerializeOperation<ArrayType, ShardMapTensor, XlaOperation, LinearXlaOperation<ShardMapTensor>>,
     ) -> Self {
         XlaOperation::Rematerialize(Box::new(op))
     }
@@ -618,7 +628,9 @@ mod tests {
     fn test_xla_rematerialize_jvp_stages_a_linear_rematerialize() {
         let operation = XlaOperation::Rematerialize(Box::new(RematerializeOperation::new(unary_rematerialize_body())));
         let tangent_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, LinearXlaOperation>::new()));
+            Rc::new(RefCell::new(
+                ProgramBuilder::<ArrayType, ShardMapTensor, LinearXlaOperation<ShardMapTensor>>::new(),
+            ));
         let tangent_atom = tangent_builder.borrow_mut().add_input(scalar_type());
         let engine = crate::experimental::engines::XlaEngine::token();
         let mut context = JvpContext::new(engine, tangent_builder.clone());

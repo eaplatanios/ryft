@@ -71,20 +71,20 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type OperationCarrier = ArrayOperation<f64>;
+        type OperationCarrier = ArrayOperation<f64, ArrayType>;
     }
 
     impl crate::tracing_v2::LinearizableEngine for ArrayScalarEngine {
-        type LinearOperationCarrier = LinearArrayOperation<f64>;
+        type LinearOperationCarrier = LinearArrayOperation<f64, ArrayType>;
     }
 
     impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperationCarrier = ArrayOperation<f64>;
+        type DifferentiableOperationCarrier = ArrayOperation<f64, ArrayType>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperationCarrier<'engine>
-            = LinearArrayOperation<Tracer<'engine, Self>>
+            = LinearArrayOperation<Tracer<'engine, Self>, ArrayType>
         where
             Self: 'engine;
     }
@@ -116,10 +116,10 @@ mod tests {
         }
     }
 
-    impl LinearOperation<ArrayType, f64, LinearArrayOperation<f64>> for PanicReplayOp {
+    impl LinearOperation<ArrayType, f64, LinearArrayOperation<f64, ArrayType>> for PanicReplayOp {
         fn transpose(
             &self,
-            _context: &mut TranspositionContext<ArrayType, f64, LinearArrayOperation<f64>>,
+            _context: &mut TranspositionContext<ArrayType, f64, LinearArrayOperation<f64, ArrayType>>,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
             check_input_count!(output_cotangents, 1, TracingError);
@@ -228,7 +228,7 @@ mod tests {
     }
 
     impl crate::tracing_v2::LinearizableEngine for SplitCarrierEngine {
-        type LinearOperationCarrier = LinearArrayOperation<f64>;
+        type LinearOperationCarrier = LinearArrayOperation<f64, ArrayType>;
     }
 
     impl DifferentiableEngine for SplitCarrierEngine {
@@ -319,7 +319,7 @@ mod tests {
     fn program_linearize_does_not_replay_the_forward_program_to_recover_representatives() {
         let primitive =
             CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule::<ArrayScalarEngine, _>(PanicReplayOp);
-        let mut builder = ProgramBuilder::<ArrayType, f64, ArrayOperation<f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, ArrayOperation<f64, ArrayType>>::new();
         let input = builder.add_input(<f64 as Typed<ArrayType>>::r#type(&3.0f64).into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.instructions.push(Instruction {
@@ -341,7 +341,7 @@ mod tests {
             CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_transpose_rule(PanicReplayOp),
         )
         .unwrap();
-        let mut builder = ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64, ArrayType>>::new();
         let input = builder.add_input(<f64 as Typed<ArrayType>>::r#type(&0.0f64).into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.instructions.push(Instruction {

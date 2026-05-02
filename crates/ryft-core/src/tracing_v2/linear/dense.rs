@@ -428,20 +428,20 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type OperationCarrier = ArrayOperation<f64>;
+        type OperationCarrier = ArrayOperation<f64, ArrayType>;
     }
 
     impl crate::tracing_v2::LinearizableEngine for ArrayScalarEngine {
-        type LinearOperationCarrier = LinearArrayOperation<f64>;
+        type LinearOperationCarrier = LinearArrayOperation<f64, ArrayType>;
     }
 
     impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperationCarrier = ArrayOperation<f64>;
+        type DifferentiableOperationCarrier = ArrayOperation<f64, ArrayType>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperationCarrier<'engine>
-            = LinearArrayOperation<Tracer<'engine, Self>>
+            = LinearArrayOperation<Tracer<'engine, Self>, ArrayType>
         where
             Self: 'engine;
     }

@@ -45,7 +45,7 @@ use super::sin::SupportsSin;
 /// [`Custom`](Self::Custom) variant is the explicit escape hatch for operations outside that default set, so the
 /// carrier remains closed for normal dispatch while still allowing user- or backend-defined extensions.
 #[derive(Clone, Debug)]
-pub enum ArrayOperation<V, T = ArrayType>
+pub enum ArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -118,7 +118,7 @@ where
 /// maps such as [`LeftMatMul`](Self::LeftMatMul) and [`RightMatMul`](Self::RightMatMul), and the
 /// linearized higher-order operations needed by rematerialization and control flow.
 #[derive(Clone, Debug)]
-pub enum LinearArrayOperation<V, T = ArrayType>
+pub enum LinearArrayOperation<V, T>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -599,14 +599,14 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsMatMul<ArrayType, V> for ArrayOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsMatMul<ArrayType, V> for ArrayOperation<V, ArrayType> {
     #[inline]
     fn matmul_operation() -> Self {
         ArrayOperation::MatrixMultiply
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> for ArrayOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> for ArrayOperation<V, ArrayType> {
     #[inline]
     fn matrix_transpose_operation() -> Self {
         ArrayOperation::Transpose
@@ -624,19 +624,24 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsReshape<ArrayType, V> for ArrayOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsReshape<ArrayType, V> for ArrayOperation<V, ArrayType> {
     #[inline]
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
         ArrayOperation::Reshape { input_shape, output_shape }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsRematerialize<ArrayType, V, LinearArrayOperation<V>>
-    for ArrayOperation<V>
+impl<V: Traceable<ArrayType> + Parameter> SupportsRematerialize<ArrayType, V, LinearArrayOperation<V, ArrayType>>
+    for ArrayOperation<V, ArrayType>
 {
     #[inline]
     fn rematerialize_operation(
-        op: crate::tracing_v2::operations::RematerializeOperation<ArrayType, V, Self, LinearArrayOperation<V>>,
+        op: crate::tracing_v2::operations::RematerializeOperation<
+            ArrayType,
+            V,
+            Self,
+            LinearArrayOperation<V, ArrayType>,
+        >,
     ) -> Self {
         ArrayOperation::Rematerialize(Box::new(op))
     }
@@ -727,7 +732,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> for LinearArrayOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> for LinearArrayOperation<V, ArrayType> {
     #[inline]
     fn matrix_transpose_operation() -> Self {
         LinearArrayOperation::Transpose
@@ -745,28 +750,30 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsLeftMatMul<ArrayType, V> for LinearArrayOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsLeftMatMul<ArrayType, V> for LinearArrayOperation<V, ArrayType> {
     #[inline]
     fn left_matmul_operation(factor: V) -> Self {
         LinearArrayOperation::LeftMatMul { factor }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsRightMatMul<ArrayType, V> for LinearArrayOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsRightMatMul<ArrayType, V> for LinearArrayOperation<V, ArrayType> {
     #[inline]
     fn right_matmul_operation(factor: V) -> Self {
         LinearArrayOperation::RightMatMul { factor }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsReshape<ArrayType, V> for LinearArrayOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsReshape<ArrayType, V> for LinearArrayOperation<V, ArrayType> {
     #[inline]
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
         LinearArrayOperation::Reshape { input_shape, output_shape }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsLinearRematerialize<ArrayType, V> for LinearArrayOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> SupportsLinearRematerialize<ArrayType, V>
+    for LinearArrayOperation<V, ArrayType>
+{
     #[inline]
     fn rematerialize_operation(
         op: crate::tracing_v2::operations::LinearRematerializeOperation<ArrayType, V, Self>,
@@ -775,11 +782,11 @@ impl<V: Traceable<ArrayType> + Parameter> SupportsLinearRematerialize<ArrayType,
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> From<ConditionOperation<V, LinearArrayOperation<V>>>
-    for LinearArrayOperation<V>
+impl<V: Traceable<ArrayType> + Parameter> From<ConditionOperation<V, LinearArrayOperation<V, ArrayType>, ArrayType>>
+    for LinearArrayOperation<V, ArrayType>
 {
     #[inline]
-    fn from(op: ConditionOperation<V, LinearArrayOperation<V>>) -> Self {
+    fn from(op: ConditionOperation<V, LinearArrayOperation<V, ArrayType>, ArrayType>) -> Self {
         LinearArrayOperation::Condition(Box::new(op))
     }
 }
@@ -1010,7 +1017,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearScalarOpe
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for ArrayOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for ArrayOperation<V, ArrayType> {
     #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()
@@ -1104,7 +1111,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ArrayOperation<
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for LinearArrayOperation<V> {
+impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for LinearArrayOperation<V, ArrayType> {
     #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()
@@ -1330,7 +1337,7 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-> InterpretableOperation<ArrayType, V> for ArrayOperation<V>
+> InterpretableOperation<ArrayType, V> for ArrayOperation<V, ArrayType>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -1411,7 +1418,7 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-> InterpretableOperation<ArrayType, V> for LinearArrayOperation<V>
+> InterpretableOperation<ArrayType, V> for LinearArrayOperation<V, ArrayType>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -1473,7 +1480,8 @@ where
     }
 }
 
-impl<'engine, E> InterpretableOperation<ArrayType, Tracer<'engine, E>> for LinearArrayOperation<Tracer<'engine, E>>
+impl<'engine, E> InterpretableOperation<ArrayType, Tracer<'engine, E>>
+    for LinearArrayOperation<Tracer<'engine, E>, ArrayType>
 where
     E: DifferentiableTracingEngine<Type = ArrayType> + ?Sized + 'static,
     Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
@@ -1629,13 +1637,17 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for LinearArrayOperation<V>
+> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for LinearArrayOperation<V, ArrayType>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<
+            ArrayType,
+            V,
+            LinearArrayOperation<V, ArrayType>,
+        >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         match self {
@@ -1851,13 +1863,14 @@ impl<
         + ControlFlowValue
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V>> + 'static,
-> DifferentiableOperation<E> for ArrayOperation<V>
+    E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V, ArrayType>>
+        + 'static,
+> DifferentiableOperation<E> for ArrayOperation<V, ArrayType>
 where
     V: Differentiable<ArrayType, Tangent = V>,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V>: super::SupportsAdd<ArrayType, V>
+    LinearArrayOperation<V, ArrayType>: super::SupportsAdd<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
@@ -1963,7 +1976,7 @@ where
 /// not work at trace time), and the [`Custom`](Self::Custom) bridge to the registered traced
 /// linearization rule.
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for ArrayOperation<V>
+    for ArrayOperation<V, ArrayType>
 where
     V: Value<ArrayType>
         + Add<Output = V>
@@ -1981,12 +1994,12 @@ where
         + ControlFlowValue
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V>>
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
         + ?Sized
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V>: super::SupportsAdd<ArrayType, V>
+    LinearArrayOperation<V, ArrayType>: super::SupportsAdd<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
@@ -1997,7 +2010,7 @@ where
         + SupportsZeroLike<ArrayType, V>
         + Clone
         + InterpretableOperation<ArrayType, V>
-        + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
+        + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
         + Mul<Output = Tracer<'engine, EInner>>
         + Neg<Output = Tracer<'engine, EInner>>

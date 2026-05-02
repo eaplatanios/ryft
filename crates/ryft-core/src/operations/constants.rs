@@ -3,10 +3,11 @@ use std::fmt::Display;
 use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, TracingError};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{Type, TypeError, Typed};
 
-/// Synthesizes a _zero_ value for a given [`Type`]. [`Zero`] is the [`Type`]-driven counterpart to [`ZeroLike`]; it is
-/// what [`ZeroOperation`] needs for its [`InterpretableOperation`] implementation.
+/// Synthesizes a _zero_ value for a given [`Type`]. [`Zero`] is the [`Type`]-driven counterpart to
+/// [`ZeroLike`](crate::tracing_v2::operations::constants::ZeroLike); it is what [`ZeroOperation`] needs for its
+/// [`InterpretableOperation`] implementation.
 pub trait Zero<T: Type>: Sized {
     /// Returns a _zero_ value for the provided [`Type`].
     fn zero(r#type: &T) -> Result<Self, TracingError>;
@@ -29,10 +30,10 @@ pub trait SupportsZero<T: Type, V: Traceable<T>> {
 }
 
 /// [`Operation`] that has no inputs and that produces a single output that corresponds to the _zero_ value for the
-/// [`Type`] that it holds (i.e., for [`ZeroOperation::r#type`]). Note that for arrays, this would typically correspond
-/// to an array of the right type and shape filled with zeros.
+/// [`Type`] that it holds (i.e., for [`ZeroOperation::r#type`]). Note that for arrays, this would typically
+/// correspond to an array of the right type and shape filled with zeros.
 #[derive(Clone, Debug)]
-pub struct ZeroOperation<T: Type = ArrayType> {
+pub struct ZeroOperation<T: Type> {
     /// [`Type`] of the value produced when this operation is interpreted.
     pub r#type: T,
 }
@@ -78,8 +79,9 @@ impl<T: Type, V: Typed<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperat
     }
 }
 
-/// Synthesizes a _one_ value for a given [`Type`]. [`One`] is the [`Type`]-driven counterpart to [`OneLike`]; it is
-/// what [`OneOperation`] needs for its [`InterpretableOperation`] implementation.
+/// Synthesizes a _one_ value for a given [`Type`]. [`One`] is the [`Type`]-driven counterpart to
+/// [`OneLike`](crate::tracing_v2::operations::constants::OneLike); it is what [`OneOperation`] needs for its
+/// [`InterpretableOperation`] implementation.
 pub trait One<T: Type>: Sized {
     /// Returns a _one_ value for the provided [`Type`].
     fn one(r#type: &T) -> Result<Self, TracingError>;
@@ -95,10 +97,10 @@ pub trait SupportsOne<T: Type, V: Traceable<T>> {
 }
 
 /// [`Operation`] that has no inputs and that produces a single output that corresponds to the _one_ value for the
-/// [`Type`] that it holds (i.e., for [`OneOperation::r#type`]). Note that for arrays, this would typically correspond
-/// to an array of the right type and shape filled with ones.
+/// [`Type`] that it holds (i.e., for [`OneOperation::r#type`]). Note that for arrays, this would typically
+/// correspond to an array of the right type and shape filled with ones.
 #[derive(Clone, Debug)]
-pub struct OneOperation<T: Type = ArrayType> {
+pub struct OneOperation<T: Type> {
     /// [`Type`] of the value produced when this operation is interpreted.
     pub r#type: T,
 }

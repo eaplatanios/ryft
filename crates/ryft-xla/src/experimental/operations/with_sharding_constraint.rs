@@ -39,7 +39,7 @@ impl WithShardingConstraintOperation {
     where
         Self: Clone
             + InterpretableOperation<ArrayType, V>
-            + LinearOperation<ArrayType, V, LinearArrayOperation<V>>
+            + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>
             + Send
             + Sync
             + 'static,
@@ -103,7 +103,7 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for WithShardingConstrain
     }
 }
 
-impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor>>
+impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>
     for WithShardingConstraintOperation
 {
     fn transpose(
@@ -111,7 +111,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
         context: &mut ryft_core::tracing::transposition::TranspositionContext<
             ArrayType,
             ShardMapTensor,
-            LinearArrayOperation<ShardMapTensor>,
+            LinearArrayOperation<ShardMapTensor, ArrayType>,
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
@@ -135,7 +135,7 @@ where
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTensor,
-            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor>,
+            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor, ArrayType>,
         > + ?Sized,
 {
     fn jvp(
@@ -160,7 +160,7 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for WithShardingConstrain
     }
 }
 
-impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer>>
+impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>
     for WithShardingConstraintOperation
 {
     fn transpose(
@@ -168,7 +168,7 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
         context: &mut ryft_core::tracing::transposition::TranspositionContext<
             ArrayType,
             ShardMapTracer,
-            LinearArrayOperation<ShardMapTracer>,
+            LinearArrayOperation<ShardMapTracer, ArrayType>,
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
@@ -230,8 +230,8 @@ mod tests {
     }
 
     fn test_transposition_context<V: Traceable<ArrayType>>(
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearArrayOperation<V>>>>,
-    ) -> TranspositionContext<ArrayType, V, LinearArrayOperation<V>> {
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearArrayOperation<V, ArrayType>>>>,
+    ) -> TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>> {
         TranspositionContext::new(builder)
     }
 
@@ -362,10 +362,11 @@ mod tests {
         let sharding = test_sharding(&mesh);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
-        let transpose_builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor>>::new(),
-            ));
+        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            ShardMapTensor,
+            LinearArrayOperation<ShardMapTensor, ArrayType>,
+        >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let mut context = test_transposition_context(transpose_builder.clone());
         let contribution_atom = LinearOperation::transpose(
@@ -399,10 +400,11 @@ mod tests {
         let sharding = test_sharding(&mesh);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
-        let transpose_builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer>>::new(),
-            ));
+        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            ShardMapTracer,
+            LinearArrayOperation<ShardMapTracer, ArrayType>,
+        >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let mut context = test_transposition_context(transpose_builder.clone());
         let contribution_atom = LinearOperation::transpose(

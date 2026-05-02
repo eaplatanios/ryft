@@ -187,7 +187,7 @@ impl<V> LinearShardMapOperation<V> {
         V: Traceable<ArrayType>,
         Self: Clone
             + InterpretableOperation<ArrayType, V>
-            + LinearOperation<ArrayType, V, LinearArrayOperation<V>>
+            + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>
             + 'static,
     {
         CustomPrimitive::new(self.clone()).with_transpose_rule(self.clone())
@@ -280,7 +280,7 @@ impl ShardMapOperation<ShardMapTracer> {
         E: DifferentiableEngine<
                 Type = ArrayType,
                 Value = ShardMapTracer,
-                LinearOperationCarrier = LinearArrayOperation<ShardMapTracer>,
+                LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
             > + ?Sized,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -349,7 +349,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
         E: DifferentiableEngine<
                 Type = ArrayType,
                 Value = ShardMapTracer,
-                LinearOperationCarrier = LinearArrayOperation<ShardMapTracer>,
+                LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
             > + ?Sized,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -515,7 +515,7 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for LinearShardMapOperati
     }
 }
 
-impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor>>
+impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>
     for LinearShardMapOperation<ShardMapTensor>
 {
     fn transpose(
@@ -523,7 +523,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
         context: &mut ryft_core::tracing::transposition::TranspositionContext<
             ArrayType,
             ShardMapTensor,
-            LinearArrayOperation<ShardMapTensor>,
+            LinearArrayOperation<ShardMapTensor, ArrayType>,
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
@@ -551,7 +551,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
 /// structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
 fn materialize_optional_cotangent<V>(
-    context: &ryft_core::tracing::transposition::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
+    context: &ryft_core::tracing::transposition::TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
     cotangent: &Option<AtomId>,
     output_type: &ArrayType,
 ) -> AtomId
@@ -579,7 +579,7 @@ where
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTensor,
-            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor>,
+            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor, ArrayType>,
         > + ?Sized,
     ShardMapTensor: Differentiable<ArrayType, Tangent = ShardMapTensor>,
 {
@@ -616,7 +616,7 @@ where
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTensor,
-            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor>,
+            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor, ArrayType>,
         > + ?Sized,
     ShardMapTensor: Differentiable<ArrayType, Tangent = ShardMapTensor>,
 {
@@ -698,7 +698,7 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for LinearShardMapOperati
     }
 }
 
-impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer>>
+impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>
     for LinearShardMapOperation<ShardMapTracer>
 {
     fn transpose(
@@ -706,7 +706,7 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
         context: &mut ryft_core::tracing::transposition::TranspositionContext<
             ArrayType,
             ShardMapTracer,
-            LinearArrayOperation<ShardMapTracer>,
+            LinearArrayOperation<ShardMapTracer, ArrayType>,
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
@@ -735,7 +735,7 @@ where
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTracer,
-            LinearOperationCarrier = LinearArrayOperation<ShardMapTracer>,
+            LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
         > + ?Sized,
     ShardMapTracer: Differentiable<ArrayType, Tangent = ShardMapTracer>,
 {
@@ -1615,8 +1615,8 @@ mod tests {
     }
 
     fn test_transposition_context<V: Traceable<ArrayType>>(
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearArrayOperation<V>>>>,
-    ) -> TranspositionContext<ArrayType, V, LinearArrayOperation<V>> {
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearArrayOperation<V, ArrayType>>>>,
+    ) -> TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>> {
         TranspositionContext::new(builder)
     }
 
@@ -1816,10 +1816,11 @@ mod tests {
     fn test_linear_tensor_shard_map_jvp_stages_linear_shard_map() {
         let body = simple_traced_shard_map_body();
         let operation = make_linear_tensor_shard_map(&body).expect("linear tensor shard_map should be buildable");
-        let tangent_builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor>>::new(),
-            ));
+        let tangent_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            ShardMapTensor,
+            LinearArrayOperation<ShardMapTensor, ArrayType>,
+        >::new()));
         let tangent_atom = tangent_builder.borrow_mut().add_input(test_array_type());
         let engine = crate::experimental::engines::XlaEngine::token();
         let mut context = JvpContext::new(engine, tangent_builder.clone());

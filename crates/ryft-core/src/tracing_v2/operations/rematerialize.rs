@@ -146,7 +146,7 @@ where
 /// [`LinearArrayOperation::Rematerialize`] variant that the active linear builder can stage
 /// directly.
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for RematerializeOperation<ArrayType, V, EInner::OperationCarrier, LinearArrayOperation<V>>
+    for RematerializeOperation<ArrayType, V, EInner::OperationCarrier, LinearArrayOperation<V, ArrayType>>
 where
     V: Value<ArrayType>
         + ZeroLike
@@ -157,10 +157,11 @@ where
     EInner::OperationCarrier: Clone
         + InterpretableOperation<ArrayType, V>
         + SupportsAdd<ArrayType, V>
-        + SupportsRematerialize<ArrayType, V, LinearArrayOperation<V>>,
+        + SupportsRematerialize<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V>:
-        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
+    LinearArrayOperation<V, ArrayType>: Clone
+        + InterpretableOperation<ArrayType, V>
+        + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
     EInner::OperationCarrier: DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
         + SupportsZeroLike<ArrayType, V>,
     EInner::LinearOperationCarrier<'engine>: Clone
@@ -239,7 +240,7 @@ impl<
         + crate::operations::constants::Zero<ArrayType>
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V>>
+    E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V, ArrayType>>
         + ?Sized
         + 'static,
     O: Clone + Operation<ArrayType>,
@@ -249,8 +250,9 @@ where
     O: DifferentiableOperation<E>,
     O: InterpretableOperation<ArrayType, V>,
     O: SupportsRematerialize<ArrayType, V, E::LinearOperationCarrier> + 'static,
-    LinearArrayOperation<V>:
-        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
+    LinearArrayOperation<V, ArrayType>: Clone
+        + InterpretableOperation<ArrayType, V>
+        + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
 {
     fn jvp(
         &self,
@@ -458,9 +460,10 @@ where
     V: Traceable<ArrayType> + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType> + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V> + DifferentiableOperation<E> + 'static,
-    LinearArrayOperation<V>:
-        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
-    E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V>>
+    LinearArrayOperation<V, ArrayType>: Clone
+        + InterpretableOperation<ArrayType, V>
+        + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
+    E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V, ArrayType>>
         + ?Sized
         + 'static,
 {
@@ -622,7 +625,7 @@ mod tests {
         ArrayType::scalar(crate::types::DataType::F64)
     }
 
-    fn test_transposition_context() -> TranspositionContext<ArrayType, f64, LinearArrayOperation<f64>> {
+    fn test_transposition_context() -> TranspositionContext<ArrayType, f64, LinearArrayOperation<f64, ArrayType>> {
         TranspositionContext::new(Rc::new(RefCell::new(ProgramBuilder::new())))
     }
 
@@ -643,33 +646,33 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type OperationCarrier = ArrayOperation<f64>;
+        type OperationCarrier = ArrayOperation<f64, ArrayType>;
     }
 
     impl crate::tracing_v2::LinearizableEngine for ArrayScalarEngine {
-        type LinearOperationCarrier = LinearArrayOperation<f64>;
+        type LinearOperationCarrier = LinearArrayOperation<f64, ArrayType>;
     }
 
     impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperationCarrier = ArrayOperation<f64>;
+        type DifferentiableOperationCarrier = ArrayOperation<f64, ArrayType>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperationCarrier<'engine>
-            = LinearArrayOperation<Tracer<'engine, Self>>
+            = LinearArrayOperation<Tracer<'engine, Self>, ArrayType>
         where
             Self: 'engine;
     }
 
     fn empty_traced_body() -> FlatTracedRematerialize<ArrayType, f64> {
-        let mut builder = ProgramBuilder::<ArrayType, f64, ArrayOperation<f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, ArrayOperation<f64, ArrayType>>::new();
         let output = builder.add_constant(0.0f64);
         let program = builder.build(vec![output], Vec::<Placeholder>::new(), vec![Placeholder]).unwrap();
         FlatTracedRematerialize::from_parts(vec![], vec![scalar_type()], program)
     }
 
-    fn empty_linear_body() -> FlatTracedRematerialize<ArrayType, f64, LinearArrayOperation<f64>> {
-        let program = ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new()
+    fn empty_linear_body() -> FlatTracedRematerialize<ArrayType, f64, LinearArrayOperation<f64, ArrayType>> {
+        let program = ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64, ArrayType>>::new()
             .build(vec![], Vec::<Placeholder>::new(), Vec::<Placeholder>::new())
             .unwrap();
         FlatTracedRematerialize::from_parts(vec![scalar_type()], vec![], program)
@@ -687,7 +690,8 @@ mod tests {
         let engine = ArrayScalarEngine;
         let operation = RematerializeOperation::<ArrayType, f64>::new(empty_traced_body());
         let inputs: Vec<JvpTracer<f64, crate::tracing::AtomId>> = Vec::new();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new()));
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64, ArrayType>>::new()));
         let mut context = crate::tracing_v2::JvpContext::new(&engine, builder);
 
         assert!(matches!(
@@ -740,7 +744,7 @@ mod tests {
     fn test_rematerialize_jit_produces_traced_op() {
         // When used inside jit, rematerialize should produce a "rematerialize" op in the program.
         let engine = ArrayScalarEngine;
-        let (output, program): (f64, Program<ArrayType, f64, ArrayOperation<f64>, f64, f64>) =
+        let (output, program): (f64, Program<ArrayType, f64, ArrayOperation<f64, ArrayType>, f64, f64>) =
             engine.interpret_and_trace(|x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         approx_eq(output, 2.0f64.sin());
@@ -752,7 +756,7 @@ mod tests {
     fn test_rematerialize_jit_program_rendering() {
         // Check the exact rendering of the jit-traced program containing a rematerialize op.
         let engine = ArrayScalarEngine;
-        let (_, program): (f64, Program<ArrayType, f64, ArrayOperation<f64>, f64, f64>) =
+        let (_, program): (f64, Program<ArrayType, f64, ArrayOperation<f64, ArrayType>, f64, f64>) =
             engine.interpret_and_trace(|x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         assert_eq!(
@@ -840,13 +844,13 @@ mod tests {
         // The forward result with rematerialize should match the result without it.
         let without: f64 = {
             let engine = ArrayScalarEngine;
-            let (output, _): (f64, Program<ArrayType, f64, ArrayOperation<f64>, f64, f64>) =
+            let (output, _): (f64, Program<ArrayType, f64, ArrayOperation<f64, ArrayType>, f64, f64>) =
                 engine.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()), 3.0f64).unwrap();
             output
         };
         let with: f64 = {
             let engine = ArrayScalarEngine;
-            let (output, _): (f64, Program<ArrayType, f64, ArrayOperation<f64>, f64, f64>) = engine
+            let (output, _): (f64, Program<ArrayType, f64, ArrayOperation<f64, ArrayType>, f64, f64>) = engine
                 .interpret_and_trace(|x| Ok(rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap()), 3.0f64)
                 .unwrap();
             output

@@ -140,7 +140,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested condition operation inside this lowering context.
     pub(crate) fn lower_condition<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>>(
         &mut self,
-        condition_op: &ConditionOperation<V, O>,
+        condition_op: &ConditionOperation<V, O, ArrayType>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_condition_to_if(condition_op, input_values, &mut self.block, self.context, self.location)
@@ -149,7 +149,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested while operation inside this lowering context.
     pub(crate) fn lower_while<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>>(
         &mut self,
-        while_op: &WhileOperation<V, O>,
+        while_op: &WhileOperation<V, O, ArrayType>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
@@ -650,7 +650,9 @@ impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOpe
     }
 }
 
-impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOperation<V> for ConditionOperation<V, O> {
+impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOperation<V>
+    for ConditionOperation<V, O, ArrayType>
+{
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -662,7 +664,9 @@ impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOpe
     }
 }
 
-impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOperation<V> for WhileOperation<V, O> {
+impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOperation<V>
+    for WhileOperation<V, O, ArrayType>
+{
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -674,7 +678,7 @@ impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOpe
     }
 }
 
-impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for ArrayOperation<V> {
+impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for ArrayOperation<V, ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -800,7 +804,7 @@ impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for ArrayOperat
     }
 }
 
-impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for LinearArrayOperation<V> {
+impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for LinearArrayOperation<V, ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -969,7 +973,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested condition operation inside this lowering context.
     pub(crate) fn lower_condition<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>>(
         &mut self,
-        condition_op: &ConditionOperation<V, O>,
+        condition_op: &ConditionOperation<V, O, ArrayType>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_condition_to_if(condition_op, input_values, &mut self.block, self.context, self.location)
@@ -978,7 +982,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested while operation inside this lowering context.
     pub(crate) fn lower_while<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>>(
         &mut self,
-        while_op: &WhileOperation<V, O>,
+        while_op: &WhileOperation<V, O, ArrayType>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
@@ -1500,7 +1504,7 @@ where
 }
 
 fn lower_condition_to_if<'b, 'c: 'b, 't: 'c, V, O>(
-    condition_op: &ConditionOperation<V, O>,
+    condition_op: &ConditionOperation<V, O, ArrayType>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -1552,7 +1556,7 @@ where
 }
 
 fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V, O>(
-    while_op: &WhileOperation<V, O>,
+    while_op: &WhileOperation<V, O, ArrayType>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -2795,20 +2799,20 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type OperationCarrier = ArrayOperation<f64>;
+        type OperationCarrier = ArrayOperation<f64, ArrayType>;
     }
 
     impl LinearizableEngine for ArrayScalarEngine {
-        type LinearOperationCarrier = LinearArrayOperation<f64>;
+        type LinearOperationCarrier = LinearArrayOperation<f64, ArrayType>;
     }
 
     impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperationCarrier = ArrayOperation<f64>;
+        type DifferentiableOperationCarrier = ArrayOperation<f64, ArrayType>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperationCarrier<'engine>
-            = LinearArrayOperation<Tracer<'engine, Self>>
+            = LinearArrayOperation<Tracer<'engine, Self>, ArrayType>
         where
             Self: 'engine;
     }
@@ -2818,7 +2822,13 @@ mod tests {
         let engine = ArrayScalarEngine;
         let (_, compiled): (
             f64,
-            ryft_core::tracing::Program<ArrayType, f64, ryft_core::tracing_v2::ArrayOperation<f64>, (f64, f64), f64>,
+            ryft_core::tracing::Program<
+                ArrayType,
+                f64,
+                ryft_core::tracing_v2::ArrayOperation<f64, ArrayType>,
+                (f64, f64),
+                f64,
+            >,
         ) = engine.interpret_and_trace(|inputs| Ok(scalar_bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
@@ -2842,7 +2852,13 @@ mod tests {
         let engine = ArrayScalarEngine;
         let (_, compiled): (
             f64,
-            ryft_core::tracing::Program<ArrayType, f64, ryft_core::tracing_v2::ArrayOperation<f64>, f64, f64>,
+            ryft_core::tracing::Program<
+                ArrayType,
+                f64,
+                ryft_core::tracing_v2::ArrayOperation<f64, ArrayType>,
+                f64,
+                f64,
+            >,
         ) = engine
             .interpret_and_trace(|x| Ok(ryft_core::tracing_v2::rematerialize(|y| y.sin(), x).unwrap()), 2.0f64)
             .unwrap();
@@ -2866,7 +2882,13 @@ mod tests {
         let engine = ArrayScalarEngine;
         let (_, compiled): (
             f64,
-            ryft_core::tracing::Program<ArrayType, f64, ryft_core::tracing_v2::ArrayOperation<f64>, f64, f64>,
+            ryft_core::tracing::Program<
+                ArrayType,
+                f64,
+                ryft_core::tracing_v2::ArrayOperation<f64, ArrayType>,
+                f64,
+                f64,
+            >,
         ) = engine
             .interpret_and_trace(
                 |x| Ok(ryft_core::tracing_v2::grad(&ArrayScalarEngine, scalar_quartic_plus_sin, x)?),
@@ -2896,7 +2918,7 @@ mod tests {
             ryft_core::tracing::Program<
                 ArrayType,
                 f64,
-                ryft_core::tracing_v2::LinearArrayOperation<f64>,
+                ryft_core::tracing_v2::LinearArrayOperation<f64, ArrayType>,
                 f64,
                 (f64, f64),
             >,
@@ -2922,7 +2944,7 @@ mod tests {
             ryft_core::tracing::Program<
                 ArrayType,
                 f64,
-                ryft_core::tracing_v2::ArrayOperation<f64>,
+                ryft_core::tracing_v2::ArrayOperation<f64, ArrayType>,
                 (f64, f64),
                 (f64, f64),
             >,
@@ -2954,7 +2976,7 @@ mod tests {
             ryft_core::tracing::Program<
                 ArrayType,
                 NdArrayValue<f64>,
-                ryft_core::tracing_v2::LinearArrayOperation<NdArrayValue<f64>>,
+                ryft_core::tracing_v2::LinearArrayOperation<NdArrayValue<f64>, ArrayType>,
                 NdArrayValue<f64>,
                 (NdArrayValue<f64>, NdArrayValue<f64>),
             >,

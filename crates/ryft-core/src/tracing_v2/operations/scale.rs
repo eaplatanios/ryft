@@ -221,8 +221,8 @@ mod tests {
     use super::*;
 
     fn test_transposition_context(
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearArrayOperation<f64>>>>,
-    ) -> TranspositionContext<ArrayType, f64, LinearArrayOperation<f64>> {
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearArrayOperation<f64, ArrayType>>>>,
+    ) -> TranspositionContext<ArrayType, f64, LinearArrayOperation<f64, ArrayType>> {
         TranspositionContext::new(builder)
     }
 
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn test_scale_transpose_scales_output_cotangents() {
         let transpose_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new()));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64, ArrayType>>::new()));
         let output_cotangent_atom =
             transpose_builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
         let mut context = test_transposition_context(transpose_builder.clone());

@@ -14,7 +14,7 @@ use crate::tracing::{Instruction, Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
 use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{
-    ArrayOperation, DifferentiableOperation, DifferentiableTracingEngine, JvpContext, JvpTracer, LinearizableEngine,
+    DifferentiableOperation, DifferentiableTracingEngine, JvpContext, JvpTracer, LinearizableEngine,
 };
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -106,7 +106,7 @@ pub enum ConditionPredicate<T: Type + PartialEq = ArrayType> {
 
 /// Two-way conditional operation with nested true and false branch programs.
 #[derive(Clone, Debug)]
-pub struct ConditionOperation<V, O = ArrayOperation<V>, T = ArrayType>
+pub struct ConditionOperation<V, O, T>
 where
     T: Type + PartialEq,
     V: Traceable<T>,
@@ -125,7 +125,7 @@ where
 
 /// While-loop operation with nested condition and body programs over the same loop-carried state.
 #[derive(Clone, Debug)]
-pub struct WhileOperation<V, O = ArrayOperation<V>, T = ArrayType>
+pub struct WhileOperation<V, O, T>
 where
     T: Type + PartialEq,
     V: Traceable<T>,
@@ -383,7 +383,7 @@ impl<V: Traceable<DataType>, O: Clone + Operation<DataType>> Operation<DataType>
     }
 }
 
-impl<V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<V, O>
+impl<V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
@@ -400,14 +400,14 @@ where
     }
 }
 
-impl<V, O> LinearOperation<ArrayType, V, O> for ConditionOperation<V, O>
+impl<V, O> LinearOperation<ArrayType, V, O> for ConditionOperation<V, O, ArrayType>
 where
     V: Traceable<ArrayType>,
     O: Clone
         + LinearOperation<ArrayType, V, O>
         + SupportsAdd<ArrayType, V>
         + crate::operations::constants::SupportsZero<ArrayType, V>
-        + From<ConditionOperation<V, O>>,
+        + From<ConditionOperation<V, O, ArrayType>>,
 {
     fn transpose(
         &self,
@@ -470,7 +470,7 @@ where
     output
 }
 
-impl<V, E, O> DifferentiableOperation<E> for ConditionOperation<V, O>
+impl<V, E, O> DifferentiableOperation<E> for ConditionOperation<V, O, ArrayType>
 where
     V: ControlFlowValue + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType>,
     E: LinearizableEngine<Type = ArrayType, Value = V> + ?Sized,
@@ -511,7 +511,7 @@ where
 /// whose `control_flow_predicate` always errors), so this impl reports
 /// [`ControlFlowError::MissingTransformRule`] for any traced JVP attempt.
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for ConditionOperation<V, EInner::OperationCarrier>
+    for ConditionOperation<V, EInner::OperationCarrier, ArrayType>
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
@@ -611,7 +611,7 @@ impl<V: Traceable<DataType>, O: Clone + Operation<DataType>> Operation<DataType>
     }
 }
 
-impl<V, O> InterpretableOperation<ArrayType, V> for WhileOperation<V, O>
+impl<V, O> InterpretableOperation<ArrayType, V> for WhileOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
@@ -637,7 +637,7 @@ where
     }
 }
 
-impl<V, O> LinearOperation<ArrayType, V, O> for WhileOperation<V, O>
+impl<V, O> LinearOperation<ArrayType, V, O> for WhileOperation<V, O, ArrayType>
 where
     V: Traceable<ArrayType>,
     O: Clone + Operation<ArrayType>,
@@ -655,7 +655,7 @@ where
 /// [`TracingContext`](crate::tracing::engines::TracingContext). See the matching
 /// [`ConditionOperation`] impl for rationale; predicate extraction does not work at trace time.
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for WhileOperation<V, EInner::OperationCarrier>
+    for WhileOperation<V, EInner::OperationCarrier, ArrayType>
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
@@ -672,7 +672,7 @@ where
     }
 }
 
-impl<V, E, O> DifferentiableOperation<E> for WhileOperation<V, O>
+impl<V, E, O> DifferentiableOperation<E> for WhileOperation<V, O, ArrayType>
 where
     V: ControlFlowValue + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType>,
     E: LinearizableEngine<Type = ArrayType, Value = V> + ?Sized,
@@ -732,6 +732,7 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::tracing::engines::{Engine, TracingEngine};
     use crate::tracing::{ProgramBuilder, Traceable, Value};
+    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::constants::OneLike;
     use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
     use crate::tracing_v2::{Differentiable, LinearArrayOperation};
@@ -835,8 +836,8 @@ mod tests {
         Add,
         Sub,
         IsPositive,
-        Condition(Box<ConditionOperation<TestValue, TestOperation>>),
-        While(Box<WhileOperation<TestValue, TestOperation>>),
+        Condition(Box<ConditionOperation<TestValue, TestOperation, ArrayType>>),
+        While(Box<WhileOperation<TestValue, TestOperation, ArrayType>>),
     }
 
     impl Display for TestOperation {
@@ -908,7 +909,7 @@ mod tests {
         Add,
         Neg,
         Scale { factor: TestValue },
-        Condition(Box<ConditionOperation<TestValue, TestLinearOperation>>),
+        Condition(Box<ConditionOperation<TestValue, TestLinearOperation, ArrayType>>),
     }
 
     impl Display for TestLinearOperation {
@@ -1041,8 +1042,8 @@ mod tests {
         }
     }
 
-    impl From<ConditionOperation<TestValue, TestLinearOperation>> for TestLinearOperation {
-        fn from(op: ConditionOperation<TestValue, TestLinearOperation>) -> Self {
+    impl From<ConditionOperation<TestValue, TestLinearOperation, ArrayType>> for TestLinearOperation {
+        fn from(op: ConditionOperation<TestValue, TestLinearOperation, ArrayType>) -> Self {
             Self::Condition(Box::new(op))
         }
     }
@@ -1192,20 +1193,20 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type OperationCarrier = ArrayOperation<f64>;
+        type OperationCarrier = ArrayOperation<f64, ArrayType>;
     }
 
     impl crate::tracing_v2::LinearizableEngine for ArrayScalarEngine {
-        type LinearOperationCarrier = LinearArrayOperation<f64>;
+        type LinearOperationCarrier = LinearArrayOperation<f64, ArrayType>;
     }
 
     impl crate::tracing_v2::DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperationCarrier = ArrayOperation<f64>;
+        type DifferentiableOperationCarrier = ArrayOperation<f64, ArrayType>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
         type LinearOperationCarrier<'engine>
-            = LinearArrayOperation<Tracer<'engine, Self>>
+            = LinearArrayOperation<Tracer<'engine, Self>, ArrayType>
         where
             Self: 'engine;
     }
@@ -1226,14 +1227,14 @@ mod tests {
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn identity_array_branch() -> FlatProgram<TestValue, ArrayOperation<TestValue>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, ArrayOperation<TestValue>>::new();
+    fn identity_array_branch() -> FlatProgram<TestValue, ArrayOperation<TestValue, ArrayType>> {
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, ArrayOperation<TestValue, ArrayType>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn scalar_scale_branch(factor: f64) -> FlatProgram<f64, ArrayOperation<f64>> {
-        let mut builder = ProgramBuilder::<ArrayType, f64, ArrayOperation<f64>>::new();
+    fn scalar_scale_branch(factor: f64) -> FlatProgram<f64, ArrayOperation<f64, ArrayType>> {
+        let mut builder = ProgramBuilder::<ArrayType, f64, ArrayOperation<f64, ArrayType>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(ArrayOperation::Scale { factor }, vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -1429,7 +1430,8 @@ mod tests {
             ConditionOperation::with_captured_predicate(true, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
                 .unwrap();
         let engine = ArrayScalarEngine;
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new()));
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64, ArrayType>>::new()));
         let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let mut context = JvpContext::new(&engine, builder.clone());
         let outputs = condition.jvp(&mut context, &[JvpTracer { primal: 4.0, tangent: tangent_input }]).unwrap();

@@ -431,7 +431,7 @@ mod tests {
         let operation = ZeroOperation::new(DataType::F64);
 
         assert_eq!(Operation::<DataType>::name(&operation), "zero");
-        assert_eq!(format!("{operation:?}"), "ZeroOperation { output_type: F64 }");
+        assert_eq!(format!("{operation:?}"), "ZeroOperation { type: F64 }");
         assert_eq!(format!("{operation}"), "zero");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![0.0]));
@@ -450,7 +450,7 @@ mod tests {
         let operation = OneOperation::new(DataType::F64);
 
         assert_eq!(Operation::<DataType>::name(&operation), "one");
-        assert_eq!(format!("{operation:?}"), "OneOperation { output_type: F64 }");
+        assert_eq!(format!("{operation:?}"), "OneOperation { type: F64 }");
         assert_eq!(format!("{operation}"), "one");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![1.0]));

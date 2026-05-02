@@ -29,15 +29,15 @@ impl Engine for ArrayScalarEngine {
 }
 
 impl TracingEngine for ArrayScalarEngine {
-    type OperationCarrier = ArrayOperation<f64>;
+    type OperationCarrier = ArrayOperation<f64, ArrayType>;
 }
 
 impl LinearizableEngine for ArrayScalarEngine {
-    type LinearOperationCarrier = LinearArrayOperation<f64>;
+    type LinearOperationCarrier = LinearArrayOperation<f64, ArrayType>;
 }
 
 impl DifferentiableEngine for ArrayScalarEngine {
-    type DifferentiableOperationCarrier = ArrayOperation<f64>;
+    type DifferentiableOperationCarrier = ArrayOperation<f64, ArrayType>;
 }
 
 impl DifferentiableTracingEngine for ArrayScalarEngine {
@@ -144,9 +144,11 @@ fn hessian_style_second_derivative_traced(x: Tracer<ArrayScalarEngine>) -> Trace
 
 /// Emits the plain JIT scalar bilinear benchmark.
 fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ArrayOperation<f64>, (f64, f64), f64>) =
-        ArrayScalarEngine
-            .interpret_and_trace(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
+    let (_, compiled): (
+        f64,
+        Program<ArrayType, f64, crate::tracing_v2::ArrayOperation<f64, ArrayType>, (f64, f64), f64>,
+    ) = ArrayScalarEngine
+        .interpret_and_trace(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jit", "jit", &compiled)?])
 }
 
@@ -154,21 +156,23 @@ fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkErr
 fn emit_scalar_bilinear_sin_jvp() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pushforward): (
         f64,
-        Program<ArrayType, f64, crate::tracing_v2::LinearArrayOperation<f64>, (f64, f64), f64>,
+        Program<ArrayType, f64, crate::tracing_v2::LinearArrayOperation<f64, ArrayType>, (f64, f64), f64>,
     ) = linearize(&ArrayScalarEngine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jvp", "jvp_pushforward", &pushforward)?])
 }
 
 /// Emits the staged scalar bilinear pullback benchmark.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pullback): (f64, Program<ArrayType, f64, crate::tracing_v2::LinearArrayOperation<f64>, f64, (f64, f64)>) =
-        vjp(&ArrayScalarEngine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
+    let (_, pullback): (
+        f64,
+        Program<ArrayType, f64, crate::tracing_v2::LinearArrayOperation<f64, ArrayType>, f64, (f64, f64)>,
+    ) = vjp(&ArrayScalarEngine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 
 /// Emits the staged scalar reverse-mode gradient benchmark.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ArrayOperation<f64>, f64, f64>) =
+    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ArrayOperation<f64, ArrayType>, f64, f64>) =
         ArrayScalarEngine.interpret_and_trace(
             |x| {
                 let gradient: Tracer<ArrayScalarEngine> = grad(&ArrayScalarEngine, quartic_plus_sin, x)?;
@@ -181,28 +185,32 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
 
 /// Emits the staged scalar value-and-gradient benchmark.
 fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): ((f64, f64), Program<ArrayType, f64, crate::tracing_v2::ArrayOperation<f64>, f64, (f64, f64)>) =
-        ArrayScalarEngine.interpret_and_trace(
-            |x| {
-                let value_and_gradient: (Tracer<ArrayScalarEngine>, Tracer<ArrayScalarEngine>) =
-                    value_and_grad(&ArrayScalarEngine, quartic_plus_sin, x)?;
-                Ok(value_and_gradient)
-            },
-            2.0f64,
-        )?;
+    let (_, compiled): (
+        (f64, f64),
+        Program<ArrayType, f64, crate::tracing_v2::ArrayOperation<f64, ArrayType>, f64, (f64, f64)>,
+    ) = ArrayScalarEngine.interpret_and_trace(
+        |x| {
+            let value_and_gradient: (Tracer<ArrayScalarEngine>, Tracer<ArrayScalarEngine>) =
+                value_and_grad(&ArrayScalarEngine, quartic_plus_sin, x)?;
+            Ok(value_and_gradient)
+        },
+        2.0f64,
+    )?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_value_and_grad", "value_and_grad", &compiled)?])
 }
 
 /// Emits the staged scalar linearization benchmark.
 fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pushforward): (f64, Program<ArrayType, f64, crate::tracing_v2::LinearArrayOperation<f64>, f64, f64>) =
-        linearize(&ArrayScalarEngine, |x| Ok(quartic_plus_sin(x)), 2.0f64)?;
+    let (_, pushforward): (
+        f64,
+        Program<ArrayType, f64, crate::tracing_v2::LinearArrayOperation<f64, ArrayType>, f64, f64>,
+    ) = linearize(&ArrayScalarEngine, |x| Ok(quartic_plus_sin(x)), 2.0f64)?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_linearize_pushforward", "linearize_pushforward", &pushforward)?])
 }
 
 /// Emits the staged forward-over-reverse scalar benchmark.
 fn emit_scalar_quartic_plus_sin_hessian_style() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ArrayOperation<f64>, f64, f64>) =
+    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ArrayOperation<f64, ArrayType>, f64, f64>) =
         ArrayScalarEngine.interpret_and_trace(|x| Ok(hessian_style_second_derivative_traced(x)), 2.0f64)?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_hessian_style", "hessian_style", &compiled)?])
 }

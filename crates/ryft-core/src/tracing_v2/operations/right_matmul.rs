@@ -78,10 +78,14 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for RightMatMulOperati
     }
 }
 
-impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for RightMatMulOperation<V> {
+impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for RightMatMulOperation<V> {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<
+            ArrayType,
+            V,
+            LinearArrayOperation<V, ArrayType>,
+        >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1, TracingError);

@@ -143,7 +143,7 @@ impl<'c> TracingEngine for XlaEngine<'c> {
 }
 
 impl<'c> LinearizableEngine for XlaEngine<'c> {
-    type LinearOperationCarrier = LinearXlaOperation;
+    type LinearOperationCarrier = LinearXlaOperation<ShardMapTensor>;
 }
 
 impl<'c> DifferentiableEngine for XlaEngine<'c> {
