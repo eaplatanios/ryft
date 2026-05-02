@@ -170,11 +170,6 @@ pub trait One<T: Type>: Sized {
 pub trait SupportsOne<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the one [`Operation`].
     fn one_operation(r#type: T) -> Self;
-
-    /// Returns the type carried by a one [`Operation`], or `None` for any other operation variant.
-    fn as_one(&self) -> Option<&T> {
-        None
-    }
 }
 
 /// Typed-one primitive: a 0-input, 1-output op that produces a value of the carried type metadata.

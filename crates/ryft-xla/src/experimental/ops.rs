@@ -548,13 +548,6 @@ impl SupportsOne<ArrayType, ShardMapTensor> for XlaOperation {
     fn one_operation(r#type: ArrayType) -> Self {
         XlaOperation::One(OneOperation::new(r#type))
     }
-
-    fn as_one(&self) -> Option<&ArrayType> {
-        match self {
-            Self::One(one) => Some(one.output_type()),
-            _ => None,
-        }
-    }
 }
 
 impl SupportsZeroLike<ArrayType, ShardMapTensor> for XlaOperation {

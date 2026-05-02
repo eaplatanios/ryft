@@ -357,14 +357,6 @@ where
     fn one_operation(r#type: DataType) -> Self {
         Self::One(OneOperation::new(r#type))
     }
-
-    #[inline]
-    fn as_one(&self) -> Option<&DataType> {
-        match self {
-            Self::One(one) => Some(one.output_type()),
-            _ => None,
-        }
-    }
 }
 
 impl<V> SupportsZeroLike<DataType, V> for ScalarOperation<V>
@@ -442,14 +434,6 @@ where
     #[inline]
     fn one_operation(r#type: DataType) -> Self {
         Self::One(OneOperation::new(r#type))
-    }
-
-    #[inline]
-    fn as_one(&self) -> Option<&DataType> {
-        match self {
-            Self::One(one) => Some(one.output_type()),
-            _ => None,
-        }
     }
 }
 
@@ -591,14 +575,6 @@ where
     fn one_operation(r#type: T) -> Self {
         ArrayOperation::One(OneOperation::new(r#type))
     }
-
-    #[inline]
-    fn as_one(&self) -> Option<&T> {
-        match self {
-            Self::One(one) => Some(one.output_type()),
-            _ => None,
-        }
-    }
 }
 
 impl<T, V> SupportsZeroLike<T, V> for ArrayOperation<V, T>
@@ -715,14 +691,6 @@ where
     #[inline]
     fn one_operation(r#type: T) -> Self {
         LinearArrayOperation::One(OneOperation::new(r#type))
-    }
-
-    #[inline]
-    fn as_one(&self) -> Option<&T> {
-        match self {
-            Self::One(one) => Some(one.output_type()),
-            _ => None,
-        }
     }
 }
 
