@@ -25,7 +25,7 @@ pub use differentiation::{
 pub use forward::jvp;
 pub use linear::{
     CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad,
-    grad_with_aux, hessian, jacfwd, jacrev, jvp_program, value_and_grad, value_and_grad_with_aux, vjp,
+    grad_with_aux, hessian, jacfwd, jacrev, linearize, value_and_grad, value_and_grad_with_aux, vjp,
 };
 pub use operations::matrix::{MatrixOps, MatrixValue};
 pub use operations::rematerialize::rematerialize;

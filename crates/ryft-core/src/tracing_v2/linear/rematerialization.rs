@@ -32,7 +32,7 @@ where
         })
         .collect::<Vec<_>>();
     let (_, traced_gradient) =
-        super::reverse::reverse_mode_scalar_traced_program(tracing_context, traced_program, traced_primals)?;
+        super::reverse::traced_program_value_and_grad(tracing_context, traced_program, traced_primals)?;
     if let Some(tracing_error) = traced_primal_builder.borrow_mut().error.take() {
         return Err(tracing_error);
     }

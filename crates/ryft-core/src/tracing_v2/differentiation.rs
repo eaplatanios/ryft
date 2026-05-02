@@ -359,7 +359,7 @@ pub trait DifferentiableEngine: Engine {
 
     /// Linear staged operation type selected by this engine for tangent and cotangent programs.
     ///
-    /// Linear programs produced by [`jvp_program`](crate::tracing_v2::jvp_program),
+    /// Linear programs produced by [`linearize`](crate::tracing_v2::linearize),
     /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
     type LinearOperation: Clone
         + LinearOperationTrait<Self::Type, Self::Value, Self::LinearOperation>
@@ -379,7 +379,7 @@ pub trait DifferentiableEngine: Engine {
 ///
 /// [`DifferentiableOperationTracingEngine::new`] reborrows an `E: DifferentiableEngine` as a
 /// [`TracingEngine`] without allocation or ownership. AD entry points construct this view at trace
-/// boundaries such as [`jvp_program`](crate::tracing_v2::jvp_program),
+/// boundaries such as [`linearize`](crate::tracing_v2::linearize),
 /// [`vjp`](crate::tracing_v2::vjp), and [`grad`](crate::tracing_v2::grad), pass it immediately to
 /// ordinary tracing helpers, and keep backend implementations centered on their real engine type.
 /// User-facing ordinary tracing should keep using the backend's own [`TracingEngine`]

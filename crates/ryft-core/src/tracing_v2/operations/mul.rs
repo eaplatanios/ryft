@@ -179,7 +179,7 @@ mod tests {
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Program;
     use crate::tracing::engines::ScalarEngine;
-    use crate::tracing_v2::{LinearScalarOperation, Sin, jvp, jvp_program};
+    use crate::tracing_v2::{LinearScalarOperation, Sin, jvp, linearize};
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -199,7 +199,7 @@ mod tests {
         approx_eq(tangent, 13.0);
 
         let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) =
-            jvp_program(&engine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
+            linearize(&engine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
 
         assert_eq!(
             pushforward.to_string(),

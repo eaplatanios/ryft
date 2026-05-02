@@ -2930,7 +2930,7 @@ mod tests {
     #[test]
     fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
         // grad(f) wrapped in JIT â€” symbolic, like JAX's jit(grad(f)).
-        // Uses the ValueAndGradInvocationLeaf<Tracer<V>> dispatch that traces through vjp+pullback.
+        // Uses the ValueAndGradDispatch<Tracer<V>> path that traces through vjp+pullback.
         let engine = ArrayScalarEngine;
         let (_, compiled): (
             (f64, f64),

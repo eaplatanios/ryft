@@ -295,7 +295,7 @@ where
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let basis_inputs = standard_basis::<Input, V>(&input_structure, input_parameters.as_slice())?;
     let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-    let (output, pushforward) = jvp_program::<E, F, Input, Output, V>(engine, function, primals)?;
+    let (output, pushforward) = linearize::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());

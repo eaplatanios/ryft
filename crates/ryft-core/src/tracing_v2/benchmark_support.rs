@@ -7,8 +7,8 @@ use crate::tracing_v2::benchmarking::{
 };
 use crate::tracing_v2::operations::constants::OneLike;
 use crate::tracing_v2::{
-    ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, Sin, grad, jvp,
-    jvp_program, value_and_grad, vjp,
+    ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, Sin, grad, jvp, linearize,
+    value_and_grad, vjp,
 };
 use crate::types::ArrayType;
 
@@ -157,7 +157,7 @@ fn emit_scalar_bilinear_sin_jvp() -> Result<Vec<IrBenchmarkRecord>, BenchmarkErr
     let (_, pushforward): (
         f64,
         Program<ArrayType, f64, crate::tracing_v2::LinearArrayOperation<f64>, (f64, f64), f64>,
-    ) = jvp_program(&ArrayScalarEngine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
+    ) = linearize(&ArrayScalarEngine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jvp", "jvp_pushforward", &pushforward)?])
 }
 
@@ -198,7 +198,7 @@ fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord
 /// Emits the staged scalar linearization benchmark.
 fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pushforward): (f64, Program<ArrayType, f64, crate::tracing_v2::LinearArrayOperation<f64>, f64, f64>) =
-        jvp_program(&ArrayScalarEngine, |x| Ok(quartic_plus_sin(x)), 2.0f64)?;
+        linearize(&ArrayScalarEngine, |x| Ok(quartic_plus_sin(x)), 2.0f64)?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_linearize_pushforward", "linearize_pushforward", &pushforward)?])
 }
 

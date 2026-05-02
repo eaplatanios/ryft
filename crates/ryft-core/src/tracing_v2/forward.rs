@@ -5,26 +5,29 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
-use crate::tracing_v2::linear::{jvp_program, jvp_traced};
+use crate::tracing_v2::linear::linearize;
 use crate::tracing_v2::operations::constants::{SupportsZeroLike, Zero};
 use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
 use crate::tracing_v2::{
     DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,
+    DifferentiationError,
 };
+use crate::types::Typed;
+
 /// Marker selecting concrete-value [`jvp`] dispatch.
 #[doc(hidden)]
-pub struct ConcreteJvpInvocation;
+pub struct ConcreteJvp;
 
 /// Marker selecting already-traced [`jvp`] dispatch.
 #[doc(hidden)]
-pub struct TracedJvpInvocation;
+pub struct TracedJvp;
 
 /// Dispatch trait used by [`jvp`] so it can operate both on concrete values and on already traced values.
 ///
 /// The public transform is intentionally small; this trait is where the concrete, traced, and
 /// batched execution strategies branch apart.
 #[doc(hidden)]
-pub trait JvpInvocationLeaf<E, Input, Output, Mode>: Parameter + Sized
+pub trait JvpDispatch<E, Input, Output, Mode>: Parameter + Sized
 where
     E: Engine,
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
@@ -52,7 +55,7 @@ where
 }
 
 /// Concrete-value dispatch for [`jvp`]: traces the user function with [`Tracer`] to build a staged
-/// pushforward via [`jvp_program`] and evaluates it at the supplied tangents.
+/// pushforward via [`linearize`] and evaluates it at the supplied tangents.
 impl<
     E,
     V: Value<E::Type>
@@ -61,7 +64,7 @@ impl<
         + Parameterized<V, ParameterStructure: PartialEq>,
     Input: Parameterized<V, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<V>,
-> JvpInvocationLeaf<E, Input, Output, ConcreteJvpInvocation> for V
+> JvpDispatch<E, Input, Output, ConcreteJvp> for V
 where
     E: DifferentiableEngine<Value = V> + 'static,
     Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
@@ -103,22 +106,22 @@ where
         }
 
         let (primal_output, tangent_program): (Output, Program<E::Type, V, E::LinearOperation, Input, Output>) =
-            jvp_program(engine, |input| Ok(function(input)), primals)?;
+            linearize(engine, |input| Ok(function(input)), primals)?;
         let tangent_output = tangent_program.interpret(tangents)?;
         Ok((primal_output, tangent_output))
     }
 }
 
-/// Already-traced dispatch for [`jvp`]: delegates to [`jvp_traced`] to replay the user function
-/// symbolically inside an enclosing [`Tracer`] scope, staging both the primal output and the
-/// tangent propagation as part of the outer compiled program.
+/// Already-traced dispatch for [`jvp`]: replays the user function symbolically inside an enclosing
+/// [`Tracer`] scope, staging both the primal output and tangent propagation as part of the outer
+/// compiled program.
 impl<
     'engine,
     E,
     V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Debug + PartialEq, To<Tracer<'engine, E>> = Input>,
     Output: Parameterized<Tracer<'engine, E>, To<Tracer<'engine, E>> = Output>,
-> JvpInvocationLeaf<E, Input, Output, TracedJvpInvocation> for Tracer<'engine, E>
+> JvpDispatch<E, Input, Output, TracedJvp> for Tracer<'engine, E>
 where
     E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + TracingEngine + 'static,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
@@ -148,7 +151,34 @@ where
     where
         F: FnOnce(Self::FunctionInput<'call>) -> Self::FunctionOutput<'call>,
     {
-        jvp_traced::<_, _, _, V, E>(|input| Ok(function(input)), primals, tangents)
+        let primal_structure = primals.parameter_structure();
+        let tangent_structure = tangents.parameter_structure();
+        if primal_structure != tangent_structure {
+            return Err(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{primal_structure:?}"),
+                right_structure: format!("{tangent_structure:?}"),
+            }
+            .into());
+        }
+
+        let traced_primals = primals.into_parameters().collect::<Vec<_>>();
+        let traced_tangents = tangents.into_parameters().collect::<Vec<_>>();
+        let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
+            return Err(DifferentiationError::MissingTracedJvpInputLeaves.into());
+        };
+        let staged_input_types = Input::To::<E::Type>::from_parameters(
+            primal_structure,
+            traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
+        )?;
+        let (primal_output_types, traced_program) =
+            tracing_context.engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?;
+        let output_structure = primal_output_types.parameter_structure();
+        let (traced_primal_output, pushforward) = tracing_context.linearize(&traced_program, traced_primals)?;
+        let traced_tangent_output = pushforward.interpret(traced_tangents)?;
+        Ok((
+            Output::from_parameters(output_structure.clone(), traced_primal_output)?,
+            Output::from_parameters(output_structure, traced_tangent_output)?,
+        ))
     }
 }
 
@@ -168,12 +198,12 @@ pub fn jvp<'engine, E, F, Input, Output, Leaf, Mode>(
 ) -> Result<(Output, Output), TracingError>
 where
     E: Engine,
-    Leaf: JvpInvocationLeaf<E, Input, Output, Mode>,
+    Leaf: JvpDispatch<E, Input, Output, Mode>,
     Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<Leaf>,
     F: FnOnce(
-        <Leaf as JvpInvocationLeaf<E, Input, Output, Mode>>::FunctionInput<'engine>,
-    ) -> <Leaf as JvpInvocationLeaf<E, Input, Output, Mode>>::FunctionOutput<'engine>,
+        <Leaf as JvpDispatch<E, Input, Output, Mode>>::FunctionInput<'engine>,
+    ) -> <Leaf as JvpDispatch<E, Input, Output, Mode>>::FunctionOutput<'engine>,
 {
     Leaf::invoke(engine, function, primals, tangents)
 }
@@ -248,7 +278,7 @@ mod tests {
         ));
 
         let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
-            jvp_program(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+            linearize(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         assert_eq!(
             pushforward.to_string(),
@@ -263,5 +293,20 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn traced_jvp_requires_input_leaves() {
+        let engine = ScalarEngine::<f64>::new();
+        let empty_primals: Vec<Tracer<'_, ScalarEngine<f64>>> = Vec::new();
+        let empty_tangents: Vec<Tracer<'_, ScalarEngine<f64>>> = Vec::new();
+
+        let result: Result<(Vec<Tracer<'_, ScalarEngine<f64>>>, Vec<Tracer<'_, ScalarEngine<f64>>>), TracingError> =
+            jvp(&engine, |inputs: Vec<Tracer<'_, ScalarEngine<f64>>>| inputs, empty_primals, empty_tangents);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::MissingTracedJvpInputLeaves))
+        ));
     }
 }

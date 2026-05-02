@@ -28,8 +28,7 @@ mod reverse;
 
 pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
-pub(crate) use reverse::jvp_traced;
-pub use reverse::{grad, grad_with_aux, jvp_program, value_and_grad, value_and_grad_with_aux, vjp};
+pub use reverse::{grad, grad_with_aux, linearize, value_and_grad, value_and_grad_with_aux, vjp};
 
 #[cfg(test)]
 mod tests {
@@ -266,16 +265,16 @@ mod tests {
                 .unwrap();
         assert_eq!(differentiable_program.instructions[0].operation.name(), "differentiable_add");
 
-        let (primal, pushforward) = jvp_program(&engine, |x| Ok(x.clone() + x), 2.0f64).unwrap();
+        let (primal, pushforward) = linearize(&engine, |x| Ok(x.clone() + x), 2.0f64).unwrap();
 
         approx_eq(primal, 4.0);
         approx_eq(pushforward.interpret(3.0f64).unwrap(), 6.0);
     }
 
     #[test]
-    fn test_jvp_program_returns_the_primal_output_and_pushforward() {
+    fn test_linearize_returns_the_primal_output_and_pushforward() {
         let engine = ArrayScalarEngine;
-        let (primal, pushforward) = jvp_program(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+        let (primal, pushforward) = linearize(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
         approx_eq(pushforward.interpret(1.5f64).unwrap(), (4.0 + 2.0f64.cos()) * 1.5);
@@ -298,7 +297,7 @@ mod tests {
     fn test_transposed_linear_program_matches_the_reverse_mode_pullback() {
         let engine = ArrayScalarEngine;
         let (primal, pushforward) =
-            jvp_program(&engine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
+            linearize(&engine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
         let pullback = pushforward.transpose(&[primal]).unwrap();
         let cotangent = pullback.interpret(1.0f64).unwrap();
 
@@ -365,7 +364,7 @@ mod tests {
     fn linear_program_display_delegates_to_the_underlying_program() {
         let engine = ScalarEngine::<f64>::new();
         let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
-            jvp_program(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+            linearize(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         assert_eq!(
             pushforward.to_string(),
