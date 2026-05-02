@@ -137,4 +137,193 @@ pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError>;
 }
 
-// TODO(eaplatanios): Add unit tests following all of our conventions and style.
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::parameters::Placeholder;
+    use crate::tracing::{Program, ProgramBuilder};
+    use crate::types::DataType;
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    struct IdentityOperation;
+
+    impl Operation<DataType> for IdentityOperation {
+        fn name(&self) -> &'static str {
+            "identity"
+        }
+
+        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+            if input_types.len() != 1 {
+                return Err(TypeError {
+                    message: format!("identity expected 1 input type but got {}", input_types.len()),
+                });
+            }
+            Ok(vec![input_types[0]])
+        }
+    }
+
+    impl InterpretableOperation<DataType, f64> for IdentityOperation {
+        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
+            if inputs.len() != 1 {
+                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
+            }
+            Ok(vec![inputs[0]])
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct InlineMetadataOperation;
+
+    impl Operation<DataType> for InlineMetadataOperation {
+        fn name(&self) -> &'static str {
+            "metadata"
+        }
+
+        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+            IdentityOperation.infer_output_types(input_types)
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+                operation.field("mode", "test")?;
+                operation.field("count", 2)
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct LongMetadataOperation;
+
+    impl LongMetadataOperation {
+        const VALUE: &'static str =
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
+    }
+
+    impl Operation<DataType> for LongMetadataOperation {
+        fn name(&self) -> &'static str {
+            "metadata"
+        }
+
+        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+            IdentityOperation.infer_output_types(input_types)
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            OperationFormatter::new(formatter, indentation, self.name())?
+                .bracketed(|operation| operation.field("value", Self::VALUE))
+        }
+    }
+
+    #[derive(Clone)]
+    struct NestedProgramOperation {
+        program: Program<DataType, f64, IdentityOperation, f64, f64>,
+    }
+
+    impl Debug for NestedProgramOperation {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.debug_struct("NestedProgramOperation").finish_non_exhaustive()
+        }
+    }
+
+    impl Operation<DataType> for NestedProgramOperation {
+        fn name(&self) -> &'static str {
+            "nested"
+        }
+
+        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+            IdentityOperation.infer_output_types(input_types)
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+                operation.field("tag", "before")?;
+                operation.program("body", &self.program)?;
+                operation.field("tag", "after")
+            })
+        }
+    }
+
+    struct RenderedOperation<'a, O> {
+        operation: &'a O,
+        indentation: usize,
+    }
+
+    impl<O: Operation<DataType>> std::fmt::Display for RenderedOperation<'_, O> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.operation.render(formatter, self.indentation)
+        }
+    }
+
+    fn render_operation(operation: &impl Operation<DataType>) -> String {
+        RenderedOperation { operation, indentation: 0 }.to_string()
+    }
+
+    fn identity_program() -> Program<DataType, f64, IdentityOperation, f64, f64> {
+        let mut builder = ProgramBuilder::<DataType, f64, IdentityOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(IdentityOperation, vec![input]).unwrap()[0];
+        builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap()
+    }
+
+    #[test]
+    fn default_operation_rendering_uses_the_operation_name() {
+        assert_eq!(render_operation(&IdentityOperation), "identity");
+    }
+
+    #[test]
+    fn operation_inference_and_interpretation_use_concrete_inputs() {
+        let operation = IdentityOperation;
+
+        assert_eq!(operation.infer_output_types(&[DataType::F64]), Ok(vec![DataType::F64]));
+        assert_eq!(
+            operation.infer_output_types(&[]),
+            Err(TypeError { message: "identity expected 1 input type but got 0".to_string() })
+        );
+        assert_eq!(operation.interpret(&[3.0f64]), Ok(vec![3.0f64]));
+        assert_eq!(operation.interpret(&[]), Err(TracingError::InvalidInputCount { expected: 1, got: 0 }));
+    }
+
+    #[test]
+    fn operation_formatter_renders_short_fields_inline() {
+        assert_eq!(render_operation(&InlineMetadataOperation), "metadata [mode=test, count=2]");
+    }
+
+    #[test]
+    fn operation_formatter_wraps_long_fields_over_multiple_lines() {
+        assert_eq!(
+            render_operation(&LongMetadataOperation),
+            format!(
+                indoc! {"
+                    metadata [
+                        value={value},
+                    ]
+                "},
+                value = LongMetadataOperation::VALUE,
+            )
+            .trim_end()
+        );
+    }
+
+    #[test]
+    fn operation_formatter_renders_program_fields_over_multiple_lines() {
+        assert_eq!(
+            render_operation(&NestedProgramOperation { program: identity_program() }),
+            indoc! {"
+                nested [
+                    tag=before,
+                    body={
+                        lambda %0:f64 .
+                        let %1:f64 = identity %0
+                        in (%1)
+                    },
+                    tag=after,
+                ]
+            "}
+            .trim_end()
+        );
+    }
+}
