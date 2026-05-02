@@ -120,16 +120,13 @@ fn main() {
           `PDLTypeType`, `PDLValueType`.
         - [ ] Add support for operations.
     - [x] `quant`
-        - [ ] Add support for types: `QuantizedType`, `AnyQuantizedType`, `CalibratedQuantizedType`,
-          `UniformQuantizedPerAxisType`, `UniformQuantizedType`, `UniformQuantizedSubChannelType`.
-        - [ ] Add support for operations.
     - [x] `scf`
     - [x] `shape`
     - [/] `shardy`: Current support for the Shardy dialect is only partial and aimed at attributes and operations that
       are relevant when building StableHLO programs to be compiled by XLA, and not covering attributes and operations
       that are internal to the Shardy compiler. Also, the current support was added hastily and is likely to change as
       we start using these attributes and operations in practice.
-    - [ ] `sparse_tensor`
+    - [x] `sparse_tensor`
     - [x] `stable_hlo`
         - [ ] For `stable_hlo::bitcast_convert` can we have the constructor only require the output data type and infer
           the output shape automatically?

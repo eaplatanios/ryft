@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Added support for Linux AArch64.
-- Added C++ bindings for the `affine`, `arith`, `gpu`, `mosaic_gpu`, `mosaic_tpu`, and `triton` MLIR dialects.
+- Added C++ bindings for the `affine`, `arith`, `gpu`, `mosaic_gpu`, `mosaic_tpu`, `nvgpu`, `shape`, `sparse_tensor`,
+  and Triton `tt` MLIR dialects.
 
 ### Changed
 
