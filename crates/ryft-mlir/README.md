@@ -83,7 +83,6 @@ fn main() {
 
 ## Roadmap / TODOs
 
-- [ ] Add support for `mlirOperationReplaceUsesOfWith` and `mlirBlockArgumentSetLocation`.
 - [ ] Add `Context` constructors like `i32_type`, etc. Maybe also `bool_type` as an alias for `i1_type`?
 - [ ] Clean up the API we have around elements attributes and use stronger typing, if possible.
 - [ ] `BooleanAttributeRef::is<IntegerAttributeRef>` panics (and the same for a 1-bit integer attribute in reverse).
