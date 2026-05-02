@@ -169,7 +169,8 @@ where
 /// Stages the primal effect by tracing the rematerialize op in the outer trace via
 /// [`TracingContext::trace`](crate::tracing::engines::TracingContext::trace), then recursively linearizes
 /// the body through
-/// [`linearize_traced_program`] to obtain a pushforward over `Tracer` values, and finally wraps
+/// [`TracingContext::linearize`](crate::tracing::engines::TracingContext::linearize) to obtain a pushforward
+/// over `Tracer` values, and finally wraps
 /// that pushforward (paired with its transpose) in a
 /// [`LinearArrayOperation::Rematerialize`] variant that the active linear builder can stage
 /// directly.
@@ -221,11 +222,7 @@ where
             return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
         }
 
-        let (_, pushforward) = crate::tracing_v2::linear::linearize_traced_program(
-            (*context.engine).clone(),
-            self.body().program(),
-            primal_inputs,
-        )?;
+        let (_, pushforward) = context.engine.linearize(self.body().program(), primal_inputs)?;
         let pullback = context.engine.transpose(&pushforward)?;
 
         let body_input_types = self.body().input_types().to_vec();

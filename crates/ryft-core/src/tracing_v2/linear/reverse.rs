@@ -73,7 +73,7 @@ where
     let input_structure = primal_structure;
     let traced_primals = primals.into_parameters().collect::<Vec<_>>();
     let traced_tangents = tangents.into_parameters().collect::<Vec<_>>();
-    let Some(exemplar_traced_primal) = traced_primals.first() else {
+    let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
         return Err(DifferentiationError::MissingTracedJvpInputLeaves.into());
     };
     let staged_input_types = Input::To::<E::Type>::from_parameters(
@@ -81,15 +81,9 @@ where
         traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
     let (primal_output_types, traced_program) =
-        trace_flat_program_from_trace_result::<E::Type, Input::To<E::Type>, Output::To<E::Type>, V, E::Operation, _>(
-            exemplar_traced_primal
-                .context
-                .engine
-                .trace(move |staged_input| function(staged_input), staged_input_types)?,
-        )?;
+        tracing_context.engine.trace(move |staged_input| function(staged_input), staged_input_types)?;
     let output_structure = primal_output_types.parameter_structure();
-    let (traced_primal_output, pushforward) =
-        linearize_traced_program(exemplar_traced_primal.context.clone(), &traced_program, traced_primals)?;
+    let (traced_primal_output, pushforward) = tracing_context.linearize(&traced_program, traced_primals)?;
     let traced_tangent_output = pushforward.interpret(traced_tangents)?;
     Ok((
         Output::from_parameters(output_structure.clone(), traced_primal_output)?,
@@ -276,11 +270,9 @@ where
         )?;
         let tracing_context = traced_primals[0].context.clone();
         let (_, traced_program) =
-            trace_flat_program_from_trace_result::<E::Type, Input::To<E::Type>, E::Type, V, E::Operation, _>(
-                tracing_context.engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?,
-            )?;
+            tracing_context.engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?;
         let (traced_output, traced_gradient) =
-            reverse_mode_scalar_traced_program::<V, E>(tracing_context, &traced_program, traced_primals)?;
+            reverse_mode_scalar_traced_program(tracing_context, &traced_program, traced_primals)?;
         Ok((traced_output, Input::from_parameters(input_structure, traced_gradient)?))
     }
 }

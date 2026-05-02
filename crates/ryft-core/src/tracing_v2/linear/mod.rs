@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::rc::Rc;
 
 use crate::operations::{InterpretableOperation, Operation};
-use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
+use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
@@ -15,7 +15,7 @@ use crate::tracing_v2::{
     Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
     DifferentiableTracingEngine, DifferentiationError,
 };
-use crate::types::{ArrayType, Type, Typed};
+use crate::types::{ArrayType, Typed};
 
 /// Dense Jacobian and Hessian materialization helpers.
 mod dense;
@@ -30,36 +30,8 @@ pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
 #[doc(hidden)]
 pub use replay::TracedLinearizableOperation;
-#[doc(hidden)]
-pub use replay::linearize_traced_program;
 pub(crate) use reverse::jvp_traced;
 pub use reverse::{grad, grad_with_aux, jvp_program, value_and_grad, value_and_grad_with_aux, vjp};
-
-fn trace_flat_program_from_trace_result<T, Input, Output, V, O, ProgramOutput>(
-    trace_result: (Output, Program<T, V, O, Input::To<V>, ProgramOutput>),
-) -> Result<(Output, Program<T, V, O, Vec<V>, Vec<V>>), TracingError>
-where
-    T: Type + Parameter,
-    V: Traceable<T> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<T>,
-    Output: Parameterized<T>,
-    ProgramOutput: Parameterized<V>,
-    Input::Family: ParameterizedFamily<V>,
-    O: Clone + Operation<T>,
-{
-    let (output_types, traced_program) = trace_result;
-    let input_leaf_count = traced_program.input_ids.len();
-    let output_leaf_count = output_types.parameter_structure().parameter_count();
-    let Program { atoms, input_ids, output_ids, instructions, .. } = traced_program;
-    let mut builder = ProgramBuilder::<T, V, O>::new();
-    builder.atoms = atoms;
-    builder.input_ids = input_ids;
-    builder.instructions = instructions;
-    let traced_program = builder
-        .build(output_ids, vec![Placeholder; input_leaf_count], vec![Placeholder; output_leaf_count])?
-        .simplified()?;
-    Ok((output_types, traced_program))
-}
 
 /// Linearizes one flat scalar traced program and stages its pullback with a unit cotangent seed.
 ///
@@ -67,13 +39,15 @@ where
 /// primal body and symbolic primals from an enclosing trace, it builds the pushforward, transposes
 /// it into a pullback, seeds that pullback with a symbolic one, and returns both the traced scalar
 /// output and the traced gradient leaves.
-fn reverse_mode_scalar_traced_program<'engine, V, E>(
+fn reverse_mode_scalar_traced_program<'engine, V, E, Input, Output>(
     tracing_context: TracingContext<'engine, E>,
-    traced_program: &Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>,
+    traced_program: &Program<E::Type, V, E::Operation, Input, Output>,
     traced_primals: Vec<Tracer<'engine, E>>,
 ) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
 where
     V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
     E: DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
     E::Operation:
         TracedLinearizableOperation<'engine, E> + SupportsAdd<E::Type, V> + SupportsZeroLike<E::Type, V> + 'static,
@@ -83,7 +57,7 @@ where
         + SupportsZero<E::Type, Tracer<'engine, E>>,
     AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
-    let (outputs, pushforward) = linearize_traced_program(tracing_context.clone(), traced_program, traced_primals)?;
+    let (outputs, pushforward) = tracing_context.linearize(traced_program, traced_primals)?;
     if outputs.len() != 1 {
         return Err(DifferentiationError::InvalidGradientOutputLeafCount { expected: 1, got: outputs.len() }.into());
     }

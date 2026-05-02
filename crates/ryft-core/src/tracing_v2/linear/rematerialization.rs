@@ -1,9 +1,9 @@
 use super::*;
 
-fn build_traced_gradient_program<'engine, E, Input, V>(
+fn build_traced_gradient_program<'engine, E, Input, ProgramInput, ProgramOutput, V>(
     engine: &'engine E,
     input_structure: Input::ParameterStructure,
-    traced_program: &Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>,
+    traced_program: &Program<E::Type, V, E::Operation, ProgramInput, ProgramOutput>,
 ) -> Result<Program<E::Type, V, E::Operation, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
@@ -18,6 +18,8 @@ where
         + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
     AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
     Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    ProgramInput: Parameterized<V>,
+    ProgramOutput: Parameterized<V>,
 {
     let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, V, E::Operation>::new()));
     let tracing_context = TracingContext::new(engine, traced_primal_builder.clone());
@@ -29,8 +31,7 @@ where
             tracing_context.input(input_type)
         })
         .collect::<Vec<_>>();
-    let (_, traced_gradient) =
-        reverse_mode_scalar_traced_program::<V, E>(tracing_context, traced_program, traced_primals)?;
+    let (_, traced_gradient) = reverse_mode_scalar_traced_program(tracing_context, traced_program, traced_primals)?;
     if let Some(tracing_error) = traced_primal_builder.borrow_mut().error.take() {
         return Err(tracing_error);
     }
@@ -85,10 +86,7 @@ where
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) =
-        trace_flat_program_from_trace_result::<E::Type, Input::To<E::Type>, E::Type, V, E::Operation, _>(
-            _engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?,
-        )?;
+    let (_, traced_program) = _engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?;
     build_traced_gradient_program(_engine, input_structure, &traced_program)
 }
 
@@ -215,13 +213,10 @@ where
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) =
-        trace_flat_program_from_trace_result::<ArrayType, Input::To<ArrayType>, ArrayType, V, E::Operation, _>(
-            engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?,
-        )?;
+    let (_, traced_program) = engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?;
     let segmented_program = match segment_size {
-        None => wrap_program_in_rematerialize::<E, V, E::Operation>(&traced_program)?,
-        Some(size) => segment_program::<E, V, E::Operation>(&traced_program, size)?,
+        None => wrap_program_in_rematerialize::<E, V, E::Operation, _, _>(&traced_program)?,
+        Some(size) => segment_program::<E, V, E::Operation, _, _>(&traced_program, size)?,
     };
     build_traced_gradient_program(engine, input_structure, &segmented_program)
 }
@@ -239,13 +234,15 @@ where
 /// The segmented program is semantically equivalent to the original: calling it on the same inputs produces
 /// the same outputs. The difference is visible only during differentiation, where each [`RematerializeOperation`]
 /// boundary forces recomputation of within-segment intermediates rather than saving them.
-fn segment_program<E, V, O>(
-    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+fn segment_program<E, V, O, ProgramInput, ProgramOutput>(
+    program: &Program<ArrayType, V, O, ProgramInput, ProgramOutput>,
     segment_size: usize,
 ) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V>,
+    ProgramInput: Parameterized<V>,
+    ProgramOutput: Parameterized<V>,
     O: Clone
         + Operation<ArrayType>
         + InterpretableOperation<ArrayType, V>
@@ -257,7 +254,7 @@ where
     // If the program has fewer instructions than a single segment, no segmentation is needed - wrap the
     // whole thing in a single RematerializeOperation.
     if instructions.len() <= segment_size {
-        return wrap_program_in_rematerialize::<E, V, O>(program);
+        return wrap_program_in_rematerialize::<E, V, O, ProgramInput, ProgramOutput>(program);
     }
 
     // Divide instructions into segments.
@@ -414,12 +411,14 @@ where
 }
 
 /// Wraps an entire program in a single [`RematerializeOperation`] boundary.
-fn wrap_program_in_rematerialize<E, V, O>(
-    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+fn wrap_program_in_rematerialize<E, V, O, ProgramInput, ProgramOutput>(
+    program: &Program<ArrayType, V, O, ProgramInput, ProgramOutput>,
 ) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V>,
+    ProgramInput: Parameterized<V>,
+    ProgramOutput: Parameterized<V>,
     O: Clone + Operation<ArrayType> + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
 {
     let program = program;
@@ -446,7 +445,16 @@ where
         })
         .collect::<Result<_, _>>()?;
 
-    let body = FlatTracedRematerialize::from_parts(input_types.clone(), output_types.clone(), program.clone());
+    let mut body_builder = ProgramBuilder::<ArrayType, V, O>::new();
+    body_builder.atoms = program.atoms.clone();
+    body_builder.input_ids = program.input_ids.clone();
+    body_builder.instructions = program.instructions.clone();
+    let body_program = body_builder.build(
+        program.output_ids.clone(),
+        vec![Placeholder; input_types.len()],
+        vec![Placeholder; output_types.len()],
+    )?;
+    let body = FlatTracedRematerialize::from_parts(input_types.clone(), output_types.clone(), body_program);
     let remat_op = RematerializeOperation::new(body);
 
     let mut outer_builder: ProgramBuilder<ArrayType, V, O> = ProgramBuilder::new();
@@ -473,8 +481,13 @@ where
 /// The sub-program takes the boundary input atoms as its inputs and produces the boundary output atoms as its
 /// outputs. Internal atoms (produced and consumed entirely within the segment) are handled as internal constants
 /// and instructions within the sub-program.
-fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>>(
-    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+fn build_segment_sub_program<
+    V: Traceable<ArrayType>,
+    O: Clone + Operation<ArrayType>,
+    ProgramInput: Parameterized<V>,
+    ProgramOutput: Parameterized<V>,
+>(
+    program: &Program<ArrayType, V, O, ProgramInput, ProgramOutput>,
     segment_instructions: &[Instruction<O>],
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
@@ -575,7 +588,9 @@ mod tests {
         let engine = ScalarEngine::<f64>::new();
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let output_atom = builder.add_constant(3.0f64);
-        let traced_program = builder.build(vec![output_atom], Vec::<Placeholder>::new(), vec![Placeholder]).unwrap();
+        let traced_program = builder
+            .build::<Vec<f64>, Vec<f64>>(vec![output_atom], Vec::<Placeholder>::new(), vec![Placeholder])
+            .unwrap();
 
         let gradient_program = build_traced_gradient_program(&engine, (), &traced_program).unwrap();
 

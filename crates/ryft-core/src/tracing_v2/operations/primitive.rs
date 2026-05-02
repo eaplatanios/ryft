@@ -2100,7 +2100,7 @@ where
 /// Forwards each variant to the per-op JVP rule, picking up the
 /// [`TracingContext`](crate::tracing::engines::TracingContext)-keyed impl for captured
 /// [`Scale`](Self::Scale), the [`Rematerialize`](Self::Rematerialize) impl that recurses via
-/// [`linearize_traced_program`](crate::tracing_v2::linear::linearize_traced_program), the
+/// [`TracingContext::linearize`](crate::tracing::engines::TracingContext::linearize), the
 /// [`Condition`](Self::Condition) / [`While`](Self::While) stub impls (predicate extraction does
 /// not work at trace time), and the [`Custom`](Self::Custom) bridge to the registered traced
 /// linearization rule.
