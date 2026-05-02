@@ -250,7 +250,7 @@ mod tests {
         );
         let r#type = context.sparse_tensor_storage_specifier_type(encoding);
         assert_eq!(&context, r#type.context());
-        assert_eq!(r#type.encoding(), encoding);
+        assert_eq!(r#type.encoding().to_string(), encoding.to_string());
     }
 
     #[test]
@@ -436,7 +436,7 @@ mod tests {
         );
         test_type_display_and_debug(
             r#type,
-            "!sparse_tensor.iter_space<#sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>, lvls = 0 to 1>",
+            "!sparse_tensor.iter_space<<{ map = (d0) -> (d0 : compressed) }>, lvls = 0>",
         );
     }
 
@@ -461,7 +461,7 @@ mod tests {
         assert_eq!(
             context
                 .parse_type(
-                    "!sparse_tensor.iter_space<#sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>, lvls = 0 to 1>",
+                    "!sparse_tensor.iter_space<#sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>, lvls = 0>",
                 )
                 .unwrap()
                 .cast::<IterationSpaceTypeRef>()
@@ -566,10 +566,7 @@ mod tests {
             0,
             1,
         );
-        test_type_display_and_debug(
-            r#type,
-            "!sparse_tensor.iterator<#sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>, lvls = 0 to 1>",
-        );
+        test_type_display_and_debug(r#type, "!sparse_tensor.iterator<<{ map = (d0) -> (d0 : compressed) }>, lvls = 0>");
     }
 
     #[test]
@@ -593,7 +590,7 @@ mod tests {
         assert_eq!(
             context
                 .parse_type(
-                    "!sparse_tensor.iterator<#sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>, lvls = 0 to 1>",
+                    "!sparse_tensor.iterator<#sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>, lvls = 0>",
                 )
                 .unwrap()
                 .cast::<IteratorTypeRef>()

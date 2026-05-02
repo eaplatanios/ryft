@@ -1079,7 +1079,7 @@ mod tests {
         StorageSpecifierKindAttributeRef,
         CoordinateMemorySize,
         ValueMemorySize,
-        "#sparse_tensor.kind<",
+        "#sparse_tensor<kind ",
     );
 
     sparse_tensor_enum_attribute_tests!(
