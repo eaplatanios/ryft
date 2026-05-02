@@ -5,6 +5,7 @@ pub mod builtin;
 pub mod cf;
 pub mod chlo;
 pub mod dialect;
+pub mod emit_c;
 pub mod func;
 pub mod gpu;
 pub mod handle;

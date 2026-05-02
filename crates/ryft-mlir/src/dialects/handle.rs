@@ -55,6 +55,7 @@ mod tests {
     fn test_dialect_handle() {
         assert_eq!(DialectHandle::affine().namespace().unwrap(), "affine");
         assert_eq!(DialectHandle::r#async().namespace().unwrap(), "async");
+        assert_eq!(DialectHandle::emit_c().namespace().unwrap(), "emitc");
         assert_eq!(DialectHandle::func().namespace().unwrap(), "func");
         assert_eq!(DialectHandle::gpu().namespace().unwrap(), "gpu");
         assert_eq!(DialectHandle::linalg().namespace().unwrap(), "linalg");
