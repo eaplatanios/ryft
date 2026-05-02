@@ -726,6 +726,8 @@ impl BuildConfiguration {
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("shape.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("sparse_tensor.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("sparse_tensor.h"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("transform.cc"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("transform.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.h"),
             PathBuf::from("WORKSPACE"),

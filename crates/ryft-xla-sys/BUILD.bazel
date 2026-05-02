@@ -185,6 +185,7 @@ cc_library(
         "src/c++/mlir/dialects/nvgpu.h",
         "src/c++/mlir/dialects/shape.h",
         "src/c++/mlir/dialects/sparse_tensor.h",
+        "src/c++/mlir/dialects/transform.h",
         "src/c++/mlir/dialects/triton.h",
     ],
     srcs = [
@@ -197,6 +198,7 @@ cc_library(
         "src/c++/mlir/dialects/nvgpu.cc",
         "src/c++/mlir/dialects/shape.cc",
         "src/c++/mlir/dialects/sparse_tensor.cc",
+        "src/c++/mlir/dialects/transform.cc",
         "src/c++/mlir/dialects/triton.cc",
     ],
     copts = tsl_copts() + [

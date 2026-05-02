@@ -61,6 +61,7 @@ mod tests {
         assert_eq!(DialectHandle::nvgpu().namespace().unwrap(), "nvgpu");
         assert_eq!(DialectHandle::sparse_tensor().namespace().unwrap(), "sparse_tensor");
         assert_eq!(DialectHandle::tensor().namespace().unwrap(), "tensor");
+        assert_eq!(DialectHandle::transform().namespace().unwrap(), "transform");
 
         // Check that we can construct multiple handles for the same dialect.
         let handle_1 = DialectHandle::gpu();

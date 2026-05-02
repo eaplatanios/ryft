@@ -151,10 +151,7 @@ fn main() {
       - [ ] `gluon`
       - [ ] `proton`
       - [ ] `proton_gpu`
-    - [ ] `transform`
-        - [ ] Add support for types: `TransformAnyOpType`, `TransformAnyParamType`, `TransformAnyValueType`,
-          `TransformOperationType`, `TransformParamType`.
-        - [ ] Add support for operations.
+    - [x] `transform`
     - [ ] `versioned_hlo`
 
 #### License
