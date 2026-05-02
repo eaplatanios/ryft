@@ -31,8 +31,7 @@ where
             tracing_context.input(input_type)
         })
         .collect::<Vec<_>>();
-    let (_, traced_gradient) =
-        super::reverse::traced_program_value_and_grad(tracing_context, traced_program, traced_primals)?;
+    let (_, traced_gradient) = tracing_context.value_and_grad(traced_program, traced_primals)?;
     if let Some(tracing_error) = traced_primal_builder.borrow_mut().error.take() {
         return Err(tracing_error);
     }

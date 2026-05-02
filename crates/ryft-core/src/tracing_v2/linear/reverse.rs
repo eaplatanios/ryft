@@ -70,44 +70,46 @@ where
     Ok((output, pullback))
 }
 
-/// Linearizes one traced scalar-output program and stages its pullback with a unit cotangent seed.
-///
-/// This is the internal core of traced reverse-mode for scalar-output functions. Given a staged
-/// primal body and symbolic primals from an enclosing trace, it builds the pushforward, transposes
-/// it into a pullback, seeds that pullback with a symbolic one, and returns both the traced scalar
-/// output and the traced gradient leaves.
-pub(super) fn traced_program_value_and_grad<'engine, V, E, Input, Output>(
-    tracing_context: TracingContext<'engine, E>,
-    traced_program: &Program<E::Type, V, E::Operation, Input, Output>,
-    traced_primals: Vec<Tracer<'engine, E>>,
-) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
-where
-    V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-    E: DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
-    E::Operation: DifferentiableOperation<TracingContext<'engine, E>>
-        + SupportsAdd<E::Type, V>
-        + SupportsZeroLike<E::Type, V>
-        + 'static,
-    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
-        + InterpretableOperation<E::Type, Tracer<'engine, E>>
-        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>
-        + SupportsZero<E::Type, Tracer<'engine, E>>,
-    AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
-{
-    let (outputs, pushforward) = tracing_context.linearize(traced_program, traced_primals)?;
-    if outputs.len() != 1 {
-        return Err(DifferentiationError::InvalidGradientOutputLeafCount { expected: 1, got: outputs.len() }.into());
+impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
+    /// Linearizes one traced scalar-output program and stages its pullback with a unit cotangent seed.
+    ///
+    /// This is the internal core of traced reverse-mode for scalar-output functions. Given a staged
+    /// primal body and symbolic primals from this enclosing trace, it builds the pushforward,
+    /// transposes it into a pullback, seeds that pullback with a symbolic one, and returns both the
+    /// traced scalar output and the traced gradient leaves.
+    pub(super) fn value_and_grad<V, Input, Output>(
+        self,
+        traced_program: &Program<E::Type, V, E::Operation, Input, Output>,
+        traced_primals: Vec<Tracer<'engine, E>>,
+    ) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
+    where
+        V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
+        Input: Parameterized<V>,
+        Output: Parameterized<V>,
+        E: DifferentiableTracingEngine<Value = V> + 'static,
+        E::Operation: DifferentiableOperation<TracingContext<'engine, E>>
+            + SupportsAdd<E::Type, V>
+            + SupportsZeroLike<E::Type, V>
+            + 'static,
+        <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
+            + InterpretableOperation<E::Type, Tracer<'engine, E>>
+            + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>
+            + SupportsZero<E::Type, Tracer<'engine, E>>,
+        AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+    {
+        let (outputs, pushforward) = self.linearize(traced_program, traced_primals)?;
+        if outputs.len() != 1 {
+            return Err(DifferentiationError::InvalidGradientOutputLeafCount { expected: 1, got: outputs.len() }.into());
+        }
+        let traced_output = outputs[0].clone();
+        let pullback = self.transpose(&pushforward)?;
+        let seed_type = traced_output.r#type().into_owned();
+        let _ = <V as One<E::Type>>::one(&seed_type)?;
+        let seed_value = self.engine.one(&seed_type)?;
+        let seed = self.constant(seed_value);
+        let traced_gradient = pullback.interpret(vec![seed])?;
+        Ok((traced_output, traced_gradient))
     }
-    let traced_output = outputs[0].clone();
-    let pullback = tracing_context.transpose(&pushforward)?;
-    let seed_type = traced_output.r#type().into_owned();
-    let _ = <V as One<E::Type>>::one(&seed_type)?;
-    let seed_value = tracing_context.engine.one(&seed_type)?;
-    let seed = tracing_context.constant(seed_value);
-    let traced_gradient = pullback.interpret(vec![seed])?;
-    Ok((traced_output, traced_gradient))
 }
 
 /// Marker selecting concrete-value [`value_and_grad`] dispatch.
@@ -126,7 +128,7 @@ pub struct TracedValueAndGrad;
 /// compact while allowing concrete replay, traced replay, and batched replay to specialize
 /// independently.
 #[doc(hidden)]
-pub trait ValueAndGradDispatch<E, Input, Mode>: Parameter + Sized
+pub(crate) trait ValueAndGradDispatch<E, Input, Mode>: Parameter + Sized
 where
     E: Engine,
     Input: Parameterized<Self, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -255,8 +257,7 @@ where
         )?;
         let (_, traced_program) =
             tracing_context.engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?;
-        let (traced_output, traced_gradient) =
-            traced_program_value_and_grad(tracing_context, &traced_program, traced_primals)?;
+        let (traced_output, traced_gradient) = tracing_context.value_and_grad(&traced_program, traced_primals)?;
         Ok((traced_output, Input::from_parameters(input_structure, traced_gradient)?))
     }
 }

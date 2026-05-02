@@ -27,7 +27,7 @@ pub struct TracedJvp;
 /// The public transform is intentionally small; this trait is where the concrete, traced, and
 /// batched execution strategies branch apart.
 #[doc(hidden)]
-pub trait JvpDispatch<E, Input, Output, Mode>: Parameter + Sized
+pub(crate) trait JvpDispatch<E, Input, Output, Mode>: Parameter + Sized
 where
     E: Engine,
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
