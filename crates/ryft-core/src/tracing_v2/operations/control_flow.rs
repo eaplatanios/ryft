@@ -75,7 +75,7 @@ macro_rules! impl_non_predicate_control_flow_value {
 
 impl_non_predicate_control_flow_value!(i8, i16, i32, i64, u8, u16, u32, u64, bf16, f16, f32, f64);
 
-impl<V: ControlFlowValue, T: Clone + crate::parameters::Parameter> ControlFlowValue for JvpTracer<V, T> {
+impl<V: ControlFlowValue, T: Clone + Debug + crate::parameters::Parameter> ControlFlowValue for JvpTracer<V, T> {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
         self.primal.control_flow_predicate()
@@ -104,7 +104,7 @@ pub enum ConditionPredicate<T: Type + PartialEq = ArrayType> {
 }
 
 /// Two-way conditional operation with nested true and false branch programs.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConditionOperation<V, O = ArrayOperation<V>, T = ArrayType>
 where
     T: Type + PartialEq,
@@ -123,7 +123,7 @@ where
 }
 
 /// While-loop operation with nested condition and body programs over the same loop-carried state.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WhileOperation<V, O = ArrayOperation<V>, T = ArrayType>
 where
     T: Type + PartialEq,
@@ -341,21 +341,19 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> ConditionOpe
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> Debug for ConditionOperation<V, O, T> {
+impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> Display for ConditionOperation<V, O, T>
+where
+    Self: Operation<T>,
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Condition").finish_non_exhaustive()
-    }
-}
-
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> Display for ConditionOperation<V, O, T> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "condition")
+        formatter.write_str(self.name())
     }
 }
 
 impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayType>
     for ConditionOperation<V, O, ArrayType>
 {
+    #[inline]
     fn name(&self) -> &'static str {
         "condition"
     }
@@ -372,6 +370,7 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayTy
 impl<V: Traceable<DataType>, O: Clone + Operation<DataType>> Operation<DataType>
     for ConditionOperation<V, O, DataType>
 {
+    #[inline]
     fn name(&self) -> &'static str {
         "condition"
     }
@@ -574,21 +573,19 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> WhileOperati
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> Debug for WhileOperation<V, O, T> {
+impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> Display for WhileOperation<V, O, T>
+where
+    Self: Operation<T>,
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("While").finish()
-    }
-}
-
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> Display for WhileOperation<V, O, T> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "while")
+        formatter.write_str(self.name())
     }
 }
 
 impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayType>
     for WhileOperation<V, O, ArrayType>
 {
+    #[inline]
     fn name(&self) -> &'static str {
         "while"
     }
@@ -603,6 +600,7 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayTy
 }
 
 impl<V: Traceable<DataType>, O: Clone + Operation<DataType>> Operation<DataType> for WhileOperation<V, O, DataType> {
+    #[inline]
     fn name(&self) -> &'static str {
         "while"
     }
@@ -853,6 +851,7 @@ mod tests {
     }
 
     impl Operation<ArrayType> for TestOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             match self {
                 Self::Add => "add",
@@ -924,6 +923,7 @@ mod tests {
     }
 
     impl Operation<ArrayType> for TestLinearOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             match self {
                 Self::Add => "linear_add",
@@ -1066,6 +1066,7 @@ mod tests {
     }
 
     impl Operation<ArrayType> for TestDifferentiableOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             match self {
                 Self::IsPositive => "is_positive",

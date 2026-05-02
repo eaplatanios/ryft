@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, TracingError};
@@ -42,7 +42,7 @@ pub trait SupportsZero<T: Type, V: Traceable<T>> {
 /// have no cotangent contribution accumulated onto them. Closed carriers implement [`SupportsZero`] to construct the
 /// carrier-specific representation, and the carrier's own trait impls then delegate to this op for [`Operation`] and
 /// [`InterpretableOperation`] semantics.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ZeroOperation<T: Type = ArrayType> {
     /// Type of the value produced when this op is interpreted.
     pub output_type: T,
@@ -56,19 +56,14 @@ impl<T: Type> ZeroOperation<T> {
     }
 }
 
-impl<T: Type> Debug for ZeroOperation<T> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Zero({})", self.output_type)
-    }
-}
-
 impl<T: Type> Display for ZeroOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "zero")
+        formatter.write_str(self.name())
     }
 }
 
 impl<T: Type> Operation<T> for ZeroOperation<T> {
+    #[inline]
     fn name(&self) -> &'static str {
         "zero"
     }
@@ -119,7 +114,7 @@ pub trait SupportsOne<T: Type, V: Traceable<T>> {
 ///
 /// [`OneOperation`] is the staged form of [`One::one`]. It is used for unit cotangent seeds and any other type-driven
 /// multiplicative identity where no exemplar value is available.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OneOperation<T: Type = ArrayType> {
     /// Type of the value produced when this op is interpreted.
     pub output_type: T,
@@ -133,19 +128,14 @@ impl<T: Type> OneOperation<T> {
     }
 }
 
-impl<T: Type> Debug for OneOperation<T> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "One({})", self.output_type)
-    }
-}
-
 impl<T: Type> Display for OneOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "one")
+        formatter.write_str(self.name())
     }
 }
 
 impl<T: Type> Operation<T> for OneOperation<T> {
+    #[inline]
     fn name(&self) -> &'static str {
         "one"
     }

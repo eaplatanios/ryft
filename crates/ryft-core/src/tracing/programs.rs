@@ -24,8 +24,9 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// Represents leaf values that can participate in traced [`Program`]s. [`Traceable`] is implemented by every type that
 /// can appear as a leaf in a staged [`Program`]: both concrete data types such as `f32`, `f64`, and backend arrays, and
 /// tracing wrappers such as [`Tracer`](crate::Tracer). It ties each leaf to a type descriptor `T` via [`Typed`] and
-/// requires [`Display`] so that constants and [`Operation`] metadata can render their carried values directly.
-pub trait Traceable<T: Type>: Clone + Display + Parameter + Typed<T> {}
+/// requires [`Debug`] and [`Display`] so that diagnostics, constants, and [`Operation`] metadata can render their
+/// carried values directly.
+pub trait Traceable<T: Type>: Clone + Debug + Display + Parameter + Typed<T> {}
 
 /// [`Atom`]s represent nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
 #[derive(Clone, Debug, Parameter)]
@@ -103,6 +104,7 @@ pub struct Instruction<O> {
 /// consists of a sequence of [`Instruction`]s paired with [`Parameterized`] input and output types. This is the primary
 /// intermediate representation (IR) used by the Ryft tracing and transformation system (e.g., to support things like
 /// automatic differentiation and just-in-time compilation).
+#[derive(Debug)]
 pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
     /// [`Atom`]s contained in this [`Program`], in the order in which they will be evaluated.
     pub atoms: Vec<Atom<T, V>>,
@@ -833,6 +835,7 @@ mod tests {
     }
 
     impl Operation<DataType> for LongMetadataOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             "long_metadata"
         }
@@ -1091,7 +1094,7 @@ mod tests {
 
     #[test]
     fn test_program_into_simplified() {
-        #[derive(Parameter)]
+        #[derive(Debug, Parameter)]
         struct CloneCountingValue {
             value: f64,
             clone_count: Rc<Cell<usize>>,

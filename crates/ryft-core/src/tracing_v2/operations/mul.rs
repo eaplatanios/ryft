@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 use std::ops::Mul;
 
 use crate::broadcasting::Broadcastable;
@@ -38,22 +38,17 @@ where
 ///
 /// Multiplication is both a user-visible primitive and a building block for derivative rules such
 /// as the JVP of [`super::SinOperation`] and the replay of captured scale factors.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct MulOperation;
-
-impl Debug for MulOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Mul")
-    }
-}
 
 impl Display for MulOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "mul")
+        formatter.write_str(<Self as Operation<ArrayType>>::name(self))
     }
 }
 
 impl Operation<ArrayType> for MulOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "mul"
     }
@@ -98,6 +93,7 @@ impl Operation<ArrayType> for MulOperation {
 }
 
 impl Operation<DataType> for MulOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "mul"
     }

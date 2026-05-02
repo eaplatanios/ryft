@@ -31,7 +31,7 @@ pub trait SupportsScale<T: Type, V: Traceable<T>> {
 ///
 /// In ordinary programs this represents "multiply by a closed-over constant." In linear programs
 /// the same semantic idea is reused to scale tangent and cotangent terms.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ScaleOperation<T: Type, V: Typed<T>> {
     /// Captured factor applied to every input of this unary linear op.
     pub factor: V,
@@ -59,19 +59,14 @@ impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Typed<T>> Debug for ScaleOperation<T, V> {
+impl<T: Type, V: Typed<T> + Debug + Display> Display for ScaleOperation<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Scale")
+        formatter.write_str(self.name())
     }
 }
 
-impl<T: Type, V: Typed<T>> Display for ScaleOperation<T, V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "scale")
-    }
-}
-
-impl<T: Type, V: Typed<T> + Display> Operation<T> for ScaleOperation<T, V> {
+impl<T: Type, V: Typed<T> + Debug + Display> Operation<T> for ScaleOperation<T, V> {
+    #[inline]
     fn name(&self) -> &'static str {
         "scale"
     }
@@ -86,7 +81,9 @@ impl<T: Type, V: Typed<T> + Display> Operation<T> for ScaleOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Typed<T> + Display + Clone + Mul<Output = V>> InterpretableOperation<T, V> for ScaleOperation<T, V> {
+impl<T: Type, V: Typed<T> + Debug + Display + Clone + Mul<Output = V>> InterpretableOperation<T, V>
+    for ScaleOperation<T, V>
+{
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
         Ok(vec![self.factor.clone() * inputs[0].clone()])

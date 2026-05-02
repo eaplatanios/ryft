@@ -244,7 +244,7 @@ impl<V: Display, T> Display for JvpTracer<V, T> {
     }
 }
 
-impl<Ty: Type, V: Traceable<Ty>, T: Clone + Parameter> Traceable<Ty> for JvpTracer<V, T> {}
+impl<Ty: Type, V: Traceable<Ty>, T: Clone + std::fmt::Debug + Parameter> Traceable<Ty> for JvpTracer<V, T> {}
 
 impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<T, V, O, Input, Output>

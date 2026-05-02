@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 use half::{bf16, f16};
 
@@ -229,7 +229,7 @@ macro_rules! impl_scalar_reshape_ops {
 impl_scalar_reshape_ops!(bf16, f16, f32, f64);
 
 /// Primitive representing one reshape between two [`Shape`]s.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ReshapeOperation {
     /// Shape expected from the input.
     pub input_shape: Shape,
@@ -245,19 +245,14 @@ impl ReshapeOperation {
     }
 }
 
-impl Debug for ReshapeOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Reshape")
-    }
-}
-
 impl Display for ReshapeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "reshape{}", &self.output_shape)
+        write!(formatter, "{}{}", self.name(), &self.output_shape)
     }
 }
 
 impl Operation<ArrayType> for ReshapeOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "reshape"
     }

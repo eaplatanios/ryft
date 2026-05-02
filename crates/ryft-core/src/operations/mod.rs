@@ -157,6 +157,7 @@ mod tests {
     struct IdentityOperation;
 
     impl Operation<DataType> for IdentityOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             "identity"
         }
@@ -184,6 +185,7 @@ mod tests {
     struct InlineMetadataOperation;
 
     impl Operation<DataType> for InlineMetadataOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             "metadata"
         }
@@ -209,6 +211,7 @@ mod tests {
     }
 
     impl Operation<DataType> for LongMetadataOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             "metadata"
         }
@@ -223,18 +226,13 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     struct NestedProgramOperation {
         program: Program<DataType, f64, IdentityOperation, f64, f64>,
     }
 
-    impl Debug for NestedProgramOperation {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.debug_struct("NestedProgramOperation").finish_non_exhaustive()
-        }
-    }
-
     impl Operation<DataType> for NestedProgramOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             "nested"
         }

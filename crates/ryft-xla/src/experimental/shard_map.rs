@@ -1136,7 +1136,7 @@ where
 }
 
 /// Erased shard-map body payload used by nested higher-order shard-map ops.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FlatTracedShardMap {
     /// Manual SPMD metadata carried by this erased shard-map body.
     pub(crate) shard_map: ShardMap,

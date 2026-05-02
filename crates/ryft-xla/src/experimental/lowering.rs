@@ -2554,6 +2554,7 @@ mod tests {
     }
 
     impl Operation<ArrayType> for TestCustomLoweredOp {
+        #[inline]
         fn name(&self) -> &'static str {
             "test_custom_lowered"
         }

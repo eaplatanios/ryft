@@ -902,6 +902,7 @@ mod tests {
     }
 
     impl Operation<ArrayType> for TestCustomOp {
+        #[inline]
         fn name(&self) -> &'static str {
             "custom_test"
         }

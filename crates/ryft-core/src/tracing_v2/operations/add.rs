@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 use std::ops::Add;
 
 use crate::broadcasting::Broadcastable;
@@ -33,22 +33,17 @@ impl<'engine, E: TracingEngine<OperationCarrier: SupportsAdd<E::Type, E::Value>>
 
 /// Elementwise addition operation. Note that nearly every `ryft-core` transform depends on its [`Operation`] carrier
 /// type implementing [`SupportsAdd`] and thus supporting this operation type.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AddOperation;
-
-impl Debug for AddOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Add")
-    }
-}
 
 impl Display for AddOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "add")
+        formatter.write_str(<Self as Operation<ArrayType>>::name(self))
     }
 }
 
 impl Operation<ArrayType> for AddOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "add"
     }
@@ -94,6 +89,7 @@ impl Operation<ArrayType> for AddOperation {
 }
 
 impl Operation<DataType> for AddOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "add"
     }

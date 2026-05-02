@@ -43,7 +43,7 @@ use super::sin::SupportsSin;
 /// custom carrier. Most variants are thin tags around one semantic primitive defined elsewhere in [`super`]. The
 /// [`Custom`](Self::Custom) variant is the explicit escape hatch for operations outside that default set, so the
 /// carrier remains closed for normal dispatch while still allowing user- or backend-defined extensions.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ArrayOperation<V, T = ArrayType>
 where
     T: Type + PartialEq,
@@ -116,7 +116,7 @@ where
 /// operations that can appear in tangent and cotangent programs, including captured-factor linear
 /// maps such as [`LeftMatMul`](Self::LeftMatMul) and [`RightMatMul`](Self::RightMatMul), and the
 /// linearized higher-order operations needed by rematerialization and control flow.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum LinearArrayOperation<V, T = ArrayType>
 where
     T: Type + PartialEq,
@@ -195,7 +195,7 @@ where
 /// [`DataType`] metadata. Array-only primitives such as reshaping and matrix multiplication remain
 /// available as standalone operations and through array backend carriers, but they are not variants
 /// of this enum.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ScalarOperation<V>
 where
     V: Traceable<DataType> + Parameter,
@@ -235,7 +235,7 @@ where
 }
 
 /// Closed scalar operation carrier for staged linear scalar programs.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum LinearScalarOperation<V>
 where
     V: Traceable<DataType> + Parameter,
@@ -896,51 +896,12 @@ where
     }
 }
 
-impl<V> Debug for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Zero(zero) => Debug::fmt(zero, formatter),
-            Self::One(one) => Debug::fmt(one, formatter),
-            Self::ZeroLike => write!(formatter, "ZeroLike"),
-            Self::OneLike => write!(formatter, "OneLike"),
-            Self::Add => write!(formatter, "Add"),
-            Self::Mul => write!(formatter, "Mul"),
-            Self::Neg => write!(formatter, "Neg"),
-            Self::Sin => write!(formatter, "Sin"),
-            Self::Cos => write!(formatter, "Cos"),
-            Self::Scale { .. } => write!(formatter, "Scale"),
-            Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
-        }
-    }
-}
-
 impl<V> Display for ScalarOperation<V>
 where
     V: Traceable<DataType> + Parameter,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.operation_name())
-    }
-}
-
-impl<V> Debug for LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Zero(zero) => Debug::fmt(zero, formatter),
-            Self::One(one) => Debug::fmt(one, formatter),
-            Self::ZeroLike => write!(formatter, "ZeroLike"),
-            Self::OneLike => write!(formatter, "OneLike"),
-            Self::Add => write!(formatter, "Add"),
-            Self::Neg => write!(formatter, "Neg"),
-            Self::Scale { .. } => write!(formatter, "Scale"),
-            Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
-        }
+        formatter.write_str(self.name())
     }
 }
 
@@ -949,37 +910,7 @@ where
     V: Traceable<DataType> + Parameter,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.operation_name())
-    }
-}
-
-impl<T, V> Debug for ArrayOperation<V, T>
-where
-    T: Type + PartialEq,
-    V: Traceable<T> + Parameter,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Zero(zero) => Debug::fmt(zero, formatter),
-            Self::One(one) => Debug::fmt(one, formatter),
-            Self::ZeroLike => write!(formatter, "ZeroLike"),
-            Self::OneLike => write!(formatter, "OneLike"),
-            Self::Add => write!(formatter, "Add"),
-            Self::Mul => write!(formatter, "Mul"),
-            Self::Neg => write!(formatter, "Neg"),
-            Self::Sin => write!(formatter, "Sin"),
-            Self::Cos => write!(formatter, "Cos"),
-            Self::MatrixMultiply => write!(formatter, "MatrixMultiply"),
-            Self::Transpose => write!(formatter, "Transpose"),
-            Self::Scale { .. } => write!(formatter, "Scale"),
-            Self::Reshape { input_shape, output_shape } => {
-                write!(formatter, "Reshape({input_shape} -> {output_shape})")
-            }
-            Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
-            Self::Condition(condition) => Debug::fmt(condition, formatter),
-            Self::While(while_operation) => Debug::fmt(while_operation, formatter),
-            Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
-        }
+        formatter.write_str(self.name())
     }
 }
 
@@ -990,36 +921,8 @@ where
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Reshape { output_shape, .. } => write!(formatter, "reshape{output_shape}"),
+            Self::Reshape { output_shape, .. } => write!(formatter, "{}{output_shape}", self.operation_name()),
             _ => write!(formatter, "{}", self.operation_name()),
-        }
-    }
-}
-
-impl<T, V> Debug for LinearArrayOperation<V, T>
-where
-    T: Type + PartialEq,
-    V: Traceable<T> + Parameter,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Zero(zero) => Debug::fmt(zero, formatter),
-            Self::One(one) => Debug::fmt(one, formatter),
-            Self::ZeroLike => write!(formatter, "ZeroLike"),
-            Self::OneLike => write!(formatter, "OneLike"),
-            Self::Add => write!(formatter, "Add"),
-            Self::Neg => write!(formatter, "Neg"),
-            Self::Transpose => write!(formatter, "Transpose"),
-            Self::Scale { .. } => write!(formatter, "Scale"),
-            Self::LeftMatMul { .. } => write!(formatter, "LeftMatMul"),
-            Self::RightMatMul { .. } => write!(formatter, "RightMatMul"),
-            Self::Reshape { input_shape, output_shape } => {
-                write!(formatter, "Reshape({input_shape} -> {output_shape})")
-            }
-            Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
-            Self::Condition(condition) => Debug::fmt(condition, formatter),
-            Self::While(while_operation) => Debug::fmt(while_operation, formatter),
-            Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
         }
     }
 }
@@ -1031,7 +934,7 @@ where
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Reshape { output_shape, .. } => write!(formatter, "reshape{output_shape}"),
+            Self::Reshape { output_shape, .. } => write!(formatter, "{}{output_shape}", self.operation_name()),
             _ => write!(formatter, "{}", self.operation_name()),
         }
     }
@@ -1042,6 +945,7 @@ fn unsupported_scalar_metadata_operation(operation_name: &'static str) -> TypeEr
 }
 
 impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ScalarOperation<V> {
+    #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()
     }
@@ -1075,6 +979,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ScalarOperation
 }
 
 impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearScalarOperation<V> {
+    #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()
     }
@@ -1105,6 +1010,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearScalarOpe
 }
 
 impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for ArrayOperation<V> {
+    #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()
     }
@@ -1152,6 +1058,7 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for ArrayOperatio
 }
 
 impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ArrayOperation<V, DataType> {
+    #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()
     }
@@ -1197,6 +1104,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ArrayOperation<
 }
 
 impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for LinearArrayOperation<V> {
+    #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()
     }
@@ -1252,6 +1160,7 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for LinearArrayOp
 }
 
 impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearArrayOperation<V, DataType> {
+    #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()
     }

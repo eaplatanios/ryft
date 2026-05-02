@@ -965,6 +965,7 @@ mod tests {
         struct NoOutputOperation;
 
         impl Operation<DataType> for NoOutputOperation {
+            #[inline]
             fn name(&self) -> &'static str {
                 "no_output"
             }

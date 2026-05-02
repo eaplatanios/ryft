@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 use std::ops::Neg;
 
 use half::{bf16, f16};
@@ -64,22 +64,17 @@ impl Cos for f16 {
 ///
 /// [`CosOperation`] is stored in staged programs whenever cosine is traced explicitly, and its JVP rule is
 /// reused by both forward-mode evaluation and higher-order traced transforms.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CosOperation;
-
-impl Debug for CosOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Cos")
-    }
-}
 
 impl Display for CosOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "cos")
+        formatter.write_str(<Self as Operation<ArrayType>>::name(self))
     }
 }
 
 impl<T: Type> Operation<T> for CosOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "cos"
     }

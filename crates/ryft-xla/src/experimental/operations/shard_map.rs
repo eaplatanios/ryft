@@ -52,7 +52,7 @@ struct LinearShardMapBodies {
 }
 
 /// Two-stage transpose factorization for one linear shard-map body.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FactorizedTransposeShardMapBodies {
     /// Primals-only residual computation staged as its own shard-map body.
     pub residual_body: FlatTracedShardMap,
@@ -62,7 +62,7 @@ pub struct FactorizedTransposeShardMapBodies {
 }
 
 /// Evaluation mode used by linear shard-map higher-order ops.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum LinearShardMapEvalMode {
     /// Evaluate the linear shard map by running one fused body.
     Body(FlatTracedShardMap),
@@ -76,7 +76,7 @@ pub enum LinearShardMapEvalMode {
 /// `captured_global_primals` holds the staging-program atom ids of the primals captured at linearization time. The
 /// vector is empty for tensor-leaf shard-map ops (where captures are never read) and populated with atom ids for
 /// tracer-leaf ops, where [`LinearShardMapOperation`] reifies each atom back into a `Tracer`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LinearShardMapState {
     /// Staged primal atom ids captured when the shard-map body was linearized.
     pub captured_global_primals: Vec<AtomId>,
@@ -101,7 +101,7 @@ fn missing_linear_shard_map_staging_context() -> TracingError {
 }
 
 /// Canonical higher-order shard-map op used for staged tracing, differentiation, and lowering.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ShardMapOperation<V> {
     /// Canonical erased shard-map body carried by this higher-order op.
     pub body: FlatTracedShardMap,
@@ -142,7 +142,7 @@ impl ShardMapOperation<ShardMapTensor> {
 }
 
 /// Canonical linear shard-map op used in tangent/cotangent programs and traced linear replay.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LinearShardMapOperation<V> {
     /// Canonical erased primal shard-map body carried by this linear higher-order op.
     pub body: FlatTracedShardMap,
@@ -370,27 +370,21 @@ impl LinearShardMapOperation<ShardMapTensor> {
     }
 }
 
-impl<V> Debug for ShardMapOperation<V> {
+impl<V> Display for ShardMapOperation<V>
+where
+    Self: Operation<ArrayType>,
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "ShardMap")
+        formatter.write_str(self.name())
     }
 }
 
-impl<V> Display for ShardMapOperation<V> {
+impl<V> Display for LinearShardMapOperation<V>
+where
+    Self: Operation<ArrayType>,
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "shard_map")
-    }
-}
-
-impl<V> Debug for LinearShardMapOperation<V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "LinearShardMap")
-    }
-}
-
-impl<V> Display for LinearShardMapOperation<V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "linear_shard_map")
+        formatter.write_str(self.name())
     }
 }
 
@@ -482,6 +476,7 @@ fn infer_shard_map_output_types(
 }
 
 impl Operation<ArrayType> for ShardMapOperation<ShardMapTensor> {
+    #[inline]
     fn name(&self) -> &'static str {
         "shard_map"
     }
@@ -505,6 +500,7 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for ShardMapOperation<Sha
 }
 
 impl Operation<ArrayType> for LinearShardMapOperation<ShardMapTensor> {
+    #[inline]
     fn name(&self) -> &'static str {
         "linear_shard_map"
     }
@@ -662,6 +658,7 @@ where
 }
 
 impl Operation<ArrayType> for ShardMapOperation<ShardMapTracer> {
+    #[inline]
     fn name(&self) -> &'static str {
         "shard_map"
     }
@@ -688,6 +685,7 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for ShardMapOperation<Sha
 }
 
 impl Operation<ArrayType> for LinearShardMapOperation<ShardMapTracer> {
+    #[inline]
     fn name(&self) -> &'static str {
         "linear_shard_map"
     }

@@ -578,6 +578,7 @@ mod tests {
     }
 
     impl Operation<TestType> for AddOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             "add"
         }
@@ -606,6 +607,7 @@ mod tests {
     }
 
     impl Operation<TestType> for TestLinearOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             match self {
                 Self::Add => "add",

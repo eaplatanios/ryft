@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
@@ -26,7 +26,7 @@ pub trait SupportsRightMatMul<T: Type, V: Traceable<T>> {
 /// Linear map `tangent -> tangent @ factor`.
 ///
 /// [`RightMatMulOperation`] is the right-acting sibling of [`super::LeftMatMulOperation`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RightMatMulOperation<V: MatrixValue> {
     /// Matrix factor multiplied on the right of every input.
     pub factor: V,
@@ -51,19 +51,14 @@ pub fn right_matmul_abstract_eval(factor_type: &ArrayType, inputs: &[ArrayType])
     Ok(vec![matmul_abstract(&inputs[0], factor_type, "right_matmul")?])
 }
 
-impl<V: MatrixValue> Debug for RightMatMulOperation<V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "RightMatMul")
-    }
-}
-
 impl<V: MatrixValue> Display for RightMatMulOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "right_matmul")
+        formatter.write_str(self.name())
     }
 }
 
 impl<V: MatrixValue> Operation<ArrayType> for RightMatMulOperation<V> {
+    #[inline]
     fn name(&self) -> &'static str {
         "right_matmul"
     }

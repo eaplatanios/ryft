@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation};
@@ -26,22 +26,17 @@ pub trait SupportsMatMul<T: Type, V: Traceable<T>> {
 /// [`MatMulOperation`] is the matrix-valued analogue of the core scalar arithmetic primitives. Its JVP
 /// rule delegates to the matrix tangent-space helpers so the same op can be reused for concrete
 /// execution and traced execution.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct MatMulOperation;
-
-impl Debug for MatMulOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "MatMul")
-    }
-}
 
 impl Display for MatMulOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "matmul")
+        formatter.write_str(self.name())
     }
 }
 
 impl Operation<ArrayType> for MatMulOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "matmul"
     }

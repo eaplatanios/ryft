@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 use std::ops::Neg;
 
 use crate::macros::check_input_count;
@@ -36,22 +36,17 @@ where
 ///
 /// [`NegOperation`] is the canonical example of a shape-preserving unary primitive with a nontrivial
 /// transpose rule.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct NegOperation;
-
-impl Debug for NegOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Neg")
-    }
-}
 
 impl Display for NegOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "neg")
+        formatter.write_str(<Self as Operation<ArrayType>>::name(self))
     }
 }
 
 impl<T: Type> Operation<T> for NegOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "neg"
     }

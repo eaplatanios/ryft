@@ -88,22 +88,17 @@ mod tests {
             Self: 'engine;
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone, Debug, Default)]
     struct PanicReplayOp;
-
-    impl Debug for PanicReplayOp {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "PanicReplay")
-        }
-    }
 
     impl Display for PanicReplayOp {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "panic_replay")
+            formatter.write_str(self.name())
         }
     }
 
     impl Operation<ArrayType> for PanicReplayOp {
+        #[inline]
         fn name(&self) -> &'static str {
             "panic_replay"
         }
@@ -155,11 +150,12 @@ mod tests {
 
     impl Display for OrdinaryAddOperation {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("ordinary_add")
+            formatter.write_str(self.name())
         }
     }
 
     impl Operation<ArrayType> for OrdinaryAddOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             "ordinary_add"
         }
@@ -189,11 +185,12 @@ mod tests {
 
     impl Display for DifferentiableAddOperation {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("differentiable_add")
+            formatter.write_str(self.name())
         }
     }
 
     impl Operation<ArrayType> for DifferentiableAddOperation {
+        #[inline]
         fn name(&self) -> &'static str {
             "differentiable_add"
         }

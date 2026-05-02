@@ -22,7 +22,7 @@ use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 use crate::mlir::ToMlir;
 
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WithShardingConstraintOperation {
     /// Requested sharding that the input leaf must satisfy after lowering.
     pub sharding: Sharding,
@@ -65,19 +65,14 @@ impl WithShardingConstraintOperation {
     }
 }
 
-impl Debug for WithShardingConstraintOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "WithShardingConstraint")
-    }
-}
-
 impl Display for WithShardingConstraintOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "with_sharding_constraint")
+        formatter.write_str(self.name())
     }
 }
 
 impl Operation<ArrayType> for WithShardingConstraintOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "with_sharding_constraint"
     }

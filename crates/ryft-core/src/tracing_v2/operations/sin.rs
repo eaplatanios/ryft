@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 use half::{bf16, f16};
 
@@ -64,22 +64,17 @@ impl Sin for f16 {
 /// [`SinOperation`] is the staged-program representation of the sine primitive. Ordinary traced programs
 /// store this op (or a backend-specific carrier that wraps it), while JVP rules delegate through
 /// its semantic implementation.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SinOperation;
-
-impl Debug for SinOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Sin")
-    }
-}
 
 impl Display for SinOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "sin")
+        formatter.write_str(<Self as Operation<ArrayType>>::name(self))
     }
 }
 
 impl<T: Type> Operation<T> for SinOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "sin"
     }

@@ -134,7 +134,7 @@ where
 
 /// Closed ordinary staged-op universe owned by the XLA backend.
 #[allow(private_interfaces)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum XlaOperation {
     /// Typed zero with no inputs and one output.
     Zero(ZeroOperation<ArrayType>),
@@ -197,45 +197,17 @@ pub enum XlaOperation {
     Custom(Arc<CustomPrimitive<ArrayType, ShardMapTensor>>),
 }
 
-impl Debug for XlaOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Zero(zero) => Debug::fmt(zero, formatter),
-            Self::One(one) => Debug::fmt(one, formatter),
-            Self::ZeroLike => write!(formatter, "ZeroLike"),
-            Self::OneLike => write!(formatter, "OneLike"),
-            Self::Add => write!(formatter, "Add"),
-            Self::Mul => write!(formatter, "Mul"),
-            Self::Neg => write!(formatter, "Neg"),
-            Self::Sin => write!(formatter, "Sin"),
-            Self::Cos => write!(formatter, "Cos"),
-            Self::MatrixMultiply => write!(formatter, "MatrixMultiply"),
-            Self::Transpose => write!(formatter, "Transpose"),
-            Self::Scale { .. } => write!(formatter, "Scale"),
-            Self::Reshape { input_shape, output_shape } => {
-                write!(formatter, "Reshape({input_shape} -> {output_shape})")
-            }
-            Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
-            Self::Condition(condition) => Debug::fmt(condition, formatter),
-            Self::While(while_operation) => Debug::fmt(while_operation, formatter),
-            Self::ShardMap(op) => Debug::fmt(op, formatter),
-            Self::LinearShardMap(op) => Debug::fmt(op, formatter),
-            Self::WithShardingConstraint(op) => Debug::fmt(op, formatter),
-            Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
-        }
-    }
-}
-
 impl Display for XlaOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Reshape { output_shape, .. } => write!(formatter, "reshape{output_shape}"),
+            Self::Reshape { output_shape, .. } => write!(formatter, "{}{output_shape}", self.name()),
             _ => write!(formatter, "{}", self.name()),
         }
     }
 }
 
 impl Operation<ArrayType> for XlaOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         match self {
             Self::Zero(zero) => zero.name(),

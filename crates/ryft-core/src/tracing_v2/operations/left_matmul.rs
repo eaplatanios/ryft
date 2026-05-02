@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
@@ -27,7 +27,7 @@ pub trait SupportsLeftMatMul<T: Type, V: Traceable<T>> {
 ///
 /// [`LeftMatMulOperation`] is the matrix-valued analogue of [`super::ScaleOperation`]: it captures one factor in
 /// the op object and applies that factor to every input it is replayed on.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LeftMatMulOperation<V: MatrixValue> {
     /// Matrix factor multiplied on the left of every input.
     pub factor: V,
@@ -52,19 +52,14 @@ pub fn left_matmul_abstract_eval(factor_type: &ArrayType, inputs: &[ArrayType]) 
     Ok(vec![matmul_abstract(factor_type, &inputs[0], "left_matmul")?])
 }
 
-impl<V: MatrixValue> Debug for LeftMatMulOperation<V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "LeftMatMul")
-    }
-}
-
 impl<V: MatrixValue> Display for LeftMatMulOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "left_matmul")
+        formatter.write_str(self.name())
     }
 }
 
 impl<V: MatrixValue> Operation<ArrayType> for LeftMatMulOperation<V> {
+    #[inline]
     fn name(&self) -> &'static str {
         "left_matmul"
     }

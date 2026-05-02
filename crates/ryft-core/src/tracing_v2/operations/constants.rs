@@ -141,22 +141,17 @@ where
 /// [`ZeroLikeOperation`] is the staged form of [`ZeroLike::zero_like`]. It takes one exemplar input
 /// and produces one output with the same abstract type, leaving concrete interpretation to the
 /// value type's [`ZeroLike`] implementation.
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct ZeroLikeOperation;
-
-impl Debug for ZeroLikeOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "ZeroLike")
-    }
-}
 
 impl Display for ZeroLikeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "zero_like")
+        formatter.write_str(<Self as Operation<ArrayType>>::name(self))
     }
 }
 
 impl<T: Type> Operation<T> for ZeroLikeOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "zero_like"
     }
@@ -258,22 +253,17 @@ where
 /// [`OneLikeOperation`] is the staged form of [`OneLike::one_like`]. It takes one exemplar input
 /// and produces one output with the same abstract type, leaving concrete interpretation to the
 /// value type's [`OneLike`] implementation.
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct OneLikeOperation;
-
-impl Debug for OneLikeOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "OneLike")
-    }
-}
 
 impl Display for OneLikeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "one_like")
+        formatter.write_str(<Self as Operation<ArrayType>>::name(self))
     }
 }
 
 impl<T: Type> Operation<T> for OneLikeOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "one_like"
     }
@@ -470,7 +460,7 @@ mod tests {
         let operation = ZeroOperation::new(DataType::F64);
 
         assert_eq!(Operation::<DataType>::name(&operation), "zero");
-        assert_eq!(format!("{operation:?}"), "Zero(f64)");
+        assert_eq!(format!("{operation:?}"), "ZeroOperation { output_type: F64 }");
         assert_eq!(format!("{operation}"), "zero");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![0.0]));
@@ -489,7 +479,7 @@ mod tests {
         let operation = OneOperation::new(DataType::F64);
 
         assert_eq!(Operation::<DataType>::name(&operation), "one");
-        assert_eq!(format!("{operation:?}"), "One(f64)");
+        assert_eq!(format!("{operation:?}"), "OneOperation { output_type: F64 }");
         assert_eq!(format!("{operation}"), "one");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![1.0]));
@@ -508,7 +498,7 @@ mod tests {
         let operation = ZeroLikeOperation;
 
         assert_eq!(Operation::<DataType>::name(&operation), "zero_like");
-        assert_eq!(format!("{operation:?}"), "ZeroLike");
+        assert_eq!(format!("{operation:?}"), "ZeroLikeOperation");
         assert_eq!(format!("{operation}"), "zero_like");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]), Ok(vec![0.0]));
@@ -532,7 +522,7 @@ mod tests {
         let operation = OneLikeOperation;
 
         assert_eq!(Operation::<DataType>::name(&operation), "one_like");
-        assert_eq!(format!("{operation:?}"), "OneLike");
+        assert_eq!(format!("{operation:?}"), "OneLikeOperation");
         assert_eq!(format!("{operation}"), "one_like");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]), Ok(vec![1.0]));

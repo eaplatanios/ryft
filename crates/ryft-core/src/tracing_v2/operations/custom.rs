@@ -507,11 +507,12 @@ mod tests {
 
     impl Display for ShiftOp {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "test_shift")
+            formatter.write_str(self.name())
         }
     }
 
     impl Operation<ArrayType> for ShiftOp {
+        #[inline]
         fn name(&self) -> &'static str {
             "test_shift"
         }

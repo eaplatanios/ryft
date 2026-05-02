@@ -39,7 +39,7 @@ pub trait SupportsLinearRematerialize<T: Type + PartialEq, V: Traceable<T>>: Siz
 ///
 /// This stores a flattened traced body that higher-order op nodes can carry around independently of
 /// the caller's original parameter shapes.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FlatTracedRematerialize<T: Type + PartialEq, V: Traceable<T>, O = ArrayOperation<V, T>> {
     /// Canonical input types of the body.
     pub input_types: Vec<T>,
@@ -65,7 +65,7 @@ impl<T: Type + PartialEq, V: Traceable<T>, O> FlatTracedRematerialize<T, V, O> {
 /// is computed and staged so that the tangent program recomputes forward intermediates from the
 /// inputs rather than storing them as constants. This makes [`RematerializeOperation`] the staged IR hook
 /// that powers the user-facing rematerialization policies in [`crate::tracing_v2::linear`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RematerializeOperation<
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -87,21 +87,19 @@ impl<T: Type + PartialEq, V: Traceable<T>, O, L> RematerializeOperation<T, V, O,
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O, L> Debug for RematerializeOperation<T, V, O, L> {
+impl<T: Type + PartialEq, V: Traceable<T>, O, L> Display for RematerializeOperation<T, V, O, L>
+where
+    Self: Operation<T>,
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Rematerialize")
+        formatter.write_str(self.name())
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O, L> Display for RematerializeOperation<T, V, O, L> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "rematerialize")
-    }
-}
-
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>, L: Clone> Operation<T>
+impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>, L: Clone + Debug> Operation<T>
     for RematerializeOperation<T, V, O, L>
 {
+    #[inline]
     fn name(&self) -> &'static str {
         "rematerialize"
     }
@@ -130,7 +128,7 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>, L: Clone> Op
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>, L: Clone> InterpretableOperation<T, V>
+impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>, L: Clone + Debug> InterpretableOperation<T, V>
     for RematerializeOperation<T, V, O, L>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -317,7 +315,7 @@ where
 }
 
 /// Linear-only rematerialization boundary that always carries both the linear body and its transpose body.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LinearRematerializeOperation<
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
@@ -344,21 +342,19 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> LinearRematerializeOperatio
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O> Debug for LinearRematerializeOperation<T, V, O> {
+impl<T: Type + PartialEq, V: Traceable<T>, O> Display for LinearRematerializeOperation<T, V, O>
+where
+    Self: Operation<T>,
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "LinearRematerialize")
-    }
-}
-
-impl<T: Type + PartialEq, V: Traceable<T>, O> Display for LinearRematerializeOperation<T, V, O> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "rematerialize")
+        formatter.write_str(self.name())
     }
 }
 
 impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> Operation<T>
     for LinearRematerializeOperation<T, V, O>
 {
+    #[inline]
     fn name(&self) -> &'static str {
         "rematerialize"
     }

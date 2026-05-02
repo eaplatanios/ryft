@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation};
@@ -24,22 +24,17 @@ pub trait SupportsMatrixTranspose<T: Type, V: Traceable<T>> {
 ///
 /// [`MatrixTransposeOperation`] is stored directly in traced programs whenever a matrix leaf is
 /// transposed symbolically.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct MatrixTransposeOperation;
-
-impl Debug for MatrixTransposeOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "MatrixTranspose")
-    }
-}
 
 impl Display for MatrixTransposeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "matrix_transpose")
+        formatter.write_str(self.name())
     }
 }
 
 impl Operation<ArrayType> for MatrixTransposeOperation {
+    #[inline]
     fn name(&self) -> &'static str {
         "matrix_transpose"
     }
