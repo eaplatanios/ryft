@@ -201,7 +201,7 @@ impl_tracing_engine_for_scalar!(f16, DataType::F16, f16::ZERO, f16::ONE);
 impl_tracing_engine_for_scalar!(f32, DataType::F32, 0.0, 1.0);
 impl_tracing_engine_for_scalar!(f64, DataType::F64, 0.0, 1.0);
 
-/// [`TracingEngine`] that is used while tracing [`Program`]s. This engine bundles an underlying [`TracingEngine`]
+/// Context that is used while _tracing_ [`Program`]s. This context bundles an underlying [`TracingEngine`]
 /// with a [`ProgramBuilder`] and uses [`Tracer`]s to represent values.
 pub struct TracingContext<'engine, E: TracingEngine + ?Sized> {
     /// [`TracingEngine`] borrowed by this [`TracingContext`] for type-driven value synthesis and operation selection.

@@ -6,7 +6,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearArrayOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};

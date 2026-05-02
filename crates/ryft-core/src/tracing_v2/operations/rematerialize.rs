@@ -576,16 +576,10 @@ where
         let Some(exemplar_traced_input) = traced_inputs.first().cloned() else {
             return Err(DifferentiationError::MissingTracedRematerializeInputLeaves.into());
         };
-        let (exemplar_output_types, body_program) =
-            crate::tracing_v2::linear::trace_flat_program_from_input_engine::<
-                Input::To<ArrayType>,
-                Output::To<ArrayType>,
-                V,
-                E,
-                _,
-            >(
-                &exemplar_traced_input.context, |staged_input| Ok(function(staged_input)), exemplar_input_types
-            )?;
+        let (exemplar_output_types, body_program) = exemplar_traced_input
+            .context
+            .engine
+            .trace(|staged_input| Ok(function(staged_input)), exemplar_input_types)?;
 
         let output_structure = exemplar_output_types.parameter_structure();
         let output_leaf_count = output_structure.parameter_count();
@@ -603,7 +597,9 @@ where
         let body = FlatTracedRematerialize::from_parts(
             input_types,
             output_types,
-            builder.build(output_ids, vec![Placeholder; input_leaf_count], vec![Placeholder; output_leaf_count])?,
+            builder
+                .build(output_ids, vec![Placeholder; input_leaf_count], vec![Placeholder; output_leaf_count])?
+                .simplified()?,
         );
 
         let traced_input_refs = traced_inputs.iter().collect::<Vec<_>>();

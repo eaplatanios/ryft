@@ -19,10 +19,10 @@ pub mod linear;
 pub mod operations;
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
-    DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,
-    DifferentiationError,
+    Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
+    DifferentiableTracingEngine, DifferentiationError, JvpContext, JvpTracer,
 };
-pub use forward::{Differentiable, JvpContext, JvpTracer, jvp};
+pub use forward::jvp;
 pub use linear::{
     CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad,
     grad_with_aux, hessian, jacfwd, jacrev, jvp_program, value_and_grad, value_and_grad_with_aux, vjp,

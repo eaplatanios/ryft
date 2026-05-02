@@ -10,7 +10,7 @@ use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
 use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::transposition::LinearOperation;
 use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
-use ryft_core::tracing_v2::forward::{Differentiable, JvpTracer};
+use ryft_core::tracing_v2::differentiation::{Differentiable, JvpTracer};
 use ryft_core::tracing_v2::linear::{linearize_traced_program, transpose_traced_linear_program};
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearArrayOperation,
@@ -1651,7 +1651,7 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::transposition::TranspositionContext;
     use ryft_core::tracing::{Atom, AtomId, ProgramBuilder, Traceable};
-    use ryft_core::tracing_v2::forward::JvpTracer;
+    use ryft_core::tracing_v2::differentiation::JvpTracer;
     use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext, LinearArrayOperation};
     use ryft_core::types::{ArrayType, DataType, Typed};
 

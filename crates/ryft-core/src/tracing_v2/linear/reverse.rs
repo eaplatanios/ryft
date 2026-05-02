@@ -81,10 +81,11 @@ where
         traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
     let (primal_output_types, traced_program) =
-        trace_flat_program_from_input_engine::<Input::To<E::Type>, Output::To<E::Type>, V, E, _>(
-            &exemplar_traced_primal.context,
-            move |staged_input| function(staged_input),
-            staged_input_types,
+        trace_flat_program_from_trace_result::<E::Type, Input::To<E::Type>, Output::To<E::Type>, V, E::Operation, _>(
+            exemplar_traced_primal
+                .context
+                .engine
+                .trace(move |staged_input| function(staged_input), staged_input_types)?,
         )?;
     let output_structure = primal_output_types.parameter_structure();
     let (traced_primal_output, pushforward) =
@@ -274,11 +275,10 @@ where
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
         let tracing_context = traced_primals[0].context.clone();
-        let (_, traced_program) = trace_flat_program_from_input_engine::<Input::To<E::Type>, E::Type, V, E, _>(
-            &tracing_context,
-            |staged_input| Ok(function(staged_input)),
-            staged_input_types,
-        )?;
+        let (_, traced_program) =
+            trace_flat_program_from_trace_result::<E::Type, Input::To<E::Type>, E::Type, V, E::Operation, _>(
+                tracing_context.engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?,
+            )?;
         let (traced_output, traced_gradient) =
             reverse_mode_scalar_traced_program::<V, E>(tracing_context, &traced_program, traced_primals)?;
         Ok((traced_output, Input::from_parameters(input_structure, traced_gradient)?))

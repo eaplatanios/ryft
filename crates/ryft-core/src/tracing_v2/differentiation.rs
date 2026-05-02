@@ -1,14 +1,20 @@
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::fmt::Display;
+use std::rc::Rc;
+
 use half::{bf16, f16};
+use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::operations::{InterpretableOperation, Operation};
+use crate::parameters::Parameter;
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation as LinearOperationTrait;
-use crate::tracing::{AtomId, TracingError};
-use crate::tracing_v2::forward::{JvpContext, JvpTracer};
+use crate::tracing::{AtomId, Instruction, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale, SupportsZero};
-use crate::tracing_v2::{Differentiable, LinearScalarOperation, ScalarOperation};
-use crate::types::ArrayType;
+use crate::tracing_v2::{LinearScalarOperation, ScalarOperation};
+use crate::types::{ArrayType, Type, Typed};
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -59,6 +65,113 @@ pub enum DifferentiationError {
     #[error("invalid Jacobian column height; expected {expected} but got {got}")]
     InvalidJacobianColumnHeight { expected: usize, got: usize },
 }
+
+/// Value-level contract for leaves that participate in automatic differentiation over `T`.
+///
+/// The associated [`Tangent`](Self::Tangent) type makes the tangent representation explicit even
+/// though today's staged linear-program IR still requires `Tangent = Self` at the transform
+/// boundary. Code paths that need to synthesize zero tangents or unit gradient seeds from abstract
+/// type metadata add [`Zero`](crate::tracing_v2::operations::constants::Zero) and
+/// [`One`](crate::tracing_v2::operations::constants::One) bounds at those synthesis sites instead
+/// of requiring every tangent representation to support metadata-only construction.
+pub trait Differentiable<T: Type>: Traceable<T> {
+    /// Tangent and cotangent leaf type associated with this primal leaf.
+    type Tangent: Traceable<T>;
+}
+
+impl<'engine, E> Differentiable<E::Type> for Tracer<'engine, E>
+where
+    E: TracingEngine + ?Sized,
+    E::Value: Differentiable<E::Type>,
+{
+    type Tangent = Self;
+}
+
+/// Concrete state threaded through forward-mode JVP rules.
+///
+/// [`JvpContext`] owns the active linear-program builder where tangent ops are staged. It is the
+/// forward-mode counterpart of
+/// [`TranspositionContext`](crate::tracing::transposition::TranspositionContext): JVP rules call
+/// [`apply_operation`](Self::apply_operation) to stage tangent ops on the active builder.
+#[doc(hidden)]
+pub struct JvpContext<'a, E: DifferentiableEngine + ?Sized> {
+    /// [`DifferentiableEngine`] borrowed by this [`JvpContext`] for type-driven value synthesis and operation
+    /// selection.
+    pub engine: &'a E,
+
+    /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::tracing::Program) that is currently being
+    /// traced.
+    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::LinearOperation>>>,
+}
+
+impl<'a, E: DifferentiableEngine + ?Sized> JvpContext<'a, E> {
+    /// Creates a JVP context that stages into `builder`.
+    #[doc(hidden)]
+    pub fn new(engine: &'a E, builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::LinearOperation>>>) -> Self {
+        Self { engine, builder }
+    }
+
+    /// Stages one operation in the currently active linear program.
+    pub fn apply_operation(
+        &self,
+        inputs: &[AtomId],
+        operation: E::LinearOperation,
+        output_count: usize,
+    ) -> Result<Vec<AtomId>, TracingError> {
+        let mut builder_borrow = self.builder.borrow_mut();
+        let input_types =
+            inputs.iter().map(|atom| builder_borrow.atoms[atom.index].r#type().into_owned()).collect::<Vec<_>>();
+        let output_types = operation.infer_output_types(&input_types)?;
+        if output_types.len() != output_count {
+            return Err(TracingError::InvalidOutputCount { expected: output_count, got: output_types.len() });
+        }
+        let outputs = output_types.into_iter().map(|r#type| builder_borrow.add_variable(r#type)).collect::<Vec<_>>();
+        builder_borrow
+            .instructions
+            .push(Instruction { operation, inputs: inputs.to_vec(), outputs: outputs.clone() });
+        Ok(outputs)
+    }
+
+    /// Stages a constant tangent on the active linear builder.
+    pub fn add_constant(&self, value: E::Value) -> AtomId {
+        self.builder.borrow_mut().add_constant(value)
+    }
+}
+
+/// Forward-mode tracer carrying both a primal and a tangent.
+///
+/// [`JvpTracer`] is to forward-mode AD what [`Tracer`](crate::tracing::engines::Tracer) is to ordinary
+/// staging: it is the leaf wrapper that primitive operations see when a function is being evaluated
+/// in JVP mode. The `primal` field carries the usual runtime value, while the `tangent` field
+/// carries the directional derivative information flowing alongside it.
+///
+/// The type parameters have no bounds on the struct itself so that `JvpTracer` can appear in
+/// signatures without eagerly propagating all tangent requirements. `tracing_v2` uses `T = AtomId`
+/// for the rule-based JVP path threaded through [`JvpContext`], where rules manipulate symbolic
+/// tangent atoms directly.
+#[derive(Clone, Debug, Parameter)]
+pub struct JvpTracer<V, T> {
+    /// The primal value.
+    pub primal: V,
+
+    /// The tangent value associated with the primal.
+    pub tangent: T,
+}
+
+impl<Ty: Type, V: Typed<Ty>, T> Typed<Ty> for JvpTracer<V, T> {
+    #[inline]
+    fn r#type(&self) -> Cow<'_, Ty> {
+        <V as Typed<Ty>>::r#type(&self.primal)
+    }
+}
+
+impl<V: Display, T> Display for JvpTracer<V, T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.primal, formatter)
+    }
+}
+
+impl<Ty: Type, V: Traceable<Ty>, T: Clone + Parameter> Traceable<Ty> for JvpTracer<V, T> {}
 
 /// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
 ///

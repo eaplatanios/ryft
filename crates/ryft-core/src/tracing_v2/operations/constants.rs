@@ -6,7 +6,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
-use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -599,11 +599,11 @@ macro_rules! impl_scalar_value_traits {
             }
         }
 
-        impl crate::tracing_v2::forward::Differentiable<DataType> for $ty {
+        impl crate::tracing_v2::differentiation::Differentiable<DataType> for $ty {
             type Tangent = Self;
         }
 
-        impl crate::tracing_v2::forward::Differentiable<ArrayType> for $ty {
+        impl crate::tracing_v2::differentiation::Differentiable<ArrayType> for $ty {
             type Tangent = Self;
         }
     };

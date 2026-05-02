@@ -5,16 +5,9 @@ use crate::operations::Operation;
 use crate::tracing::{AtomId, Instruction, ProgramBuilder, Traceable, TracingError};
 use crate::types::{Type, Typed};
 
-/// State threaded through [`LinearOperation::transpose`] while building a reverse linear program.
-///
-/// [`TranspositionContext`] owns the active [`ProgramBuilder`] for the transposed program. Rules
-/// use [`stage`](Self::stage) to append operations whose inputs are [`AtomId`]s already present in
-/// that builder, and higher-order rules may temporarily replace [`builder`](Self::builder) while
-/// transposing nested linear programs.
-///
-/// The context deliberately carries only builder state. Transpose rules operate on already-linear
-/// operations and abstract atom metadata, and structural zeros are represented by `Option<AtomId>`
-/// in [`LinearOperation::transpose`].
+/// Context that is used while _transposing_ [`Program`](crate::Program)s. This context is threaded through the
+/// transposition transformation using [`LinearOperation::transpose`]. It owns the active [`ProgramBuilder`] that is
+/// used for building the transposed [`Program`](crate::Program).
 pub struct TranspositionContext<T: Type, V: Traceable<T>, O: Clone + Operation<T>> {
     /// [`ProgramBuilder`] that owns the reverse linear [`Program`](crate::tracing::Program) currently being staged.
     pub builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,

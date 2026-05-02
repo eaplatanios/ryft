@@ -9,7 +9,7 @@ use crate::tracing::engines::Tracer;
 use crate::tracing::engines::TracingEngine;
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{Instruction, Program, Traceable, TracingError, Value};
-use crate::tracing_v2::forward::Differentiable;
+use crate::tracing_v2::differentiation::Differentiable;
 use crate::tracing_v2::linear::linearize_program;
 use crate::tracing_v2::operations::constants::{Zero, ZeroLike};
 use crate::tracing_v2::{

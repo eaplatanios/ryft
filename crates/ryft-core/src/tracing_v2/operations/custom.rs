@@ -10,7 +10,7 @@ use crate::parameters::Parameter;
 use crate::tracing::engines::{Tracer, TracingContext};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError, Value};
-use crate::tracing_v2::forward::{Differentiable, JvpTracer};
+use crate::tracing_v2::differentiation::{Differentiable, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 

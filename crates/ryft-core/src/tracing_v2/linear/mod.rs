@@ -7,7 +7,7 @@ use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placehold
 use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
-use crate::tracing_v2::forward::JvpTracer;
+use crate::tracing_v2::differentiation::JvpTracer;
 use crate::tracing_v2::operations::constants::{One, OneLike, SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::tracing_v2::operations::rematerialize::{FlatTracedRematerialize, RematerializeOperation};
 use crate::tracing_v2::operations::{AddOperation, SupportsAdd, SupportsRematerialize};
@@ -40,70 +40,6 @@ pub use replay::linearize_traced_program;
 pub(crate) use reverse::jvp_traced;
 pub use reverse::{grad, grad_with_aux, jvp_program, value_and_grad, value_and_grad_with_aux, vjp};
 
-#[inline]
-fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
-    vec![Placeholder; count]
-}
-
-fn ensure_single_gradient_output<T, V>(outputs: &[V]) -> Result<(), TracingError>
-where
-    T: Type,
-    V: Differentiable<T>,
-{
-    if outputs.len() != 1 {
-        return Err(DifferentiationError::InvalidGradientOutputLeafCount { expected: 1, got: outputs.len() }.into());
-    }
-    Ok(())
-}
-
-/// Traces one type-directed body and normalizes the captured program to flat leaf vectors.
-///
-/// Many linearization helpers want a uniform "flat vector of leaves" view even when the caller's
-/// original function uses tuples, structs, or other parameterized shapes. This helper is the bridge
-/// between those worlds: it traces the structured function once, then retags the captured program
-/// so downstream reverse-mode code can operate on a canonical `Vec<V>` representation.
-pub(crate) fn trace_flat_program_from_input_types<'engine, Input, Output, V, E, F>(
-    engine: &'engine E,
-    function: F,
-    input_types: Input,
-) -> Result<(Output, Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>), TracingError>
-where
-    V: Traceable<E::Type> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<E::Type>,
-    Output: Parameterized<E::Type>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
-    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
-    Output::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, To<E::Type> = Output>,
-    E: TracingEngine<Value = V> + ?Sized + 'static,
-    E::Operation: Clone,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-{
-    trace_flat_program_from_trace_result::<E::Type, Input, Output, V, E::Operation, _>(
-        engine.trace(function, input_types)?,
-    )
-}
-
-pub(crate) fn trace_flat_program_from_input_engine<'engine, Input, Output, V, E, F>(
-    tracing_context: &TracingContext<'engine, E>,
-    function: F,
-    input_types: Input,
-) -> Result<(Output, Program<E::Type, V, E::Operation, Vec<V>, Vec<V>>), TracingError>
-where
-    V: Traceable<E::Type> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<E::Type>,
-    Output: Parameterized<E::Type>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
-    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
-    Output::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, To<E::Type> = Output>,
-    E: TracingEngine<Value = V> + ?Sized + 'static,
-    E::Operation: Clone,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-{
-    trace_flat_program_from_trace_result::<E::Type, Input, Output, V, E::Operation, _>(
-        tracing_context.engine.trace(function, input_types)?,
-    )
-}
-
 fn trace_flat_program_from_trace_result<T, Input, Output, V, O, ProgramOutput>(
     trace_result: (Output, Program<T, V, O, Input::To<V>, ProgramOutput>),
 ) -> Result<(Output, Program<T, V, O, Vec<V>, Vec<V>>), TracingError>
@@ -125,11 +61,7 @@ where
     builder.input_ids = input_ids;
     builder.instructions = instructions;
     let traced_program = builder
-        .build(
-            output_ids,
-            flat_leaf_parameter_structure(input_leaf_count),
-            flat_leaf_parameter_structure(output_leaf_count),
-        )?
+        .build(output_ids, vec![Placeholder; input_leaf_count], vec![Placeholder; output_leaf_count])?
         .simplified()?;
     Ok((output_types, traced_program))
 }
@@ -157,7 +89,9 @@ where
     AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     let (outputs, pushforward) = linearize_traced_program(tracing_context.clone(), traced_program, traced_primals)?;
-    ensure_single_gradient_output::<E::Type, _>(outputs.as_slice())?;
+    if outputs.len() != 1 {
+        return Err(DifferentiationError::InvalidGradientOutputLeafCount { expected: 1, got: outputs.len() }.into());
+    }
     let traced_output = outputs[0].clone();
     let pullback = transpose_traced_linear_program(tracing_context.clone(), &pushforward)?;
     let seed_type = traced_output.r#type().into_owned();
@@ -179,8 +113,7 @@ mod tests {
     use crate::tracing::transposition::TranspositionContext;
     use crate::tracing::{ProgramBuilder, TracingError};
     use crate::tracing_v2::{
-        ArrayOperation, CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearArrayOperation,
-        LinearScalarOperation, Sin,
+        ArrayOperation, CustomPrimitive, DifferentiableOperation, LinearArrayOperation, LinearScalarOperation, Sin,
     };
     use crate::types::{ArrayType, DataType, TypeError, Typed};
     use indoc::indoc;
@@ -558,19 +491,6 @@ mod tests {
         let (grad_x2, grad_y2) = compiled.interpret((1.0f64, 5.0f64)).unwrap();
         approx_eq(grad_x2, 5.0 + 1.0f64.cos());
         approx_eq(grad_y2, 1.0);
-    }
-
-    #[test]
-    fn test_scalar_gradient_output_requires_single_leaf() {
-        let result = ensure_single_gradient_output::<ArrayType, _>(&[1.0f64, 2.0f64]);
-
-        assert!(matches!(
-            result,
-            Err(TracingError::Differentiation(DifferentiationError::InvalidGradientOutputLeafCount {
-                expected: 1,
-                got: 2
-            }))
-        ));
     }
 
     // -----------------------------------------------------------------------

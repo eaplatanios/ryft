@@ -85,11 +85,10 @@ where
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<E::Type>, E::Type, V, E, _>(
-        _engine,
-        |staged_input| Ok(function(staged_input)),
-        staged_input_types,
-    )?;
+    let (_, traced_program) =
+        trace_flat_program_from_trace_result::<E::Type, Input::To<E::Type>, E::Type, V, E::Operation, _>(
+            _engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?,
+        )?;
     build_traced_gradient_program(_engine, input_structure, &traced_program)
 }
 
@@ -216,11 +215,10 @@ where
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<ArrayType>, ArrayType, V, E, _>(
-        engine,
-        |staged_input| Ok(function(staged_input)),
-        staged_input_types,
-    )?;
+    let (_, traced_program) =
+        trace_flat_program_from_trace_result::<ArrayType, Input::To<ArrayType>, ArrayType, V, E::Operation, _>(
+            engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?,
+        )?;
     let segmented_program = match segment_size {
         None => wrap_program_in_rematerialize::<E, V, E::Operation>(&traced_program)?,
         Some(size) => segment_program::<E, V, E::Operation>(&traced_program, size)?,
@@ -409,8 +407,8 @@ where
 
     let outer_program = outer_builder.build(
         outer_outputs,
-        flat_leaf_parameter_structure(input_atoms.len()),
-        flat_leaf_parameter_structure(program.output_ids.len()),
+        vec![Placeholder; input_atoms.len()],
+        vec![Placeholder; program.output_ids.len()],
     )?;
     Ok(outer_program)
 }
@@ -464,8 +462,8 @@ where
 
     let outer_program = outer_builder.build(
         outer_outputs,
-        flat_leaf_parameter_structure(outer_inputs.len()),
-        flat_leaf_parameter_structure(program.output_ids.len()),
+        vec![Placeholder; outer_inputs.len()],
+        vec![Placeholder; program.output_ids.len()],
     )?;
     Ok(outer_program)
 }
@@ -556,8 +554,8 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone + Operation<Array
 
     let sub_program = sub_builder.build(
         sub_outputs,
-        flat_leaf_parameter_structure(boundary_input_atoms.len()),
-        flat_leaf_parameter_structure(boundary_output_atoms.len()),
+        vec![Placeholder; boundary_input_atoms.len()],
+        vec![Placeholder; boundary_output_atoms.len()],
     )?;
     Ok(sub_program)
 }

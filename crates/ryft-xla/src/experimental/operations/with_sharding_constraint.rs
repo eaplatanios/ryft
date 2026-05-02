@@ -6,7 +6,7 @@ use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing::transposition::LinearOperation;
 use ryft_core::tracing::{AtomId, Traceable, TracingError};
-use ryft_core::tracing_v2::forward::JvpTracer;
+use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearArrayOperation,
     LinearCustomPrimitive,
