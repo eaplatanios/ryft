@@ -293,57 +293,62 @@ where
 /// This mirrors the semantics of a `has_aux` transform while keeping the Rust API explicit: the
 /// primal value and auxiliary data are returned as `((value, aux), gradient)`.
 #[allow(private_bounds)]
-pub fn value_and_grad_with_aux<'engine, E, F, Input, Aux, V>(
-    engine: &'engine E,
-    function: F,
-    primals: Input,
-) -> Result<((V, Aux), Input), TracingError>
-where
-    E: DifferentiableEngine<Value = V> + 'static,
-    V: Value<E::Type>
-        + Differentiable<E::Type, Tangent = V>
-        + Zero<E::Type>
-        + One<E::Type>
-        + Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    V: Parameterized<
-            V,
-            To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>> = Tracer<
-                'engine,
-                DifferentiableOperationTracingEngine<E>,
-            >,
-        >,
-    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Aux: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Aux::Family: ParameterizedFamily<
-            Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
-            To = Aux::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-        >,
-    V::Family: ParameterizedFamily<
-            Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
-            To = Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
-        >,
-    E::DifferentiableOperation: DifferentiableOperation<E>,
+pub fn value_and_grad_with_aux<
+    'engine,
+    E: DifferentiableEngine<
+            Value = V,
+            DifferentiableOperation: DifferentiableOperation<E>,
+            LinearOperation: Clone
+                                 + InterpretableOperation<E::Type, V>
+                                 + LinearOperation<E::Type, V, E::LinearOperation>
+                                 + SupportsZero<E::Type, V>,
+        > + 'static,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> (
         Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
         Aux::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ),
-    E::LinearOperation: Clone
-        + InterpretableOperation<E::Type, V>
-        + LinearOperation<E::Type, V, E::LinearOperation>
-        + crate::tracing_v2::operations::SupportsZero<E::Type, V>,
-{
-    let ((output, aux), pullback): ((V, Aux), Program<E::Type, V, E::LinearOperation, (V, Aux), Input>) =
-        vjp(engine, |input| Ok(function(input)), primals)?;
+    Input: Parameterized<
+            V,
+            Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    Aux: Parameterized<
+            V,
+            Family: ParameterizedFamily<
+                Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+                To = Aux::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            >,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    V: Value<E::Type>
+        + Differentiable<E::Type, Tangent = V>
+        + Zero<E::Type>
+        + One<E::Type>
+        + Parameterized<
+            V,
+            Family: ParameterizedFamily<
+                Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+                To = Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+            >,
+            To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>> = Tracer<
+                'engine,
+                DifferentiableOperationTracingEngine<E>,
+            >,
+            ParameterStructure: Debug + PartialEq,
+        >,
+>(
+    engine: &'engine E,
+    function: F,
+    primals: Input,
+) -> Result<((V, Aux), Input), TracingError> {
+    let ((output, aux), pullback) = vjp(engine, |input| Ok(function(input)), primals)?;
     let aux_zeros = Aux::from_parameters(
         aux.parameter_structure(),
-        aux.parameters()
-            .map(|value| <V as Zero<E::Type>>::zero(value.r#type().as_ref()))
-            .collect::<Result<Vec<_>, _>>()?,
+        aux.parameters().map(|value| V::zero(value.r#type().as_ref())).collect::<Result<Vec<_>, _>>()?,
     )?;
-    let gradient = pullback.interpret((<V as One<E::Type>>::one(output.r#type().as_ref())?, aux_zeros))?;
+    let gradient = pullback.interpret((V::one(output.r#type().as_ref())?, aux_zeros))?;
     Ok(((output, aux), gradient))
 }
 
