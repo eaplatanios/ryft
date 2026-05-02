@@ -976,6 +976,22 @@ mod tests {
     }
 
     #[test]
+    fn test_new_identified_struct_type() {
+        let context = Context::new();
+        let i32_type = context.signless_integer_type(32);
+        let struct_type = context.llvm_new_identified_struct_type("new_node", &[i32_type], true);
+        assert_eq!(&context, struct_type.context());
+        assert_eq!(struct_type.dialect().namespace().unwrap(), "llvm");
+        assert!(struct_type.is_identified());
+        assert!(!struct_type.is_literal());
+        assert!(struct_type.is_packed());
+        assert!(!struct_type.is_opaque());
+        assert_eq!(struct_type.identifier().unwrap().as_str().unwrap(), "new_node");
+        assert_eq!(struct_type.element_count(), Some(1));
+        assert_eq!(struct_type.element_type(0), i32_type);
+    }
+
+    #[test]
     fn test_opaque_struct_type() {
         let context = Context::new();
         let struct_type = context.llvm_opaque_struct_type("opaque_node");
@@ -1021,7 +1037,7 @@ mod tests {
         let i32_type = context.signless_integer_type(32);
         assert_eq!(
             context.parse_type("!llvm.struct<(i32)>").unwrap(),
-            context.llvm_literal_struct_type(&[i32_type], false)
+            context.llvm_literal_struct_type(&[i32_type], false),
         );
         assert_eq!(
             context.parse_type("!llvm.struct<packed (i32)>").unwrap(),

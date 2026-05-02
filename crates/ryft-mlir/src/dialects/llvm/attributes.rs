@@ -27,8 +27,8 @@ use ryft_xla_sys::bindings::{
     MlirLLVMLinkage_MlirLLVMLinkageExternal, MlirLLVMLinkage_MlirLLVMLinkageInternal,
     MlirLLVMLinkage_MlirLLVMLinkageLinkonce, MlirLLVMLinkage_MlirLLVMLinkageLinkonceODR,
     MlirLLVMLinkage_MlirLLVMLinkagePrivate, MlirLLVMLinkage_MlirLLVMLinkageWeak,
-    MlirLLVMLinkage_MlirLLVMLinkageWeakODR, mlirLLVMCConvAttrGet, mlirLLVMComdatAttrGet, mlirLLVMDINullTypeAttrGet,
-    mlirLLVMLinkageAttrGet,
+    MlirLLVMLinkage_MlirLLVMLinkageWeakODR, mlirLLVMCConvAttrGet, mlirLLVMComdatAttrGet, mlirLLVMDIExpressionAttrGet,
+    mlirLLVMDIExpressionElemAttrGet, mlirLLVMDINullTypeAttrGet, mlirLLVMLinkageAttrGet,
 };
 use ryft_xla_sys::mlir::dialects::llvm::{
     MlirLlvmFramePointerKind, mlirAttributeIsALlvmAccessGroupAttr, mlirAttributeIsALlvmAddressSpaceAttr,
@@ -828,6 +828,43 @@ impl<'t> Context<'t> {
         }
     }
 
+    /// Creates a new LLVM [`DiExpressionElemAttributeRef`] owned by this [`Context`].
+    pub fn llvm_di_expression_elem_attribute<'c>(
+        &'c self,
+        opcode: u32,
+        arguments: &[u64],
+    ) -> DiExpressionElemAttributeRef<'c, 't> {
+        self.load_dialect(DialectHandle::llvm());
+        unsafe {
+            DiExpressionElemAttributeRef::from_c_api(
+                mlirLLVMDIExpressionElemAttrGet(
+                    *self.handle.borrow(),
+                    opcode,
+                    arguments.len().cast_signed(),
+                    arguments.as_ptr(),
+                ),
+                self,
+            )
+            .expect("invalid LLVM debug info expression element attribute")
+        }
+    }
+
+    /// Creates a new LLVM [`DiExpressionAttributeRef`] owned by this [`Context`].
+    pub fn llvm_di_expression_attribute<'c>(
+        &'c self,
+        operations: &[DiExpressionElemAttributeRef<'c, 't>],
+    ) -> DiExpressionAttributeRef<'c, 't> {
+        self.load_dialect(DialectHandle::llvm());
+        let operations = operations.iter().map(|operation| unsafe { operation.to_c_api() }).collect::<Vec<_>>();
+        unsafe {
+            DiExpressionAttributeRef::from_c_api(
+                mlirLLVMDIExpressionAttrGet(*self.handle.borrow(), operations.len().cast_signed(), operations.as_ptr()),
+                self,
+            )
+            .expect("invalid LLVM debug info expression attribute")
+        }
+    }
+
     /// Creates a new LLVM [`DiNullTypeAttributeRef`] owned by this [`Context`].
     pub fn llvm_di_null_type_attribute<'c>(&'c self) -> DiNullTypeAttributeRef<'c, 't> {
         self.load_dialect(DialectHandle::llvm());
@@ -914,9 +951,281 @@ impl<'t> Context<'t> {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
 
     use super::*;
+
+    macro_rules! parsed_llvm_attribute_tests {
+        ($test_name:ident, $attribute_name:ident, $source:expr, $different_source:expr $(,)?) => {
+            paste::paste! {
+                #[test]
+                fn [<test_ $test_name _attribute>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    assert_eq!(&context, attribute.context());
+                    assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+                }
+
+                #[test]
+                fn [<test_ $test_name _attribute_equality>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute_1 = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    let attribute_2 = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    assert_eq!(attribute_1, attribute_2);
+
+                    let attribute_2 = context
+                        .parse_attribute($different_source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $different_source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $different_source));
+                    assert_ne!(attribute_1, attribute_2);
+
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute_2 = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    assert_ne!(attribute_1, attribute_2);
+                }
+
+                #[test]
+                fn [<test_ $test_name _attribute_display_and_debug>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    test_attribute_display_and_debug(attribute, $source);
+                }
+
+                #[test]
+                fn [<test_ $test_name _attribute_casting>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    test_attribute_casting(attribute);
+                }
+            }
+        };
+        ($test_name:ident, $attribute_name:ident, $source:expr $(,)?) => {
+            paste::paste! {
+                #[test]
+                fn [<test_ $test_name _attribute>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    assert_eq!(&context, attribute.context());
+                    assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+                }
+
+                #[test]
+                fn [<test_ $test_name _attribute_equality>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute_1 = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    let attribute_2 = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    assert_eq!(attribute_1, attribute_2);
+
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute_2 = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    assert_ne!(attribute_1, attribute_2);
+                }
+
+                #[test]
+                fn [<test_ $test_name _attribute_display_and_debug>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    test_attribute_display_and_debug(attribute, $source);
+                }
+
+                #[test]
+                fn [<test_ $test_name _attribute_casting>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    test_attribute_casting(attribute);
+                }
+            }
+        };
+    }
+
+    macro_rules! parsed_distinct_llvm_attribute_tests {
+        ($test_name:ident, $attribute_name:ident, $source:expr, $different_source:expr $(,)?) => {
+            paste::paste! {
+                #[test]
+                fn [<test_ $test_name _attribute>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    assert_eq!(&context, attribute.context());
+                    assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+                }
+
+                #[test]
+                fn [<test_ $test_name _attribute_equality>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute_1 = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    assert_eq!(attribute_1, attribute_1);
+
+                    let attribute_2 = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    assert_ne!(attribute_1, attribute_2);
+
+                    let attribute_2 = context
+                        .parse_attribute($different_source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $different_source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $different_source));
+                    assert_ne!(attribute_1, attribute_2);
+
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute_2 = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    assert_ne!(attribute_1, attribute_2);
+                }
+
+                #[test]
+                fn [<test_ $test_name _attribute_display_and_debug>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    test_attribute_display_and_debug(attribute, $source);
+                }
+
+                #[test]
+                fn [<test_ $test_name _attribute_casting>]() {
+                    let context = Context::new();
+                    context.load_dialect(DialectHandle::llvm());
+                    let attribute = context
+                        .parse_attribute($source)
+                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
+                        .cast::<$attribute_name>()
+                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                    test_attribute_casting(attribute);
+                }
+            }
+        };
+    }
+
+    #[test]
+    fn test_address_space_attribute() {
+        let context = Context::new();
+        let attribute = context.llvm_address_space_attribute(3);
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.address_space(), 3);
+    }
+
+    #[test]
+    fn test_address_space_attribute_equality() {
+        let context = Context::new();
+        let attribute_1 = context.llvm_address_space_attribute(3);
+        let attribute_2 = context.llvm_address_space_attribute(3);
+        assert_eq!(attribute_1, attribute_2);
+
+        let attribute_2 = context.llvm_address_space_attribute(4);
+        assert_ne!(attribute_1, attribute_2);
+
+        let context = Context::new();
+        let attribute_2 = context.llvm_address_space_attribute(3);
+        assert_ne!(attribute_1, attribute_2);
+    }
+
+    #[test]
+    fn test_address_space_attribute_display_and_debug() {
+        let context = Context::new();
+        test_attribute_display_and_debug(context.llvm_address_space_attribute(3), "#llvm.address_space<3>");
+    }
+
+    #[test]
+    fn test_address_space_attribute_parsing() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context
+                .parse_attribute("#llvm.address_space<3>")
+                .unwrap()
+                .cast::<AddressSpaceAttributeRef>()
+                .unwrap(),
+            context.llvm_address_space_attribute(3),
+        );
+    }
+
+    #[test]
+    fn test_address_space_attribute_casting() {
+        let context = Context::new();
+        test_attribute_casting(context.llvm_address_space_attribute(3));
+    }
 
     #[test]
     fn test_calling_convention_attribute() {
@@ -948,6 +1257,20 @@ mod tests {
         test_attribute_display_and_debug(
             context.llvm_calling_convention_attribute(CallingConvention::Fast),
             "#llvm.cconv<fastcc>",
+        );
+    }
+
+    #[test]
+    fn test_calling_convention_attribute_parsing() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context
+                .parse_attribute("#llvm.cconv<fastcc>")
+                .unwrap()
+                .cast::<CallingConventionAttributeRef>()
+                .unwrap(),
+            context.llvm_calling_convention_attribute(CallingConvention::Fast),
         );
     }
 
@@ -991,6 +1314,20 @@ mod tests {
     }
 
     #[test]
+    fn test_comdat_attribute_parsing() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context
+                .parse_attribute("#llvm<comdat nodeduplicate>")
+                .unwrap()
+                .cast::<ComdatAttributeRef>()
+                .unwrap(),
+            context.llvm_comdat_attribute(Comdat::NoDeduplicate),
+        );
+    }
+
+    #[test]
     fn test_comdat_attribute_casting() {
         let context = Context::new();
         test_attribute_casting(context.llvm_comdat_attribute(Comdat::NoDeduplicate));
@@ -1027,45 +1364,19 @@ mod tests {
     }
 
     #[test]
+    fn test_linkage_attribute_parsing() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context.parse_attribute("#llvm.linkage<internal>").unwrap().cast::<LinkageAttributeRef>().unwrap(),
+            context.llvm_linkage_attribute(Linkage::Internal),
+        );
+    }
+
+    #[test]
     fn test_linkage_attribute_casting() {
         let context = Context::new();
         test_attribute_casting(context.llvm_linkage_attribute(Linkage::Internal));
-    }
-
-    #[test]
-    fn test_address_space_attribute() {
-        let context = Context::new();
-        let attribute = context.llvm_address_space_attribute(3);
-        assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
-        assert_eq!(attribute.address_space(), 3);
-    }
-
-    #[test]
-    fn test_address_space_attribute_equality() {
-        let context = Context::new();
-        let attribute_1 = context.llvm_address_space_attribute(3);
-        let attribute_2 = context.llvm_address_space_attribute(3);
-        assert_eq!(attribute_1, attribute_2);
-
-        let attribute_2 = context.llvm_address_space_attribute(4);
-        assert_ne!(attribute_1, attribute_2);
-
-        let context = Context::new();
-        let attribute_2 = context.llvm_address_space_attribute(3);
-        assert_ne!(attribute_1, attribute_2);
-    }
-
-    #[test]
-    fn test_address_space_attribute_display_and_debug() {
-        let context = Context::new();
-        test_attribute_display_and_debug(context.llvm_address_space_attribute(3), "#llvm.address_space<3>");
-    }
-
-    #[test]
-    fn test_address_space_attribute_casting() {
-        let context = Context::new();
-        test_attribute_casting(context.llvm_address_space_attribute(3));
     }
 
     #[test]
@@ -1102,9 +1413,190 @@ mod tests {
     }
 
     #[test]
+    fn test_frame_pointer_kind_attribute_parsing() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context
+                .parse_attribute("#llvm.framePointerKind<\"non-leaf\">")
+                .unwrap()
+                .cast::<FramePointerKindAttributeRef>()
+                .unwrap(),
+            context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf),
+        );
+    }
+
+    #[test]
     fn test_frame_pointer_kind_attribute_casting() {
         let context = Context::new();
         test_attribute_casting(context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf));
+    }
+
+    parsed_llvm_attribute_tests!(
+        loop_vectorize,
+        LoopVectorizeAttributeRef,
+        "#llvm.loop_vectorize<disable = false, predicateEnable = true, scalableEnable = false, width = 16 : i32>",
+        "#llvm.loop_vectorize<disable = true>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        loop_interleave,
+        LoopInterleaveAttributeRef,
+        "#llvm.loop_interleave<count = 4 : i32>",
+        "#llvm.loop_interleave<count = 8 : i32>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        loop_unroll,
+        LoopUnrollAttributeRef,
+        "#llvm.loop_unroll<count = 4 : i32>",
+        "#llvm.loop_unroll<count = 8 : i32>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        loop_unroll_and_jam,
+        LoopUnrollAndJamAttributeRef,
+        "#llvm.loop_unroll_and_jam<count = 4 : i32>",
+        "#llvm.loop_unroll_and_jam<count = 8 : i32>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        loop_licm,
+        LoopLicmAttributeRef,
+        "#llvm.loop_licm<disable = true>",
+        "#llvm.loop_licm<versioningDisable = true>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        loop_distribute,
+        LoopDistributeAttributeRef,
+        "#llvm.loop_distribute<disable = true>",
+        "#llvm.loop_distribute<>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        loop_pipeline,
+        LoopPipelineAttributeRef,
+        "#llvm.loop_pipeline<initiationinterval = 2 : i32>",
+        "#llvm.loop_pipeline<disable = true>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        loop_peeled,
+        LoopPeeledAttributeRef,
+        "#llvm.loop_peeled<count = 1 : i32>",
+        "#llvm.loop_peeled<count = 2 : i32>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        loop_unswitch,
+        LoopUnswitchAttributeRef,
+        "#llvm.loop_unswitch<partialDisable = true>",
+        "#llvm.loop_unswitch<>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        loop_annotation,
+        LoopAnnotationAttributeRef,
+        "#llvm.loop_annotation<disableNonforced = true>",
+        "#llvm.loop_annotation<mustProgress = true>",
+    );
+
+    #[test]
+    fn test_di_expression_elem_attribute() {
+        let context = Context::new();
+        let attribute = context.llvm_di_expression_elem_attribute(6, &[]);
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+    }
+
+    #[test]
+    fn test_di_expression_elem_attribute_equality() {
+        let context = Context::new();
+        let attribute_1 = context.llvm_di_expression_elem_attribute(6, &[]);
+        let attribute_2 = context.llvm_di_expression_elem_attribute(6, &[]);
+        assert_eq!(attribute_1, attribute_2);
+
+        let attribute_2 = context.llvm_di_expression_elem_attribute(34, &[]);
+        assert_ne!(attribute_1, attribute_2);
+
+        let context = Context::new();
+        let attribute_2 = context.llvm_di_expression_elem_attribute(6, &[]);
+        assert_ne!(attribute_1, attribute_2);
+    }
+
+    #[test]
+    fn test_di_expression_elem_attribute_display_and_debug() {
+        let context = Context::new();
+        test_attribute_display_and_debug(
+            context.llvm_di_expression_elem_attribute(6, &[]),
+            "#llvm.di_expression_elemDW_OP_deref",
+        );
+    }
+
+    #[test]
+    fn test_di_expression_elem_attribute_casting() {
+        let context = Context::new();
+        test_attribute_casting(context.llvm_di_expression_elem_attribute(6, &[]));
+    }
+
+    #[test]
+    fn test_di_expression_attribute() {
+        let context = Context::new();
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
+        let attribute = context.llvm_di_expression_attribute(&[operation]);
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+    }
+
+    #[test]
+    fn test_di_expression_attribute_equality() {
+        let context = Context::new();
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
+        let attribute_1 = context.llvm_di_expression_attribute(&[operation]);
+        let attribute_2 = context.llvm_di_expression_attribute(&[operation]);
+        assert_eq!(attribute_1, attribute_2);
+
+        let operation = context.llvm_di_expression_elem_attribute(34, &[]);
+        let attribute_2 = context.llvm_di_expression_attribute(&[operation]);
+        assert_ne!(attribute_1, attribute_2);
+
+        let context = Context::new();
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
+        let attribute_2 = context.llvm_di_expression_attribute(&[operation]);
+        assert_ne!(attribute_1, attribute_2);
+    }
+
+    #[test]
+    fn test_di_expression_attribute_display_and_debug() {
+        let context = Context::new();
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
+        test_attribute_display_and_debug(
+            context.llvm_di_expression_attribute(&[operation]),
+            "#llvm.di_expression<[DW_OP_deref]>",
+        );
+    }
+
+    #[test]
+    fn test_di_expression_attribute_parsing() {
+        let context = Context::new();
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context
+                .parse_attribute("#llvm.di_expression<[DW_OP_deref]>")
+                .unwrap()
+                .cast::<DiExpressionAttributeRef>()
+                .unwrap(),
+            context.llvm_di_expression_attribute(&[operation]),
+        );
+    }
+
+    #[test]
+    fn test_di_expression_attribute_casting() {
+        let context = Context::new();
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
+        test_attribute_casting(context.llvm_di_expression_attribute(&[operation]));
     }
 
     #[test]
@@ -1116,9 +1608,31 @@ mod tests {
     }
 
     #[test]
+    fn test_di_null_type_attribute_equality() {
+        let context = Context::new();
+        let attribute_1 = context.llvm_di_null_type_attribute();
+        let attribute_2 = context.llvm_di_null_type_attribute();
+        assert_eq!(attribute_1, attribute_2);
+
+        let context = Context::new();
+        let attribute_2 = context.llvm_di_null_type_attribute();
+        assert_ne!(attribute_1, attribute_2);
+    }
+
+    #[test]
     fn test_di_null_type_attribute_display_and_debug() {
         let context = Context::new();
         test_attribute_display_and_debug(context.llvm_di_null_type_attribute(), "#llvm.di_null_type");
+    }
+
+    #[test]
+    fn test_di_null_type_attribute_parsing() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context.parse_attribute("#llvm.di_null_type").unwrap().cast::<DiNullTypeAttributeRef>().unwrap(),
+            context.llvm_di_null_type_attribute(),
+        );
     }
 
     #[test]
@@ -1127,49 +1641,805 @@ mod tests {
         test_attribute_casting(context.llvm_di_null_type_attribute());
     }
 
+    parsed_llvm_attribute_tests!(
+        di_basic_type,
+        DiBasicTypeAttributeRef,
+        concat!(
+            "#llvm.di_basic_type<tag = DW_TAG_base_type, name = \"i32\", ",
+            "sizeInBits = 32, encoding = DW_ATE_signed>"
+        ),
+        "#llvm.di_basic_type<tag = DW_TAG_base_type, name = \"i64\", sizeInBits = 64, encoding = DW_ATE_signed>",
+    );
+
+    parsed_distinct_llvm_attribute_tests!(
+        di_compile_unit,
+        DiCompileUnitAttributeRef,
+        concat!(
+            "#llvm.di_compile_unit<id = distinct[0]<>, sourceLanguage = DW_LANG_C, ",
+            "file = <\"file.c\" in \"/tmp\">, emissionKind = Full>"
+        ),
+        concat!(
+            "#llvm.di_compile_unit<id = distinct[1]<>, sourceLanguage = DW_LANG_C, ",
+            "file = <\"file.c\" in \"/tmp\">, isOptimized = true, emissionKind = Full>"
+        ),
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_composite_type,
+        DiCompositeTypeAttributeRef,
+        concat!(
+            "#llvm.di_composite_type<tag = DW_TAG_structure_type, name = \"S\", ",
+            "sizeInBits = 32, elements = #llvm.di_basic_type<tag = DW_TAG_base_type, ",
+            "name = \"i32\", sizeInBits = 32, encoding = DW_ATE_signed>>"
+        ),
+        "#llvm.di_composite_type<tag = DW_TAG_structure_type, name = \"T\", sizeInBits = 64>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_derived_type,
+        DiDerivedTypeAttributeRef,
+        concat!(
+            "#llvm.di_derived_type<tag = DW_TAG_pointer_type, name = \"ptr\", baseType = ",
+            "#llvm.di_basic_type<tag = DW_TAG_base_type, name = \"i32\", sizeInBits = 32, ",
+            "encoding = DW_ATE_signed>, sizeInBits = 64>"
+        ),
+        "#llvm.di_derived_type<tag = DW_TAG_pointer_type, name = \"other\">",
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_file,
+        DiFileAttributeRef,
+        "#llvm.di_file<\"file.c\" in \"/tmp\">",
+        "#llvm.di_file<\"other.c\" in \"/tmp\">",
+    );
+
+    parsed_distinct_llvm_attribute_tests!(
+        di_global_variable_expression,
+        DiGlobalVariableExpressionAttributeRef,
+        concat!(
+            "#llvm.di_global_variable_expression<var = <scope = #llvm.di_compile_unit<id = distinct[0]<>, ",
+            "sourceLanguage = DW_LANG_C, file = <\"file.c\" in \"/tmp\">, ",
+            "emissionKind = Full>, name = \"g\", file = <\"file.c\" in \"/tmp\">, line = 1, type = #llvm.di_basic_type<tag = ",
+            "DW_TAG_base_type, name = \"i32\", sizeInBits = 32, encoding = DW_ATE_signed>>, expr = <>>"
+        ),
+        concat!(
+            "#llvm.di_global_variable_expression<var = <file = #llvm.di_file<\"file.c\" in \"/tmp\">, ",
+            "line = 2, type = #llvm.di_null_type>, expr = <>>"
+        ),
+    );
+
+    parsed_distinct_llvm_attribute_tests!(
+        di_global_variable,
+        DiGlobalVariableAttributeRef,
+        concat!(
+            "#llvm.di_global_variable<scope = #llvm.di_compile_unit<id = distinct[0]<>, ",
+            "sourceLanguage = DW_LANG_C, file = <\"file.c\" in \"/tmp\">, ",
+            "emissionKind = Full>, name = \"g\", file = <\"file.c\" in \"/tmp\">, line = 1, type = #llvm.di_basic_type<tag = ",
+            "DW_TAG_base_type, name = \"i32\", sizeInBits = 32, encoding = DW_ATE_signed>>"
+        ),
+        concat!(
+            "#llvm.di_global_variable<file = #llvm.di_file<\"file.c\" in \"/tmp\">, line = 2, ",
+            "type = #llvm.di_null_type>"
+        ),
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_lexical_block,
+        DiLexicalBlockAttributeRef,
+        concat!(
+            "#llvm.di_lexical_block<scope = #llvm.di_file<\"file.c\" in \"/tmp\">, ",
+            "file = <\"file.c\" in \"/tmp\">, line = 1, column = 2>"
+        ),
+        "#llvm.di_lexical_block<scope = #llvm.di_file<\"file.c\" in \"/tmp\">, line = 2>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_lexical_block_file,
+        DiLexicalBlockFileAttributeRef,
+        concat!(
+            "#llvm.di_lexical_block_file<scope = #llvm.di_file<\"file.c\" in \"/tmp\">, ",
+            "file = <\"file.c\" in \"/tmp\">, discriminator = 1>"
+        ),
+        "#llvm.di_lexical_block_file<scope = #llvm.di_file<\"file.c\" in \"/tmp\">, discriminator = 2>",
+    );
+
+    parsed_distinct_llvm_attribute_tests!(
+        di_local_variable,
+        DiLocalVariableAttributeRef,
+        concat!(
+            "#llvm.di_local_variable<scope = #llvm.di_subprogram<compileUnit = ",
+            "<id = distinct[0]<>, sourceLanguage = DW_LANG_C, file = <\"file.c\" in \"/tmp\">, emissionKind = Full>, ",
+            "scope = #llvm.di_file<\"file.c\" in \"/tmp\">, name = \"fn\", file = ",
+            "<\"file.c\" in \"/tmp\">, subprogramFlags = Definition, type = ",
+            "<callingConvention = DW_CC_normal>>, name = \"v\", file = ",
+            "<\"file.c\" in \"/tmp\">, line = 1, arg = 1, type = ",
+            "#llvm.di_basic_type<tag = DW_TAG_base_type, name = \"i32\", sizeInBits = 32, ",
+            "encoding = DW_ATE_signed>>"
+        ),
+        concat!(
+            "#llvm.di_local_variable<scope = #llvm.di_file<\"file.c\" in \"/tmp\">, name = \"w\", ",
+            "type = #llvm.di_null_type>"
+        ),
+    );
+
+    parsed_distinct_llvm_attribute_tests!(
+        di_subprogram,
+        DiSubprogramAttributeRef,
+        concat!(
+            "#llvm.di_subprogram<compileUnit = <id = distinct[0]<>, sourceLanguage = DW_LANG_C, ",
+            "file = <\"file.c\" in \"/tmp\">, emissionKind = Full>, ",
+            "scope = #llvm.di_file<\"file.c\" in \"/tmp\">, name = \"fn\", file = <\"file.c\" in \"/tmp\">, ",
+            "subprogramFlags = Definition, type = <callingConvention = DW_CC_normal>>"
+        ),
+        "#llvm.di_subprogram<scope = #llvm.di_file<\"file.c\" in \"/tmp\">, name = \"other\", subprogramFlags = Definition>",
+    );
+
+    parsed_distinct_llvm_attribute_tests!(
+        di_module,
+        DiModuleAttributeRef,
+        concat!(
+            "#llvm.di_module<file = <\"file.c\" in \"/tmp\">, scope = ",
+            "#llvm.di_compile_unit<id = distinct[0]<>, sourceLanguage = DW_LANG_C, ",
+            "file = <\"file.c\" in \"/tmp\">, emissionKind = Full>, ",
+            "name = \"mod\">"
+        ),
+        "#llvm.di_module<name = \"other\">",
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_namespace,
+        DiNamespaceAttributeRef,
+        "#llvm.di_namespace<name = \"ns\", scope = #llvm.di_file<\"file.c\" in \"/tmp\">, exportSymbols = false>",
+        "#llvm.di_namespace<name = \"other\", exportSymbols = true>",
+    );
+
+    parsed_distinct_llvm_attribute_tests!(
+        di_imported_entity,
+        DiImportedEntityAttributeRef,
+        concat!(
+            "#llvm.di_imported_entity<tag = DW_TAG_imported_module, scope = ",
+            "#llvm.di_subprogram<compileUnit = <id = distinct[0]<>, sourceLanguage = DW_LANG_C, ",
+            "file = <\"file.c\" in \"/tmp\">, emissionKind = Full>, scope = #llvm.di_file<\"file.c\" in \"/tmp\">, ",
+            "name = \"fn\", file = <\"file.c\" in \"/tmp\">, subprogramFlags = Definition, ",
+            "type = <callingConvention = DW_CC_normal>>, entity = ",
+            "#llvm.di_module<file = <\"file.c\" in \"/tmp\">, scope = ",
+            "#llvm.di_compile_unit<id = distinct[0]<>, sourceLanguage = DW_LANG_C, ",
+            "file = <\"file.c\" in \"/tmp\">, emissionKind = Full>, name = \"mod\">, file = ",
+            "<\"file.c\" in \"/tmp\">, line = 1>"
+        ),
+        concat!(
+            "#llvm.di_imported_entity<tag = DW_TAG_imported_module, scope = ",
+            "#llvm.di_file<\"file.c\" in \"/tmp\">, entity = #llvm.di_module<name = \"other\">>"
+        ),
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_annotation,
+        DiAnnotationAttributeRef,
+        "#llvm.di_annotation<name = \"ann\", value = \"value\">",
+        "#llvm.di_annotation<name = \"other\", value = \"value\">",
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_subrange,
+        DiSubrangeAttributeRef,
+        "#llvm.di_subrange<count = 4 : i64, lowerBound = 0 : i64>",
+        "#llvm.di_subrange<count = 8 : i64>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_common_block,
+        DiCommonBlockAttributeRef,
+        concat!(
+            "#llvm.di_common_block<scope = #llvm.di_file<\"file.c\" in \"/tmp\">, name = \"common\", ",
+            "file = <\"file.c\" in \"/tmp\">, line = 1>"
+        ),
+        "#llvm.di_common_block<scope = #llvm.di_file<\"file.c\" in \"/tmp\">, name = \"other\">",
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_generic_subrange,
+        DiGenericSubrangeAttributeRef,
+        "#llvm.di_generic_subrange<count = 4 : i64, lowerBound = 0 : i64, stride = 1 : i64>",
+        "#llvm.di_generic_subrange<lowerBound = 1 : i64, stride = 2 : i64>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_subroutine_type,
+        DiSubroutineTypeAttributeRef,
+        "#llvm.di_subroutine_type<callingConvention = DW_CC_normal>",
+        "#llvm.di_subroutine_type<callingConvention = DW_CC_program>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_label,
+        DiLabelAttributeRef,
+        concat!(
+            "#llvm.di_label<scope = #llvm.di_file<\"file.c\" in \"/tmp\">, name = \"label\", ",
+            "file = <\"file.c\" in \"/tmp\">, line = 1>"
+        ),
+        "#llvm.di_label<scope = #llvm.di_file<\"file.c\" in \"/tmp\">, name = \"other\">",
+    );
+
+    parsed_llvm_attribute_tests!(
+        di_string_type,
+        DiStringTypeAttributeRef,
+        "#llvm.di_string_type<tag = DW_TAG_string_type, name = \"string\", sizeInBits = 32, encoding = DW_ATE_signed_char>",
+        "#llvm.di_string_type<tag = DW_TAG_string_type, name = \"other\", encoding = DW_ATE_unsigned_char>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        memory_effects,
+        MemoryEffectsAttributeRef,
+        "#llvm.memory_effects<other = readwrite, argMem = none, inaccessibleMem = read, errnoMem = none, targetMem0 = none, targetMem1 = none>",
+        "#llvm.memory_effects<other = none, argMem = none, inaccessibleMem = none, errnoMem = none, targetMem0 = none, targetMem1 = none>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        denormal_fp_env,
+        DenormalFpEnvAttributeRef,
+        "#llvm.denormal_fpenv<default_output_mode = ieee, default_input_mode = ieee, float_output_mode = preservesign, float_input_mode = preservesign>",
+        "#llvm.denormal_fpenv<default_output_mode = dynamic, default_input_mode = dynamic, float_output_mode = preservesign, float_input_mode = preservesign>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        alias_scope_domain,
+        AliasScopeDomainAttributeRef,
+        "#llvm.alias_scope_domain<id = \"domain\", description = \"domain desc\">",
+        "#llvm.alias_scope_domain<id = \"other\", description = \"domain desc\">",
+    );
+
+    parsed_llvm_attribute_tests!(
+        alias_scope,
+        AliasScopeAttributeRef,
+        concat!(
+            "#llvm.alias_scope<id = \"scope\", domain = <id = \"domain\", ",
+            "description = \"domain desc\">, description = \"scope desc\">"
+        ),
+        concat!(
+            "#llvm.alias_scope<id = \"other\", domain = <id = \"domain\", ",
+            "description = \"domain desc\">, description = \"scope desc\">"
+        ),
+    );
+
+    parsed_distinct_llvm_attribute_tests!(
+        access_group,
+        AccessGroupAttributeRef,
+        "#llvm.access_group<id = distinct[0]<>>",
+        "#llvm.access_group<id = distinct[1]<>>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        tbaa_root,
+        TbaaRootAttributeRef,
+        "#llvm.tbaa_root<id = \"root\">",
+        "#llvm.tbaa_root<id = \"other\">",
+    );
+
+    parsed_llvm_attribute_tests!(
+        tbaa_member,
+        TbaaMemberAttributeRef,
+        "#llvm.tbaa_member<#llvm.tbaa_root<id = \"root\">, 0>",
+        "#llvm.tbaa_member<#llvm.tbaa_root<id = \"root\">, 4>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        tbaa_type_descriptor,
+        TbaaTypeDescriptorAttributeRef,
+        "#llvm.tbaa_type_desc<id = \"int\", members = {<#llvm.tbaa_root<id = \"root\">, 0>}>",
+        "#llvm.tbaa_type_desc<id = \"other\", members = {<#llvm.tbaa_root<id = \"root\">, 0>}>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        tbaa_tag,
+        TbaaTagAttributeRef,
+        concat!(
+            "#llvm.tbaa_tag<base_type = <id = \"int\", members = ",
+            "{<#llvm.tbaa_root<id = \"root\">, 0>}>, access_type = <id = \"int\", ",
+            "members = {<#llvm.tbaa_root<id = \"root\">, 0>}>, offset = 0>"
+        ),
+        concat!(
+            "#llvm.tbaa_tag<base_type = <id = \"int\", members = ",
+            "{<#llvm.tbaa_root<id = \"root\">, 0>}>, access_type = <id = \"int\", ",
+            "members = {<#llvm.tbaa_root<id = \"root\">, 0>}>, offset = 4>"
+        ),
+    );
+
+    parsed_llvm_attribute_tests!(
+        mmra_tag,
+        MmraTagAttributeRef,
+        "#llvm.mmra_tag<\"amdgpu\":\"local\">",
+        "#llvm.mmra_tag<\"amdgpu\":\"global\">",
+    );
+
+    parsed_llvm_attribute_tests!(
+        constant_range,
+        ConstantRangeAttributeRef,
+        "#llvm.constant_range<i64, 0, 4097>",
+        "#llvm.constant_range<i64, 1, 4097>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        vscale_range,
+        VScaleRangeAttributeRef,
+        "#llvm.vscale_range<minRange = 2 : i32, maxRange = 8 : i32>",
+        "#llvm.vscale_range<minRange = 1 : i32, maxRange = 8 : i32>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        target_features,
+        TargetFeaturesAttributeRef,
+        "#llvm.target_features<[\"+sme\", \"+sve\"]>",
+        "#llvm.target_features<[\"+sme\"]>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        target,
+        TargetAttributeRef,
+        "#llvm.target<triple = \"x86_64-unknown-linux-gnu\", chip = \"generic\", features = <[\"+sse2\"]>>",
+        "#llvm.target<triple = \"aarch64-unknown-linux-gnu\", chip = \"generic\">",
+    );
+
     #[test]
-    fn test_constant_like_attributes() {
+    fn test_undef_attribute() {
         let context = Context::new();
-        let undef = context.llvm_undef_attribute();
-        let poison = context.llvm_poison_attribute();
-        let zero = context.llvm_zero_attribute();
-        assert_eq!(&context, undef.context());
-        assert_eq!(&context, poison.context());
-        assert_eq!(&context, zero.context());
-        test_attribute_display_and_debug(undef, "#llvm.undef");
-        test_attribute_display_and_debug(poison, "#llvm.poison");
-        test_attribute_display_and_debug(zero, "#llvm.zero");
-        test_attribute_casting(undef);
-        test_attribute_casting(poison);
-        test_attribute_casting(zero);
+        let attribute = context.llvm_undef_attribute();
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
     }
 
     #[test]
-    fn test_metadata_attributes() {
+    fn test_undef_attribute_equality() {
         let context = Context::new();
-        let string = context.llvm_md_string_attribute("foo.buffer");
+        let attribute_1 = context.llvm_undef_attribute();
+        let attribute_2 = context.llvm_undef_attribute();
+        assert_eq!(attribute_1, attribute_2);
+
+        let context = Context::new();
+        let attribute_2 = context.llvm_undef_attribute();
+        assert_ne!(attribute_1, attribute_2);
+    }
+
+    #[test]
+    fn test_undef_attribute_display_and_debug() {
+        let context = Context::new();
+        test_attribute_display_and_debug(context.llvm_undef_attribute(), "#llvm.undef");
+    }
+
+    #[test]
+    fn test_undef_attribute_parsing() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context.parse_attribute("#llvm.undef").unwrap().cast::<UndefAttributeRef>().unwrap(),
+            context.llvm_undef_attribute(),
+        );
+    }
+
+    #[test]
+    fn test_undef_attribute_casting() {
+        let context = Context::new();
+        test_attribute_casting(context.llvm_undef_attribute());
+    }
+
+    #[test]
+    fn test_poison_attribute() {
+        let context = Context::new();
+        let attribute = context.llvm_poison_attribute();
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+    }
+
+    #[test]
+    fn test_poison_attribute_equality() {
+        let context = Context::new();
+        let attribute_1 = context.llvm_poison_attribute();
+        let attribute_2 = context.llvm_poison_attribute();
+        assert_eq!(attribute_1, attribute_2);
+
+        let context = Context::new();
+        let attribute_2 = context.llvm_poison_attribute();
+        assert_ne!(attribute_1, attribute_2);
+    }
+
+    #[test]
+    fn test_poison_attribute_display_and_debug() {
+        let context = Context::new();
+        test_attribute_display_and_debug(context.llvm_poison_attribute(), "#llvm.poison");
+    }
+
+    #[test]
+    fn test_poison_attribute_parsing() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context.parse_attribute("#llvm.poison").unwrap().cast::<PoisonAttributeRef>().unwrap(),
+            context.llvm_poison_attribute(),
+        );
+    }
+
+    #[test]
+    fn test_poison_attribute_casting() {
+        let context = Context::new();
+        test_attribute_casting(context.llvm_poison_attribute());
+    }
+
+    parsed_llvm_attribute_tests!(
+        dso_local_equivalent,
+        DsoLocalEquivalentAttributeRef,
+        "#llvm<dso_local_equivalent @extern_func>",
+        "#llvm<dso_local_equivalent @other_func>",
+    );
+
+    parsed_llvm_attribute_tests!(block_tag, BlockTagAttributeRef, "#llvm.blocktag<id = 1>", "#llvm.blocktag<id = 2>");
+
+    parsed_llvm_attribute_tests!(
+        block_address,
+        BlockAddressAttributeRef,
+        "#llvm.blockaddress<function = @fn, tag = <id = 1>>",
+        "#llvm.blockaddress<function = @fn, tag = <id = 2>>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        vec_type_hint,
+        VecTypeHintAttributeRef,
+        "#llvm.vec_type_hint<hint = i32>",
+        "#llvm.vec_type_hint<hint = i32, is_signed = true>",
+    );
+
+    #[test]
+    fn test_zero_attribute() {
+        let context = Context::new();
+        let attribute = context.llvm_zero_attribute();
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+    }
+
+    #[test]
+    fn test_zero_attribute_equality() {
+        let context = Context::new();
+        let attribute_1 = context.llvm_zero_attribute();
+        let attribute_2 = context.llvm_zero_attribute();
+        assert_eq!(attribute_1, attribute_2);
+
+        let context = Context::new();
+        let attribute_2 = context.llvm_zero_attribute();
+        assert_ne!(attribute_1, attribute_2);
+    }
+
+    #[test]
+    fn test_zero_attribute_display_and_debug() {
+        let context = Context::new();
+        test_attribute_display_and_debug(context.llvm_zero_attribute(), "#llvm.zero");
+    }
+
+    #[test]
+    fn test_zero_attribute_parsing() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context.parse_attribute("#llvm.zero").unwrap().cast::<ZeroAttributeRef>().unwrap(),
+            context.llvm_zero_attribute(),
+        );
+    }
+
+    #[test]
+    fn test_zero_attribute_casting() {
+        let context = Context::new();
+        test_attribute_casting(context.llvm_zero_attribute());
+    }
+
+    parsed_llvm_attribute_tests!(
+        tail_call_kind,
+        TailCallKindAttributeRef,
+        "#llvm.tailcallkind<tail>",
+        "#llvm.tailcallkind<musttail>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        workgroup_attribution,
+        WorkgroupAttributionAttributeRef,
+        "#llvm.mlir.workgroup_attribution<32 : i64, f32>",
+        "#llvm.mlir.workgroup_attribution<16 : i64, i16>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        dereferenceable,
+        DereferenceableAttributeRef,
+        "#llvm.dereferenceable<bytes = 4, mayBeNull = true>",
+        "#llvm.dereferenceable<bytes = 8>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        module_flag,
+        ModuleFlagAttributeRef,
+        "#llvm.mlir.module_flag<error, \"wchar_size\", 4 : i32>",
+        "#llvm.mlir.module_flag<warning, \"Debug Info Version\", 3 : i32>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        module_flag_cg_profile_entry,
+        ModuleFlagCgProfileEntryAttributeRef,
+        "#llvm.cgprofile_entry<from = @from, to = @to, count = 222>",
+        "#llvm.cgprofile_entry<from = @from, count = 222>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        module_flag_profile_summary_detailed,
+        ModuleFlagProfileSummaryDetailedAttributeRef,
+        "#llvm.profile_summary_detailed<cut_off = 10000, min_count = 1, num_counts = 2>",
+        "#llvm.profile_summary_detailed<cut_off = 100000, min_count = 1, num_counts = 2>",
+    );
+
+    parsed_llvm_attribute_tests!(
+        module_flag_profile_summary,
+        ModuleFlagProfileSummaryAttributeRef,
+        concat!(
+            "#llvm.profile_summary<format = InstrProf, total_count = 10, max_count = 5, ",
+            "max_internal_count = 4, max_function_count = 3, num_counts = 2, num_functions = 1, ",
+            "detailed_summary = <cut_off = 10000, min_count = 1, num_counts = 2>>"
+        ),
+        concat!(
+            "#llvm.profile_summary<format = InstrProf, total_count = 11, max_count = 5, ",
+            "max_internal_count = 4, max_function_count = 3, num_counts = 2, num_functions = 1, ",
+            "detailed_summary = <cut_off = 10000, min_count = 1, num_counts = 2>>"
+        ),
+    );
+
+    parsed_llvm_attribute_tests!(
+        dependent_libraries,
+        DependentLibrariesAttributeRef,
+        "#llvm.dependent_libraries<\"foo\", \"bar\">",
+        "#llvm.dependent_libraries<\"foo\">",
+    );
+
+    parsed_llvm_attribute_tests!(
+        uw_table_kind,
+        UwTableKindAttributeRef,
+        "#llvm.uwtableKind<sync>",
+        "#llvm.uwtableKind<async>",
+    );
+
+    #[test]
+    fn test_md_string_attribute() {
+        let context = Context::new();
+        let attribute = context.llvm_md_string_attribute("foo.buffer");
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.value().as_str().unwrap(), "foo.buffer");
+    }
+
+    #[test]
+    fn test_md_string_attribute_equality() {
+        let context = Context::new();
+        let attribute_1 = context.llvm_md_string_attribute("foo.buffer");
+        let attribute_2 = context.llvm_md_string_attribute("foo.buffer");
+        assert_eq!(attribute_1, attribute_2);
+
+        let attribute_2 = context.llvm_md_string_attribute("other.buffer");
+        assert_ne!(attribute_1, attribute_2);
+
+        let context = Context::new();
+        let attribute_2 = context.llvm_md_string_attribute("foo.buffer");
+        assert_ne!(attribute_1, attribute_2);
+    }
+
+    #[test]
+    fn test_md_string_attribute_display_and_debug() {
+        let context = Context::new();
+        test_attribute_display_and_debug(
+            context.llvm_md_string_attribute("foo.buffer"),
+            "#llvm.md_string<\"foo.buffer\">",
+        );
+    }
+
+    #[test]
+    fn test_md_string_attribute_parsing() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context
+                .parse_attribute("#llvm.md_string<\"foo.buffer\">")
+                .unwrap()
+                .cast::<MdStringAttributeRef>()
+                .unwrap(),
+            context.llvm_md_string_attribute("foo.buffer"),
+        );
+    }
+
+    #[test]
+    fn test_md_string_attribute_casting() {
+        let context = Context::new();
+        test_attribute_casting(context.llvm_md_string_attribute("foo.buffer"));
+    }
+
+    #[test]
+    fn test_md_constant_attribute() {
+        let context = Context::new();
+        let value = context.integer_attribute(context.signless_integer_type(32), 42);
+        let attribute = context.llvm_md_constant_attribute(value);
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.value(), value);
+    }
+
+    #[test]
+    fn test_md_constant_attribute_equality() {
+        let context = Context::new();
+        let value = context.integer_attribute(context.signless_integer_type(32), 42);
+        let attribute_1 = context.llvm_md_constant_attribute(value);
+        let attribute_2 = context.llvm_md_constant_attribute(value);
+        assert_eq!(attribute_1, attribute_2);
+
+        let value = context.integer_attribute(context.signless_integer_type(32), 43);
+        let attribute_2 = context.llvm_md_constant_attribute(value);
+        assert_ne!(attribute_1, attribute_2);
+
+        let context = Context::new();
+        let value = context.integer_attribute(context.signless_integer_type(32), 42);
+        let attribute_2 = context.llvm_md_constant_attribute(value);
+        assert_ne!(attribute_1, attribute_2);
+    }
+
+    #[test]
+    fn test_md_constant_attribute_display_and_debug() {
+        let context = Context::new();
+        let value = context.integer_attribute(context.signless_integer_type(32), 42);
+        test_attribute_display_and_debug(context.llvm_md_constant_attribute(value), "#llvm.md_const<42 : i32>");
+    }
+
+    #[test]
+    fn test_md_constant_attribute_parsing() {
+        let context = Context::new();
+        let value = context.integer_attribute(context.signless_integer_type(32), 42);
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context
+                .parse_attribute("#llvm.md_const<42 : i32>")
+                .unwrap()
+                .cast::<MdConstantAttributeRef>()
+                .unwrap(),
+            context.llvm_md_constant_attribute(value),
+        );
+    }
+
+    #[test]
+    fn test_md_constant_attribute_casting() {
+        let context = Context::new();
+        let value = context.integer_attribute(context.signless_integer_type(32), 42);
+        test_attribute_casting(context.llvm_md_constant_attribute(value));
+    }
+
+    #[test]
+    fn test_md_func_attribute() {
+        let context = Context::new();
+        let attribute = context.llvm_md_func_attribute("callee");
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.name().reference().as_str().unwrap(), "callee");
+    }
+
+    #[test]
+    fn test_md_func_attribute_equality() {
+        let context = Context::new();
+        let attribute_1 = context.llvm_md_func_attribute("callee");
+        let attribute_2 = context.llvm_md_func_attribute("callee");
+        assert_eq!(attribute_1, attribute_2);
+
+        let attribute_2 = context.llvm_md_func_attribute("other");
+        assert_ne!(attribute_1, attribute_2);
+
+        let context = Context::new();
+        let attribute_2 = context.llvm_md_func_attribute("callee");
+        assert_ne!(attribute_1, attribute_2);
+    }
+
+    #[test]
+    fn test_md_func_attribute_display_and_debug() {
+        let context = Context::new();
+        test_attribute_display_and_debug(context.llvm_md_func_attribute("callee"), "#llvm.md_func<@callee>");
+    }
+
+    #[test]
+    fn test_md_func_attribute_parsing() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context.parse_attribute("#llvm.md_func<@callee>").unwrap().cast::<MdFuncAttributeRef>().unwrap(),
+            context.llvm_md_func_attribute("callee"),
+        );
+    }
+
+    #[test]
+    fn test_md_func_attribute_casting() {
+        let context = Context::new();
+        test_attribute_casting(context.llvm_md_func_attribute("callee"));
+    }
+
+    #[test]
+    fn test_md_node_attribute() {
+        let context = Context::new();
         let constant =
             context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
+        let string = context.llvm_md_string_attribute("foo.buffer");
         let function = context.llvm_md_func_attribute("callee");
-        let node = context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]);
-        assert_eq!(string.value().as_str().unwrap(), "foo.buffer");
-        assert_eq!(constant.value().to_string(), "42 : i32");
-        assert_eq!(function.name().reference().as_str().unwrap(), "callee");
-        assert_eq!(node.operand_count(), 3);
+        let attribute = context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]);
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.operand_count(), 3);
         assert_eq!(
-            node.operands().map(|operand| operand.to_string()).collect::<Vec<_>>(),
-            vec!["#llvm.md_const<42 : i32>", "#llvm.md_string<\"foo.buffer\">", "#llvm.md_func<@callee>",]
+            attribute.operands().map(|operand| operand.to_string()).collect::<Vec<_>>(),
+            vec!["#llvm.md_const<42 : i32>", "#llvm.md_string<\"foo.buffer\">", "#llvm.md_func<@callee>"],
         );
-        test_attribute_display_and_debug(string, "#llvm.md_string<\"foo.buffer\">");
-        test_attribute_display_and_debug(constant, "#llvm.md_const<42 : i32>");
-        test_attribute_display_and_debug(function, "#llvm.md_func<@callee>");
+    }
+
+    #[test]
+    fn test_md_node_attribute_equality() {
+        let context = Context::new();
+        let constant =
+            context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
+        let string = context.llvm_md_string_attribute("foo.buffer");
+        let function = context.llvm_md_func_attribute("callee");
+        let attribute_1 = context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]);
+        let attribute_2 = context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]);
+        assert_eq!(attribute_1, attribute_2);
+
+        let attribute_2 = context.llvm_md_node_attribute(&[constant.as_ref()]);
+        assert_ne!(attribute_1, attribute_2);
+
+        let context = Context::new();
+        let constant =
+            context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
+        let string = context.llvm_md_string_attribute("foo.buffer");
+        let function = context.llvm_md_func_attribute("callee");
+        let attribute_2 = context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]);
+        assert_ne!(attribute_1, attribute_2);
+    }
+
+    #[test]
+    fn test_md_node_attribute_display_and_debug() {
+        let context = Context::new();
+        let constant =
+            context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
+        let string = context.llvm_md_string_attribute("foo.buffer");
+        let function = context.llvm_md_func_attribute("callee");
         test_attribute_display_and_debug(
-            node,
+            context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]),
             "#llvm.md_node<#llvm.md_const<42 : i32>, #llvm.md_string<\"foo.buffer\">, #llvm.md_func<@callee>>",
         );
-        test_attribute_casting(string);
-        test_attribute_casting(constant);
-        test_attribute_casting(function);
-        test_attribute_casting(node);
+    }
+
+    #[test]
+    fn test_md_node_attribute_parsing() {
+        let context = Context::new();
+        let constant =
+            context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
+        let string = context.llvm_md_string_attribute("foo.buffer");
+        let function = context.llvm_md_func_attribute("callee");
+        context.load_dialect(DialectHandle::llvm());
+        assert_eq!(
+            context
+                .parse_attribute(
+                    "#llvm.md_node<#llvm.md_const<42 : i32>, #llvm.md_string<\"foo.buffer\">, #llvm.md_func<@callee>>"
+                )
+                .unwrap()
+                .cast::<MdNodeAttributeRef>()
+                .unwrap(),
+            context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]),
+        );
+    }
+
+    #[test]
+    fn test_md_node_attribute_casting() {
+        let context = Context::new();
+        let constant =
+            context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
+        let string = context.llvm_md_string_attribute("foo.buffer");
+        let function = context.llvm_md_func_attribute("callee");
+        test_attribute_casting(context.llvm_md_node_attribute(&[
+            constant.as_ref(),
+            string.as_ref(),
+            function.as_ref(),
+        ]));
     }
 }
