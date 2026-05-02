@@ -27,11 +27,12 @@ pub struct TracedJvp;
 /// The public transform is intentionally small; this trait is where the concrete, traced, and
 /// batched execution strategies branch apart.
 #[doc(hidden)]
-pub(crate) trait JvpDispatch<E, Input, Output, Mode>: Parameter + Sized
-where
+pub(crate) trait JvpDispatch<
     E: Engine,
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<Self>,
+    Mode,
+>: Parameter + Sized
 {
     /// Input type expected by the user-provided function.
     type FunctionInput<'engine>
@@ -44,38 +45,43 @@ where
         E: 'engine;
 
     /// Invokes [`jvp`] for one leaf regime.
-    fn invoke<'engine, F>(
+    fn invoke<'engine, F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>>(
         engine: &'engine E,
         function: F,
         primals: Input,
         tangents: Input,
-    ) -> Result<(Output, Output), TracingError>
-    where
-        F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>;
+    ) -> Result<(Output, Output), TracingError>;
 }
 
 /// Concrete-value dispatch for [`jvp`]: traces the user function with [`Tracer`] to build a staged
 /// pushforward via [`linearize`] and evaluates it at the supplied tangents.
 impl<
-    E,
+    E: DifferentiableEngine<
+            Value = V,
+            DifferentiableOperation: DifferentiableOperation<E>,
+            LinearOperation: InterpretableOperation<E::Type, V>
+                                 + SupportsAdd<E::Type, V>
+                                 + SupportsNeg<E::Type, V>
+                                 + SupportsScale<E::Type, V>,
+        > + 'static,
     V: Value<E::Type>
         + Differentiable<E::Type, Tangent = V>
         + Zero<E::Type>
         + Parameterized<V, ParameterStructure: PartialEq>,
-    Input: Parameterized<V, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<V>,
+    Input: Parameterized<
+            V,
+            Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    Output: for<'call> Parameterized<
+            V,
+            Family: ParameterizedFamily<Tracer<'call, DifferentiableOperationTracingEngine<E>>>,
+            To<Tracer<'call, DifferentiableOperationTracingEngine<E>>>: Parameterized<
+                Tracer<'call, DifferentiableOperationTracingEngine<E>>,
+                To<V> = Output,
+            >,
+        >,
 > JvpDispatch<E, Input, Output, ConcreteJvp> for V
-where
-    E: DifferentiableEngine<Value = V> + 'static,
-    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    for<'engine> Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
-        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
-    E::DifferentiableOperation: DifferentiableOperation<E>,
-    E::LinearOperation: InterpretableOperation<E::Type, V>
-        + SupportsAdd<E::Type, V>
-        + SupportsNeg<E::Type, V>
-        + SupportsScale<E::Type, V>,
 {
     type FunctionInput<'engine>
         = Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>
@@ -86,15 +92,12 @@ where
     where
         E: 'engine;
 
-    fn invoke<'engine, F>(
+    fn invoke<'engine, F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>>(
         engine: &'engine E,
         function: F,
         primals: Input,
         tangents: Input,
-    ) -> Result<(Output, Output), TracingError>
-    where
-        F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>,
-    {
+    ) -> Result<(Output, Output), TracingError> {
         let primal_structure = primals.parameter_structure();
         let tangent_structure = tangents.parameter_structure();
         if primal_structure != tangent_structure {
@@ -117,20 +120,30 @@ where
 /// compiled program.
 impl<
     'engine,
-    E,
+    E: DifferentiableTracingEngine<
+            Value = V,
+            Operation: DifferentiableOperation<TracingContext<'engine, E>>
+                           + SupportsAdd<E::Type, V>
+                           + SupportsZeroLike<E::Type, V>,
+            LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+        > + TracingEngine
+        + 'static,
     V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Debug + PartialEq, To<Tracer<'engine, E>> = Input>,
-    Output: Parameterized<Tracer<'engine, E>, To<Tracer<'engine, E>> = Output>,
+    Input: Parameterized<
+            Tracer<'engine, E>,
+            Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
+            To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
+            ParameterStructure: Debug + PartialEq,
+            To<Tracer<'engine, E>> = Input,
+        >,
+    Output: Parameterized<
+            Tracer<'engine, E>,
+            Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
+            To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Output>,
+            To<Tracer<'engine, E>> = Output,
+        >,
 > JvpDispatch<E, Input, Output, TracedJvp> for Tracer<'engine, E>
 where
-    E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + TracingEngine + 'static,
-    Input::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
-    Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
-    Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
-    Output::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Output>,
-    E::Operation:
-        DifferentiableOperation<TracingContext<'engine, E>> + SupportsAdd<E::Type, V> + SupportsZeroLike<E::Type, V>,
-    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
     crate::tracing_v2::operations::AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     type FunctionInput<'call>
@@ -142,15 +155,12 @@ where
     where
         E: 'call;
 
-    fn invoke<'call, F>(
+    fn invoke<'call, F: FnOnce(Self::FunctionInput<'call>) -> Self::FunctionOutput<'call>>(
         _engine: &'call E,
         function: F,
         primals: Input,
         tangents: Input,
-    ) -> Result<(Output, Output), TracingError>
-    where
-        F: FnOnce(Self::FunctionInput<'call>) -> Self::FunctionOutput<'call>,
-    {
+    ) -> Result<(Output, Output), TracingError> {
         let primal_structure = primals.parameter_structure();
         let tangent_structure = tangents.parameter_structure();
         if primal_structure != tangent_structure {
@@ -190,21 +200,22 @@ where
 /// Primitive-specific local JVP rules live in [`crate::tracing_v2::operations`]; [`jvp`] is the
 /// orchestration layer that selects the concrete or traced execution path.
 #[allow(private_bounds, private_interfaces)]
-pub fn jvp<'engine, E, F, Input, Output, Leaf, Mode>(
+pub fn jvp<
+    'engine,
+    E: Engine,
+    F: FnOnce(
+        <Leaf as JvpDispatch<E, Input, Output, Mode>>::FunctionInput<'engine>,
+    ) -> <Leaf as JvpDispatch<E, Input, Output, Mode>>::FunctionOutput<'engine>,
+    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
+    Output: Parameterized<Leaf>,
+    Leaf: JvpDispatch<E, Input, Output, Mode>,
+    Mode,
+>(
     engine: &'engine E,
     function: F,
     primals: Input,
     tangents: Input,
-) -> Result<(Output, Output), TracingError>
-where
-    E: Engine,
-    Leaf: JvpDispatch<E, Input, Output, Mode>,
-    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<Leaf>,
-    F: FnOnce(
-        <Leaf as JvpDispatch<E, Input, Output, Mode>>::FunctionInput<'engine>,
-    ) -> <Leaf as JvpDispatch<E, Input, Output, Mode>>::FunctionOutput<'engine>,
-{
+) -> Result<(Output, Output), TracingError> {
     Leaf::invoke(engine, function, primals, tangents)
 }
 

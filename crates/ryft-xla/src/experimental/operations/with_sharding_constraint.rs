@@ -41,9 +41,8 @@ impl WithShardingConstraintOperation {
         &self.sharding
     }
 
-    fn base_custom_primitive<V>(&self) -> CustomPrimitive<ArrayType, V>
+    fn base_custom_primitive<V: Traceable<ArrayType> + 'static>(&self) -> CustomPrimitive<ArrayType, V>
     where
-        V: Traceable<ArrayType> + 'static,
         Self: Clone
             + InterpretableOperation<ArrayType, V>
             + LinearOperation<ArrayType, V, LinearArrayOperation<V>>

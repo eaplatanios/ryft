@@ -29,13 +29,14 @@ use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 /// Linear staged operation carrier used by the XLA backend.
 pub type LinearXlaOperation<V = ShardMapTensor> = LinearArrayOperation<V>;
 
-fn make_linear_xla_rematerialize<E>(
+fn make_linear_xla_rematerialize<
+    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
+>(
     engine: &E,
     body: &FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaOperation>,
     input_primals: Vec<ShardMapTensor>,
 ) -> Result<LinearRematerializeOperation<ArrayType, ShardMapTensor>, TracingError>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
     XlaOperation: DifferentiableOperation<E>,
 {
     let body_program = body.program();
@@ -93,13 +94,14 @@ fn replay_xla_program_with_tracers(
         .collect()
 }
 
-fn interpret_xla_condition_jvp<E>(
+fn interpret_xla_condition_jvp<
+    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
+>(
     condition: &ConditionOperation<ShardMapTensor, XlaOperation>,
     context: &mut JvpContext<'_, E>,
     inputs: &[JvpTracer<ShardMapTensor, AtomId>],
 ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
     XlaOperation: DifferentiableOperation<E>,
 {
     let ConditionPredicate::Captured(predicate) = condition.predicate() else {

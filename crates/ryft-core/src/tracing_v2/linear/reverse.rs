@@ -7,25 +7,31 @@ use crate::tracing_v2::DifferentiationError;
 /// [`linearize`] is the staged counterpart to [`crate::tracing_v2::jvp`]. Instead of immediately
 /// applying a tangent input, it captures the Jacobian-vector product as a staged [`Program`] over
 /// linear operations that can be replayed later on any tangent with the same parameter structure.
-pub fn linearize<'engine, E, F, Input, Output, V>(
-    engine: &'engine E,
-    function: F,
-    primals: Input,
-) -> Result<(Output, Program<E::Type, V, E::LinearOperation, Input, Output>), TracingError>
-where
-    E: DifferentiableEngine<Value = V> + 'static,
-    V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
-    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Output: Parameterized<V>,
-    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Output::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
-        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
-    E::DifferentiableOperation: DifferentiableOperation<E>,
+pub fn linearize<
+    'engine,
+    E: DifferentiableEngine<Value = V, DifferentiableOperation: DifferentiableOperation<E>> + 'static,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-{
+    Input: Parameterized<
+            V,
+            Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    Output: Parameterized<
+            V,
+            Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>: Parameterized<
+                Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+                To<V> = Output,
+            >,
+        >,
+    V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
+>(
+    engine: &'engine E,
+    function: F,
+    primals: Input,
+) -> Result<(Output, Program<E::Type, V, E::LinearOperation, Input, Output>), TracingError> {
     let input_structure = primals.parameter_structure();
     let input_primals: Vec<V> = primals.into_parameters().collect();
     let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
@@ -41,29 +47,38 @@ where
 /// builds the corresponding pushforward program, and then transposes that pushforward into a staged
 /// pullback that maps output cotangents back to input cotangents.
 #[allow(private_bounds)]
-pub fn vjp<'engine, E, F, Input, Output, V>(
-    engine: &'engine E,
-    function: F,
-    primals: Input,
-) -> Result<(Output, Program<E::Type, V, E::LinearOperation, Output, Input>), TracingError>
-where
-    E: DifferentiableEngine<Value = V> + 'static,
-    V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
-    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Output: Parameterized<V>,
-    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Output::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
-        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
-    E::DifferentiableOperation: DifferentiableOperation<E>,
+pub fn vjp<
+    'engine,
+    E: DifferentiableEngine<
+            Value = V,
+            DifferentiableOperation: DifferentiableOperation<E>,
+            LinearOperation: Clone
+                                 + InterpretableOperation<E::Type, V>
+                                 + LinearOperation<E::Type, V, E::LinearOperation>
+                                 + SupportsZero<E::Type, V>,
+        > + 'static,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    E::LinearOperation: Clone
-        + InterpretableOperation<E::Type, V>
-        + LinearOperation<E::Type, V, E::LinearOperation>
-        + crate::tracing_v2::operations::SupportsZero<E::Type, V>,
-{
+    Input: Parameterized<
+            V,
+            Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    Output: Parameterized<
+            V,
+            Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>: Parameterized<
+                Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+                To<V> = Output,
+            >,
+        >,
+    V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
+>(
+    engine: &'engine E,
+    function: F,
+    primals: Input,
+) -> Result<(Output, Program<E::Type, V, E::LinearOperation, Output, Input>), TracingError> {
     let (output, pushforward) = linearize::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
     let pullback = pushforward.transpose(output_examples.as_slice())?;

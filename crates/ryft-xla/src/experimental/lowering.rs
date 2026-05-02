@@ -428,17 +428,13 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
     }
 }
 
-fn lower_constant_output<'b, 'c: 'b, 't: 'c, B, L>(
+fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Location<'c, 't> + Copy>(
     output_types: &[ArrayType],
     constant_kind: ShardMapConstantKind,
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    L: Location<'c, 't> + Copy,
-{
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     let output_type = output_types
         .first()
         .ok_or_else(|| LoweringError::from(TracingError::InvalidOutputCount { expected: 1, got: 0 }))?;
@@ -466,18 +462,14 @@ where
     Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
 }
 
-fn lower_like_constant<'b, 'c: 'b, 't: 'c, B, L>(
+fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Location<'c, 't> + Copy>(
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     constant_kind: ShardMapConstantKind,
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    L: Location<'c, 't> + Copy,
-{
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     if input_values.len() != 1 {
         return Err(TracingError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
     }

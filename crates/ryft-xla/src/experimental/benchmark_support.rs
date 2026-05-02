@@ -180,14 +180,13 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
 ///
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `traced`: Traced XLA handle to render.
-fn traced_xla_records<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>(
+fn traced_xla_records<
+    Input: Parameterized<ArrayType, Family: ParameterizedFamily<ShardMapTensor>>,
+    Output: Parameterized<ArrayType, Family: ParameterizedFamily<ShardMapTensor>>,
+>(
     case_id: &'static str,
     traced: &TracedXlaProgram<Input, Output>,
-) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError>
-where
-    Input::Family: ParameterizedFamily<ShardMapTensor>,
-    Output::Family: ParameterizedFamily<ShardMapTensor>,
-{
+) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let program = fold_xla_program_constants(traced.program())?.simplified()?;
     let summary = summarize_xla_program(&program)?;
     Ok(vec![record(

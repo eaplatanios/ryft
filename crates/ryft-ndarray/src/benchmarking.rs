@@ -37,15 +37,14 @@ pub fn cases() -> Vec<BenchmarkCase> {
 /// # Parameters
 ///
 ///   - `program`: Program to summarize.
-fn summarize_tracing_program<V, Input, Output, O>(
-    program: &Program<ArrayType, V, O, Input, Output>,
-) -> Result<IrBenchmarkSummary, BenchmarkError>
-where
+fn summarize_tracing_program<
     V: Traceable<ArrayType>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O: Clone + Operation<ArrayType>,
-{
+>(
+    program: &Program<ArrayType, V, O, Input, Output>,
+) -> Result<IrBenchmarkSummary, BenchmarkError> {
     summarize_program(program, |_| Ok(Vec::new()))
 }
 
@@ -56,17 +55,16 @@ where
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `surface`: Artifact surface to record.
 ///   - `program`: Program to render and summarize.
-fn ndarray_record<V, Input, Output, O>(
-    case_id: &'static str,
-    surface: &'static str,
-    program: &Program<ArrayType, V, O, Input, Output>,
-) -> Result<IrBenchmarkRecord, BenchmarkError>
-where
+fn ndarray_record<
     V: Traceable<ArrayType>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O: Clone + Operation<ArrayType>,
-{
+>(
+    case_id: &'static str,
+    surface: &'static str,
+    program: &Program<ArrayType, V, O, Input, Output>,
+) -> Result<IrBenchmarkRecord, BenchmarkError> {
     Ok(record(case_id, "matrix", surface, program.to_string(), summarize_tracing_program(program)?))
 }
 
@@ -83,10 +81,7 @@ fn matrix_inputs() -> MatrixPair {
 /// # Parameters
 ///
 ///   - `inputs`: Structured matrix inputs.
-fn bilinear_matmul<M>(inputs: (M, M)) -> M
-where
-    M: Clone + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
-{
+fn bilinear_matmul<M: Clone + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>>(inputs: (M, M)) -> M {
     inputs.0.matmul(inputs.1)
 }
 
@@ -95,10 +90,9 @@ where
 /// # Parameters
 ///
 ///   - `inputs`: Structured matrix inputs.
-fn three_matmul_sine<M>(inputs: (M, M, M, M)) -> M
-where
-    M: Clone + Sin + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
-{
+fn three_matmul_sine<M: Clone + Sin + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>>(
+    inputs: (M, M, M, M),
+) -> M {
     let (x, a, b, c) = inputs;
     x.matmul(a).sin().matmul(b).matmul(c)
 }

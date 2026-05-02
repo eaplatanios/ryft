@@ -71,15 +71,14 @@ pub(crate) fn cases() -> Vec<BenchmarkCase> {
 /// # Parameters
 ///
 ///   - `program`: Program to summarize.
-fn summarize_tracing_program<V, Input, Output, O>(
-    program: &Program<ArrayType, V, O, Input, Output>,
-) -> Result<IrBenchmarkSummary, BenchmarkError>
-where
+fn summarize_tracing_program<
     V: Traceable<ArrayType>,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
     O: Clone + crate::operations::Operation<ArrayType>,
-{
+>(
+    program: &Program<ArrayType, V, O, Input, Output>,
+) -> Result<IrBenchmarkSummary, BenchmarkError> {
     summarize_program(program, |_| Ok(Vec::new()))
 }
 
@@ -90,12 +89,7 @@ where
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `surface`: Artifact surface to record.
 ///   - `program`: Program to render and summarize.
-fn tracing_record<V, Input, Output, O>(
-    case_id: &'static str,
-    surface: &'static str,
-    program: &Program<ArrayType, V, O, Input, Output>,
-) -> Result<IrBenchmarkRecord, BenchmarkError>
-where
+fn tracing_record<
     V: Traceable<ArrayType>
         + crate::tracing_v2::Sin
         + crate::tracing_v2::Cos
@@ -109,7 +103,11 @@ where
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
     O: Clone + crate::operations::Operation<ArrayType>,
-{
+>(
+    case_id: &'static str,
+    surface: &'static str,
+    program: &Program<ArrayType, V, O, Input, Output>,
+) -> Result<IrBenchmarkRecord, BenchmarkError> {
     Ok(record(case_id, tracing_category(case_id), surface, program.to_string(), summarize_tracing_program(program)?))
 }
 
@@ -127,10 +125,7 @@ fn tracing_category(case_id: &str) -> &'static str {
 /// # Parameters
 ///
 ///   - `x`: Scalar input.
-fn quartic_plus_sin<T>(x: T) -> T
-where
-    T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
-{
+fn quartic_plus_sin<T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>>(x: T) -> T {
     x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
 }
 

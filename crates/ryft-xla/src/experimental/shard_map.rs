@@ -505,13 +505,12 @@ fn xla_op_supports_constant_folding(op: &XlaOperation) -> bool {
 }
 
 /// Folds literal-only first-order XLA instructions while keeping higher-order XLA ops staged.
-pub(crate) fn fold_xla_program_constants<Input, Output>(
-    program: &XlaProgram<Input, Output>,
-) -> Result<XlaProgram<Input, Output>, TracingError>
-where
+pub(crate) fn fold_xla_program_constants<
     Input: Parameterized<ShardMapTensor>,
     Output: Parameterized<ShardMapTensor>,
-{
+>(
+    program: &XlaProgram<Input, Output>,
+) -> Result<XlaProgram<Input, Output>, TracingError> {
     let mut atoms = program.atoms.clone();
     let mut instructions = Vec::with_capacity(program.instructions.len());
 
