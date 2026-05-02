@@ -453,11 +453,7 @@ where
             .map(|(cotangent, input_type)| materialize_optional_cotangent(context, *cotangent, input_type))
             .collect::<Vec<_>>();
         Ok(context
-            .apply_operation(
-                materialized.as_slice(),
-                LinearArrayOperation::<V, T>::Rematerialize(Box::new(transpose)),
-                self.body.input_types().len(),
-            )?
+            .stage(LinearArrayOperation::<V, T>::Rematerialize(Box::new(transpose)), materialized.as_slice())?
             .into_iter()
             .map(Some)
             .collect::<Vec<_>>())

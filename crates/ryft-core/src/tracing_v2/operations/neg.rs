@@ -86,7 +86,7 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<Array
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
-                    .apply_operation(&[atom], LinearArrayOperation::Neg, 1)?
+                    .stage(LinearArrayOperation::Neg, &[atom])?
                     .into_iter()
                     .next()
                     .expect("neg transpose should produce one cotangent contribution"),
@@ -112,7 +112,7 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + Z
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
-                    .apply_operation(&[atom], LinearArrayOperation::<V, DataType>::Neg, 1)?
+                    .stage(LinearArrayOperation::<V, DataType>::Neg, &[atom])?
                     .into_iter()
                     .next()
                     .expect("neg transpose should produce one cotangent contribution"),

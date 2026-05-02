@@ -588,10 +588,9 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
             .zip(self.output_types.iter())
             .map(|(cotangent, output_type)| materialize_optional_cotangent(context, cotangent, output_type))
             .collect::<Vec<_>>();
-        let contributions = context.apply_operation(
-            materialized.as_slice(),
+        let contributions = context.stage(
             LinearArrayOperation::Custom(Arc::new(self.transpose_op().to_tensor_linear_custom_primitive())),
-            self.input_types.len(),
+            materialized.as_slice(),
         )?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
@@ -775,10 +774,9 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
             .zip(self.output_types.iter())
             .map(|(cotangent, output_type)| materialize_optional_cotangent(context, cotangent, output_type))
             .collect::<Vec<_>>();
-        let contributions = context.apply_operation(
-            materialized.as_slice(),
+        let contributions = context.stage(
             LinearArrayOperation::Custom(Arc::new(self.transpose_op().to_tracer_linear_custom_primitive())),
-            self.input_types.len(),
+            materialized.as_slice(),
         )?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }

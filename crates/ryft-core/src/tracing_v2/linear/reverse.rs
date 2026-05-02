@@ -653,13 +653,13 @@ mod tests {
                 Self::Add => vec![output_cotangents[0], output_cotangents[0]],
                 Self::Neg => match output_cotangents[0] {
                     Some(cotangent) => {
-                        vec![Some(context.apply_operation(&[cotangent], Self::Neg, 1)?[0])]
+                        vec![Some(context.stage(Self::Neg, &[cotangent])?[0])]
                     }
                     None => vec![None],
                 },
                 Self::Scale { factor } => match output_cotangents[0] {
                     Some(cotangent) => {
-                        vec![Some(context.apply_operation(&[cotangent], Self::Scale { factor: factor.clone() }, 1)?[0])]
+                        vec![Some(context.stage(Self::Scale { factor: factor.clone() }, &[cotangent])?[0])]
                     }
                     None => vec![None],
                 },

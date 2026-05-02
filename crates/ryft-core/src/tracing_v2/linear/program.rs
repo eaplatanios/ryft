@@ -209,7 +209,12 @@ where
         })
         .collect::<Vec<_>>();
     drop(builder);
-    let builder = context.take_builder()?;
+    let builder = context.builder.clone();
+    context.builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+    let builder = match Rc::try_unwrap(builder) {
+        Ok(builder) => builder.into_inner(),
+        Err(_) => return Err(TracingError::EscapedProgramBuilder),
+    };
     builder
         .build(outputs, program.output_structure.clone(), program.input_structure.clone())?
         .simplified()
@@ -230,9 +235,10 @@ where
         Input: Parameterized<V>,
         Output: Parameterized<V>,
     {
-        let parent_builder = self.replace_builder(Rc::new(RefCell::new(ProgramBuilder::new())));
+        let parent_builder = self.builder.clone();
+        self.builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let result = transpose_linear_program_with_context(self, program);
-        let _nested_builder = self.replace_builder(parent_builder);
+        self.builder = parent_builder;
         result
     }
 }

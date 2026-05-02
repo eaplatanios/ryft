@@ -1721,7 +1721,7 @@ where
                     return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
                 }
                 output_cotangents[0]
-                    .map(|atom| context.apply_operation(&[atom], Self::Neg, 1).map(|outputs| vec![Some(outputs[0])]))
+                    .map(|atom| context.stage(Self::Neg, &[atom]).map(|outputs| vec![Some(outputs[0])]))
                     .unwrap_or_else(|| Ok(vec![None]))
             }
             Self::Scale { factor } => {
@@ -1731,7 +1731,7 @@ where
                 output_cotangents[0]
                     .map(|atom| {
                         context
-                            .apply_operation(&[atom], Self::Scale { factor: factor.clone() }, 1)
+                            .stage(Self::Scale { factor: factor.clone() }, &[atom])
                             .map(|outputs| vec![Some(outputs[0])])
                     })
                     .unwrap_or_else(|| Ok(vec![None]))

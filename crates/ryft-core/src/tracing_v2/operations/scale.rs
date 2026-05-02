@@ -114,7 +114,7 @@ where
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
-                    .apply_operation(&[atom], LinearArrayOperation::<V, T>::Scale { factor: self.factor().clone() }, 1)?
+                    .stage(LinearArrayOperation::<V, T>::Scale { factor: self.factor().clone() }, &[atom])?
                     .into_iter()
                     .next()
                     .expect("scale transpose should produce one cotangent contribution"),

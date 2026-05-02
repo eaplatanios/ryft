@@ -67,7 +67,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for 
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
-                    .apply_operation(&[atom], LinearArrayOperation::Transpose, 1)?
+                    .stage(LinearArrayOperation::Transpose, &[atom])?
                     .into_iter()
                     .next()
                     .expect("matrix transpose should produce one cotangent contribution"),

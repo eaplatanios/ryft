@@ -99,10 +99,9 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for 
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
-                    .apply_operation(
-                        &[atom],
+                    .stage(
                         LinearArrayOperation::LeftMatMul { factor: self.factor.clone().transpose_matrix() },
-                        1,
+                        &[atom],
                     )?
                     .into_iter()
                     .next()

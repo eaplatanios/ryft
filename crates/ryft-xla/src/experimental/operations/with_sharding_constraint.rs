@@ -129,7 +129,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
         match output_cotangents[0] {
             Some(atom) => {
                 let contribution = context
-                    .apply_operation(&[atom], LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, 1)?
+                    .stage(LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, &[atom])?
                     .into_iter()
                     .next()
                     .expect("sharding constraint should produce one cotangent contribution");
@@ -186,11 +186,7 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
         match output_cotangents[0] {
             Some(atom) => {
                 let contribution = context
-                    .apply_operation(
-                        &[atom],
-                        LinearArrayOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())),
-                        1,
-                    )?
+                    .stage(LinearArrayOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())), &[atom])?
                     .into_iter()
                     .next()
                     .expect("sharding constraint should produce one cotangent contribution");

@@ -457,9 +457,7 @@ where
             .zip(self.output_types().iter())
             .map(|(cotangent, output_type)| stage_optional_cotangent(context, *cotangent, output_type))
             .collect::<Vec<_>>();
-        let input_count = self.input_types().len();
-        let cotangents =
-            context.apply_operation(materialized.as_slice(), O::from(transposed_condition), input_count)?;
+        let cotangents = context.stage(O::from(transposed_condition), materialized.as_slice())?;
         Ok(cotangents.into_iter().map(Some).collect())
     }
 }
@@ -1025,7 +1023,7 @@ mod tests {
                     match output_cotangents[0] {
                         Some(atom) => Ok(vec![Some(
                             context
-                                .apply_operation(&[atom], Self::Neg, 1)?
+                                .stage(Self::Neg, &[atom])?
                                 .into_iter()
                                 .next()
                                 .expect("neg transpose should produce one cotangent contribution"),
@@ -1038,7 +1036,7 @@ mod tests {
                     match output_cotangents[0] {
                         Some(atom) => Ok(vec![Some(
                             context
-                                .apply_operation(&[atom], Self::Scale { factor: factor.clone() }, 1)?
+                                .stage(Self::Scale { factor: factor.clone() }, &[atom])?
                                 .into_iter()
                                 .next()
                                 .expect("scale transpose should produce one cotangent contribution"),

@@ -313,13 +313,12 @@ impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for
         }
         Ok(vec![Some(
             context
-                .apply_operation(
-                    &[atom],
+                .stage(
                     LinearArrayOperation::Reshape {
                         input_shape: self.output_shape().clone(),
                         output_shape: self.input_shape().clone(),
                     },
-                    1,
+                    &[atom],
                 )?
                 .into_iter()
                 .next()

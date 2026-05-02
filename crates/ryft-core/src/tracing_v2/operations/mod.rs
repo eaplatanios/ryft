@@ -86,124 +86,111 @@ pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
 pub use scale::{ScaleOperation, SupportsScale};
 pub use sin::{Sin, SinOperation, SupportsSin};
 
-/// Semantic contract for staged operations that can live in linear programs.
+/// State threaded through [`LinearOperation::transpose`] while building a reverse linear program.
 ///
-/// A [`LinearOperation`] is not a separate IR container by itself. Instead, it is the capability
-/// an operation type must provide in order to participate in tangent and cotangent programs after
-/// one primal program has been linearized. In practice, this trait is implemented both by
-/// primitive semantic op types like [`AddOperation`] and by closed carrier enums such as
-/// [`LinearArrayOperation`], which delegate the rule to the wrapped semantic primitive.
+/// [`TranspositionContext`] owns the active [`ProgramBuilder`] for the transposed program. Rules
+/// use [`stage`](Self::stage) to append operations whose inputs are [`AtomId`]s already present in
+/// that builder, and higher-order rules may temporarily replace [`builder`](Self::builder) while
+/// transposing nested linear programs.
 ///
-/// For one linear operation `y = L(x)`, the transpose rule builds the reverse linear map `L^T`
-/// that pulls cotangents on `y` back to cotangents on `x`. The rule does not receive concrete
-/// primal witnesses because those are not part of the transpose trace. Instead, it operates
-/// directly on staged output cotangents and emits staged cotangent contributions for the op
-/// inputs. The transpose context is available for higher-order rules that need to recursively
-/// transpose nested programs and synthesize zeros for disconnected leaves.
-///
-/// A few concrete examples:
-///
-/// - For [`ScaleOperation`], `y = a * x`, the transpose stages one new scale instruction that
-///   computes `a * c`, where `c` is the output cotangent atom.
-/// - For [`AddOperation`], `y = x0 + x1`, the transpose returns the same cotangent atom for both
-///   inputs.
-/// - For [`MatrixTransposeOperation`], `Y = X^T`, the transpose stages another transpose on the
-///   output cotangent atom.
-/// - For [`ReshapeOperation`], the transpose reshapes the output cotangent back to the input shape because
-///   reshape only changes layout metadata.
-///
-/// Structural validation happens when the forward linear program is built and when any staged ops
-/// emitted by the rule are added to the transpose program.
-///
-/// Concrete state threaded through linear transposition rules.
-///
-/// [`TranspositionContext`] owns the currently active transpose-program builder. Primitive rules
-/// stage new linear instructions through it, and higher-order rules use it to recursively transpose
-/// nested linear programs into the same builder. The pass propagates structural zeros via
-/// `Option<AtomId>`, so no cotangent-synthesis policy lives on the context anymore.
+/// The context deliberately carries only builder state. Transpose rules operate on already-linear
+/// operations and abstract atom metadata, and structural zeros are represented by `Option<AtomId>`
+/// in [`LinearOperation::transpose`].
 pub struct TranspositionContext<T: Type, V: Traceable<T>, O: Clone + Operation<T>> {
-    /// Builder for the currently active transpose program.
+    /// [`ProgramBuilder`] that owns the reverse linear [`Program`](crate::tracing::Program) currently being staged.
     pub builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> TranspositionContext<T, V, O> {
-    /// Creates a transposition context that stages into `builder`.
-    #[doc(hidden)]
+    /// Creates a new [`TranspositionContext`] that stages into the provided [`ProgramBuilder`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `builder`: Shared builder that will own the staged reverse linear program.
     pub fn new(builder: Rc<RefCell<ProgramBuilder<T, V, O>>>) -> Self {
         Self { builder }
     }
 
-    /// Stages one operation in the currently active transpose program.
+    /// Stages `operation` in the active transpose builder and returns its output atoms.
     ///
-    /// `inputs` are atom ids that already live in the transpose builder. Output types are inferred
-    /// via [`Operation::infer_output_types`] and the resulting variable atoms are returned in
-    /// forward order.
-    pub fn apply_operation(
-        &self,
-        inputs: &[AtomId],
-        operation: O,
-        output_count: usize,
-    ) -> Result<Vec<AtomId>, TracingError> {
+    /// Output types are inferred with [`Operation::infer_output_types`] from the current types of
+    /// `inputs`. New variable atoms are allocated before the instruction is recorded, and the
+    /// returned atom ids are ordered like the operation outputs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Operation to append to the active transpose builder.
+    ///   - `inputs`: Atom ids in the active transpose builder that feed `operation`.
+    pub fn stage(&self, operation: O, inputs: &[AtomId]) -> Result<Vec<AtomId>, TracingError> {
         let mut builder_borrow = self.builder.borrow_mut();
         let input_types =
             inputs.iter().map(|atom| builder_borrow.atoms[atom.index].r#type().into_owned()).collect::<Vec<_>>();
         let output_types = operation.infer_output_types(&input_types)?;
-        if output_types.len() != output_count {
-            return Err(TracingError::InvalidOutputCount { expected: output_count, got: output_types.len() });
-        }
         let outputs = output_types.into_iter().map(|r#type| builder_borrow.add_variable(r#type)).collect::<Vec<_>>();
         builder_borrow
             .instructions
             .push(Instruction { operation, inputs: inputs.to_vec(), outputs: outputs.clone() });
         Ok(outputs)
     }
-
-    /// Replaces the active transpose-program builder and returns the previous one.
-    #[inline]
-    pub(crate) fn replace_builder(
-        &mut self,
-        builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
-    ) -> Rc<RefCell<ProgramBuilder<T, V, O>>> {
-        std::mem::replace(&mut self.builder, builder)
-    }
-
-    /// Takes ownership of the active builder, leaving an empty builder behind.
-    pub(crate) fn take_builder(&mut self) -> Result<ProgramBuilder<T, V, O>, TracingError> {
-        let builder = self.replace_builder(Rc::new(RefCell::new(ProgramBuilder::new())));
-        match Rc::try_unwrap(builder) {
-            Ok(builder) => Ok(builder.into_inner()),
-            Err(_) => Err(TracingError::EscapedProgramBuilder),
-        }
-    }
 }
 
-pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>>: Operation<T> {
-    /// Applies the transpose rule for reverse-mode differentiation.
+/// Operation-level contract for staged linear maps that can be transposed.
+///
+/// A [`LinearOperation`] is the capability an operation carrier provides after a primal program has
+/// been linearized. Implementors describe how one staged linear instruction contributes to the
+/// reverse linear program used by VJP and reverse-mode gradient transforms. The trait is
+/// implemented by primitive operation types, such as [`AddOperation`], and by carrier enums, such
+/// as [`LinearArrayOperation`], that delegate to primitive rules.
+///
+/// For a linear instruction `y = L(x)`, [`transpose`](Self::transpose) receives symbolic cotangent
+/// atoms for `y` and returns symbolic cotangent contributions for `x`. Rules may reuse existing
+/// cotangent atoms, return `None` for structural zeros, or stage additional linear operations in
+/// the active [`TranspositionContext`]. The rule does not receive concrete primal values; any
+/// required metadata must be encoded in the operation itself or in staged atom types.
+///
+/// Structural validation happens when the linear program is built and when transpose rules stage
+/// additional operations in the transpose builder.
+pub trait LinearOperation<T: Type, V: Traceable<T>, O: Clone + Operation<T>>: Operation<T> {
+    /// Applies this operation's transpose rule to symbolic output cotangents.
     ///
-    /// `output_cotangents` is aligned with the op outputs in forward order. Each entry is
-    /// `Some(atom)` when the corresponding output has an accumulated symbolic cotangent atom in
-    /// the active transpose builder and `None` when its cotangent is structurally zero. The
-    /// returned vector must be aligned with the op inputs in forward order.
+    /// The returned vector must contain one entry per operation input. Each `Some(atom)` is a
+    /// staged cotangent contribution in the active transpose builder, and each `None` means the
+    /// corresponding input receives a structural zero from this operation.
     ///
-    /// Returning `Some(atom)` means that input receives the staged cotangent contribution `atom`.
-    /// Returning `None` means the contribution is structurally zero and the transpose pass does
-    /// not need to materialize an explicit zero atom for that input. Rules stage new linear ops in
-    /// the transpose builder via [`TranspositionContext::apply_operation`].
+    /// # Parameters
+    ///
+    ///   - `context`: Active transpose context used to stage any new linear operations required by
+    ///     the rule.
+    ///   - `output_cotangents`: Cotangent atoms aligned with this operation's outputs. `None`
+    ///     entries represent structural zeros.
     fn transpose(
         &self,
-        context: &mut TranspositionContext<T, V, LinearCarrier>,
+        context: &mut TranspositionContext<T, V, O>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError>;
 }
 
-/// Forward-mode differentiation rule keyed only by the engine that owns the staged carriers.
+/// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
 ///
-/// Primitive JVP rules consume `JvpTracer<E::Value, AtomId>` inputs — primal value plus tangent
-/// atom id in the active linear-program builder — and stage tangent ops via
-/// [`JvpContext::apply_operation`]. Higher-order rules (e.g., the rematerialization and
-/// control-flow ops) use [`JvpContext::engine`] to recurse into nested sub-programs.
+/// A [`DifferentiableOperation`] is keyed by the [`DifferentiableEngine`] that supplies the value,
+/// type, and linear-operation families used while differentiating. Implementors consume
+/// [`JvpTracer`] inputs, each carrying a primal value and a tangent atom in the active linear
+/// builder, and return traced primal/tangent outputs.
+///
+/// Primitive rules usually stage tangent operations through [`JvpContext::apply_operation`].
+/// Higher-order rules use [`JvpContext::engine`] to recurse into nested programs with the same
+/// engine.
 pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E::Type> {
-    /// Applies the forward-mode Jacobian-Vector Product (JVP) rule.
+    /// Applies this operation's forward-mode Jacobian-Vector Product (JVP) rule.
+    ///
+    /// The returned vector must be aligned with this operation's outputs and must carry both the
+    /// primal output values and the staged tangent atoms for those outputs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active JVP context used to stage tangent operations and access the
+    ///     differentiable engine.
+    ///   - `inputs`: Traced inputs aligned with this operation's inputs.
     fn jvp(
         &self,
         context: &mut JvpContext<'_, E>,
