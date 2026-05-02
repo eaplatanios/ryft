@@ -437,7 +437,7 @@ mod tests {
             let mut target_block = context.block(&[(i32_type, location)]);
             let argument = entry_block.argument(0).unwrap();
             let op = br(&target_block, &[argument], location);
-            assert_eq!(op.destination(), (&target_block).into());
+            assert_eq!(op.destination(), BlockRef::from(&target_block));
             assert_eq!(op.destination_operands(), vec![argument]);
             assert_eq!(op.operands().count(), 1);
             assert_eq!(op.results().count(), 0);
@@ -493,8 +493,8 @@ mod tests {
             assert_eq!(unweighted_op.branch_weights(), None);
             let op = cond_br(predicate, &true_block, &false_block, &[true_value], &[false_value], &[13, 21], location);
             assert_eq!(op.predicate(), predicate);
-            assert_eq!(op.on_true_successor(), (&true_block).into());
-            assert_eq!(op.on_false_successor(), (&false_block).into());
+            assert_eq!(op.on_true_successor(), BlockRef::from(&true_block));
+            assert_eq!(op.on_false_successor(), BlockRef::from(&false_block));
             assert_eq!(op.on_true_successor_operands(), vec![true_value]);
             assert_eq!(op.on_false_successor_operands(), vec![false_value]);
             assert_eq!(op.branch_weights().map(Vec::<i32>::from), Some(vec![13, 21]));
