@@ -11,7 +11,7 @@ use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::transposition::LinearOperation;
 use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::{Differentiable, JvpTracer};
-use ryft_core::tracing_v2::linear::{linearize_traced_program, transpose_traced_linear_program};
+use ryft_core::tracing_v2::linear::linearize_traced_program;
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearArrayOperation,
     LinearCustomPrimitive,
@@ -1428,8 +1428,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
         let local_output_cotangents = combined_inputs[local_input_count..].to_vec();
         let (_, pushforward_program) =
             linearize_traced_program(pullback_compiled_context.clone(), &body.program, local_primals)?;
-        let pullback_program =
-            transpose_traced_linear_program(pullback_compiled_context.clone(), &pushforward_program)?;
+        let pullback_program = pullback_compiled_context.transpose(&pushforward_program)?;
         pullback_program.interpret(local_output_cotangents)?
     };
     drop(pullback_compiled_context);

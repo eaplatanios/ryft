@@ -8,10 +8,11 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::operations::{InterpretableOperation, Operation};
-use crate::parameters::Parameter;
+use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation as LinearOperationTrait;
-use crate::tracing::{AtomId, Instruction, ProgramBuilder, Traceable, TracingError};
+use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
+use crate::tracing_v2::operations::constants::Zero;
 use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale, SupportsZero};
 use crate::tracing_v2::{LinearScalarOperation, ScalarOperation};
 use crate::types::{ArrayType, Type, Typed};
@@ -172,6 +173,127 @@ impl<V: Display, T> Display for JvpTracer<V, T> {
 }
 
 impl<Ty: Type, V: Traceable<Ty>, T: Clone + Parameter> Traceable<Ty> for JvpTracer<V, T> {}
+
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Program<T, V, O, Input, Output>
+{
+    /// Converts this staged primal [`Program`] into a staged pushforward linear map.
+    ///
+    /// This is the reusable IR-level form of forward-mode differentiation. Instead of evaluating
+    /// the JVP immediately, it builds a staged [`Program`] over linear operations that can be
+    /// replayed later on arbitrary tangent inputs at the same primal point.
+    ///
+    /// # Parameters
+    ///
+    ///   - `engine`: Differentiable engine that supplies the linear operation carrier and primitive
+    ///     JVP rules.
+    ///   - `input_primals`: Concrete primal values aligned with this program's input atoms.
+    pub fn linearize<E: DifferentiableEngine<Type = T, Value = V> + ?Sized>(
+        &self,
+        engine: &E,
+        input_primals: Vec<V>,
+    ) -> Result<Program<T, V, E::LinearOperation, Input, Output>, TracingError>
+    where
+        V: Differentiable<T, Tangent = V> + Zero<T>,
+        O: DifferentiableOperation<E>,
+    {
+        fn tangent_for_atom<T, V, LinearOperation>(
+            primal_values: &[Option<V>],
+            builder: &Rc<RefCell<ProgramBuilder<T, V, LinearOperation>>>,
+            tangents: &mut [Option<AtomId>],
+            atom_id: AtomId,
+        ) -> Result<AtomId, TracingError>
+        where
+            T: Type,
+            V: Differentiable<T, Tangent = V> + Zero<T>,
+            LinearOperation: Clone + Operation<T>,
+        {
+            if let Some(atom) = tangents[atom_id.index] {
+                return Ok(atom);
+            }
+            let primal = primal_values[atom_id.index].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
+            let atom = builder.borrow_mut().add_constant(<V as Zero<T>>::zero(primal.r#type().as_ref())?);
+            tangents[atom_id.index] = Some(atom);
+            Ok(atom)
+        }
+
+        if input_primals.len() != self.input_ids.len() {
+            return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: input_primals.len() });
+        }
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, E::LinearOperation>::new()));
+        let mut primals: Vec<Option<V>> = vec![None; self.atoms.len()];
+        let mut tangents: Vec<Option<AtomId>> = vec![None; self.atoms.len()];
+        for (input_atom, input_primal) in self.input_ids.iter().copied().zip(input_primals.into_iter()) {
+            let tangent_atom = builder.borrow_mut().add_input(input_primal.r#type().into_owned());
+            tangents[input_atom.index] = Some(tangent_atom);
+            primals[input_atom.index] = Some(input_primal);
+        }
+        for (atom_index, atom) in self.atoms.iter().enumerate() {
+            let atom_id = AtomId { index: atom_index };
+            if let Atom::Constant(value) = atom {
+                primals[atom_id.index] = Some(value.clone());
+            }
+        }
+
+        let mut context = JvpContext::new(engine, builder.clone());
+        for instruction in &self.instructions {
+            let input_duals = instruction
+                .inputs
+                .iter()
+                .copied()
+                .map(|input_atom| {
+                    Ok(JvpTracer {
+                        primal: primals[input_atom.index]
+                            .clone()
+                            .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
+                        tangent: tangent_for_atom::<T, V, E::LinearOperation>(
+                            primals.as_slice(),
+                            &builder,
+                            tangents.as_mut_slice(),
+                            input_atom,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, TracingError>>()?;
+            let output_duals = instruction.operation.jvp(&mut context, input_duals.as_slice())?;
+            if output_duals.len() != instruction.outputs.len() {
+                return Err(TracingError::InvalidOutputCount {
+                    expected: instruction.outputs.len(),
+                    got: output_duals.len(),
+                });
+            }
+            for (output_atom, output_dual) in instruction.outputs.iter().copied().zip(output_duals.into_iter()) {
+                primals[output_atom.index] = Some(output_dual.primal);
+                tangents[output_atom.index] = Some(output_dual.tangent);
+            }
+        }
+
+        let output_tangents = self
+            .output_ids
+            .iter()
+            .copied()
+            .map(|output_atom| {
+                tangent_for_atom::<T, V, E::LinearOperation>(
+                    primals.as_slice(),
+                    &builder,
+                    tangents.as_mut_slice(),
+                    output_atom,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(context);
+        drop(tangents);
+        let builder = match Rc::try_unwrap(builder) {
+            Ok(builder) => builder.into_inner(),
+            Err(_) => {
+                return Err(TracingError::EscapedProgramBuilder);
+            }
+        };
+        builder
+            .build(output_tangents, self.input_structure.clone(), self.output_structure.clone())?
+            .simplified()
+    }
+}
 
 /// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
 ///

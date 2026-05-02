@@ -6,7 +6,6 @@ use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placehold
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
-use crate::tracing_v2::linear::{linearize_program, transpose_linear_program_with_output_examples};
 use crate::tracing_v2::operations::constants::{SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::tracing_v2::{
     ArrayOperation, Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine,
@@ -227,8 +226,7 @@ where
             self.body().program(),
             primal_inputs,
         )?;
-        let pullback =
-            crate::tracing_v2::linear::transpose_traced_linear_program((*context.engine).clone(), &pushforward)?;
+        let pullback = context.engine.transpose(&pushforward)?;
 
         let body_input_types = self.body().input_types().to_vec();
         let body_output_types = self.body().output_types().to_vec();
@@ -508,8 +506,8 @@ where
 {
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
-    let pushforward = linearize_program(engine, body_program, input_primals)?;
-    let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
+    let pushforward = body_program.linearize(engine, input_primals)?;
+    let pullback = pushforward.transpose(output_primals.as_slice())?;
     Ok(LinearRematerializeOperation::new(
         FlatTracedRematerialize::from_parts(body.input_types.clone(), body.output_types.clone(), pushforward),
         FlatTracedRematerialize::from_parts(body.output_types.clone(), body.input_types.clone(), pullback),

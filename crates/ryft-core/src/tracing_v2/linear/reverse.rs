@@ -32,7 +32,7 @@ where
     let differentiable_tracing_engine = DifferentiableOperationTracingEngine::new(engine);
     let (primal_output, program) =
         differentiable_tracing_engine.interpret_and_trace(function, reconstructed_primals)?;
-    Ok((primal_output, linearize_program(engine, &program, input_primals)?))
+    Ok((primal_output, program.linearize(engine, input_primals)?))
 }
 
 /// Runs forward-mode differentiation inside an existing outer trace.
@@ -128,7 +128,7 @@ where
 {
     let (output, pushforward) = jvp_program::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
-    let pullback = transpose_linear_program_with_output_examples(&pushforward, output_examples.as_slice())?;
+    let pullback = pushforward.transpose(output_examples.as_slice())?;
     Ok((output, pullback))
 }
 

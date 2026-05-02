@@ -19,8 +19,6 @@ use crate::types::{ArrayType, Type, Typed};
 
 /// Dense Jacobian and Hessian materialization helpers.
 mod dense;
-/// Program-level linearization and transpose construction.
-mod program;
 /// Rematerialization-aware compiled-gradient helpers.
 mod rematerialization;
 /// Traced-program linearization helpers.
@@ -29,9 +27,6 @@ mod replay;
 mod reverse;
 
 pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
-#[doc(hidden)]
-pub use program::linearize_program;
-pub use program::{transpose_linear_program_with_output_examples, transpose_traced_linear_program};
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
 #[doc(hidden)]
 pub use replay::TracedLinearizableOperation;
@@ -93,7 +88,7 @@ where
         return Err(DifferentiationError::InvalidGradientOutputLeafCount { expected: 1, got: outputs.len() }.into());
     }
     let traced_output = outputs[0].clone();
-    let pullback = transpose_traced_linear_program(tracing_context.clone(), &pushforward)?;
+    let pullback = tracing_context.transpose(&pushforward)?;
     let seed_type = traced_output.r#type().into_owned();
     let _ = <V as One<E::Type>>::one(&seed_type)?;
     let seed_value = tracing_context.engine.one(&seed_type)?;
@@ -370,7 +365,7 @@ mod tests {
         let engine = ArrayScalarEngine;
         let (primal, pushforward) =
             jvp_program(&engine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
-        let pullback = transpose_linear_program_with_output_examples(&pushforward, &[primal]).unwrap();
+        let pullback = pushforward.transpose(&[primal]).unwrap();
         let cotangent = pullback.interpret(1.0f64).unwrap();
 
         approx_eq(primal, 2.0 * 3.0 + 2.0f64.sin());
@@ -391,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn linearize_program_does_not_replay_the_forward_program_to_recover_representatives() {
+    fn program_linearize_does_not_replay_the_forward_program_to_recover_representatives() {
         let primitive =
             CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule::<ArrayScalarEngine, _>(PanicReplayOp);
         let mut builder = ProgramBuilder::<ArrayType, f64, ArrayOperation<f64>>::new();
@@ -406,7 +401,7 @@ mod tests {
         let program = builder.build::<f64, f64>(output, Placeholder, Placeholder).unwrap();
 
         let engine = ArrayScalarEngine;
-        let pushforward = linearize_program(&engine, &program, vec![3.0f64]).unwrap();
+        let pushforward = program.linearize(&engine, vec![3.0f64]).unwrap();
         approx_eq(pushforward.interpret(2.5f64).unwrap(), 2.5);
     }
 
@@ -428,7 +423,7 @@ mod tests {
         let program = builder.build::<f64, f64>(output, Placeholder, Placeholder).unwrap();
         let pushforward = program;
 
-        let pullback = super::program::transpose_linear_program_with_output_examples(&pushforward, &[0.0f64]).unwrap();
+        let pullback = pushforward.transpose(&[0.0f64]).unwrap();
         approx_eq(pullback.interpret(4.0f64).unwrap(), 4.0);
     }
 

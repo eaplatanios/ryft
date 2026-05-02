@@ -10,7 +10,6 @@ use crate::tracing::engines::TracingEngine;
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{Instruction, Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
-use crate::tracing_v2::linear::linearize_program;
 use crate::tracing_v2::operations::constants::{Zero, ZeroLike};
 use crate::tracing_v2::{
     ArrayOperation, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, JvpContext, JvpTracer,
@@ -451,8 +450,8 @@ where
         }
         let transposed_condition = ConditionOperation::with_captured_predicate(
             predicate,
-            context.transpose_nested_program(&self.true_branch)?,
-            context.transpose_nested_program(&self.false_branch)?,
+            context.transpose_nested(&self.true_branch)?,
+            context.transpose_nested(&self.false_branch)?,
         )?;
         let materialized = output_cotangents
             .iter()
@@ -518,7 +517,7 @@ where
         let tangent_operands = operands.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let branch = self.selected_branch(predicate);
         let primal_outputs = branch.interpret(primal_operands.clone())?;
-        let pushforward = linearize_program(context.engine, branch, primal_operands)?;
+        let pushforward = branch.linearize(context.engine, primal_operands)?;
         let tangent_outputs = replay_linear_program_on_atoms(context, &pushforward, tangent_operands.as_slice())?;
         Ok(primal_outputs
             .into_iter()
@@ -742,7 +741,7 @@ where
                     .collect());
             }
 
-            let pushforward = linearize_program(context.engine, self.body(), state_primals.clone())?;
+            let pushforward = self.body().linearize(context.engine, state_primals.clone())?;
             let next_primals = self.body.interpret(state_primals)?;
             let next_tangents = replay_linear_program_on_atoms(context, &pushforward, state_tangents.as_slice())?;
             if next_primals.len() != state_count {

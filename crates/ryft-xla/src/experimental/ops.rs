@@ -5,9 +5,7 @@ use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{AtomId, TracingError};
 use ryft_core::tracing_v2::differentiation::{Differentiable, JvpTracer};
-use ryft_core::tracing_v2::linear::{
-    TracedLinearizableOperation, linearize_program, transpose_linear_program_with_output_examples,
-};
+use ryft_core::tracing_v2::linear::TracedLinearizableOperation;
 use ryft_core::tracing_v2::operations::{
     AddOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation, FlatTracedRematerialize,
     LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
@@ -42,8 +40,8 @@ where
 {
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
-    let pushforward = linearize_program(engine, body_program, input_primals)?;
-    let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
+    let pushforward = body_program.linearize(engine, input_primals)?;
+    let pullback = pushforward.transpose(output_primals.as_slice())?;
     Ok(LinearRematerializeOperation::new(
         FlatTracedRematerialize::from_parts(body.input_types().to_vec(), body.output_types().to_vec(), pushforward),
         FlatTracedRematerialize::from_parts(body.output_types().to_vec(), body.input_types().to_vec(), pullback),
@@ -114,8 +112,8 @@ where
 
     let selected_branch = if *predicate { condition.true_branch() } else { condition.false_branch() };
     let primal_outputs = selected_branch.interpret(primal_inputs.clone())?;
-    let true_pushforward = linearize_program(context.engine, condition.true_branch(), primal_inputs.clone())?;
-    let false_pushforward = linearize_program(context.engine, condition.false_branch(), primal_inputs)?;
+    let true_pushforward = condition.true_branch().linearize(context.engine, primal_inputs.clone())?;
+    let false_pushforward = condition.false_branch().linearize(context.engine, primal_inputs)?;
     let linear_condition = ConditionOperation::with_captured_predicate(*predicate, true_pushforward, false_pushforward)
         .map_err(TracingError::from)?;
     let tangent_outputs = context.apply_operation(

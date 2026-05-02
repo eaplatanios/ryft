@@ -28,7 +28,7 @@ where
 /// Builds a staged linear program by replaying a traced primal program on symbolic dual inputs.
 ///
 /// In the overall architecture, this is the traced-program analogue of
-/// [`super::program::linearize_program`]: instead of consuming concrete primals and producing a
+/// [`Program::linearize`](crate::tracing::Program::linearize): instead of consuming concrete primals and producing a
 /// linear program immediately, it works inside an outer JIT trace and stages the resulting
 /// pushforward symbolically.
 #[doc(hidden)]
