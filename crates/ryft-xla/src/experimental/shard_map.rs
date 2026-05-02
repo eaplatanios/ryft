@@ -491,7 +491,9 @@ pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, X
 fn xla_op_supports_constant_folding(op: &XlaOperation) -> bool {
     matches!(
         op,
-        XlaOperation::Add
+        XlaOperation::Zero(_)
+            | XlaOperation::One(_)
+            | XlaOperation::Add
             | XlaOperation::Mul
             | XlaOperation::Neg
             | XlaOperation::Sin

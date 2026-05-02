@@ -73,7 +73,9 @@ impl<V: Typed<DataType> + Clone + Neg<Output = V>> InterpretableOperation<DataTy
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for NegOperation {
+impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<ArrayType, V, LinearArrayOperation<V>>
+    for NegOperation
+{
     fn transpose(
         &self,
         context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
@@ -93,8 +95,8 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<Array
     }
 }
 
-impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + ZeroLike> LinearOperation<DataType, V>
-    for NegOperation
+impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + ZeroLike>
+    LinearOperation<DataType, V, LinearArrayOperation<V, DataType>> for NegOperation
 {
     fn transpose(
         &self,

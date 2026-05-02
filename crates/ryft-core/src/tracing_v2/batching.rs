@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::tracing::engines::Tracer;
 use crate::tracing::{InterpretableOperation, Operation, Program, Traceable, TracingError, Value};
-use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
+use crate::tracing_v2::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::{
     ArrayOperation, ControlFlowError, ControlFlowValue, Cos, LinearArrayOperation, MatrixOps, Sin,
@@ -301,6 +301,8 @@ impl<
         + Neg<Output = V>
         + Sin
         + Cos
+        + Zero<ArrayType>
+        + One<ArrayType>
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -312,6 +314,8 @@ where
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         match self {
+            Self::Zero(zero) => batch_by_interpreting_physical_operation(zero, inputs),
+            Self::One(one) => batch_by_interpreting_physical_operation(one, inputs),
             Self::Add => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::AddOperation, inputs),
             Self::Mul => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::MulOperation, inputs),
             Self::Neg => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::NegOperation, inputs),
@@ -350,8 +354,10 @@ impl<
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
+        + Zero<ArrayType>
+        + One<ArrayType>
         + ZeroLike
-        + crate::tracing_v2::operations::constants::Zero<ArrayType>
+        + OneLike
         + MatrixOps
         + ReshapeOps
         + ControlFlowValue,

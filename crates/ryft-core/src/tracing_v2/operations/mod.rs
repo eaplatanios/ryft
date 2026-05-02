@@ -1,11 +1,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Instruction, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableEngine;
 use crate::tracing_v2::forward::{JvpContext, JvpTracer};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{Type, TypeError, Typed};
 
 /// Elementwise addition.
 pub mod add;
@@ -60,7 +59,8 @@ pub mod sin;
 
 pub use add::{AddOperation, SupportsAdd};
 pub use constants::{
-    OneLikeOperation, SupportsOneLike, SupportsZero, SupportsZeroLike, ZeroLikeOperation, ZeroOperation,
+    OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike, ZeroLikeOperation,
+    ZeroOperation,
 };
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
@@ -85,38 +85,6 @@ pub use reshape::{ReshapeOperation, SupportsReshape};
 pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
 pub use scale::{ScaleOperation, SupportsScale};
 pub use sin::{Sin, SinOperation, SupportsSin};
-
-/// Carrier capability required by [`TracingContext`](crate::tracing::engines::TracingContext).
-///
-/// Traced linearization runs ordinary JVP rules with [`Tracer`] primals. Those rules may stage the
-/// primal side of built-in arithmetic through the outer operation carrier, so the carrier must know
-/// how to represent the primitive operations that can appear while evaluating those traced primals.
-/// Keeping that requirement as one semantic bound prevents every traced-linearization impl from
-/// repeating the individual primitive support traits.
-#[doc(hidden)]
-pub trait TracedLinearizationCarrier<T: Type, V: Traceable<T>>:
-    Clone + Operation<T> + SupportsAdd<T, V> + SupportsMul<T, V> + SupportsNeg<T, V> + SupportsScale<T, V> + 'static
-{
-}
-
-impl<T, V, O> TracedLinearizationCarrier<T, V> for O
-where
-    T: Type,
-    V: Traceable<T>,
-    O: Clone + Operation<T> + SupportsAdd<T, V> + SupportsMul<T, V> + SupportsNeg<T, V> + SupportsScale<T, V> + 'static,
-{
-}
-
-/// Lifts one concrete value into the staged program owned by a JIT tracer.
-pub fn lift_jit_constant<'engine, V: Traceable<ArrayType>, E: TracingEngine<Type = ArrayType, Value = V> + ?Sized>(
-    constant: &V,
-    exemplar: &Tracer<'engine, E>,
-) -> Tracer<'engine, E> {
-    let builder = exemplar.builder().clone();
-    let r#type = constant.r#type().into_owned();
-    let atom = builder.borrow_mut().add_constant(constant.clone());
-    exemplar.context.tracer(atom, Some(r#type))
-}
 
 /// Propagates one unary input type through a shape-preserving staged op.
 pub fn unary_abstract<T: Type>(inputs: &[T]) -> Result<T, TypeError> {
@@ -228,9 +196,7 @@ impl<'a, T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> Transpos
     }
 }
 
-pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primitive::LinearArrayOperation<V, T>>:
-    Operation<T>
-{
+pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>>: Operation<T> {
     /// Applies the transpose rule for reverse-mode differentiation.
     ///
     /// `output_cotangents` is aligned with the op outputs in forward order. Each entry is
@@ -246,9 +212,7 @@ pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primi
         &self,
         context: &mut TranspositionContext<'_, T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError>
-    where
-        LinearCarrier: Operation<T>;
+    ) -> Result<Vec<Option<AtomId>>, TracingError>;
 }
 
 /// Forward-mode differentiation rule keyed only by the engine that owns the staged carriers.

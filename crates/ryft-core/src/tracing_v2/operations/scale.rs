@@ -12,15 +12,16 @@ use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, TracedLinearizationCarrier,
-    unary_abstract,
-};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd, unary_abstract};
 
 /// Hidden carrier capability for staging the scaling primitive.
 ///
 /// Ordinary tracing carriers and linear-program carriers can both implement this trait when they
 /// support representing a captured-factor scale operation in their own operation universe.
+///
+/// This is intentionally separate from [`SupportsMul`](super::SupportsMul): multiplication is a
+/// binary operation over two input atoms, while scaling is a unary operation that carries one
+/// captured factor in the operation itself.
 #[doc(hidden)]
 pub trait SupportsScale<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the scaling primitive with a captured factor.
@@ -99,7 +100,7 @@ impl<T: Type, V: Typed<T> + Display + Clone + Mul<Output = V>> InterpretableOper
 }
 
 impl<T: Type + PartialEq, V: Traceable<T> + crate::parameters::Parameter + Mul<Output = V> + ZeroLike>
-    LinearOperation<T, V> for ScaleOperation<T, V>
+    LinearOperation<T, V, LinearArrayOperation<V, T>> for ScaleOperation<T, V>
 where
     LinearArrayOperation<V, T>: Operation<T>,
 {
@@ -189,7 +190,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized,
-    EInner::Operation: TracedLinearizationCarrier<ArrayType, V>,
+    EInner::Operation: SupportsAdd<ArrayType, V>,
     Tracer<'engine, EInner>: Mul<Output = Tracer<'engine, EInner>>,
     EInner::LinearOperation<'engine>: SupportsScale<ArrayType, Tracer<'engine, EInner>>,
 {
@@ -205,7 +206,7 @@ where
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
         let input = &inputs[0];
-        let factor_tracer = engine.lift(self.factor().clone());
+        let factor_tracer = engine.constant(self.factor().clone());
         let tangent = context
             .apply_operation(
                 &[input.tangent],

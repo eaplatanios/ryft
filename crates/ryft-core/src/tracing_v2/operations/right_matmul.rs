@@ -10,7 +10,7 @@ use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
 use super::primitive::LinearArrayOperation;
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, TracedLinearizationCarrier};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd};
 
 /// Hidden carrier capability for staging the right matrix-multiplication primitive.
 #[doc(hidden)]
@@ -88,7 +88,7 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for RightMatMulOperati
     }
 }
 
-impl<V: MatrixValue> LinearOperation<ArrayType, V> for RightMatMulOperation<V> {
+impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for RightMatMulOperation<V> {
     fn transpose(
         &self,
         context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
@@ -148,7 +148,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized,
-    EInner::Operation: TracedLinearizationCarrier<ArrayType, V>,
+    EInner::Operation: SupportsAdd<ArrayType, V>,
     EInner::LinearOperation<'engine>: SupportsRightMatMul<ArrayType, Tracer<'engine, EInner>>,
     Tracer<'engine, EInner>: MatrixOps,
 {
@@ -163,7 +163,7 @@ where
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
-        let factor_tracer = engine.lift(self.factor().clone());
+        let factor_tracer = engine.constant(self.factor().clone());
         let primal = inputs[0].primal.clone().matmul(factor_tracer.clone());
         let tangent = context
             .apply_operation(

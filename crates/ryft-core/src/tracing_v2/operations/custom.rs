@@ -136,7 +136,7 @@ impl<Ty: Type, V: Traceable<Ty>, O: Operation<Ty> + InterpretableOperation<Ty, V
 /// supplies shape metadata and eager interpretation; optional transform rules are registered using
 /// the existing tracing traits directly:
 ///
-/// - [`LinearOperation<ArrayType, V>`] for reverse-mode transpose,
+/// - [`LinearOperation<ArrayType, V, LinearArrayOperation<V>>`] for reverse-mode transpose,
 /// - [`DifferentiableOperation<E>`] for forward-mode JVP under engine `E`,
 /// - [`CustomTracedLinearizationRule`] for JVPs whose primals are already staged tracers.
 #[derive(Clone)]
@@ -145,7 +145,7 @@ pub struct CustomPrimitive<T: Type + PartialEq, V: Traceable<T> + Parameter> {
     base: Arc<dyn CustomBaseOperation<T, V>>,
 
     /// Optional reverse-mode transpose rule for the primitive.
-    transpose_rule: Option<Arc<dyn LinearOperation<T, V>>>,
+    transpose_rule: Option<Arc<dyn LinearOperation<T, V, LinearArrayOperation<V, T>>>>,
 
     /// Typed extension registry carrying backend- or transform-specific extra rules.
     extensions: CustomPrimitiveExtensions<T, V>,
@@ -167,7 +167,8 @@ impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> Custo
     /// Registers one transpose rule for reverse-mode differentiation.
     pub fn with_transpose_rule<Rule>(mut self, rule: Rule) -> Self
     where
-        Rule: LinearOperation<T, V> + 'static,
+        LinearArrayOperation<V, T>: Operation<T>,
+        Rule: LinearOperation<T, V, LinearArrayOperation<V, T>> + 'static,
     {
         self.transpose_rule = Some(Arc::new(rule));
         self
@@ -323,8 +324,8 @@ impl<T: Type + PartialEq, V: Traceable<T> + Parameter> InterpretableOperation<T,
     }
 }
 
-impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> LinearOperation<T, V>
-    for CustomPrimitive<T, V>
+impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static>
+    LinearOperation<T, V, LinearArrayOperation<V, T>> for CustomPrimitive<T, V>
 where
     LinearArrayOperation<V, T>: Operation<T>,
 {
@@ -439,7 +440,8 @@ impl<T: Type + PartialEq, V: Traceable<T> + Parameter> InterpretableOperation<T,
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T> + Parameter> LinearOperation<T, V> for LinearCustomPrimitive<T, V>
+impl<T: Type + PartialEq, V: Traceable<T> + Parameter> LinearOperation<T, V, LinearArrayOperation<V, T>>
+    for LinearCustomPrimitive<T, V>
 where
     LinearArrayOperation<V, T>: Operation<T>,
 {
@@ -550,7 +552,7 @@ mod tests {
         }
     }
 
-    impl LinearOperation<ArrayType, f64> for ShiftOp {
+    impl LinearOperation<ArrayType, f64, LinearArrayOperation<f64>> for ShiftOp {
         fn transpose(
             &self,
             _context: &mut crate::tracing_v2::operations::TranspositionContext<

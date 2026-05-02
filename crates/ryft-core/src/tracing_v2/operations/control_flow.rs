@@ -15,7 +15,7 @@ use crate::tracing_v2::operations::constants::{Zero, ZeroLike};
 use crate::tracing_v2::{ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, JvpContext, JvpTracer};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-use super::{DifferentiableOperation, LinearOperation, SupportsAdd, TracedLinearizationCarrier, TranspositionContext};
+use super::{DifferentiableOperation, LinearOperation, SupportsAdd, TranspositionContext};
 
 /// Flat nested program shape used by control-flow operations.
 pub type FlatProgram<V, O, T = ArrayType> = Program<T, V, O, Vec<V>, Vec<V>>;
@@ -540,7 +540,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    EInner::Operation: TracedLinearizationCarrier<ArrayType, V>,
+    EInner::Operation: SupportsAdd<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(
@@ -702,7 +702,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    EInner::Operation: TracedLinearizationCarrier<ArrayType, V>,
+    EInner::Operation: SupportsAdd<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(

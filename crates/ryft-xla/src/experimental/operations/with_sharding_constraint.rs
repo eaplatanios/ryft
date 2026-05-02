@@ -43,7 +43,12 @@ impl WithShardingConstraintOperation {
     fn base_custom_primitive<V>(&self) -> CustomPrimitive<ArrayType, V>
     where
         V: Traceable<ArrayType> + 'static,
-        Self: Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V> + Send + Sync + 'static,
+        Self: Clone
+            + InterpretableOperation<ArrayType, V>
+            + LinearOperation<ArrayType, V, LinearArrayOperation<V>>
+            + Send
+            + Sync
+            + 'static,
     {
         CustomPrimitive::new(self.clone()).with_transpose_rule(self.clone())
     }
@@ -108,7 +113,9 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for WithShardingConstrain
     }
 }
 
-impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperation {
+impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor>>
+    for WithShardingConstraintOperation
+{
     fn transpose(
         &self,
         context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
@@ -165,7 +172,9 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for WithShardingConstrain
     }
 }
 
-impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperation {
+impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer>>
+    for WithShardingConstraintOperation
+{
     fn transpose(
         &self,
         context: &mut ryft_core::tracing_v2::operations::TranspositionContext<

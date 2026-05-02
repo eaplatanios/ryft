@@ -216,7 +216,10 @@ impl<V> LinearShardMapOperation<V> {
     fn base_custom_primitive(&self) -> CustomPrimitive<ArrayType, V>
     where
         V: Traceable<ArrayType>,
-        Self: Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V> + 'static,
+        Self: Clone
+            + InterpretableOperation<ArrayType, V>
+            + LinearOperation<ArrayType, V, LinearArrayOperation<V>>
+            + 'static,
     {
         CustomPrimitive::new(self.clone()).with_transpose_rule(self.clone())
     }
@@ -542,7 +545,9 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for LinearShardMapOperati
     }
 }
 
-impl LinearOperation<ArrayType, ShardMapTensor> for LinearShardMapOperation<ShardMapTensor> {
+impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor>>
+    for LinearShardMapOperation<ShardMapTensor>
+{
     fn transpose(
         &self,
         context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
@@ -730,7 +735,9 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for LinearShardMapOperati
     }
 }
 
-impl LinearOperation<ArrayType, ShardMapTracer> for LinearShardMapOperation<ShardMapTracer> {
+impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer>>
+    for LinearShardMapOperation<ShardMapTracer>
+{
     fn transpose(
         &self,
         context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
@@ -1385,10 +1392,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
         let combined_inputs = pushforward_local_input_types
             .iter()
             .cloned()
-            .map(|input_type| {
-                let atom = pushforward_compiled_builder.borrow_mut().add_input(input_type.clone());
-                pushforward_compiled_context.tracer(atom, Some(input_type))
-            })
+            .map(|input_type| pushforward_compiled_context.input(input_type))
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
         let local_tangents = combined_inputs[local_input_count..].to_vec();
@@ -1411,10 +1415,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
         let combined_inputs = pullback_local_input_types
             .iter()
             .cloned()
-            .map(|input_type| {
-                let atom = pullback_compiled_builder.borrow_mut().add_input(input_type.clone());
-                pullback_compiled_context.tracer(atom, Some(input_type))
-            })
+            .map(|input_type| pullback_compiled_context.input(input_type))
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
         let local_output_cotangents = combined_inputs[local_input_count..].to_vec();

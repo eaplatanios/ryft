@@ -329,9 +329,7 @@ where
             && instruction.outputs.len() == 1
             && instruction.inputs.is_empty()
         {
-            let zero_value = tracing_context.engine.zero(zero_type)?;
-            let outer_atom = tracing_context.builder.borrow_mut().add_constant(zero_value);
-            let zero_tracer = tracing_context.tracer(outer_atom, Some(zero_type.clone()));
+            let zero_tracer = tracing_context.constant(tracing_context.engine.zero(zero_type)?);
             let constant_atom = builder.add_constant(zero_tracer);
             atom_remapping[instruction.outputs[0].index] = Some(constant_atom);
         } else {

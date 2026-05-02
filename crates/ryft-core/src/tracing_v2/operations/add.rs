@@ -130,7 +130,9 @@ impl<V: Typed<DataType> + Clone + Add<Output = V>> InterpretableOperation<DataTy
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for AddOperation {
+impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<ArrayType, V, LinearArrayOperation<V>>
+    for AddOperation
+{
     fn transpose(
         &self,
         _context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
@@ -141,8 +143,8 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<Array
     }
 }
 
-impl<V: Traceable<DataType> + crate::parameters::Parameter + Add<Output = V> + ZeroLike> LinearOperation<DataType, V>
-    for AddOperation
+impl<V: Traceable<DataType> + crate::parameters::Parameter + Add<Output = V> + ZeroLike>
+    LinearOperation<DataType, V, LinearArrayOperation<V, DataType>> for AddOperation
 {
     fn transpose(
         &self,

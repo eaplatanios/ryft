@@ -10,10 +10,10 @@ use ryft_core::tracing_v2::linear::{
 use ryft_core::tracing_v2::operations::{
     AddOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation, FlatTracedRematerialize,
     LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
-    OneLikeOperation, RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation, SupportsAdd, SupportsCos,
-    SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg, SupportsOneLike,
-    SupportsRematerialize, SupportsReshape, SupportsScale, SupportsSin, SupportsZeroLike, WhileOperation,
-    ZeroLikeOperation, lift_jit_constant,
+    OneLikeOperation, OneOperation, RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation,
+    SupportsAdd, SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg,
+    SupportsOne, SupportsOneLike, SupportsRematerialize, SupportsReshape, SupportsScale, SupportsSin, SupportsZero,
+    SupportsZeroLike, WhileOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableEngine, DifferentiableOperation, DifferentiationError,
@@ -70,7 +70,7 @@ fn replay_xla_program_with_tracers(
             let Some(exemplar) = exemplar.as_ref() else {
                 return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
             };
-            values[atom_index] = Some(lift_jit_constant(value, exemplar));
+            values[atom_index] = Some(exemplar.context.constant(value.clone()));
         }
     }
     for instruction in program.instructions.iter() {
@@ -134,6 +134,18 @@ where
 #[allow(private_interfaces)]
 #[derive(Clone)]
 pub enum XlaOperation {
+    /// Typed zero with no inputs and one output.
+    Zero(ZeroOperation<ArrayType>),
+
+    /// Typed one with no inputs and one output.
+    One(OneOperation<ArrayType>),
+
+    /// Exemplar-derived zero.
+    ZeroLike,
+
+    /// Exemplar-derived one.
+    OneLike,
+
     /// Elementwise addition.
     Add,
 
@@ -148,12 +160,6 @@ pub enum XlaOperation {
 
     /// Elementwise cosine.
     Cos,
-
-    /// Exemplar-derived zero.
-    ZeroLike,
-
-    /// Exemplar-derived one.
-    OneLike,
 
     /// Matrix multiplication.
     MatrixMultiply,
@@ -192,13 +198,15 @@ pub enum XlaOperation {
 impl Debug for XlaOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Zero(zero) => Debug::fmt(zero, formatter),
+            Self::One(one) => Debug::fmt(one, formatter),
+            Self::ZeroLike => write!(formatter, "ZeroLike"),
+            Self::OneLike => write!(formatter, "OneLike"),
             Self::Add => write!(formatter, "Add"),
             Self::Mul => write!(formatter, "Mul"),
             Self::Neg => write!(formatter, "Neg"),
             Self::Sin => write!(formatter, "Sin"),
             Self::Cos => write!(formatter, "Cos"),
-            Self::ZeroLike => write!(formatter, "ZeroLike"),
-            Self::OneLike => write!(formatter, "OneLike"),
             Self::MatrixMultiply => write!(formatter, "MatrixMultiply"),
             Self::Transpose => write!(formatter, "Transpose"),
             Self::Scale { .. } => write!(formatter, "Scale"),
@@ -228,13 +236,15 @@ impl Display for XlaOperation {
 impl Operation<ArrayType> for XlaOperation {
     fn name(&self) -> &'static str {
         match self {
+            Self::Zero(zero) => zero.name(),
+            Self::One(one) => one.name(),
+            Self::ZeroLike => "zero_like",
+            Self::OneLike => "one_like",
             Self::Add => "add",
             Self::Mul => "mul",
             Self::Neg => "neg",
             Self::Sin => "sin",
             Self::Cos => "cos",
-            Self::ZeroLike => "zero_like",
-            Self::OneLike => "one_like",
             Self::MatrixMultiply => "matmul",
             Self::Transpose => "matrix_transpose",
             Self::Scale { .. } => "scale",
@@ -251,13 +261,15 @@ impl Operation<ArrayType> for XlaOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         match self {
+            Self::Zero(zero) => zero.infer_output_types(input_types),
+            Self::One(one) => one.infer_output_types(input_types),
+            Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
+            Self::OneLike => OneLikeOperation.infer_output_types(input_types),
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
-            Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
-            Self::OneLike => OneLikeOperation.infer_output_types(input_types),
             Self::MatrixMultiply => MatMulOperation.infer_output_types(input_types),
             Self::Transpose => MatrixTransposeOperation.infer_output_types(input_types),
             Self::Scale { .. } => ScaleOperation::<ArrayType, ShardMapTensor>::abstract_eval_static(input_types),
@@ -278,13 +290,15 @@ impl Operation<ArrayType> for XlaOperation {
 impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaOperation {
     fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
         match self {
+            Self::Zero(zero) => zero.interpret(inputs),
+            Self::One(one) => one.interpret(inputs),
+            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
+            Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => AddOperation.interpret(inputs),
             Self::Mul => MulOperation.interpret(inputs),
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
-            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
-            Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::MatrixMultiply => MatMulOperation.interpret(inputs),
             Self::Transpose => MatrixTransposeOperation.interpret(inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
@@ -305,18 +319,32 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaOperation {
 impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
         match self {
+            Self::Zero(zero) => Err(TypeError {
+                message: format!(
+                    "typed zero operation over tracer values was not materialized before interpretation for {}",
+                    zero.output_type()
+                ),
+            }
+            .into()),
+            Self::One(one) => Err(TypeError {
+                message: format!(
+                    "typed one operation over tracer values was not materialized before interpretation for {}",
+                    one.output_type()
+                ),
+            }
+            .into()),
+            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
+            Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => AddOperation.interpret(inputs),
             Self::Mul => MulOperation.interpret(inputs),
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
-            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
-            Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::MatrixMultiply => MatMulOperation.interpret(inputs),
             Self::Transpose => MatrixTransposeOperation.interpret(inputs),
             Self::Scale { factor } => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                ScaleOperation::new(lift_jit_constant(factor, exemplar)).interpret(inputs)
+                ScaleOperation::new(exemplar.context.constant(factor.clone())).interpret(inputs)
             }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
@@ -371,13 +399,15 @@ where
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         match self {
+            Self::Zero(zero) => zero.jvp(engine, context, inputs),
+            Self::One(one) => one.jvp(engine, context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
             Self::Add => AddOperation.jvp(engine, context, inputs),
             Self::Mul => MulOperation.jvp(engine, context, inputs),
             Self::Neg => NegOperation.jvp(engine, context, inputs),
             Self::Sin => SinOperation.jvp(engine, context, inputs),
             Self::Cos => CosOperation.jvp(engine, context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
             Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
             Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
@@ -426,13 +456,15 @@ impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaOperation {
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
         match self {
+            Self::Zero(zero) => zero.jvp(engine, context, inputs),
+            Self::One(one) => one.jvp(engine, context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
             Self::Add => AddOperation.jvp(engine, context, inputs),
             Self::Mul => MulOperation.jvp(engine, context, inputs),
             Self::Neg => NegOperation.jvp(engine, context, inputs),
             Self::Sin => SinOperation.jvp(engine, context, inputs),
             Self::Cos => CosOperation.jvp(engine, context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
             Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
             Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
@@ -501,6 +533,32 @@ impl SupportsSin<ArrayType, ShardMapTensor> for XlaOperation {
 impl SupportsCos<ArrayType, ShardMapTensor> for XlaOperation {
     fn cos_operation() -> Self {
         XlaOperation::Cos
+    }
+}
+
+impl SupportsZero<ArrayType, ShardMapTensor> for XlaOperation {
+    fn zero_operation(r#type: ArrayType) -> Self {
+        XlaOperation::Zero(ZeroOperation::new(r#type))
+    }
+
+    fn as_zero(&self) -> Option<&ArrayType> {
+        match self {
+            Self::Zero(zero) => Some(zero.output_type()),
+            _ => None,
+        }
+    }
+}
+
+impl SupportsOne<ArrayType, ShardMapTensor> for XlaOperation {
+    fn one_operation(r#type: ArrayType) -> Self {
+        XlaOperation::One(OneOperation::new(r#type))
+    }
+
+    fn as_one(&self) -> Option<&ArrayType> {
+        match self {
+            Self::One(one) => Some(one.output_type()),
+            _ => None,
+        }
     }
 }
 

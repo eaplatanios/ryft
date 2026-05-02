@@ -158,13 +158,11 @@ where
     let (outputs, pushforward) = linearize_traced_program(tracing_context.clone(), traced_program, traced_primals)?;
     ensure_single_gradient_output::<E::Type, _>(outputs.as_slice())?;
     let traced_output = outputs[0].clone();
-    let tracing_builder = traced_output.builder().clone();
     let pullback = transpose_traced_linear_program(tracing_context.clone(), &pushforward)?;
     let seed_type = traced_output.r#type().into_owned();
     let _ = <V as One<E::Type>>::one(&seed_type)?;
     let seed_value = tracing_context.engine.one(&seed_type)?;
-    let seed_atom = tracing_builder.borrow_mut().add_constant(seed_value);
-    let seed = traced_output.context.tracer(seed_atom, Some(seed_type));
+    let seed = tracing_context.constant(seed_value);
     let traced_gradient = pullback.interpret(vec![seed])?;
     Ok((traced_output, traced_gradient))
 }
@@ -274,7 +272,7 @@ mod tests {
         }
     }
 
-    impl LinearOperation<ArrayType, f64> for PanicReplayOp {
+    impl LinearOperation<ArrayType, f64, LinearArrayOperation<f64>> for PanicReplayOp {
         fn transpose(
             &self,
             _context: &mut TranspositionContext<'_, ArrayType, f64, LinearArrayOperation<f64>>,

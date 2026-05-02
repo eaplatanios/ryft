@@ -427,8 +427,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
     }
 }
 
-fn lower_like_constant<'b, 'c: 'b, 't: 'c, B, L>(
-    input_values: &[ValueRef<'b, 'c, 't>],
+fn lower_constant_output<'b, 'c: 'b, 't: 'c, B, L>(
     output_types: &[ArrayType],
     constant_kind: ShardMapConstantKind,
     block: &mut B,
@@ -439,9 +438,6 @@ where
     B: Block<'b, 'c, 't>,
     L: Location<'c, 't> + Copy,
 {
-    if input_values.len() != 1 {
-        return Err(TracingError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
-    }
     let output_type = output_types
         .first()
         .ok_or_else(|| LoweringError::from(TracingError::InvalidOutputCount { expected: 1, got: 0 }))?;
@@ -469,6 +465,24 @@ where
     Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
 }
 
+fn lower_like_constant<'b, 'c: 'b, 't: 'c, B, L>(
+    input_values: &[ValueRef<'b, 'c, 't>],
+    output_types: &[ArrayType],
+    constant_kind: ShardMapConstantKind,
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+where
+    B: Block<'b, 'c, 't>,
+    L: Location<'c, 't> + Copy,
+{
+    if input_values.len() != 1 {
+        return Err(TracingError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+    }
+    lower_constant_output(output_types, constant_kind, block, context, location)
+}
+
 impl LowerableXlaOperation<ShardMapTensor> for XlaOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -478,6 +492,30 @@ impl LowerableXlaOperation<ShardMapTensor> for XlaOperation {
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
+            Self::Zero(_) => {
+                if !input_values.is_empty() {
+                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                }
+                lower_constant_output(
+                    output_types,
+                    ShardMapConstantKind::Zero,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
+            Self::One(_) => {
+                if !input_values.is_empty() {
+                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                }
+                lower_constant_output(
+                    output_types,
+                    ShardMapConstantKind::One,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
             Self::Add => <AddOperation as LowerableXlaOperation<ShardMapTensor>>::lower_to_mlir(
                 &AddOperation,
                 input_values,
@@ -658,6 +696,30 @@ impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for ArrayOperat
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
+            ArrayOperation::Zero(_) => {
+                if !input_values.is_empty() {
+                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                }
+                lower_constant_output(
+                    output_types,
+                    ShardMapConstantKind::Zero,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
+            ArrayOperation::One(_) => {
+                if !input_values.is_empty() {
+                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                }
+                lower_constant_output(
+                    output_types,
+                    ShardMapConstantKind::One,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
             ArrayOperation::Add => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &AddOperation,
                 input_values,
@@ -760,6 +822,46 @@ impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for LinearArray
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
+            LinearArrayOperation::Zero(_) => {
+                if !input_values.is_empty() {
+                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                }
+                lower_constant_output(
+                    output_types,
+                    ShardMapConstantKind::Zero,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
+            LinearArrayOperation::One(_) => {
+                if !input_values.is_empty() {
+                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                }
+                lower_constant_output(
+                    output_types,
+                    ShardMapConstantKind::One,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
+            LinearArrayOperation::ZeroLike => lower_like_constant(
+                input_values,
+                output_types,
+                ShardMapConstantKind::Zero,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
+            LinearArrayOperation::OneLike => lower_like_constant(
+                input_values,
+                output_types,
+                ShardMapConstantKind::One,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
             LinearArrayOperation::Add => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &AddOperation,
                 input_values,
@@ -816,35 +918,6 @@ impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for LinearArray
                     mode,
                     lowerer,
                 )
-            }
-            LinearArrayOperation::ZeroLike => lower_like_constant(
-                input_values,
-                output_types,
-                ShardMapConstantKind::Zero,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            LinearArrayOperation::Zero(zero) => {
-                if !input_values.is_empty() {
-                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
-                }
-                if output_types.len() != 1 {
-                    return Err(TracingError::InvalidOutputCount { expected: 1, got: output_types.len() }.into());
-                }
-                let zero_type = zero.output_type();
-                let block = &mut lowerer.block;
-                let context = lowerer.context;
-                let location = lowerer.location;
-                let tensor_type = lower_tensor_type(zero_type, context, location)?;
-                let elements = lower_constant_elements_attribute(
-                    zero_type.data_type,
-                    tensor_type,
-                    ShardMapConstantKind::Zero,
-                    context,
-                )?;
-                let constant = block.append_operation(stable_hlo::constant(elements, location));
-                Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
             }
             LinearArrayOperation::Rematerialize(remat) => {
                 <LinearRematerializeOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
@@ -1985,6 +2058,30 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
     lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     match op {
+        XlaOperation::Zero(_) => {
+            if !input_values.is_empty() {
+                return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+            }
+            lower_constant_output(
+                output_types,
+                ShardMapConstantKind::Zero,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )
+        }
+        XlaOperation::One(_) => {
+            if !input_values.is_empty() {
+                return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+            }
+            lower_constant_output(
+                output_types,
+                ShardMapConstantKind::One,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )
+        }
         XlaOperation::Add => {
             let result =
                 lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));

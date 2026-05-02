@@ -298,7 +298,7 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
     }
 }
 
-impl<V: ReshapeValue> LinearOperation<ArrayType, V> for ReshapeOperation {
+impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for ReshapeOperation {
     fn transpose(
         &self,
         context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,

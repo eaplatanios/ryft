@@ -4,9 +4,7 @@ use thiserror::Error;
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::{InterpretableOperation, TracingError};
 use crate::tracing_v2::LinearOperation as LinearOperationTrait;
-use crate::tracing_v2::operations::{
-    SupportsAdd, SupportsNeg, SupportsScale, SupportsZero, TracedLinearizationCarrier,
-};
+use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale, SupportsZero};
 use crate::tracing_v2::{Differentiable, LinearScalarOperation, ScalarOperation};
 use crate::types::ArrayType;
 
@@ -184,7 +182,7 @@ impl<'engine, E> DifferentiableEngine for TracingContext<'engine, E>
 where
     E: DifferentiableTracingEngine + ?Sized,
     E::Value: Differentiable<E::Type, Tangent = E::Value>,
-    E::Operation: TracedLinearizationCarrier<E::Type, E::Value>,
+    E::Operation: SupportsAdd<E::Type, E::Value>,
     crate::tracing_v2::operations::AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     type DifferentiableOperation = crate::tracing_v2::operations::AddOperation;

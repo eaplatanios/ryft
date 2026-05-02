@@ -12,7 +12,7 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, TracedLinearizationCarrier};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd};
 
 /// Hidden carrier capability for staging the `rematerialize` higher-order primitive.
 #[doc(hidden)]
@@ -181,8 +181,8 @@ where
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    EInner::Operation: TracedLinearizationCarrier<ArrayType, V>
-        + InterpretableOperation<ArrayType, V>
+    EInner::Operation: InterpretableOperation<ArrayType, V>
+        + SupportsAdd<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, LinearArrayOperation<V>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V>:
@@ -430,7 +430,7 @@ where
     }
 }
 
-impl<T, V> LinearOperation<T, V> for LinearRematerializeOperation<T, V>
+impl<T, V> LinearOperation<T, V, LinearArrayOperation<V, T>> for LinearRematerializeOperation<T, V>
 where
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
