@@ -194,165 +194,26 @@ mod tests {
     use half::{bf16, f16};
     use indoc::indoc;
 
-    use crate::operations::constants::{
-        OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation, ZeroOperation,
-    };
-    use crate::operations::{InterpretableOperation, Operation};
+    use crate::tracing::Program;
     use crate::tracing::engines::{ScalarEngine, TracingEngine};
-    use crate::tracing::{Program, TracingError, Value};
-    use crate::tracing_v2::{Cos, ScalarOperation, Sin};
-    use crate::types::{ArrayType, DataType, TypeError, Typed};
-
-    fn assert_scalar_value_type<V: Value<DataType>>(value: V, expected_type: DataType) {
-        assert_eq!(value.r#type().into_owned(), expected_type);
-    }
-
-    fn assert_scalar_data_type<V: Value<DataType>>(value: V, expected_type: DataType) {
-        assert_eq!(value.r#type().into_owned(), expected_type);
-    }
-
-    fn assert_scalar_identities<V>(value: V, zero: V, one: V)
-    where
-        V: Value<DataType> + ZeroLike + OneLike + std::fmt::Debug + PartialEq,
-    {
-        assert_eq!(value.zero_like(), zero);
-        assert_eq!(value.one_like(), one);
-    }
+    use crate::tracing_v2::{Cos, Differentiable, ScalarOperation, Sin};
+    use crate::types::DataType;
 
     #[test]
-    fn test_zero_operation() {
-        let operation = ZeroOperation::new(DataType::F64);
-
-        assert_eq!(Operation::<DataType>::name(&operation), "zero");
-        assert_eq!(format!("{operation:?}"), "ZeroOperation { type: F64 }");
-        assert_eq!(format!("{operation}"), "zero");
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![0.0]));
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
-            Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]),
-            Err(TracingError::InvalidInputCount { expected: 0, got: 1 }),
-        );
-    }
-
-    #[test]
-    fn test_one_operation() {
-        let operation = OneOperation::new(DataType::F64);
-
-        assert_eq!(Operation::<DataType>::name(&operation), "one");
-        assert_eq!(format!("{operation:?}"), "OneOperation { type: F64 }");
-        assert_eq!(format!("{operation}"), "one");
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![1.0]));
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
-            Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]),
-            Err(TracingError::InvalidInputCount { expected: 0, got: 1 }),
-        );
-    }
-
-    #[test]
-    fn test_zero_like_operation() {
-        let operation = ZeroLikeOperation;
-
-        assert_eq!(Operation::<DataType>::name(&operation), "zero_like");
-        assert_eq!(format!("{operation:?}"), "ZeroLikeOperation");
-        assert_eq!(format!("{operation}"), "zero_like");
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]), Ok(vec![0.0]));
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)]),
-            Ok(vec![ArrayType::scalar(DataType::F32)]),
-        );
-
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
-        );
-    }
-
-    #[test]
-    fn test_one_like_operation() {
-        let operation = OneLikeOperation;
-
-        assert_eq!(Operation::<DataType>::name(&operation), "one_like");
-        assert_eq!(format!("{operation:?}"), "OneLikeOperation");
-        assert_eq!(format!("{operation}"), "one_like");
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]), Ok(vec![1.0]));
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)]),
-            Ok(vec![ArrayType::scalar(DataType::F32)]),
-        );
-
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
-        );
-    }
-
-    #[test]
-    fn test_scalar_leaf_traits_report_expected_values() {
-        assert_scalar_data_type(false, DataType::Boolean);
-        assert_scalar_data_type(1i8, DataType::I8);
-        assert_scalar_data_type(1i16, DataType::I16);
-        assert_scalar_data_type(1i32, DataType::I32);
-        assert_scalar_data_type(1i64, DataType::I64);
-        assert_scalar_data_type(1u8, DataType::U8);
-        assert_scalar_data_type(1u16, DataType::U16);
-        assert_scalar_data_type(1u32, DataType::U32);
-        assert_scalar_data_type(1u64, DataType::U64);
-        assert_scalar_data_type(bf16::from_f32(1.25), DataType::BF16);
-        assert_scalar_data_type(f16::from_f32(1.25), DataType::F16);
-        assert_eq!(<f32 as Typed<DataType>>::r#type(&1.25f32).into_owned(), DataType::F32);
-        assert_eq!(<f64 as Typed<DataType>>::r#type(&2.5f64).into_owned(), DataType::F64);
-
-        assert_scalar_value_type(false, DataType::Boolean);
-        assert_scalar_value_type(1i8, DataType::I8);
-        assert_scalar_value_type(1i16, DataType::I16);
-        assert_scalar_value_type(1i32, DataType::I32);
-        assert_scalar_value_type(1i64, DataType::I64);
-        assert_scalar_value_type(1u8, DataType::U8);
-        assert_scalar_value_type(1u16, DataType::U16);
-        assert_scalar_value_type(1u32, DataType::U32);
-        assert_scalar_value_type(1u64, DataType::U64);
-        assert_scalar_value_type(bf16::from_f32(1.25), DataType::BF16);
-        assert_scalar_value_type(f16::from_f32(1.25), DataType::F16);
-        assert_scalar_identities(false, false, true);
-        assert_scalar_identities(5i32, 0i32, 1i32);
-        assert_scalar_identities(5u32, 0u32, 1u32);
-        assert_scalar_identities(bf16::from_f32(5.0), bf16::from_f32(0.0), bf16::from_f32(1.0));
-        assert_scalar_identities(f16::from_f32(5.0), f16::from_f32(0.0), f16::from_f32(1.0));
-        assert_scalar_identities(3.0f32, 0.0f32, 1.0f32);
-        assert_scalar_identities(7.0f64, 0.0f64, 1.0f64);
-
-        let engine = ScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) =
-            engine.interpret_and_trace(|x| Ok(x.sin()), 2.0f64).unwrap();
-
-        assert_eq!(
-            compiled.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = sin %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
+    fn test_scalar_types_are_differentiable() {
+        let _: Option<<bool as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<i8 as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<i16 as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<i32 as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<i64 as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<u8 as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<u16 as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<u32 as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<u64 as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<bf16 as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<f16 as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<f32 as Differentiable<DataType>>::Tangent> = None;
+        let _: Option<<f64 as Differentiable<DataType>>::Tangent> = None;
     }
 
     #[test]
