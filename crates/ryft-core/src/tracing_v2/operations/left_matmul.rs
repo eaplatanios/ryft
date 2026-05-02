@@ -30,7 +30,7 @@ pub trait SupportsLeftMatMul<T: Type, V: Traceable<T>> {
 #[derive(Clone)]
 pub struct LeftMatMulOperation<V: MatrixValue> {
     /// Matrix factor multiplied on the left of every input.
-    factor: V,
+    pub factor: V,
 }
 
 impl<V: MatrixValue> LeftMatMulOperation<V> {
@@ -38,12 +38,6 @@ impl<V: MatrixValue> LeftMatMulOperation<V> {
     #[inline]
     pub fn new(factor: V) -> Self {
         Self { factor }
-    }
-
-    /// Returns the captured matrix factor.
-    #[inline]
-    pub fn factor(&self) -> &V {
-        &self.factor
     }
 }
 
@@ -81,7 +75,7 @@ impl<V: MatrixValue> Operation<ArrayType> for LeftMatMulOperation<V> {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("factor", self.factor()))
+            .bracketed(|operation| operation.field("factor", &self.factor))
     }
 }
 
@@ -127,12 +121,12 @@ where
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
-        let primal = self.factor().clone().matmul(inputs[0].primal.clone());
+        let primal = self.factor.clone().matmul(inputs[0].primal.clone());
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent],
                 <E::LinearOperationCarrier as SupportsLeftMatMul<ArrayType, V>>::left_matmul_operation(
-                    self.factor().clone(),
+                    self.factor.clone(),
                 ),
                 1,
             )?
@@ -160,7 +154,7 @@ where
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
-        let factor_tracer = context.engine.constant(self.factor().clone());
+        let factor_tracer = context.engine.constant(self.factor.clone());
         let primal = factor_tracer.clone().matmul(inputs[0].primal.clone());
         let tangent =
             context

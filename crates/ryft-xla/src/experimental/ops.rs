@@ -39,13 +39,13 @@ fn make_linear_xla_rematerialize<
 where
     XlaOperation: DifferentiableOperation<E>,
 {
-    let body_program = body.program();
+    let body_program = &body.program;
     let output_primals = body_program.interpret(input_primals.clone())?;
     let pushforward = body_program.linearize(engine, input_primals)?;
     let pullback = pushforward.transpose(output_primals.as_slice())?;
     Ok(LinearRematerializeOperation::new(
-        FlatTracedRematerialize::from_parts(body.input_types().to_vec(), body.output_types().to_vec(), pushforward),
-        FlatTracedRematerialize::from_parts(body.output_types().to_vec(), body.input_types().to_vec(), pullback),
+        FlatTracedRematerialize::from_parts(body.input_types.clone(), body.output_types.clone(), pushforward),
+        FlatTracedRematerialize::from_parts(body.output_types.clone(), body.input_types.clone(), pullback),
     ))
 }
 
@@ -104,7 +104,7 @@ fn interpret_xla_condition_jvp<
 where
     XlaOperation: DifferentiableOperation<E>,
 {
-    let ConditionPredicate::Captured(predicate) = condition.predicate() else {
+    let ConditionPredicate::Captured(predicate) = &condition.predicate else {
         return Err(ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition jvp" }.into());
     };
     let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -113,10 +113,10 @@ where
         return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
     }
 
-    let selected_branch = if *predicate { condition.true_branch() } else { condition.false_branch() };
+    let selected_branch = if *predicate { &condition.true_branch } else { &condition.false_branch };
     let primal_outputs = selected_branch.interpret(primal_inputs.clone())?;
-    let true_pushforward = condition.true_branch().linearize(context.engine, primal_inputs.clone())?;
-    let false_pushforward = condition.false_branch().linearize(context.engine, primal_inputs)?;
+    let true_pushforward = condition.true_branch.linearize(context.engine, primal_inputs.clone())?;
+    let false_pushforward = condition.false_branch.linearize(context.engine, primal_inputs)?;
     let linear_condition = ConditionOperation::with_captured_predicate(*predicate, true_pushforward, false_pushforward)
         .map_err(TracingError::from)?;
     let tangent_outputs = context.apply_operation(
@@ -323,14 +323,14 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "typed zero operation over tracer values was not materialized before interpretation for {}",
-                    zero.output_type()
+                    &zero.output_type
                 ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
                 message: format!(
                     "typed one operation over tracer values was not materialized before interpretation for {}",
-                    one.output_type()
+                    &one.output_type
                 ),
             }
             .into()),
@@ -373,7 +373,7 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
             Self::Custom(op) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 let replay_context = ShardMapReplayContext::new(exemplar.builder().clone());
-                op.extensions()
+                op.extensions
                     .get::<ShardMapCustomReplayExtension>()
                     .ok_or_else(|| {
                         TracingError::CustomOperation(ryft_core::tracing_v2::CustomOperationError::MissingRule {
@@ -414,17 +414,17 @@ impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
                 let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
                 let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
                 let primal_outputs = remat.interpret(primal_inputs.as_slice())?;
-                if tangent_inputs.is_empty() && !remat.body().output_types().is_empty() {
+                if tangent_inputs.is_empty() && !remat.body.output_types.as_slice().is_empty() {
                     return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
                 }
                 let tangent_outputs = context.apply_operation(
                     tangent_inputs.as_slice(),
                     LinearArrayOperation::Rematerialize(Box::new(make_linear_xla_rematerialize(
                         context.engine,
-                        remat.body(),
+                        &remat.body,
                         primal_inputs,
                     )?)),
-                    remat.body().output_types().len(),
+                    remat.body.output_types.as_slice().len(),
                 )?;
                 Ok(primal_outputs
                     .into_iter()
@@ -470,7 +470,7 @@ impl DifferentiableOperation<TracingContext<'static, XlaEngine<'static>>> for Xl
             Self::Condition(condition) => condition.jvp(context, inputs),
             Self::While(while_operation) => while_operation.jvp(context, inputs),
             Self::ShardMap(op) => {
-                let traced_op = ShardMapOperation::<ShardMapTracer>::new(op.body().clone());
+                let traced_op = ShardMapOperation::<ShardMapTracer>::new(op.body.clone());
                 traced_op.jvp_with_builders(context.engine.builder.clone(), context, inputs)
             }
             Self::LinearShardMap(op) => op.jvp_traced_with_builders(context.engine.builder.clone(), context, inputs),
@@ -536,9 +536,9 @@ impl SupportsZero<ArrayType, ShardMapTensor> for XlaOperation {
         XlaOperation::Zero(ZeroOperation::new(r#type))
     }
 
-    fn as_zero(&self) -> Option<&ArrayType> {
+    fn as_zero_operation(&self) -> Option<&ZeroOperation<ArrayType>> {
         match self {
-            Self::Zero(zero) => Some(zero.output_type()),
+            Self::Zero(zero) => Some(zero),
             _ => None,
         }
     }

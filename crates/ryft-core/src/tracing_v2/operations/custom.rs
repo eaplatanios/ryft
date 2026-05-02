@@ -126,7 +126,8 @@ impl<
     }
 }
 
-trait CustomBaseOperation<T: Type, V: Typed<T>>: Operation<T> + InterpretableOperation<T, V> {}
+/// Base operation contract wrapped by one [`CustomPrimitive`].
+pub trait CustomBaseOperation<T: Type, V: Typed<T>>: Operation<T> + InterpretableOperation<T, V> {}
 
 impl<Ty: Type, V: Traceable<Ty>, O: Operation<Ty> + InterpretableOperation<Ty, V>> CustomBaseOperation<Ty, V> for O {}
 
@@ -142,13 +143,13 @@ impl<Ty: Type, V: Traceable<Ty>, O: Operation<Ty> + InterpretableOperation<Ty, V
 #[derive(Clone)]
 pub struct CustomPrimitive<T: Type + PartialEq, V: Traceable<T> + Parameter> {
     /// Required base op providing abstract evaluation and eager interpretation.
-    base: Arc<dyn CustomBaseOperation<T, V>>,
+    pub base: Arc<dyn CustomBaseOperation<T, V>>,
 
     /// Optional reverse-mode transpose rule for the primitive.
-    transpose_rule: Option<Arc<dyn LinearOperation<T, V, LinearArrayOperation<V, T>>>>,
+    pub transpose_rule: Option<Arc<dyn LinearOperation<T, V, LinearArrayOperation<V, T>>>>,
 
     /// Typed extension registry carrying backend- or transform-specific extra rules.
-    extensions: CustomPrimitiveExtensions<T, V>,
+    pub extensions: CustomPrimitiveExtensions<T, V>,
 }
 
 impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> CustomPrimitive<T, V> {
@@ -189,12 +190,6 @@ impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> Custo
     pub fn with_extension<E: 'static>(mut self, extension: E) -> Self {
         self.extensions.insert(extension);
         self
-    }
-
-    /// Returns the typed extension registry carried by this primitive.
-    #[inline]
-    pub fn extensions(&self) -> &CustomPrimitiveExtensions<T, V> {
-        &self.extensions
     }
 
     /// Returns one linear-only wrapper for this primitive after verifying that it provides a transpose rule.
@@ -375,7 +370,7 @@ where
 #[derive(Clone)]
 pub struct LinearCustomPrimitive<T: Type + PartialEq, V: Traceable<T> + Parameter> {
     /// Wrapped custom primitive known to provide a transpose rule.
-    primitive: Arc<CustomPrimitive<T, V>>,
+    pub primitive: Arc<CustomPrimitive<T, V>>,
 }
 
 impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> LinearCustomPrimitive<T, V> {
@@ -386,12 +381,6 @@ impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> Linea
             .as_ref()
             .ok_or_else(|| TracingError::from(primitive.missing_rule("transpose")))?;
         Ok(Self { primitive })
-    }
-
-    /// Returns the wrapped custom primitive.
-    #[inline]
-    pub fn primitive(&self) -> &Arc<CustomPrimitive<T, V>> {
-        &self.primitive
     }
 }
 

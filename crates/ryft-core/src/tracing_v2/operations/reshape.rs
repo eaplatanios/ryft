@@ -232,26 +232,16 @@ impl_scalar_reshape_ops!(bf16, f16, f32, f64);
 #[derive(Clone)]
 pub struct ReshapeOperation {
     /// Shape expected from the input.
-    input_shape: Shape,
+    pub input_shape: Shape,
 
     /// Shape produced by the reshape.
-    output_shape: Shape,
+    pub output_shape: Shape,
 }
 
 impl ReshapeOperation {
     /// Creates a reshape op from `input_shape` to `output_shape`.
     pub fn new(input_shape: Shape, output_shape: Shape) -> Self {
         Self { input_shape, output_shape }
-    }
-
-    /// Returns the expected input shape.
-    pub fn input_shape(&self) -> &Shape {
-        &self.input_shape
-    }
-
-    /// Returns the produced output shape.
-    pub fn output_shape(&self) -> &Shape {
-        &self.output_shape
     }
 }
 
@@ -263,7 +253,7 @@ impl Debug for ReshapeOperation {
 
 impl Display for ReshapeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "reshape{}", self.output_shape())
+        write!(formatter, "reshape{}", &self.output_shape)
     }
 }
 
@@ -276,22 +266,18 @@ impl Operation<ArrayType> for ReshapeOperation {
         if input_types.len() != 1 {
             return Err(TypeError { message: format!("reshape expected 1 input type but got {}", input_types.len()) });
         }
-        if input_types[0].shape != *self.input_shape() {
+        if input_types[0].shape != *&self.input_shape {
             return Err(TypeError {
-                message: format!(
-                    "reshape expected input shape {} but got {}",
-                    self.input_shape(),
-                    input_types[0].shape
-                ),
+                message: format!("reshape expected input shape {} but got {}", &self.input_shape, input_types[0].shape),
             });
         }
-        Ok(vec![reshape_abstract(&input_types[0], self.output_shape(), "reshape")?])
+        Ok(vec![reshape_abstract(&input_types[0], &self.output_shape, "reshape")?])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-            operation.field("input_shape", self.input_shape())?;
-            operation.field("output_shape", self.output_shape())
+            operation.field("input_shape", &self.input_shape)?;
+            operation.field("output_shape", &self.output_shape)
         })
     }
 }
@@ -299,7 +285,7 @@ impl Operation<ArrayType> for ReshapeOperation {
 impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
-        Ok(vec![inputs[0].clone().reshape(self.output_shape().clone())?])
+        Ok(vec![inputs[0].clone().reshape(self.output_shape.clone())?])
     }
 }
 
@@ -313,15 +299,15 @@ impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for
         let Some(atom) = output_cotangents[0] else {
             return Ok(vec![None]);
         };
-        if self.input_shape() == self.output_shape() {
+        if &self.input_shape == &self.output_shape {
             return Ok(vec![Some(atom)]);
         }
         Ok(vec![Some(
             context
                 .stage(
                     LinearArrayOperation::Reshape {
-                        input_shape: self.output_shape().clone(),
-                        output_shape: self.input_shape().clone(),
+                        input_shape: self.output_shape.clone(),
+                        output_shape: self.input_shape.clone(),
                     },
                     &[atom],
                 )?
@@ -344,13 +330,13 @@ where
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
-        let primal = inputs[0].primal.clone().reshape(self.output_shape().clone())?;
+        let primal = inputs[0].primal.clone().reshape(self.output_shape.clone())?;
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent],
                 <E::LinearOperationCarrier as SupportsReshape<ArrayType, E::Value>>::reshape_operation(
-                    self.input_shape().clone(),
-                    self.output_shape().clone(),
+                    self.input_shape.clone(),
+                    self.output_shape.clone(),
                 ),
                 1,
             )?

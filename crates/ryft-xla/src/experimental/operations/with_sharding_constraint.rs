@@ -25,7 +25,7 @@ use crate::mlir::ToMlir;
 #[derive(Clone)]
 pub struct WithShardingConstraintOperation {
     /// Requested sharding that the input leaf must satisfy after lowering.
-    sharding: Sharding,
+    pub sharding: Sharding,
 }
 
 impl WithShardingConstraintOperation {
@@ -33,12 +33,6 @@ impl WithShardingConstraintOperation {
     #[inline]
     pub fn new(sharding: Sharding) -> Self {
         Self { sharding }
-    }
-
-    /// Returns the target sharding carried by this op.
-    #[inline]
-    pub fn sharding(&self) -> &Sharding {
-        &self.sharding
     }
 
     fn base_custom_primitive<V: Traceable<ArrayType> + 'static>(&self) -> CustomPrimitive<ArrayType, V>
@@ -91,12 +85,12 @@ impl Operation<ArrayType> for WithShardingConstraintOperation {
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_input_count!(input_types, 1, TypeError);
         let mut output = input_types[0].clone();
-        if output.rank() != self.sharding().rank() {
+        if output.rank() != self.sharding.rank() {
             return Err(TypeError {
                 message: "with_sharding_constraint rank does not match the requested sharding rank".to_string(),
             });
         }
-        let mut sharding = self.sharding().clone();
+        let mut sharding = self.sharding.clone();
         sharding.varying_manual_axes = output
             .sharding
             .as_ref()
@@ -208,7 +202,7 @@ impl StableHloCustomLowering<ShardMapTensor> for WithShardingConstraintOperation
     ) -> Result<Vec<ryft_mlir::ValueRef<'b, 'c, 't>>, LoweringError> {
         let operation = lowerer.block.append_operation(ryft_mlir::dialects::shardy::sharding_constraint(
             input_values[0],
-            self.sharding().to_mlir(lowerer.location),
+            self.sharding.to_mlir(lowerer.location),
             lowerer.location,
         ));
         Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])

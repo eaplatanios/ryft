@@ -111,14 +111,14 @@ where
     O: Clone,
 {
     /// Predicate source.
-    predicate: ConditionPredicate<T>,
+    pub predicate: ConditionPredicate<T>,
 
     // TODO(eaplatanios): Why are we limiting our control flow operations to flat programs only?
     /// Program evaluated when the predicate is true.
-    true_branch: FlatProgram<V, O, T>,
+    pub true_branch: FlatProgram<V, O, T>,
 
     /// Program evaluated when the predicate is false.
-    false_branch: FlatProgram<V, O, T>,
+    pub false_branch: FlatProgram<V, O, T>,
 }
 
 /// While-loop operation with nested condition and body programs over the same loop-carried state.
@@ -130,10 +130,10 @@ where
     O: Clone,
 {
     /// Program that maps the current loop state to one scalar boolean predicate.
-    condition: FlatProgram<V, O, T>,
+    pub condition: FlatProgram<V, O, T>,
 
     /// Program that maps the current loop state to the next loop state.
-    body: FlatProgram<V, O, T>,
+    pub body: FlatProgram<V, O, T>,
 }
 
 /// Returns the flat input types of a nested control-flow program.
@@ -278,24 +278,6 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> ConditionOpe
         Ok(Self { predicate, true_branch, false_branch })
     }
 
-    /// Returns the predicate source used by this condition.
-    #[inline]
-    pub fn predicate(&self) -> &ConditionPredicate<T> {
-        &self.predicate
-    }
-
-    /// Returns the true branch program.
-    #[inline]
-    pub fn true_branch(&self) -> &FlatProgram<V, O, T> {
-        &self.true_branch
-    }
-
-    /// Returns the false branch program.
-    #[inline]
-    pub fn false_branch(&self) -> &FlatProgram<V, O, T> {
-        &self.false_branch
-    }
-
     /// Returns the operand input types consumed by both branches.
     #[inline]
     pub fn input_types(&self) -> Vec<T> {
@@ -352,8 +334,8 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> ConditionOpe
                     operation.field("predicate", format_args!("captured({predicate})"))?;
                 }
             }
-            operation.program("true_branch", self.true_branch())?;
-            operation.program("false_branch", self.false_branch())
+            operation.program("true_branch", &self.true_branch)?;
+            operation.program("false_branch", &self.false_branch)
         })
     }
 }
@@ -572,18 +554,6 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> WhileOperation<V,
 }
 
 impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> WhileOperation<V, O, T> {
-    /// Returns the condition program.
-    #[inline]
-    pub fn condition(&self) -> &FlatProgram<V, O, T> {
-        &self.condition
-    }
-
-    /// Returns the body program.
-    #[inline]
-    pub fn body(&self) -> &FlatProgram<V, O, T> {
-        &self.body
-    }
-
     /// Returns the loop-carried state types.
     #[inline]
     pub fn state_types(&self) -> Vec<T> {
@@ -599,8 +569,8 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> WhileOperati
 
     fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, "while")?.bracketed(|operation| {
-            operation.program("condition", self.condition())?;
-            operation.program("body", self.body())
+            operation.program("condition", &self.condition)?;
+            operation.program("body", &self.body)
         })
     }
 }
@@ -741,7 +711,7 @@ where
                     .collect());
             }
 
-            let pushforward = self.body().linearize(context.engine, state_primals.clone())?;
+            let pushforward = &self.body.linearize(context.engine, state_primals.clone())?;
             let next_primals = self.body.interpret(state_primals)?;
             let next_tangents = replay_linear_program_on_atoms(context, &pushforward, state_tangents.as_slice())?;
             if next_primals.len() != state_count {

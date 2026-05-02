@@ -41,13 +41,13 @@ pub trait SupportsLinearRematerialize<T: Type + PartialEq, V: Traceable<T>>: Siz
 #[derive(Clone)]
 pub struct FlatTracedRematerialize<T: Type + PartialEq, V: Traceable<T>, O = ArrayOperation<V, T>> {
     /// Canonical input types of the body.
-    input_types: Vec<T>,
+    pub input_types: Vec<T>,
 
     /// Canonical output types of the body.
-    output_types: Vec<T>,
+    pub output_types: Vec<T>,
 
     /// Flat body sub-program executed by this rematerialization boundary.
-    program: Program<T, V, O, Vec<V>, Vec<V>>,
+    pub program: Program<T, V, O, Vec<V>, Vec<V>>,
 }
 
 impl<T: Type + PartialEq, V: Traceable<T>, O> FlatTracedRematerialize<T, V, O> {
@@ -55,24 +55,6 @@ impl<T: Type + PartialEq, V: Traceable<T>, O> FlatTracedRematerialize<T, V, O> {
     #[inline]
     pub fn from_parts(input_types: Vec<T>, output_types: Vec<T>, program: Program<T, V, O, Vec<V>, Vec<V>>) -> Self {
         Self { input_types, output_types, program }
-    }
-
-    /// Returns the canonical input types of the body.
-    #[inline]
-    pub fn input_types(&self) -> &[T] {
-        self.input_types.as_slice()
-    }
-
-    /// Returns the canonical output types of the body.
-    #[inline]
-    pub fn output_types(&self) -> &[T] {
-        self.output_types.as_slice()
-    }
-
-    /// Returns the flat body sub-program.
-    #[inline]
-    pub fn program(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
-        &self.program
     }
 }
 
@@ -90,10 +72,10 @@ pub struct RematerializeOperation<
     L = LinearArrayOperation<V, T>,
 > {
     /// The forward body sub-program.
-    body: FlatTracedRematerialize<T, V, O>,
+    pub body: FlatTracedRematerialize<T, V, O>,
 
     /// Phantom marker tying the op to the linear carrier used when the body is linearized.
-    marker: PhantomData<fn() -> L>,
+    pub marker: PhantomData<fn() -> L>,
 }
 
 impl<T: Type + PartialEq, V: Traceable<T>, O, L> RematerializeOperation<T, V, O, L> {
@@ -101,12 +83,6 @@ impl<T: Type + PartialEq, V: Traceable<T>, O, L> RematerializeOperation<T, V, O,
     #[inline]
     pub fn new(body: FlatTracedRematerialize<T, V, O>) -> Self {
         Self { body, marker: PhantomData }
-    }
-
-    /// Returns the forward body.
-    #[inline]
-    pub fn body(&self) -> &FlatTracedRematerialize<T, V, O> {
-        &self.body
     }
 }
 
@@ -149,7 +125,7 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>, L: Clone> Op
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.program("body", self.body().program()))
+            .bracketed(|operation| operation.program("body", &self.body.program))
     }
 }
 
@@ -162,7 +138,7 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        self.body.program().interpret(inputs.to_vec())
+        self.body.program.interpret(inputs.to_vec())
     }
 }
 
@@ -210,7 +186,7 @@ where
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
 
         let primal_outputs = if primal_inputs.is_empty() {
-            if !self.body().output_types().is_empty() {
+            if !self.body.output_types.as_slice().is_empty() {
                 return Err(DifferentiationError::MissingTracedRematerializeInputLeaves.into());
             }
             Vec::new()
@@ -226,11 +202,11 @@ where
             return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
         }
 
-        let (_, pushforward) = context.engine.linearize(self.body().program(), primal_inputs)?;
+        let (_, pushforward) = context.engine.linearize(&self.body.program, primal_inputs)?;
         let pullback = context.engine.transpose(&pushforward)?;
 
-        let body_input_types = self.body().input_types().to_vec();
-        let body_output_types = self.body().output_types().to_vec();
+        let body_input_types = self.body.input_types.as_slice().to_vec();
+        let body_output_types = self.body.output_types.as_slice().to_vec();
         let linear_remat = LinearRematerializeOperation::<
             ArrayType,
             Tracer<'engine, EInner>,
@@ -254,7 +230,7 @@ where
                 ArrayType,
                 Tracer<'engine, EInner>,
             >>::rematerialize_operation(linear_remat),
-            self.body().output_types().len(),
+            self.body.output_types.as_slice().len(),
         )?;
 
         Ok(primal_outputs
@@ -325,7 +301,7 @@ where
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         if inputs.is_empty() {
-            return if self.body.output_types().is_empty() {
+            return if self.body.output_types.as_slice().is_empty() {
                 Ok(Vec::new())
             } else {
                 Err(DifferentiationError::MissingTracedRematerializeInputLeaves.into())
@@ -347,10 +323,10 @@ pub struct LinearRematerializeOperation<
     O = LinearArrayOperation<V, T>,
 > {
     /// The forward linear body sub-program.
-    body: FlatTracedRematerialize<T, V, O>,
+    pub body: FlatTracedRematerialize<T, V, O>,
 
     /// The transpose linear body.
-    transpose_body: FlatTracedRematerialize<T, V, O>,
+    pub transpose_body: FlatTracedRematerialize<T, V, O>,
 }
 
 impl<T: Type + PartialEq, V: Traceable<T>, O> LinearRematerializeOperation<T, V, O> {
@@ -358,12 +334,6 @@ impl<T: Type + PartialEq, V: Traceable<T>, O> LinearRematerializeOperation<T, V,
     #[inline]
     pub fn new(body: FlatTracedRematerialize<T, V, O>, transpose_body: FlatTracedRematerialize<T, V, O>) -> Self {
         Self { body, transpose_body }
-    }
-
-    /// Returns the forward body.
-    #[inline]
-    pub fn body(&self) -> &FlatTracedRematerialize<T, V, O> {
-        &self.body
     }
 }
 
@@ -412,8 +382,8 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> Operation<T>
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-            operation.program("body", self.body().program())?;
-            operation.program("transpose_body", self.transpose_body.program())
+            operation.program("body", &self.body.program)?;
+            operation.program("transpose_body", &self.transpose_body.program)
         })
     }
 }
@@ -427,7 +397,7 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        self.body.program().interpret(inputs.to_vec())
+        self.body.program.interpret(inputs.to_vec())
     }
 }
 
@@ -444,18 +414,18 @@ where
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         let transpose = self.transpose_op();
         if output_cotangents.is_empty() {
-            return if self.body.input_types().is_empty() {
+            return if self.body.input_types.as_slice().is_empty() {
                 Ok(Vec::new())
             } else {
                 Err(DifferentiationError::MissingLinearRematerializeTransposeCotangentLeaves.into())
             };
         }
         if output_cotangents.iter().all(Option::is_none) {
-            return Ok(vec![None; self.body.input_types().len()]);
+            return Ok(vec![None; self.body.input_types.as_slice().len()]);
         }
         let materialized = output_cotangents
             .iter()
-            .zip(transpose.body.input_types().iter())
+            .zip(transpose.body.input_types.as_slice().iter())
             .map(|(cotangent, input_type)| materialize_optional_cotangent(context, *cotangent, input_type))
             .collect::<Vec<_>>();
         Ok(context
@@ -512,7 +482,7 @@ where
         + ?Sized
         + 'static,
 {
-    let body_program = body.program();
+    let body_program = &body.program;
     let output_primals = body_program.interpret(input_primals.clone())?;
     let pushforward = body_program.linearize(engine, input_primals)?;
     let pullback = pushforward.transpose(output_primals.as_slice())?;

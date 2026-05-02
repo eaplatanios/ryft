@@ -341,9 +341,9 @@ where
     }
 
     #[inline]
-    fn as_zero(&self) -> Option<&DataType> {
+    fn as_zero_operation(&self) -> Option<&ZeroOperation<DataType>> {
         match self {
-            Self::Zero(zero) => Some(zero.output_type()),
+            Self::Zero(zero) => Some(zero),
             _ => None,
         }
     }
@@ -419,9 +419,9 @@ where
     }
 
     #[inline]
-    fn as_zero(&self) -> Option<&DataType> {
+    fn as_zero_operation(&self) -> Option<&ZeroOperation<DataType>> {
         match self {
-            Self::Zero(zero) => Some(zero.output_type()),
+            Self::Zero(zero) => Some(zero),
             _ => None,
         }
     }
@@ -558,9 +558,9 @@ where
     }
 
     #[inline]
-    fn as_zero(&self) -> Option<&T> {
+    fn as_zero_operation(&self) -> Option<&ZeroOperation<T>> {
         match self {
-            Self::Zero(zero) => Some(zero.output_type()),
+            Self::Zero(zero) => Some(zero),
             _ => None,
         }
     }
@@ -675,9 +675,9 @@ where
     }
 
     #[inline]
-    fn as_zero(&self) -> Option<&T> {
+    fn as_zero_operation(&self) -> Option<&ZeroOperation<T>> {
         match self {
-            Self::Zero(zero) => Some(zero.output_type()),
+            Self::Zero(zero) => Some(zero),
             _ => None,
         }
     }
@@ -1375,14 +1375,14 @@ where
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    zero.output_type()
+                    &zero.output_type
                 ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
-                    one.output_type()
+                    &one.output_type
                 ),
             }
             .into()),
@@ -1582,14 +1582,14 @@ where
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    zero.output_type()
+                    &zero.output_type
                 ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
-                    one.output_type()
+                    &one.output_type
                 ),
             }
             .into()),
@@ -1634,14 +1634,14 @@ where
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    zero.output_type()
+                    &zero.output_type
                 ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
-                    one.output_type()
+                    &one.output_type
                 ),
             }
             .into()),

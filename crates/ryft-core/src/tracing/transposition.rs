@@ -282,13 +282,13 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
         let mut atom_remapping: Vec<Option<AtomId>> = vec![None; builder.atoms.len()];
         let mut rewritten_instructions = Vec::with_capacity(pullback.instructions.len());
         for instruction in &pullback.instructions {
-            if let Some(zero_type) = instruction.operation.as_zero()
+            if let Some(zero_operation) = instruction.operation.as_zero_operation()
                 && instruction.outputs.len() == 1
                 && instruction.inputs.is_empty()
             {
                 // Zero ops in traced pullbacks have no inputs from which interpretation can recover a tracing
                 // context, so materialize each one as a constant in this outer trace and remap its uses.
-                let zero_tracer = self.constant(self.engine.zero(zero_type)?);
+                let zero_tracer = self.constant(self.engine.zero(&zero_operation.output_type)?);
                 let constant_atom = builder.add_constant(zero_tracer);
                 atom_remapping[instruction.outputs[0].index] = Some(constant_atom);
             } else {

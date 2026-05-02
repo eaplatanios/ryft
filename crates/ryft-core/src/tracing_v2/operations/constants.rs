@@ -31,12 +31,12 @@ pub trait SupportsZero<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the zero [`Operation`].
     fn zero_operation(r#type: T) -> Self;
 
-    /// Returns the type carried by a zero [`Operation`], or `None` for any other operation variant.
+    /// Returns the zero [`Operation`], or `None` for any other operation variant.
     ///
     /// Higher-order passes (notably the traced reverse-mode pipeline that has to materialize
     /// `Zero` ops into outer-trace constants before its pullback can be interpreted) use this hook
     /// to identify zero ops without pattern-matching on a concrete carrier enum.
-    fn as_zero(&self) -> Option<&T> {
+    fn as_zero_operation(&self) -> Option<&ZeroOperation<T>> {
         None
     }
 }
@@ -51,7 +51,7 @@ pub trait SupportsZero<T: Type, V: Traceable<T>> {
 #[derive(Clone)]
 pub struct ZeroOperation<T: Type = ArrayType> {
     /// Type of the value produced when this op is interpreted.
-    output_type: T,
+    pub output_type: T,
 }
 
 impl<T: Type> ZeroOperation<T> {
@@ -59,12 +59,6 @@ impl<T: Type> ZeroOperation<T> {
     #[inline]
     pub fn new(output_type: T) -> Self {
         Self { output_type }
-    }
-
-    /// Returns the type produced by this zero op.
-    #[inline]
-    pub fn output_type(&self) -> &T {
-        &self.output_type
     }
 }
 
@@ -179,7 +173,7 @@ pub trait SupportsOne<T: Type, V: Traceable<T>> {
 #[derive(Clone)]
 pub struct OneOperation<T: Type = ArrayType> {
     /// Type of the value produced when this op is interpreted.
-    output_type: T,
+    pub output_type: T,
 }
 
 impl<T: Type> OneOperation<T> {
@@ -187,12 +181,6 @@ impl<T: Type> OneOperation<T> {
     #[inline]
     pub fn new(output_type: T) -> Self {
         Self { output_type }
-    }
-
-    /// Returns the type produced by this one op.
-    #[inline]
-    pub fn output_type(&self) -> &T {
-        &self.output_type
     }
 }
 

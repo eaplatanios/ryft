@@ -77,15 +77,15 @@ pub enum LinearShardMapEvalMode {
 /// vector is empty for tensor-leaf shard-map ops (where captures are never read) and populated with atom ids for
 /// tracer-leaf ops, where [`LinearShardMapOperation`] reifies each atom back into a `Tracer`.
 #[derive(Clone)]
-struct LinearShardMapState {
+pub struct LinearShardMapState {
     /// Staged primal atom ids captured when the shard-map body was linearized.
-    captured_global_primals: Vec<AtomId>,
+    pub captured_global_primals: Vec<AtomId>,
 
     /// Evaluation strategy used when replaying the forward linear body.
-    eval_mode: LinearShardMapEvalMode,
+    pub eval_mode: LinearShardMapEvalMode,
 
     /// Evaluation strategy used when replaying the transpose body.
-    transpose_mode: LinearShardMapEvalMode,
+    pub transpose_mode: LinearShardMapEvalMode,
 }
 
 fn missing_traced_shard_map_staging_context() -> TracingError {
@@ -104,16 +104,16 @@ fn missing_linear_shard_map_staging_context() -> TracingError {
 #[derive(Clone)]
 pub struct ShardMapOperation<V> {
     /// Canonical erased shard-map body carried by this higher-order op.
-    body: FlatTracedShardMap,
+    pub body: FlatTracedShardMap,
 
     /// Global input types expected by the carried body.
-    input_types: Vec<ArrayType>,
+    pub input_types: Vec<ArrayType>,
 
     /// Global output types produced by the carried body.
-    output_types: Vec<ArrayType>,
+    pub output_types: Vec<ArrayType>,
 
     /// Phantom marker tying the op to the traced leaf type it will replay with.
-    marker: PhantomData<fn() -> V>,
+    pub marker: PhantomData<fn() -> V>,
 }
 
 impl<V> ShardMapOperation<V> {
@@ -126,12 +126,6 @@ impl<V> ShardMapOperation<V> {
             body,
             marker: PhantomData,
         }
-    }
-
-    /// Returns the canonical primal shard-map body carried by this higher-order op.
-    #[inline]
-    pub fn body(&self) -> &FlatTracedShardMap {
-        &self.body
     }
 }
 
@@ -151,19 +145,19 @@ impl ShardMapOperation<ShardMapTensor> {
 #[derive(Clone)]
 pub struct LinearShardMapOperation<V> {
     /// Canonical erased primal shard-map body carried by this linear higher-order op.
-    body: FlatTracedShardMap,
+    pub body: FlatTracedShardMap,
 
     /// Global input types expected by the carried body.
-    input_types: Vec<ArrayType>,
+    pub input_types: Vec<ArrayType>,
 
     /// Global output types produced by the carried body.
-    output_types: Vec<ArrayType>,
+    pub output_types: Vec<ArrayType>,
 
     /// Linear execution state for replaying this linear shard-map.
-    linear_state: LinearShardMapState,
+    pub linear_state: LinearShardMapState,
 
     /// Phantom marker tying the op to the traced leaf type it will replay with.
-    marker: PhantomData<fn() -> V>,
+    pub marker: PhantomData<fn() -> V>,
 }
 
 impl<V> LinearShardMapOperation<V> {
@@ -184,31 +178,6 @@ impl<V> LinearShardMapOperation<V> {
             linear_state: LinearShardMapState { captured_global_primals, eval_mode, transpose_mode },
             marker: PhantomData,
         }
-    }
-
-    /// Returns the canonical primal shard-map body carried by this linear higher-order op.
-    #[inline]
-    pub fn body(&self) -> &FlatTracedShardMap {
-        &self.body
-    }
-
-    /// Returns the active linear evaluation mode for this linear shard-map op.
-    #[inline]
-    pub fn eval_mode(&self) -> &LinearShardMapEvalMode {
-        &self.linear_state.eval_mode
-    }
-
-    /// Returns the outer-program atom ids of the primals captured when this linear shard-map was staged.
-    #[inline]
-    pub(crate) fn captured_global_primals(&self) -> &[AtomId] {
-        self.linear_state.captured_global_primals.as_slice()
-    }
-
-    /// Returns the transpose evaluation mode for this linear shard-map op.
-    #[inline]
-    #[cfg(feature = "benchmarking")]
-    pub fn transpose_mode(&self) -> &LinearShardMapEvalMode {
-        &self.linear_state.transpose_mode
     }
 
     /// Returns the shared custom-primitive registration used by this linear shard-map variant.
@@ -645,7 +614,7 @@ where
         let tangent_outputs = context.apply_operation(
             tangent_inputs.as_slice(),
             LinearArrayOperation::Custom(Arc::new(
-                make_linear_tensor_shard_map(self.body())
+                make_linear_tensor_shard_map(&self.body)
                     .map_err(trace_error_from_shard_map)?
                     .to_tensor_linear_custom_primitive(),
             )),
@@ -814,7 +783,7 @@ impl StableHloCustomLowering<ShardMapTensor> for LinearShardMapOperation<ShardMa
         _output_types: &[ArrayType],
         lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ryft_mlir::ValueRef<'b, 'c, 't>>, LoweringError> {
-        lowerer.lower_linear_shard_map_eval_mode(self.eval_mode(), &[], input_values)
+        lowerer.lower_linear_shard_map_eval_mode(&self.linear_state.eval_mode, &[], input_values)
     }
 }
 

@@ -655,9 +655,9 @@ where
     fn constrain_leaf(input: ShardMapTracer, sharding: Sharding) -> Result<ShardMapTracer, ShardMapTraceError> {
         let op = WithShardingConstraintOperation::new(sharding.clone());
         let input_type = input.r#type();
-        if op.sharding().rank() != input_type.rank() {
+        if op.sharding.rank() != input_type.rank() {
             return Err(ShardingError::ShardingRankMismatch {
-                sharding_rank: op.sharding().rank(),
+                sharding_rank: op.sharding.rank(),
                 array_rank: input_type.rank(),
             }
             .into());
