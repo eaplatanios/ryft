@@ -1,7 +1,5 @@
 use std::fmt::Display;
 
-use half::{bf16, f16};
-
 use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::sharding::{Sharding, ShardingDimension};
@@ -212,21 +210,6 @@ where
             .expect("reshape should produce one traced output"))
     }
 }
-
-macro_rules! impl_scalar_reshape_ops {
-    ($($ty:ty),* $(,)?) => {
-        $(
-            impl ReshapeOps for $ty {
-                fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-                    reshape_abstract(&self.r#type(), &target_shape, "reshape")?;
-                    Ok(self)
-                }
-            }
-        )*
-    };
-}
-
-impl_scalar_reshape_ops!(bf16, f16, f32, f64);
 
 /// Primitive representing one reshape between two [`Shape`]s.
 #[derive(Clone, Debug)]

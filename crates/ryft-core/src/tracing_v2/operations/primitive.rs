@@ -1713,7 +1713,6 @@ where
 
 impl<
     V: Value<DataType>
-        + Traceable<ArrayType>
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
@@ -1765,7 +1764,6 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
     for ScalarOperation<V>
 where
     V: Value<DataType>
-        + Traceable<ArrayType>
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
@@ -1912,7 +1910,6 @@ where
 
 impl<
     V: Value<DataType>
-        + Traceable<ArrayType>
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
@@ -2064,7 +2061,6 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
     for ArrayOperation<V, DataType>
 where
     V: Value<DataType>
-        + Traceable<ArrayType>
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>

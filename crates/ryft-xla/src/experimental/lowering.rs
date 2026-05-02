@@ -1219,27 +1219,6 @@ pub(crate) trait MlirLowerableValue: Clone + Traceable<ArrayType> + Typed<ArrayT
     }
 }
 
-impl MlirLowerableValue for f64 {
-    fn to_dense_elements_attribute<'c, 't>(
-        &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-        context
-            .dense_f64_elements_attribute(tensor_type, std::slice::from_ref(self))
-            .and_then(|attribute| attribute.cast::<DenseElementsAttributeRef>())
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })
-    }
-
-    fn to_scalar_dense_elements_attribute<'c, 't>(
-        &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
-    ) -> Result<Option<DenseElementsAttributeRef<'c, 't>>, LoweringError> {
-        Ok(Some(self.to_dense_elements_attribute(tensor_type, context)?))
-    }
-}
-
 #[cfg(feature = "ndarray")]
 impl MlirLowerableValue for NdArrayValue<f64> {
     fn to_dense_elements_attribute<'c, 't>(
@@ -2490,23 +2469,30 @@ fn unsigned_integer_width(data_type: DataType) -> Result<usize, LoweringError> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::fmt::Display;
+    use std::ops::{Add, Mul, Neg};
     use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use ryft_mlir::Value as MlirValue;
+
+    use ryft_core::broadcasting::Broadcastable;
     use ryft_core::macros::check_input_count;
-    use ryft_core::operations::constants::{OneLike, ZeroLike};
+    use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
     use ryft_core::operations::{InterpretableOperation, Operation};
-    use ryft_core::parameters::Placeholder;
+    use ryft_core::parameters::{Parameter, Placeholder};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
-    use ryft_core::tracing::{ProgramBuilder, TracingError};
+    use ryft_core::tracing::{ProgramBuilder, Traceable, TracingError, Value as TraceValue};
+    use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::{
-        ArrayOperation, Cos, CustomPrimitive, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation,
-        LinearizableEngine, MatrixOps, Sin,
+        ArrayOperation, CoordinateValue, Cos, CustomPrimitive, Differentiable, DifferentiableEngine,
+        DifferentiableTracingEngine, LinearArrayOperation, LinearizableEngine, MatrixOps, ReshapeOps, Sin,
     };
-    use ryft_core::types::{Shape, TypeError};
+    use ryft_core::types::{Shape, TypeError, Typed};
     #[cfg(feature = "ndarray")]
     use ryft_ndarray::{Array as NdArrayValue, NdArrayEngine};
 
@@ -2523,6 +2509,191 @@ mod tests {
 
     fn test_matrix_type(rows: usize, cols: usize) -> ArrayType {
         ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None).unwrap()
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct TestArray {
+        r#type: ArrayType,
+        values: Vec<f64>,
+    }
+
+    impl TestArray {
+        fn scalar(value: f64) -> Self {
+            Self { r#type: ArrayType::scalar(DataType::F64), values: vec![value] }
+        }
+
+        fn element_count(r#type: &ArrayType) -> usize {
+            if r#type.rank() == 0 {
+                1
+            } else {
+                r#type.shape.dimensions.iter().map(|dimension| dimension.value().unwrap()).product()
+            }
+        }
+
+        fn binary(self, rhs: Self, function: impl Fn(f64, f64) -> f64) -> Self {
+            Self {
+                r#type: self.r#type.clone().broadcast(&rhs.r#type).unwrap(),
+                values: self.values.into_iter().zip(rhs.values).map(|(left, right)| function(left, right)).collect(),
+            }
+        }
+    }
+
+    impl Parameter for TestArray {}
+
+    impl Display for TestArray {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{:?}", self.values)
+        }
+    }
+
+    impl Typed<ArrayType> for TestArray {
+        fn r#type(&self) -> Cow<'_, ArrayType> {
+            Cow::Borrowed(&self.r#type)
+        }
+    }
+
+    impl Traceable<ArrayType> for TestArray {}
+
+    impl TraceValue<ArrayType> for TestArray {}
+
+    impl ControlFlowValue for TestArray {
+        fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+            Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type.clone() }.into())
+        }
+    }
+
+    impl Zero<ArrayType> for TestArray {
+        fn zero(r#type: &ArrayType) -> Result<Self, TracingError> {
+            Ok(Self { r#type: r#type.clone(), values: vec![0.0; Self::element_count(r#type)] })
+        }
+    }
+
+    impl One<ArrayType> for TestArray {
+        fn one(r#type: &ArrayType) -> Result<Self, TracingError> {
+            Ok(Self { r#type: r#type.clone(), values: vec![1.0; Self::element_count(r#type)] })
+        }
+    }
+
+    impl ZeroLike for TestArray {
+        fn zero_like(&self) -> Self {
+            Self { r#type: self.r#type.clone(), values: vec![0.0; self.values.len()] }
+        }
+    }
+
+    impl OneLike for TestArray {
+        fn one_like(&self) -> Self {
+            Self { r#type: self.r#type.clone(), values: vec![1.0; self.values.len()] }
+        }
+    }
+
+    impl Differentiable<ArrayType> for TestArray {
+        type Tangent = Self;
+    }
+
+    impl CoordinateValue for TestArray {
+        type Coordinate = f64;
+
+        fn coordinate_count(&self) -> usize {
+            self.values.len()
+        }
+
+        fn coordinate_basis(&self) -> Vec<Self> {
+            (0..self.values.len())
+                .map(|index| {
+                    let mut values = vec![0.0; self.values.len()];
+                    values[index] = 1.0;
+                    Self { r#type: self.r#type.clone(), values }
+                })
+                .collect()
+        }
+
+        fn coordinates(&self) -> Vec<Self::Coordinate> {
+            self.values.clone()
+        }
+    }
+
+    impl Add for TestArray {
+        type Output = Self;
+
+        fn add(self, rhs: Self) -> Self::Output {
+            self.binary(rhs, |left, right| left + right)
+        }
+    }
+
+    impl Mul for TestArray {
+        type Output = Self;
+
+        fn mul(self, rhs: Self) -> Self::Output {
+            self.binary(rhs, |left, right| left * right)
+        }
+    }
+
+    impl Neg for TestArray {
+        type Output = Self;
+
+        fn neg(self) -> Self::Output {
+            Self { r#type: self.r#type, values: self.values.into_iter().map(|value| -value).collect() }
+        }
+    }
+
+    impl Sin for TestArray {
+        fn sin(self) -> Self {
+            Self { r#type: self.r#type, values: self.values.into_iter().map(f64::sin).collect() }
+        }
+    }
+
+    impl Cos for TestArray {
+        fn cos(self) -> Self {
+            Self { r#type: self.r#type, values: self.values.into_iter().map(f64::cos).collect() }
+        }
+    }
+
+    impl MatrixOps for TestArray {
+        fn matmul(self, rhs: Self) -> Self {
+            self * rhs
+        }
+
+        fn transpose_matrix(self) -> Self {
+            self
+        }
+    }
+
+    impl ReshapeOps for TestArray {
+        fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
+            Ok(Self {
+                r#type: ArrayType::new(self.r#type.data_type, target_shape, None, None).unwrap(),
+                values: self.values,
+            })
+        }
+    }
+
+    impl MlirLowerableValue for TestArray {
+        fn to_dense_elements_attribute<'c, 't>(
+            &self,
+            tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+            context: &'c MlirContext<'t>,
+        ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
+            context
+                .dense_f64_elements_attribute(tensor_type, self.values.as_slice())
+                .and_then(|attribute| attribute.cast::<DenseElementsAttributeRef>())
+                .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })
+        }
+
+        fn to_scalar_dense_elements_attribute<'c, 't>(
+            &self,
+            tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+            context: &'c MlirContext<'t>,
+        ) -> Result<Option<DenseElementsAttributeRef<'c, 't>>, LoweringError> {
+            let [value] = self.values.as_slice() else {
+                return Ok(None);
+            };
+            Ok(Some(
+                context
+                    .dense_f64_elements_attribute(tensor_type, std::slice::from_ref(value))
+                    .and_then(|attribute| attribute.cast::<DenseElementsAttributeRef>())
+                    .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?,
+            ))
+        }
     }
 
     fn xla_identity_branch(
@@ -2783,34 +2954,34 @@ mod tests {
     }
 
     #[derive(Copy, Clone, Debug)]
-    struct ArrayScalarEngine;
+    struct TestArrayEngine;
 
-    impl Engine for ArrayScalarEngine {
+    impl Engine for TestArrayEngine {
         type Type = ArrayType;
-        type Value = f64;
+        type Value = TestArray;
 
-        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(0.0)
+        fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
+            TestArray::zero(r#type)
         }
 
-        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(1.0)
+        fn one(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
+            TestArray::one(r#type)
         }
     }
 
-    impl TracingEngine for ArrayScalarEngine {
-        type OperationCarrier = ArrayOperation<f64, ArrayType>;
+    impl TracingEngine for TestArrayEngine {
+        type OperationCarrier = ArrayOperation<TestArray, ArrayType>;
     }
 
-    impl LinearizableEngine for ArrayScalarEngine {
-        type LinearOperationCarrier = LinearArrayOperation<f64, ArrayType>;
+    impl LinearizableEngine for TestArrayEngine {
+        type LinearOperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
     }
 
-    impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperationCarrier = ArrayOperation<f64, ArrayType>;
+    impl DifferentiableEngine for TestArrayEngine {
+        type DifferentiableOperationCarrier = ArrayOperation<TestArray, ArrayType>;
     }
 
-    impl DifferentiableTracingEngine for ArrayScalarEngine {
+    impl DifferentiableTracingEngine for TestArrayEngine {
         type LinearOperationCarrier<'engine>
             = LinearArrayOperation<Tracer<'engine, Self>, ArrayType>
         where
@@ -2819,17 +2990,22 @@ mod tests {
 
     #[test]
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
-        let engine = ArrayScalarEngine;
+        let engine = TestArrayEngine;
         let (_, compiled): (
-            f64,
+            TestArray,
             ryft_core::tracing::Program<
                 ArrayType,
-                f64,
-                ryft_core::tracing_v2::ArrayOperation<f64, ArrayType>,
-                (f64, f64),
-                f64,
+                TestArray,
+                ryft_core::tracing_v2::ArrayOperation<TestArray, ArrayType>,
+                (TestArray, TestArray),
+                TestArray,
             >,
-        ) = engine.interpret_and_trace(|inputs| Ok(scalar_bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
+        ) = engine
+            .interpret_and_trace(
+                |inputs| Ok(scalar_bilinear_sin(inputs)),
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+            )
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         assert_eq!(
@@ -2849,18 +3025,21 @@ mod tests {
 
     #[test]
     fn test_plain_rematerialize_lowers_optimization_barrier() {
-        let engine = ArrayScalarEngine;
+        let engine = TestArrayEngine;
         let (_, compiled): (
-            f64,
+            TestArray,
             ryft_core::tracing::Program<
                 ArrayType,
-                f64,
-                ryft_core::tracing_v2::ArrayOperation<f64, ArrayType>,
-                f64,
-                f64,
+                TestArray,
+                ryft_core::tracing_v2::ArrayOperation<TestArray, ArrayType>,
+                TestArray,
+                TestArray,
             >,
         ) = engine
-            .interpret_and_trace(|x| Ok(ryft_core::tracing_v2::rematerialize(|y| y.sin(), x).unwrap()), 2.0f64)
+            .interpret_and_trace(
+                |x| Ok(ryft_core::tracing_v2::rematerialize(|y| y.sin(), x).unwrap()),
+                TestArray::scalar(2.0),
+            )
             .unwrap();
 
         assert_eq!(
@@ -2879,20 +3058,20 @@ mod tests {
 
     #[test]
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
-        let engine = ArrayScalarEngine;
+        let engine = TestArrayEngine;
         let (_, compiled): (
-            f64,
+            TestArray,
             ryft_core::tracing::Program<
                 ArrayType,
-                f64,
-                ryft_core::tracing_v2::ArrayOperation<f64, ArrayType>,
-                f64,
-                f64,
+                TestArray,
+                ryft_core::tracing_v2::ArrayOperation<TestArray, ArrayType>,
+                TestArray,
+                TestArray,
             >,
         ) = engine
             .interpret_and_trace(
-                |x| Ok(ryft_core::tracing_v2::grad(&ArrayScalarEngine, scalar_quartic_plus_sin, x)?),
-                2.0f64,
+                |x| Ok(ryft_core::tracing_v2::grad(&TestArrayEngine, scalar_quartic_plus_sin, x)?),
+                TestArray::scalar(2.0),
             )
             .unwrap();
 
@@ -2914,16 +3093,20 @@ mod tests {
     fn test_plain_scalar_bilinear_sin_vjp_pullback_standalone_stablehlo() {
         // Standalone pullback â€” specialized to primal point (x=2.0, y=3.0), like JAX's standalone vjp_fn.
         let (_, pullback): (
-            f64,
+            TestArray,
             ryft_core::tracing::Program<
                 ArrayType,
-                f64,
-                ryft_core::tracing_v2::LinearArrayOperation<f64, ArrayType>,
-                f64,
-                (f64, f64),
+                TestArray,
+                ryft_core::tracing_v2::LinearArrayOperation<TestArray, ArrayType>,
+                TestArray,
+                (TestArray, TestArray),
             >,
-        ) = ryft_core::tracing_v2::vjp(&ArrayScalarEngine, |inputs| Ok(scalar_bilinear_sin(inputs)), (2.0f64, 3.0f64))
-            .unwrap();
+        ) = ryft_core::tracing_v2::vjp(
+            &TestArrayEngine,
+            |inputs| Ok(scalar_bilinear_sin(inputs)),
+            (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+        )
+        .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         println!("=== ryft standalone vjp_pullback(x*y + sin(x)) StableHLO ===\n{stablehlo}");
@@ -2938,20 +3121,20 @@ mod tests {
     fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
         // grad(f) wrapped in JIT â€” symbolic, like JAX's jit(grad(f)).
         // Uses the ValueAndGradDispatch<Tracer<V>> path that traces through vjp+pullback.
-        let engine = ArrayScalarEngine;
+        let engine = TestArrayEngine;
         let (_, compiled): (
-            (f64, f64),
+            (TestArray, TestArray),
             ryft_core::tracing::Program<
                 ArrayType,
-                f64,
-                ryft_core::tracing_v2::ArrayOperation<f64, ArrayType>,
-                (f64, f64),
-                (f64, f64),
+                TestArray,
+                ryft_core::tracing_v2::ArrayOperation<TestArray, ArrayType>,
+                (TestArray, TestArray),
+                (TestArray, TestArray),
             >,
         ) = engine
             .interpret_and_trace(
-                |inputs| Ok(ryft_core::tracing_v2::grad(&ArrayScalarEngine, scalar_bilinear_sin, inputs)?),
-                (2.0f64, 3.0f64),
+                |inputs| Ok(ryft_core::tracing_v2::grad(&TestArrayEngine, scalar_bilinear_sin, inputs)?),
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();
 

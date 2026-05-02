@@ -217,12 +217,13 @@ mod tests {
     use crate::tracing::ProgramBuilder;
     use crate::tracing::transposition::TranspositionContext;
     use crate::tracing_v2::LinearArrayOperation;
+    use crate::tracing_v2::test_util::TestArray;
 
     use super::*;
 
     fn test_transposition_context(
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearArrayOperation<f64, ArrayType>>>>,
-    ) -> TranspositionContext<ArrayType, f64, LinearArrayOperation<f64, ArrayType>> {
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>>>,
+    ) -> TranspositionContext<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>> {
         TranspositionContext::new(builder)
     }
 
@@ -234,11 +235,12 @@ mod tests {
     #[test]
     fn test_scale_transpose_scales_output_cotangents() {
         let transpose_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64, ArrayType>>::new()));
-        let output_cotangent_atom =
-            transpose_builder.borrow_mut().add_input(<f64 as Typed<ArrayType>>::r#type(&1.0f64).into_owned());
+            Rc::new(RefCell::new(
+                ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
+            ));
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let mut context = test_transposition_context(transpose_builder.clone());
-        let contribution_atom = ScaleOperation::new(3.0f64)
+        let contribution_atom = ScaleOperation::new(TestArray::scalar(3.0))
             .transpose(&mut context, &[Some(output_cotangent_atom)])
             .unwrap()
             .into_iter()
@@ -250,14 +252,15 @@ mod tests {
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
-        let transpose_program =
-            transpose_builder.build::<f64, f64>(vec![contribution_atom], Placeholder, Placeholder).unwrap();
-        approx_eq(transpose_program.interpret(2.0f64).unwrap(), 6.0);
+        let transpose_program = transpose_builder
+            .build::<TestArray, TestArray>(vec![contribution_atom], Placeholder, Placeholder)
+            .unwrap();
+        approx_eq(transpose_program.interpret(TestArray::scalar(2.0)).unwrap().values[0], 6.0);
         assert_eq!(
             transpose_program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = scale [factor=3] %0
+                let %1:f64[] = scale [factor=[3.0]] %0
                 in (%1)
             "}
             .trim_end(),

@@ -9,7 +9,7 @@ use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
-use crate::types::{ArrayType, DataType, Type};
+use crate::types::{DataType, Type};
 
 impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
     for ZeroOperation<T>
@@ -172,10 +172,6 @@ macro_rules! impl_scalar_differentiable {
         impl crate::tracing_v2::differentiation::Differentiable<DataType> for $ty {
             type Tangent = Self;
         }
-
-        impl crate::tracing_v2::differentiation::Differentiable<ArrayType> for $ty {
-            type Tangent = Self;
-        }
     };
 }
 
@@ -207,8 +203,8 @@ mod tests {
     use crate::tracing_v2::{Cos, ScalarOperation, Sin};
     use crate::types::{ArrayType, DataType, TypeError, Typed};
 
-    fn assert_scalar_value_type<V: Value<ArrayType>>(value: V, expected_type: DataType) {
-        assert_eq!(value.r#type().into_owned(), ArrayType::scalar(expected_type));
+    fn assert_scalar_value_type<V: Value<DataType>>(value: V, expected_type: DataType) {
+        assert_eq!(value.r#type().into_owned(), expected_type);
     }
 
     fn assert_scalar_data_type<V: Value<DataType>>(value: V, expected_type: DataType) {
@@ -217,7 +213,7 @@ mod tests {
 
     fn assert_scalar_identities<V>(value: V, zero: V, one: V)
     where
-        V: Value<ArrayType> + ZeroLike + OneLike + std::fmt::Debug + PartialEq,
+        V: Value<DataType> + ZeroLike + OneLike + std::fmt::Debug + PartialEq,
     {
         assert_eq!(value.zero_like(), zero);
         assert_eq!(value.one_like(), one);
@@ -336,8 +332,6 @@ mod tests {
         assert_scalar_value_type(1u64, DataType::U64);
         assert_scalar_value_type(bf16::from_f32(1.25), DataType::BF16);
         assert_scalar_value_type(f16::from_f32(1.25), DataType::F16);
-        assert_eq!(<f32 as Typed<ArrayType>>::r#type(&1.25f32).into_owned(), ArrayType::scalar(DataType::F32));
-        assert_eq!(<f64 as Typed<ArrayType>>::r#type(&2.5f64).into_owned(), ArrayType::scalar(DataType::F64));
         assert_scalar_identities(false, false, true);
         assert_scalar_identities(5i32, 0i32, 1i32);
         assert_scalar_identities(5u32, 0u32, 1u32);

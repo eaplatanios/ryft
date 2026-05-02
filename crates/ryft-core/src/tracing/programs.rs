@@ -11,7 +11,7 @@ use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::tracing::TracingError;
-use crate::types::{ArrayType, DataType, Type, Typed};
+use crate::types::{DataType, Type, Typed};
 
 /// Identifies values in [`Program`]s. [`Value`] is a subtrait of [`Traceable`] implemented by types that carry real
 /// data, such as arrays. The sole purpose of this marker is to give Rust's coherence checker a way to tell two blanket
@@ -24,28 +24,19 @@ use crate::types::{ArrayType, DataType, Type, Typed};
 /// Because `Tracer<V>` implements [`Traceable`] but not [`Value`], these two implementations never overlap.
 pub trait Value<T: Type>: Traceable<T> {}
 
-macro_rules! impl_value_for_scalar {
-    ($ty:ty) => {
-        impl Value<DataType> for $ty {}
-
-        // TODO(eaplatanios): Remove this.
-        impl Value<ArrayType> for $ty {}
-    };
-}
-
-impl_value_for_scalar!(bool);
-impl_value_for_scalar!(i8);
-impl_value_for_scalar!(i16);
-impl_value_for_scalar!(i32);
-impl_value_for_scalar!(i64);
-impl_value_for_scalar!(u8);
-impl_value_for_scalar!(u16);
-impl_value_for_scalar!(u32);
-impl_value_for_scalar!(u64);
-impl_value_for_scalar!(bf16);
-impl_value_for_scalar!(f16);
-impl_value_for_scalar!(f32);
-impl_value_for_scalar!(f64);
+impl Value<DataType> for bool {}
+impl Value<DataType> for i8 {}
+impl Value<DataType> for i16 {}
+impl Value<DataType> for i32 {}
+impl Value<DataType> for i64 {}
+impl Value<DataType> for u8 {}
+impl Value<DataType> for u16 {}
+impl Value<DataType> for u32 {}
+impl Value<DataType> for u64 {}
+impl Value<DataType> for bf16 {}
+impl Value<DataType> for f16 {}
+impl Value<DataType> for f32 {}
+impl Value<DataType> for f64 {}
 
 /// Represents leaf values that can participate in traced [`Program`]s. [`Traceable`] is implemented by every type that
 /// can appear as a leaf in a staged [`Program`]: both concrete data types such as `f32`, `f64`, and backend arrays, and
@@ -54,28 +45,19 @@ impl_value_for_scalar!(f64);
 /// carried values directly.
 pub trait Traceable<T: Type>: Clone + Debug + Display + Parameter + Typed<T> {}
 
-macro_rules! impl_traceable_for_scalar {
-    ($ty:ty) => {
-        impl Traceable<DataType> for $ty {}
-
-        // TODO(eaplatanios): Remove this.
-        impl Traceable<ArrayType> for $ty {}
-    };
-}
-
-impl_traceable_for_scalar!(bool);
-impl_traceable_for_scalar!(i8);
-impl_traceable_for_scalar!(i16);
-impl_traceable_for_scalar!(i32);
-impl_traceable_for_scalar!(i64);
-impl_traceable_for_scalar!(u8);
-impl_traceable_for_scalar!(u16);
-impl_traceable_for_scalar!(u32);
-impl_traceable_for_scalar!(u64);
-impl_traceable_for_scalar!(bf16);
-impl_traceable_for_scalar!(f16);
-impl_traceable_for_scalar!(f32);
-impl_traceable_for_scalar!(f64);
+impl Traceable<DataType> for bool {}
+impl Traceable<DataType> for i8 {}
+impl Traceable<DataType> for i16 {}
+impl Traceable<DataType> for i32 {}
+impl Traceable<DataType> for i64 {}
+impl Traceable<DataType> for u8 {}
+impl Traceable<DataType> for u16 {}
+impl Traceable<DataType> for u32 {}
+impl Traceable<DataType> for u64 {}
+impl Traceable<DataType> for bf16 {}
+impl Traceable<DataType> for f16 {}
+impl Traceable<DataType> for f32 {}
+impl Traceable<DataType> for f64 {}
 
 /// [`Atom`]s represent nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
 #[derive(Clone, Debug, Parameter)]

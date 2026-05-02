@@ -1,6 +1,5 @@
 use std::fmt::{Debug, Display};
 
-use half::{bf16, f16};
 use thiserror::Error;
 
 use crate::macros::check_input_count;
@@ -50,31 +49,6 @@ pub trait ControlFlowValue: Traceable<ArrayType> {
     /// Extracts a scalar boolean predicate from this value.
     fn control_flow_predicate(&self) -> Result<bool, TracingError>;
 }
-
-impl ControlFlowValue for bool {
-    #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
-        Ok(*self)
-    }
-}
-
-macro_rules! impl_non_predicate_control_flow_value {
-    ($($ty:ty),* $(,)?) => {
-        $(
-            impl ControlFlowValue for $ty {
-                #[inline]
-                fn control_flow_predicate(&self) -> Result<bool, TracingError> {
-                    Err(ControlFlowError::InvalidPredicateValue {
-                        type_: <Self as Typed<ArrayType>>::r#type(self).into_owned(),
-                    }
-                    .into())
-                }
-            }
-        )*
-    };
-}
-
-impl_non_predicate_control_flow_value!(i8, i16, i32, i64, u8, u16, u32, u64, bf16, f16, f32, f64);
 
 impl<V: ControlFlowValue, T: Clone + Debug + crate::parameters::Parameter> ControlFlowValue for JvpTracer<V, T> {
     #[inline]

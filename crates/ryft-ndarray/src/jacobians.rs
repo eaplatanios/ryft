@@ -20,50 +20,18 @@ impl<S: Clone, InputStructure, OutputStructure> DenseJacobianNdArrayExt<S>
 mod tests {
     use ndarray::arr2;
     use pretty_assertions::assert_eq;
-    use ryft_core::ArrayType;
-    use ryft_core::tracing::TracingError;
-    use ryft_core::tracing::engines::{Engine, TracingEngine};
-    use ryft_core::tracing_v2::{
-        ArrayOperation, DifferentiableEngine, LinearArrayOperation, LinearizableEngine, Sin, jacfwd,
-    };
+    use ryft_core::tracing_v2::{Sin, jacfwd};
 
     use super::DenseJacobianNdArrayExt;
-
-    #[derive(Copy, Clone, Debug)]
-    struct ArrayScalarEngine;
-
-    impl Engine for ArrayScalarEngine {
-        type Type = ArrayType;
-        type Value = f64;
-
-        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(0.0)
-        }
-
-        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(1.0)
-        }
-    }
-
-    impl TracingEngine for ArrayScalarEngine {
-        type OperationCarrier = ArrayOperation<f64, ArrayType>;
-    }
-
-    impl LinearizableEngine for ArrayScalarEngine {
-        type LinearOperationCarrier = LinearArrayOperation<f64, ArrayType>;
-    }
-
-    impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperationCarrier = ArrayOperation<f64, ArrayType>;
-    }
+    use crate::{Array, NdArrayEngine};
 
     #[test]
     fn test_dense_jacobian_converts_to_array2() {
-        let engine = ArrayScalarEngine;
-        let jacobian = jacfwd::<ArrayScalarEngine, _, (f64, f64), (f64, f64), f64>(
+        let engine = NdArrayEngine::<f64>::new();
+        let jacobian = jacfwd::<NdArrayEngine<f64>, _, (Array<f64>, Array<f64>), (Array<f64>, Array<f64>), Array<f64>>(
             &engine,
             |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
-            (2.0f64, 3.0f64),
+            (Array::scalar(2.0), Array::scalar(3.0)),
         )
         .unwrap();
 

@@ -24,44 +24,6 @@ pub trait CoordinateValue:
     /// Flattens the leaf into its coordinate values in a deterministic order.
     fn coordinates(&self) -> Vec<Self::Coordinate>;
 }
-impl CoordinateValue for f32 {
-    type Coordinate = f32;
-
-    #[inline]
-    fn coordinate_count(&self) -> usize {
-        1
-    }
-
-    #[inline]
-    fn coordinate_basis(&self) -> Vec<Self> {
-        vec![1.0]
-    }
-
-    #[inline]
-    fn coordinates(&self) -> Vec<Self::Coordinate> {
-        vec![*self]
-    }
-}
-
-impl CoordinateValue for f64 {
-    type Coordinate = f64;
-
-    #[inline]
-    fn coordinate_count(&self) -> usize {
-        1
-    }
-
-    #[inline]
-    fn coordinate_basis(&self) -> Vec<Self> {
-        vec![1.0]
-    }
-
-    #[inline]
-    fn coordinates(&self) -> Vec<Self::Coordinate> {
-        vec![*self]
-    }
-}
-
 /// Dense matrix representation of a Jacobian- or Hessian-like linear map.
 ///
 /// The stored matrix is accompanied by the input and output parameter structures plus per-leaf

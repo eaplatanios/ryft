@@ -5,7 +5,7 @@ use half::{bf16, f16};
 use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{DataType, Type, TypeError, Typed};
 
 /// Synthesizes a _zero_ value for a given [`Type`]. [`Zero`] is the [`Type`]-driven counterpart to [`ZeroLike`]; it is
 /// what [`ZeroOperation`] needs for its [`InterpretableOperation`] implementation.
@@ -257,16 +257,6 @@ impl<'engine, E: TracingEngine<OperationCarrier: SupportsOneLike<E::Type, E::Val
     }
 }
 
-// TODO(eaplatanios): Remove this.
-fn ensure_scalar_array_seed_type(r#type: &ArrayType) -> Result<(), TracingError> {
-    if r#type.rank() != 0 {
-        return Err(
-            crate::tracing_v2::DifferentiationError::NonScalarGradientOutput { output_type: r#type.clone() }.into()
-        );
-    }
-    Ok(())
-}
-
 // TODO(eaplatanios): Inline this.
 fn ensure_scalar_data_type(r#type: DataType, expected: DataType) -> Result<(), TracingError> {
     if r#type != expected {
@@ -302,27 +292,10 @@ macro_rules! impl_constants_for_scalar {
             }
         }
 
-        // TODO(eaplatanios): Remove this.
-        impl Zero<ArrayType> for $ty {
-            #[inline]
-            fn zero(_type: &ArrayType) -> Result<Self, TracingError> {
-                Ok($zero)
-            }
-        }
-
         impl One<DataType> for $ty {
             #[inline]
             fn one(r#type: &DataType) -> Result<Self, TracingError> {
                 ensure_scalar_data_type(*r#type, $data_type)?;
-                Ok($one)
-            }
-        }
-
-        // TODO(eaplatanios): Remove this.
-        impl One<ArrayType> for $ty {
-            #[inline]
-            fn one(r#type: &ArrayType) -> Result<Self, TracingError> {
-                ensure_scalar_array_seed_type(r#type)?;
                 Ok($one)
             }
         }
