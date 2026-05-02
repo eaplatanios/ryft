@@ -254,6 +254,13 @@ impl Device<'_> {
         )
     }
 
+    /// Clears the memory/allocator statistics for this [`Device`]. Note that not all PJRT [`Plugin`]s support this
+    /// functionality, and this function may return [`Error::Unimplemented`] for plugins where it is not supported.
+    pub fn clear_memory_statistics(&self) -> Result<(), Error> {
+        use ffi::PJRT_Device_ClearMemoryStats_Args;
+        invoke_pjrt_api_error_fn!(self.api(), PJRT_Device_ClearMemoryStats, { device = self.to_c_api() })
+    }
+
     /// _Poisons_ the earliest execution on this [`Device`] with the provided launch ID if it is not finished
     /// yet (i.e., sets the resulting [`Buffer`](crate::Buffer) to an error buffer; refer to the documentation of
     /// [`Client::error_buffer`] for more information on buffer _poisoning_). Returns `true` if the execution was
@@ -982,6 +989,22 @@ pub(crate) mod ffi {
     }
 
     pub type PJRT_Device_MemoryStats = unsafe extern "C" fn(args: *mut PJRT_Device_MemoryStats_Args) -> *mut PJRT_Error;
+
+    #[repr(C)]
+    pub struct PJRT_Device_ClearMemoryStats_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub device: *mut PJRT_Device,
+    }
+
+    impl PJRT_Device_ClearMemoryStats_Args {
+        pub fn new(device: *mut PJRT_Device) -> Self {
+            Self { struct_size: size_of::<Self>(), extension_start: std::ptr::null_mut(), device }
+        }
+    }
+
+    pub type PJRT_Device_ClearMemoryStats =
+        unsafe extern "C" fn(args: *mut PJRT_Device_ClearMemoryStats_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
     pub struct PJRT_Device_PoisonExecution_Args {
