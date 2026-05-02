@@ -10,7 +10,7 @@ use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearEngine};
+use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearizableEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Hidden carrier capability for staging the addition primitive.
@@ -26,13 +26,13 @@ pub trait SupportsAdd<T: Type, V: Traceable<T>>: Clone {
 
 impl<'engine, E: TracingEngine + ?Sized> Add for Tracer<'engine, E>
 where
-    E::Operation: SupportsAdd<E::Type, E::Value>,
+    E::OperationCarrier: SupportsAdd<E::Type, E::Value>,
 {
     type Output = Self;
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, E::Operation::add_operation())
+        self.binary(rhs, E::OperationCarrier::add_operation())
     }
 }
 
@@ -162,10 +162,10 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Add<Output = V> + Z
 
 impl<E> DifferentiableOperation<E> for AddOperation
 where
-    E: LinearEngine + ?Sized,
+    E: LinearizableEngine + ?Sized,
     AddOperation: Operation<E::Type>,
     E::Value: Add<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperation: SupportsAdd<E::Type, E::Value>,
+    E::LinearOperationCarrier: SupportsAdd<E::Type, E::Value>,
 {
     fn jvp(
         &self,
@@ -176,7 +176,7 @@ where
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent, inputs[1].tangent],
-                <E::LinearOperation as SupportsAdd<E::Type, E::Value>>::add_operation(),
+                <E::LinearOperationCarrier as SupportsAdd<E::Type, E::Value>>::add_operation(),
                 1,
             )?
             .into_iter()

@@ -7,7 +7,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearEngine};
+use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::SupportsScale;
@@ -104,10 +104,10 @@ impl<V: Typed<DataType> + Clone + Sin> InterpretableOperation<DataType, V> for S
 
 impl<E> DifferentiableOperation<E> for SinOperation
 where
-    E: LinearEngine + ?Sized,
+    E: LinearizableEngine + ?Sized,
     SinOperation: Operation<E::Type>,
     E::Value: Sin + Cos + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperation: SupportsScale<E::Type, E::Value>,
+    E::LinearOperationCarrier: SupportsScale<E::Type, E::Value>,
 {
     fn jvp(
         &self,
@@ -119,7 +119,9 @@ where
         let tangent = context
             .apply_operation(
                 &[input.tangent],
-                <E::LinearOperation as SupportsScale<E::Type, E::Value>>::scale_operation(input.primal.clone().cos()),
+                <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(
+                    input.primal.clone().cos(),
+                ),
                 1,
             )?
             .into_iter()
@@ -133,10 +135,10 @@ impl<'engine, E> Sin for Tracer<'engine, E>
 where
     E: TracingEngine + ?Sized,
     E::Value: Sin,
-    E::Operation: SupportsSin<E::Type, E::Value>,
+    E::OperationCarrier: SupportsSin<E::Type, E::Value>,
 {
     #[inline]
     fn sin(self) -> Self {
-        self.unary(E::Operation::sin_operation())
+        self.unary(E::OperationCarrier::sin_operation())
     }
 }

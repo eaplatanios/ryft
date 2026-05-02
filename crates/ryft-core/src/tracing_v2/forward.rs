@@ -58,10 +58,10 @@ pub(crate) trait JvpDispatch<
 impl<
     E: DifferentiableEngine<
             Value = V,
-            LinearOperation: InterpretableOperation<E::Type, V>
-                                 + SupportsAdd<E::Type, V>
-                                 + SupportsNeg<E::Type, V>
-                                 + SupportsScale<E::Type, V>,
+            LinearOperationCarrier: InterpretableOperation<E::Type, V>
+                                        + SupportsAdd<E::Type, V>
+                                        + SupportsNeg<E::Type, V>
+                                        + SupportsScale<E::Type, V>,
         > + 'static,
     V: Value<E::Type>
         + Differentiable<E::Type, Tangent = V>
@@ -107,7 +107,7 @@ impl<
             .into());
         }
 
-        let (primal_output, tangent_program): (Output, Program<E::Type, V, E::LinearOperation, Input, Output>) =
+        let (primal_output, tangent_program): (Output, Program<E::Type, V, E::LinearOperationCarrier, Input, Output>) =
             linearize(engine, |input| Ok(function(input)), primals)?;
         let tangent_output = tangent_program.interpret(tangents)?;
         Ok((primal_output, tangent_output))
@@ -121,10 +121,10 @@ impl<
     'engine,
     E: DifferentiableTracingEngine<
             Value = V,
-            Operation: DifferentiableOperation<TracingContext<'engine, E>>
-                           + SupportsAdd<E::Type, V>
-                           + SupportsZeroLike<E::Type, V>,
-            LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+            OperationCarrier: DifferentiableOperation<TracingContext<'engine, E>>
+                                  + SupportsAdd<E::Type, V>
+                                  + SupportsZeroLike<E::Type, V>,
+            LinearOperationCarrier<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
         > + TracingEngine
         + 'static,
     V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + Parameterized<V, ParameterStructure = Placeholder>,

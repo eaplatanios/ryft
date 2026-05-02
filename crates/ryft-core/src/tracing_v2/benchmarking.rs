@@ -329,7 +329,7 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type Operation = crate::tracing_v2::ArrayOperation<f64>;
+        type OperationCarrier = crate::tracing_v2::ArrayOperation<f64>;
     }
 
     /// Summarizes a small scalar program and verifies the structural metrics.

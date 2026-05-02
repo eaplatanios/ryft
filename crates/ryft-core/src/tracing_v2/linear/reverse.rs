@@ -31,7 +31,7 @@ pub fn linearize<
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(Output, Program<E::Type, V, E::LinearOperation, Input, Output>), TracingError> {
+) -> Result<(Output, Program<E::Type, V, E::LinearOperationCarrier, Input, Output>), TracingError> {
     let input_structure = primals.parameter_structure();
     let input_primals: Vec<V> = primals.into_parameters().collect();
     let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
@@ -51,10 +51,10 @@ pub fn vjp<
     'engine,
     E: DifferentiableEngine<
             Value = V,
-            LinearOperation: Clone
-                                 + InterpretableOperation<E::Type, V>
-                                 + LinearOperation<E::Type, V, E::LinearOperation>
-                                 + SupportsZero<E::Type, V>,
+            LinearOperationCarrier: Clone
+                                        + InterpretableOperation<E::Type, V>
+                                        + LinearOperation<E::Type, V, E::LinearOperationCarrier>
+                                        + SupportsZero<E::Type, V>,
         > + 'static,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
@@ -77,7 +77,7 @@ pub fn vjp<
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(Output, Program<E::Type, V, E::LinearOperation, Output, Input>), TracingError> {
+) -> Result<(Output, Program<E::Type, V, E::LinearOperationCarrier, Output, Input>), TracingError> {
     let (output, pushforward) = linearize::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
     let pullback = pushforward.transpose(output_examples.as_slice())?;
@@ -93,7 +93,7 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
     /// traced scalar output and the traced gradient leaves.
     pub(super) fn value_and_grad<V, Input, Output>(
         self,
-        traced_program: &Program<E::Type, V, E::Operation, Input, Output>,
+        traced_program: &Program<E::Type, V, E::OperationCarrier, Input, Output>,
         traced_primals: Vec<Tracer<'engine, E>>,
     ) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
     where
@@ -101,14 +101,17 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
         Input: Parameterized<V>,
         Output: Parameterized<V>,
         E: DifferentiableTracingEngine<Value = V> + 'static,
-        E::Operation: DifferentiableOperation<TracingContext<'engine, E>>
+        E::OperationCarrier: DifferentiableOperation<TracingContext<'engine, E>>
             + SupportsAdd<E::Type, V>
             + SupportsZeroLike<E::Type, V>
             + 'static,
-        <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
+        <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
             + InterpretableOperation<E::Type, Tracer<'engine, E>>
-            + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>
-            + SupportsZero<E::Type, Tracer<'engine, E>>,
+            + LinearOperation<
+                E::Type,
+                Tracer<'engine, E>,
+                <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
+            > + SupportsZero<E::Type, Tracer<'engine, E>>,
         AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
     {
         let (outputs, pushforward) = self.linearize(traced_program, traced_primals)?;
@@ -174,10 +177,10 @@ pub(crate) trait ValueAndGradDispatch<
 impl<
     E: DifferentiableEngine<
             Value = V,
-            LinearOperation: Clone
-                                 + InterpretableOperation<E::Type, V>
-                                 + LinearOperation<E::Type, V, E::LinearOperation>
-                                 + SupportsZero<E::Type, V>,
+            LinearOperationCarrier: Clone
+                                        + InterpretableOperation<E::Type, V>
+                                        + LinearOperation<E::Type, V, E::LinearOperationCarrier>
+                                        + SupportsZero<E::Type, V>,
         > + 'static,
     V: Value<E::Type>
         + Differentiable<E::Type, Tangent = V>
@@ -215,7 +218,7 @@ impl<
         function: F,
         primals: Input,
     ) -> Result<(Self::Value, Input), TracingError> {
-        let (output, pullback): (V, Program<E::Type, V, E::LinearOperation, V, Input>) =
+        let (output, pullback): (V, Program<E::Type, V, E::LinearOperationCarrier, V, Input>) =
             vjp(engine, |input| Ok(function(input)), primals)?;
         let gradient = pullback.interpret(<V as One<E::Type>>::one(output.r#type().as_ref())?)?;
         Ok((output, gradient))
@@ -228,15 +231,15 @@ impl<
     'engine,
     E: DifferentiableTracingEngine<
             Value = V,
-            Operation: DifferentiableOperation<TracingContext<'engine, E>>
-                           + SupportsAdd<E::Type, V>
-                           + SupportsZeroLike<E::Type, V>,
-            LinearOperation<'engine>: Clone
-                                          + InterpretableOperation<E::Type, Tracer<'engine, E>>
-                                          + LinearOperation<
+            OperationCarrier: DifferentiableOperation<TracingContext<'engine, E>>
+                                  + SupportsAdd<E::Type, V>
+                                  + SupportsZeroLike<E::Type, V>,
+            LinearOperationCarrier<'engine>: Clone
+                                                 + InterpretableOperation<E::Type, Tracer<'engine, E>>
+                                                 + LinearOperation<
                 E::Type,
                 Tracer<'engine, E>,
-                <E as DifferentiableTracingEngine>::LinearOperation<'engine>,
+                <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
             >,
         > + 'static,
     V: Traceable<E::Type>
@@ -326,10 +329,10 @@ pub fn value_and_grad_with_aux<
     'engine,
     E: DifferentiableEngine<
             Value = V,
-            LinearOperation: Clone
-                                 + InterpretableOperation<E::Type, V>
-                                 + LinearOperation<E::Type, V, E::LinearOperation>
-                                 + SupportsZero<E::Type, V>,
+            LinearOperationCarrier: Clone
+                                        + InterpretableOperation<E::Type, V>
+                                        + LinearOperation<E::Type, V, E::LinearOperationCarrier>
+                                        + SupportsZero<E::Type, V>,
         > + 'static,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
@@ -414,10 +417,10 @@ pub fn grad_with_aux<
     'engine,
     E: DifferentiableEngine<
             Value = V,
-            LinearOperation: Clone
-                                 + InterpretableOperation<E::Type, V>
-                                 + LinearOperation<E::Type, V, E::LinearOperation>
-                                 + SupportsZero<E::Type, V>,
+            LinearOperationCarrier: Clone
+                                        + InterpretableOperation<E::Type, V>
+                                        + LinearOperation<E::Type, V, E::LinearOperationCarrier>
+                                        + SupportsZero<E::Type, V>,
         > + 'static,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
@@ -703,15 +706,15 @@ mod tests {
     }
 
     impl TracingEngine for TestEngine {
-        type Operation = AddOperation;
+        type OperationCarrier = AddOperation;
     }
 
-    impl crate::tracing_v2::LinearEngine for TestEngine {
-        type LinearOperation = TestLinearOperation;
+    impl crate::tracing_v2::LinearizableEngine for TestEngine {
+        type LinearOperationCarrier = TestLinearOperation;
     }
 
     impl DifferentiableEngine for TestEngine {
-        type DifferentiableOperation = AddOperation;
+        type DifferentiableOperationCarrier = AddOperation;
     }
 
     #[test]

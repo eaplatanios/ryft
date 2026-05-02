@@ -8,7 +8,7 @@ use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
-use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearEngine};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearizableEngine};
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::arrays::{Array, ArrayError};
@@ -139,19 +139,19 @@ impl<'c> Engine for XlaEngine<'c> {
 }
 
 impl<'c> TracingEngine for XlaEngine<'c> {
-    type Operation = XlaOperation;
+    type OperationCarrier = XlaOperation;
 }
 
-impl<'c> LinearEngine for XlaEngine<'c> {
-    type LinearOperation = LinearXlaOperation;
+impl<'c> LinearizableEngine for XlaEngine<'c> {
+    type LinearOperationCarrier = LinearXlaOperation;
 }
 
 impl<'c> DifferentiableEngine for XlaEngine<'c> {
-    type DifferentiableOperation = XlaOperation;
+    type DifferentiableOperationCarrier = XlaOperation;
 }
 
 impl<'c> DifferentiableTracingEngine for XlaEngine<'c> {
-    type LinearOperation<'engine>
+    type LinearOperationCarrier<'engine>
         = LinearXlaOperation<Tracer<'engine, Self>>
     where
         Self: 'engine;

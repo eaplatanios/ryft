@@ -18,7 +18,9 @@ use crate::tracing_v2::operations::{
     AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
     NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
 };
-use crate::tracing_v2::{Cos, DifferentiableOperation, DifferentiableTracingEngine, LinearEngine, MatrixOps, Sin};
+use crate::tracing_v2::{
+    Cos, DifferentiableOperation, DifferentiableTracingEngine, LinearizableEngine, MatrixOps, Sin,
+};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
 use super::add::SupportsAdd;
@@ -1840,7 +1842,7 @@ impl<
         + Parameterized<V>
         + Differentiable<DataType, Tangent = V>
         + 'static,
-    E: LinearEngine<Type = DataType, Value = V, LinearOperation = LinearScalarOperation<V>> + 'static,
+    E: LinearizableEngine<Type = DataType, Value = V, LinearOperationCarrier = LinearScalarOperation<V>> + 'static,
 > DifferentiableOperation<E> for ScalarOperation<V>
 where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
@@ -1892,7 +1894,9 @@ where
         + Parameterized<V>
         + Differentiable<DataType, Tangent = V>
         + 'static,
-    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, Operation = ScalarOperation<V>> + ?Sized + 'static,
+    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, OperationCarrier = ScalarOperation<V>>
+        + ?Sized
+        + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearScalarOperation<V>: super::SupportsAdd<DataType, V>
@@ -1910,9 +1914,9 @@ where
         + Cos
         + ZeroLike
         + OneLike,
-    EInner::LinearOperation<'engine>: Clone
+    EInner::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<DataType, Tracer<'engine, EInner>>
-        + LinearOperation<DataType, Tracer<'engine, EInner>, EInner::LinearOperation<'engine>>
+        + LinearOperation<DataType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
         + SupportsScale<DataType, Tracer<'engine, EInner>>
         + SupportsZeroLike<DataType, Tracer<'engine, EInner>>
         + SupportsZero<DataType, Tracer<'engine, EInner>>,
@@ -1938,18 +1942,19 @@ where
                 }
                 let input = &inputs[0];
                 let factor_tracer = context.engine.constant(factor.clone());
-                let tangent = context
-                    .apply_operation(
-                        &[input.tangent],
-                        <EInner::LinearOperation<'engine> as SupportsScale<
-                            DataType,
-                            Tracer<'engine, EInner>,
-                        >>::scale_operation(factor_tracer.clone()),
-                        1,
-                    )?
-                    .into_iter()
-                    .next()
-                    .expect("scale jvp should produce one tangent");
+                let tangent =
+                    context
+                        .apply_operation(
+                            &[input.tangent],
+                            <EInner::LinearOperationCarrier<'engine> as SupportsScale<
+                                DataType,
+                                Tracer<'engine, EInner>,
+                            >>::scale_operation(factor_tracer.clone()),
+                            1,
+                        )?
+                        .into_iter()
+                        .next()
+                        .expect("scale jvp should produce one tangent");
                 Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent }])
             }
             Self::Custom(_) => {
@@ -1977,7 +1982,7 @@ impl<
         + ControlFlowValue
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    E: LinearEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>> + 'static,
+    E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V>> + 'static,
 > DifferentiableOperation<E> for ArrayOperation<V>
 where
     V: Differentiable<ArrayType, Tangent = V>,
@@ -2037,7 +2042,8 @@ impl<
         + Parameterized<V>
         + Differentiable<DataType, Tangent = V>
         + 'static,
-    E: LinearEngine<Type = DataType, Value = V, LinearOperation = LinearArrayOperation<V, DataType>> + 'static,
+    E: LinearizableEngine<Type = DataType, Value = V, LinearOperationCarrier = LinearArrayOperation<V, DataType>>
+        + 'static,
 > DifferentiableOperation<E> for ArrayOperation<V, DataType>
 where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
@@ -2106,7 +2112,9 @@ where
         + ControlFlowValue
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>> + ?Sized + 'static,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V>>
+        + ?Sized
+        + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V>: super::SupportsAdd<ArrayType, V>
@@ -2129,9 +2137,9 @@ where
         + MatrixOps
         + ZeroLike
         + OneLike,
-    EInner::LinearOperation<'engine>: Clone
+    EInner::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, EInner>>
-        + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperation<'engine>>
+        + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
         + SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>
         + SupportsRightMatMul<ArrayType, Tracer<'engine, EInner>>
         + SupportsMatrixTranspose<ArrayType, Tracer<'engine, EInner>>
@@ -2186,7 +2194,7 @@ where
         + Parameterized<V>
         + Differentiable<DataType, Tangent = V>
         + 'static,
-    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, Operation = ArrayOperation<V, DataType>>
+    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, OperationCarrier = ArrayOperation<V, DataType>>
         + ?Sized
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
@@ -2206,9 +2214,9 @@ where
         + Cos
         + ZeroLike
         + OneLike,
-    EInner::LinearOperation<'engine>: Clone
+    EInner::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<DataType, Tracer<'engine, EInner>>
-        + LinearOperation<DataType, Tracer<'engine, EInner>, EInner::LinearOperation<'engine>>
+        + LinearOperation<DataType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
         + SupportsScale<DataType, Tracer<'engine, EInner>>
         + SupportsZeroLike<DataType, Tracer<'engine, EInner>>
         + SupportsZero<DataType, Tracer<'engine, EInner>>,
@@ -2234,18 +2242,19 @@ where
                 }
                 let input = &inputs[0];
                 let factor_tracer = context.engine.constant(factor.clone());
-                let tangent = context
-                    .apply_operation(
-                        &[input.tangent],
-                        <EInner::LinearOperation<'engine> as SupportsScale<
-                            DataType,
-                            Tracer<'engine, EInner>,
-                        >>::scale_operation(factor_tracer.clone()),
-                        1,
-                    )?
-                    .into_iter()
-                    .next()
-                    .expect("scale jvp should produce one tangent");
+                let tangent =
+                    context
+                        .apply_operation(
+                            &[input.tangent],
+                            <EInner::LinearOperationCarrier<'engine> as SupportsScale<
+                                DataType,
+                                Tracer<'engine, EInner>,
+                            >>::scale_operation(factor_tracer.clone()),
+                            1,
+                        )?
+                        .into_iter()
+                        .next()
+                        .expect("scale jvp should produce one tangent");
                 Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent }])
             }
             Self::MatrixMultiply

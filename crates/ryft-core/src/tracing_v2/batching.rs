@@ -439,7 +439,7 @@ where
     Output::To<Tracer<'engine, E>>:
         Parameterized<Tracer<'engine, E>, To<ArrayType> = Output::To<ArrayType>, To<V> = Output>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::Operation: Clone + BatchableOperation<V>,
+    E::OperationCarrier: Clone + BatchableOperation<V>,
 {
     let structure = input.parameter_structure();
     let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -466,7 +466,7 @@ where
     }
 
     let input_types = Input::To::<ArrayType>::from_parameters(structure.clone(), logical_types)?;
-    let (_, program): (Output::To<ArrayType>, Program<ArrayType, V, E::Operation, Input, Output>) =
+    let (_, program): (Output::To<ArrayType>, Program<ArrayType, V, E::OperationCarrier, Input, Output>) =
         engine.trace(function, input_types)?;
     let batched_input = Input::To::<ArrayBatch<V>>::from_parameters(structure, batched_inputs)?;
     let batched_output = interpret_batched_program(&program, batched_input)?;
@@ -880,15 +880,15 @@ mod tests {
     }
 
     impl TracingEngine for TestArrayEngine {
-        type Operation = ArrayOperation<TestArray>;
+        type OperationCarrier = ArrayOperation<TestArray>;
     }
 
-    impl crate::tracing_v2::LinearEngine for TestArrayEngine {
-        type LinearOperation = LinearArrayOperation<TestArray>;
+    impl crate::tracing_v2::LinearizableEngine for TestArrayEngine {
+        type LinearOperationCarrier = LinearArrayOperation<TestArray>;
     }
 
     impl DifferentiableEngine for TestArrayEngine {
-        type DifferentiableOperation = ArrayOperation<TestArray>;
+        type DifferentiableOperationCarrier = ArrayOperation<TestArray>;
     }
 
     #[derive(Clone, Debug)]

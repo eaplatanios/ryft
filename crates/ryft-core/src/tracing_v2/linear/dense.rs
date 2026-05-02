@@ -287,7 +287,7 @@ where
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    E::LinearOperation: InterpretableOperation<ArrayType, V>,
+    E::LinearOperationCarrier: InterpretableOperation<ArrayType, V>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -341,9 +341,9 @@ where
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    E::LinearOperation: Clone
+    E::LinearOperationCarrier: Clone
         + InterpretableOperation<ArrayType, V>
-        + LinearOperation<ArrayType, V, E::LinearOperation>
+        + LinearOperation<ArrayType, V, E::LinearOperationCarrier>
         + crate::tracing_v2::operations::SupportsZero<ArrayType, V>,
 {
     let input_structure = primals.parameter_structure();
@@ -389,7 +389,7 @@ where
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    E::LinearOperation: InterpretableOperation<ArrayType, V>,
+    E::LinearOperationCarrier: InterpretableOperation<ArrayType, V>,
 {
     jacfwd::<E, F, Input, Input, V>(engine, gradient_function, primals)
 }
@@ -428,19 +428,19 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type Operation = ArrayOperation<f64>;
+        type OperationCarrier = ArrayOperation<f64>;
     }
 
-    impl crate::tracing_v2::LinearEngine for ArrayScalarEngine {
-        type LinearOperation = LinearArrayOperation<f64>;
+    impl crate::tracing_v2::LinearizableEngine for ArrayScalarEngine {
+        type LinearOperationCarrier = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperation = ArrayOperation<f64>;
+        type DifferentiableOperationCarrier = ArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
-        type LinearOperation<'engine>
+        type LinearOperationCarrier<'engine>
             = LinearArrayOperation<Tracer<'engine, Self>>
         where
             Self: 'engine;

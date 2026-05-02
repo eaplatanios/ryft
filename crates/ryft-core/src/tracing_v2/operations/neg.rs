@@ -8,7 +8,7 @@ use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearEngine};
+use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearizableEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Hidden carrier capability for staging the negation primitive.
@@ -20,13 +20,13 @@ pub trait SupportsNeg<T: Type, V: Traceable<T>>: Clone {
 
 impl<'engine, E: TracingEngine + ?Sized> Neg for Tracer<'engine, E>
 where
-    E::Operation: SupportsNeg<E::Type, E::Value>,
+    E::OperationCarrier: SupportsNeg<E::Type, E::Value>,
 {
     type Output = Self;
 
     #[inline]
     fn neg(self) -> Self::Output {
-        self.unary(E::Operation::neg_operation())
+        self.unary(E::OperationCarrier::neg_operation())
     }
 }
 
@@ -124,10 +124,10 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + Z
 
 impl<E> DifferentiableOperation<E> for NegOperation
 where
-    E: LinearEngine + ?Sized,
+    E: LinearizableEngine + ?Sized,
     NegOperation: Operation<E::Type>,
     E::Value: Neg<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperation: SupportsNeg<E::Type, E::Value>,
+    E::LinearOperationCarrier: SupportsNeg<E::Type, E::Value>,
 {
     fn jvp(
         &self,
@@ -138,7 +138,7 @@ where
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent],
-                <E::LinearOperation as SupportsNeg<E::Type, E::Value>>::neg_operation(),
+                <E::LinearOperationCarrier as SupportsNeg<E::Type, E::Value>>::neg_operation(),
                 1,
             )?
             .into_iter()

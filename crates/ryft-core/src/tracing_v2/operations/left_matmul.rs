@@ -7,7 +7,7 @@ use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableOperation, DifferentiableTracingEngine, LinearEngine};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiableTracingEngine, LinearizableEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::SupportsAdd;
@@ -117,8 +117,8 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for 
 impl<V, E> DifferentiableOperation<E> for LeftMatMulOperation<V>
 where
     V: MatrixValue + ZeroLike + Differentiable<ArrayType, Tangent = V>,
-    E: LinearEngine<Type = ArrayType, Value = V> + ?Sized,
-    E::LinearOperation: SupportsLeftMatMul<ArrayType, V>,
+    E: LinearizableEngine<Type = ArrayType, Value = V> + ?Sized,
+    E::LinearOperationCarrier: SupportsLeftMatMul<ArrayType, V>,
 {
     fn jvp(
         &self,
@@ -130,7 +130,9 @@ where
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent],
-                <E::LinearOperation as SupportsLeftMatMul<ArrayType, V>>::left_matmul_operation(self.factor().clone()),
+                <E::LinearOperationCarrier as SupportsLeftMatMul<ArrayType, V>>::left_matmul_operation(
+                    self.factor().clone(),
+                ),
                 1,
             )?
             .into_iter()
@@ -147,8 +149,8 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized,
-    EInner::Operation: SupportsAdd<ArrayType, V>,
-    EInner::LinearOperation<'engine>: SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>,
+    EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
+    EInner::LinearOperationCarrier<'engine>: SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>,
     Tracer<'engine, EInner>: MatrixOps,
 {
     fn jvp(
@@ -159,18 +161,19 @@ where
         check_input_count!(inputs, 1, TracingError);
         let factor_tracer = context.engine.constant(self.factor().clone());
         let primal = factor_tracer.clone().matmul(inputs[0].primal.clone());
-        let tangent = context
-            .apply_operation(
-                &[inputs[0].tangent],
-                <EInner::LinearOperation<'engine> as SupportsLeftMatMul<
-                    ArrayType,
-                    Tracer<'engine, EInner>,
-                >>::left_matmul_operation(factor_tracer),
-                1,
-            )?
-            .into_iter()
-            .next()
-            .expect("left matmul jvp should produce one tangent");
+        let tangent =
+            context
+                .apply_operation(
+                    &[inputs[0].tangent],
+                    <EInner::LinearOperationCarrier<'engine> as SupportsLeftMatMul<
+                        ArrayType,
+                        Tracer<'engine, EInner>,
+                    >>::left_matmul_operation(factor_tracer),
+                    1,
+                )?
+                .into_iter()
+                .next()
+                .expect("left matmul jvp should produce one tangent");
         Ok(vec![JvpTracer { primal, tangent }])
     }
 }

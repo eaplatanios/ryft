@@ -151,11 +151,11 @@ fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
 impl<'engine, V: Traceable<ArrayType>, E> MatrixOps for Tracer<'engine, E>
 where
     E: crate::tracing::engines::TracingEngine<Type = ArrayType, Value = V> + ?Sized,
-    E::Operation: SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
+    E::OperationCarrier: SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
 {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
-        self.binary(rhs, E::Operation::matmul_operation())
+        self.binary(rhs, E::OperationCarrier::matmul_operation())
     }
 
     #[inline]
@@ -163,6 +163,6 @@ where
         if matrix_transpose_is_identity_type(&self.r#type()) {
             return self;
         }
-        self.unary(E::Operation::matrix_transpose_operation())
+        self.unary(E::OperationCarrier::matrix_transpose_operation())
     }
 }

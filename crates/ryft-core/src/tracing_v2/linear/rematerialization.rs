@@ -3,25 +3,29 @@ use super::*;
 fn build_traced_gradient_program<'engine, E, Input, ProgramInput, ProgramOutput, V>(
     engine: &'engine E,
     input_structure: Input::ParameterStructure,
-    traced_program: &Program<E::Type, V, E::Operation, ProgramInput, ProgramOutput>,
-) -> Result<Program<E::Type, V, E::Operation, Input, Input>, TracingError>
+    traced_program: &Program<E::Type, V, E::OperationCarrier, ProgramInput, ProgramOutput>,
+) -> Result<Program<E::Type, V, E::OperationCarrier, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
     V: Value<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
-    E::Operation: InterpretableOperation<E::Type, V>
+    E::OperationCarrier: InterpretableOperation<E::Type, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<E::Type, V>
         + SupportsZeroLike<E::Type, V>
         + 'static,
-    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
+    <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
-        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
+        + LinearOperation<
+            E::Type,
+            Tracer<'engine, E>,
+            <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
+        >,
     AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
     Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     ProgramInput: Parameterized<V>,
     ProgramOutput: Parameterized<V>,
 {
-    let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, V, E::Operation>::new()));
+    let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, V, E::OperationCarrier>::new()));
     let tracing_context = TracingContext::new(engine, traced_primal_builder.clone());
     let traced_primals = traced_program
         .input_ids
@@ -60,17 +64,21 @@ pub fn compile_grad<'engine, E, F, Input, V>(
     _engine: &'engine E,
     function: F,
     example_primals: Input,
-) -> Result<Program<E::Type, V, E::Operation, Input, Input>, TracingError>
+) -> Result<Program<E::Type, V, E::OperationCarrier, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
     V: Value<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
-    E::Operation: InterpretableOperation<E::Type, V>
+    E::OperationCarrier: InterpretableOperation<E::Type, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<E::Type, V>
         + SupportsZeroLike<E::Type, V>,
-    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
+    <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
-        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
+        + LinearOperation<
+            E::Type,
+            Tracer<'engine, E>,
+            <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
+        >,
     AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<E::Type> + ParameterizedFamily<Tracer<'engine, E>>,
@@ -134,20 +142,24 @@ pub fn compile_grad_with_policy<'engine, E, F, Input, V>(
     function: F,
     example_primals: Input,
     policy: RematerializationPolicy,
-) -> Result<Program<ArrayType, V, E::Operation, Input, Input>, TracingError>
+) -> Result<Program<ArrayType, V, E::OperationCarrier, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V>
         + DifferentiableTracingEngine<Type = ArrayType, Value = V>
         + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
-    E::Operation: InterpretableOperation<ArrayType, V>
+    E::OperationCarrier: InterpretableOperation<ArrayType, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>
-        + SupportsRematerialize<ArrayType, V, <E as crate::tracing_v2::LinearEngine>::LinearOperation>,
-    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
+        + SupportsRematerialize<ArrayType, V, <E as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier>,
+    <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E>>
-        + LinearOperation<ArrayType, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
+        + LinearOperation<
+            ArrayType,
+            Tracer<'engine, E>,
+            <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
+        >,
     AddOperation: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
@@ -184,20 +196,24 @@ fn compile_grad_segmented<'engine, E, F, Input, V>(
     function: &F,
     example_primals: Input,
     segment_size: Option<usize>,
-) -> Result<Program<ArrayType, V, E::Operation, Input, Input>, TracingError>
+) -> Result<Program<ArrayType, V, E::OperationCarrier, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V>
         + DifferentiableTracingEngine<Type = ArrayType, Value = V>
         + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
-    E::Operation: InterpretableOperation<ArrayType, V>
+    E::OperationCarrier: InterpretableOperation<ArrayType, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>
-        + SupportsRematerialize<ArrayType, V, <E as crate::tracing_v2::LinearEngine>::LinearOperation>,
-    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
+        + SupportsRematerialize<ArrayType, V, <E as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier>,
+    <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E>>
-        + LinearOperation<ArrayType, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
+        + LinearOperation<
+            ArrayType,
+            Tracer<'engine, E>,
+            <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
+        >,
     AddOperation: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
@@ -215,8 +231,8 @@ where
     )?;
     let (_, traced_program) = engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?;
     let segmented_program = match segment_size {
-        None => wrap_program_in_rematerialize::<E, V, E::Operation, _, _>(&traced_program)?,
-        Some(size) => segment_program::<E, V, E::Operation, _, _>(&traced_program, size)?,
+        None => wrap_program_in_rematerialize::<E, V, E::OperationCarrier, _, _>(&traced_program)?,
+        Some(size) => segment_program::<E, V, E::OperationCarrier, _, _>(&traced_program, size)?,
     };
     build_traced_gradient_program(engine, input_structure, &segmented_program)
 }
@@ -246,7 +262,7 @@ where
     O: Clone
         + Operation<ArrayType>
         + InterpretableOperation<ArrayType, V>
-        + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
+        + SupportsRematerialize<ArrayType, V, E::LinearOperationCarrier>,
 {
     let program = program;
     let instructions = program.instructions.as_slice();
@@ -419,7 +435,7 @@ where
     V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     ProgramInput: Parameterized<V>,
     ProgramOutput: Parameterized<V>,
-    O: Clone + Operation<ArrayType> + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
+    O: Clone + Operation<ArrayType> + SupportsRematerialize<ArrayType, V, E::LinearOperationCarrier>,
 {
     let program = program;
     let input_types: Vec<_> = program

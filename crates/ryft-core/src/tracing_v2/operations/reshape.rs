@@ -9,7 +9,7 @@ use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearEngine};
+use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearizableEngine};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Hidden carrier capability for staging the reshape primitive.
@@ -191,7 +191,7 @@ impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 impl<'engine, V: Traceable<ArrayType>, E> ReshapeOps for Tracer<'engine, E>
 where
     E: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
-    E::Operation: SupportsReshape<ArrayType, V>,
+    E::OperationCarrier: SupportsReshape<ArrayType, V>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.r#type().into_owned();
@@ -201,7 +201,10 @@ where
         }
         let context = self.context.clone();
         Ok(context
-            .trace(E::Operation::reshape_operation(input_type.shape.clone(), output_type.shape.clone()), &[&self])?
+            .trace(
+                E::OperationCarrier::reshape_operation(input_type.shape.clone(), output_type.shape.clone()),
+                &[&self],
+            )?
             .into_iter()
             .next()
             .expect("reshape should produce one traced output"))
@@ -329,9 +332,9 @@ impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for
 
 impl<E> DifferentiableOperation<E> for ReshapeOperation
 where
-    E: LinearEngine<Type = ArrayType> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType> + ?Sized,
     E::Value: ReshapeValue + Differentiable<ArrayType, Tangent = E::Value>,
-    E::LinearOperation: SupportsReshape<ArrayType, E::Value>,
+    E::LinearOperationCarrier: SupportsReshape<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
@@ -343,7 +346,7 @@ where
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent],
-                <E::LinearOperation as SupportsReshape<ArrayType, E::Value>>::reshape_operation(
+                <E::LinearOperationCarrier as SupportsReshape<ArrayType, E::Value>>::reshape_operation(
                     self.input_shape().clone(),
                     self.output_shape().clone(),
                 ),

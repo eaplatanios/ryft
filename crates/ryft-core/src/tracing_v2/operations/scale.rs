@@ -12,7 +12,7 @@ use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiableTracingEngine, LinearArrayOperation, LinearEngine,
+    DifferentiableOperation, DifferentiableTracingEngine, LinearArrayOperation, LinearizableEngine,
 };
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -131,8 +131,8 @@ where
 impl<V, E> DifferentiableOperation<E> for ScaleOperation<ArrayType, V>
 where
     V: Differentiable<ArrayType, Tangent = V> + Mul<Output = V>,
-    E: LinearEngine<Type = ArrayType, Value = V> + ?Sized,
-    E::LinearOperation: SupportsScale<ArrayType, V>,
+    E: LinearizableEngine<Type = ArrayType, Value = V> + ?Sized,
+    E::LinearOperationCarrier: SupportsScale<ArrayType, V>,
 {
     fn jvp(
         &self,
@@ -144,7 +144,7 @@ where
         let tangent = context
             .apply_operation(
                 &[input.tangent],
-                <E::LinearOperation as SupportsScale<ArrayType, V>>::scale_operation(self.factor().clone()),
+                <E::LinearOperationCarrier as SupportsScale<ArrayType, V>>::scale_operation(self.factor().clone()),
                 1,
             )?
             .into_iter()
@@ -157,8 +157,8 @@ where
 impl<V, E> DifferentiableOperation<E> for ScaleOperation<DataType, V>
 where
     V: Differentiable<DataType, Tangent = V> + Mul<Output = V>,
-    E: LinearEngine<Type = DataType, Value = V> + ?Sized,
-    E::LinearOperation: SupportsScale<DataType, V>,
+    E: LinearizableEngine<Type = DataType, Value = V> + ?Sized,
+    E::LinearOperationCarrier: SupportsScale<DataType, V>,
 {
     fn jvp(
         &self,
@@ -170,7 +170,7 @@ where
         let tangent = context
             .apply_operation(
                 &[input.tangent],
-                <E::LinearOperation as SupportsScale<DataType, V>>::scale_operation(self.factor().clone()),
+                <E::LinearOperationCarrier as SupportsScale<DataType, V>>::scale_operation(self.factor().clone()),
                 1,
             )?
             .into_iter()
@@ -193,9 +193,9 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized,
-    EInner::Operation: SupportsAdd<ArrayType, V>,
+    EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
     Tracer<'engine, EInner>: Mul<Output = Tracer<'engine, EInner>>,
-    EInner::LinearOperation<'engine>: SupportsScale<ArrayType, Tracer<'engine, EInner>>,
+    EInner::LinearOperationCarrier<'engine>: SupportsScale<ArrayType, Tracer<'engine, EInner>>,
 {
     fn jvp(
         &self,
@@ -208,7 +208,7 @@ where
         let tangent = context
             .apply_operation(
                 &[input.tangent],
-                <EInner::LinearOperation<'engine> as SupportsScale<ArrayType, Tracer<'engine, EInner>>>::scale_operation(
+                <EInner::LinearOperationCarrier<'engine> as SupportsScale<ArrayType, Tracer<'engine, EInner>>>::scale_operation(
                     factor_tracer.clone(),
                 ),
                 1,

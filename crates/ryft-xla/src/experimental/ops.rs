@@ -30,7 +30,7 @@ use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 pub type LinearXlaOperation<V = ShardMapTensor> = LinearArrayOperation<V>;
 
 fn make_linear_xla_rematerialize<
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
+    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperationCarrier = LinearXlaOperation>,
 >(
     engine: &E,
     body: &FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaOperation>,
@@ -95,7 +95,7 @@ fn replay_xla_program_with_tracers(
 }
 
 fn interpret_xla_condition_jvp<
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
+    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperationCarrier = LinearXlaOperation>,
 >(
     condition: &ConditionOperation<ShardMapTensor, XlaOperation>,
     context: &mut JvpContext<'_, E>,

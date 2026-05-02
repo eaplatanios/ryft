@@ -5,7 +5,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearEngine};
+use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
 use crate::types::{ArrayType, Type, TypeError};
 
 use super::LinearArrayOperation;
@@ -81,9 +81,9 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for 
 
 impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
 where
-    E: LinearEngine<Type = ArrayType> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType> + ?Sized,
     E::Value: MatrixValue + Differentiable<ArrayType, Tangent = E::Value>,
-    E::LinearOperation: SupportsMatrixTranspose<ArrayType, E::Value>,
+    E::LinearOperationCarrier: SupportsMatrixTranspose<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
@@ -95,7 +95,8 @@ where
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent],
-                <E::LinearOperation as SupportsMatrixTranspose<ArrayType, E::Value>>::matrix_transpose_operation(),
+                <E::LinearOperationCarrier as SupportsMatrixTranspose<ArrayType, E::Value>>::matrix_transpose_operation(
+                ),
                 1,
             )?
             .into_iter()

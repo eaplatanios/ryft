@@ -33,7 +33,7 @@ impl<'engine, E: DifferentiableTracingEngine + ?Sized> TracingContext<'engine, E
             Program<
                 T,
                 Tracer<'engine, E>,
-                <E as DifferentiableTracingEngine>::LinearOperation<'engine>,
+                <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
                 Vec<Tracer<'engine, E>>,
                 Vec<Tracer<'engine, E>>,
             >,
@@ -42,14 +42,18 @@ impl<'engine, E: DifferentiableTracingEngine + ?Sized> TracingContext<'engine, E
     >
     where
         E: DifferentiableTracingEngine<Type = T, Value = V> + 'static,
-        E::Operation: SupportsZeroLike<T, V> + SupportsAdd<T, V> + 'static,
+        E::OperationCarrier: SupportsZeroLike<T, V> + SupportsAdd<T, V> + 'static,
         AddOperation: InterpretableOperation<T, Tracer<'engine, E>>,
     {
         fn tangent_for_atom<'engine, T, V, E>(
             primal_values: &[Option<Tracer<'engine, E>>],
             builder: &Rc<
                 RefCell<
-                    ProgramBuilder<T, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
+                    ProgramBuilder<
+                        T,
+                        Tracer<'engine, E>,
+                        <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
+                    >,
                 >,
             >,
             tangents: &mut [Option<AtomId>],
@@ -59,7 +63,7 @@ impl<'engine, E: DifferentiableTracingEngine + ?Sized> TracingContext<'engine, E
             T: Type,
             V: Traceable<T>,
             E: DifferentiableTracingEngine<Type = T, Value = V> + ?Sized,
-            E::Operation: SupportsZeroLike<T, V>,
+            E::OperationCarrier: SupportsZeroLike<T, V>,
         {
             if let Some(atom) = tangents[atom_id.index] {
                 return Ok(atom);
@@ -77,7 +81,7 @@ impl<'engine, E: DifferentiableTracingEngine + ?Sized> TracingContext<'engine, E
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             T,
             Tracer<'engine, E>,
-            <E as DifferentiableTracingEngine>::LinearOperation<'engine>,
+            <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
         >::new()));
         let mut primal_values: Vec<Option<Tracer<'engine, E>>> = vec![None; program.atoms.len()];
         let mut tangents: Vec<Option<AtomId>> = vec![None; program.atoms.len()];

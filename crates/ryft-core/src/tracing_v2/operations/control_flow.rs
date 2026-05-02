@@ -12,7 +12,7 @@ use crate::tracing::{Instruction, Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
 use crate::tracing_v2::operations::constants::{Zero, ZeroLike};
 use crate::tracing_v2::{
-    ArrayOperation, DifferentiableOperation, DifferentiableTracingEngine, JvpContext, JvpTracer, LinearEngine,
+    ArrayOperation, DifferentiableOperation, DifferentiableTracingEngine, JvpContext, JvpTracer, LinearizableEngine,
 };
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -196,9 +196,9 @@ fn ensure_input_count(expected: usize, got: usize, operation: &'static str) -> R
 
 /// Replays one staged linear program by inlining its instructions into an existing linear builder
 /// owned by a [`JvpContext`].
-fn replay_linear_program_on_atoms<E: LinearEngine<Type = ArrayType> + ?Sized>(
+fn replay_linear_program_on_atoms<E: LinearizableEngine<Type = ArrayType> + ?Sized>(
     context: &JvpContext<'_, E>,
-    program: &FlatProgram<E::Value, E::LinearOperation>,
+    program: &FlatProgram<E::Value, E::LinearOperationCarrier>,
     inputs: &[crate::tracing::AtomId],
 ) -> Result<Vec<crate::tracing::AtomId>, TracingError> {
     if inputs.len() != program.input_ids.len() {
@@ -494,9 +494,9 @@ where
 impl<V, E, O> DifferentiableOperation<E> for ConditionOperation<V, O>
 where
     V: ControlFlowValue + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType>,
-    E: LinearEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType, Value = V> + ?Sized,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
-    <E as crate::tracing_v2::LinearEngine>::LinearOperation: Operation<ArrayType>,
+    <E as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Operation<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(
@@ -534,11 +534,11 @@ where
 /// whose `control_flow_predicate` always errors), so this impl reports
 /// [`ControlFlowError::MissingTransformRule`] for any traced JVP attempt.
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for ConditionOperation<V, EInner::Operation>
+    for ConditionOperation<V, EInner::OperationCarrier>
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    EInner::Operation: SupportsAdd<ArrayType, V>,
+    EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(
@@ -691,11 +691,11 @@ where
 /// [`TracingContext`](crate::tracing::engines::TracingContext). See the matching
 /// [`ConditionOperation`] impl for rationale; predicate extraction does not work at trace time.
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for WhileOperation<V, EInner::Operation>
+    for WhileOperation<V, EInner::OperationCarrier>
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    EInner::Operation: SupportsAdd<ArrayType, V>,
+    EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(
@@ -711,9 +711,9 @@ where
 impl<V, E, O> DifferentiableOperation<E> for WhileOperation<V, O>
 where
     V: ControlFlowValue + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType>,
-    E: LinearEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType, Value = V> + ?Sized,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
-    <E as crate::tracing_v2::LinearEngine>::LinearOperation: Operation<ArrayType>,
+    <E as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Operation<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(
@@ -1161,15 +1161,15 @@ mod tests {
     }
 
     impl TracingEngine for TestEngine {
-        type Operation = TestDifferentiableOperation;
+        type OperationCarrier = TestDifferentiableOperation;
     }
 
-    impl crate::tracing_v2::LinearEngine for TestEngine {
-        type LinearOperation = TestLinearOperation;
+    impl crate::tracing_v2::LinearizableEngine for TestEngine {
+        type LinearOperationCarrier = TestLinearOperation;
     }
 
     impl crate::tracing_v2::DifferentiableEngine for TestEngine {
-        type DifferentiableOperation = TestDifferentiableOperation;
+        type DifferentiableOperationCarrier = TestDifferentiableOperation;
     }
 
     fn test_transposition_context(
@@ -1226,19 +1226,19 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type Operation = ArrayOperation<f64>;
+        type OperationCarrier = ArrayOperation<f64>;
     }
 
-    impl crate::tracing_v2::LinearEngine for ArrayScalarEngine {
-        type LinearOperation = LinearArrayOperation<f64>;
+    impl crate::tracing_v2::LinearizableEngine for ArrayScalarEngine {
+        type LinearOperationCarrier = LinearArrayOperation<f64>;
     }
 
     impl crate::tracing_v2::DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperation = ArrayOperation<f64>;
+        type DifferentiableOperationCarrier = ArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
-        type LinearOperation<'engine>
+        type LinearOperationCarrier<'engine>
             = LinearArrayOperation<Tracer<'engine, Self>>
         where
             Self: 'engine;

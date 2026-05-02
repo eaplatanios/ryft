@@ -9,7 +9,7 @@ use crate::tracing::{Instruction, Program, ProgramBuilder, Traceable, TracingErr
 use crate::tracing_v2::operations::constants::{SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::tracing_v2::{
     ArrayOperation, Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine,
-    DifferentiationError, LinearArrayOperation, LinearEngine,
+    DifferentiationError, LinearArrayOperation, LinearizableEngine,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -175,7 +175,7 @@ where
 /// [`LinearArrayOperation::Rematerialize`] variant that the active linear builder can stage
 /// directly.
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for RematerializeOperation<ArrayType, V, EInner::Operation, LinearArrayOperation<V>>
+    for RematerializeOperation<ArrayType, V, EInner::OperationCarrier, LinearArrayOperation<V>>
 where
     V: Value<ArrayType>
         + ZeroLike
@@ -183,17 +183,17 @@ where
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    EInner::Operation: InterpretableOperation<ArrayType, V>
+    EInner::OperationCarrier: InterpretableOperation<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, LinearArrayOperation<V>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V>:
         Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
-    EInner::Operation: DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
+    EInner::OperationCarrier: DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
         + SupportsZeroLike<ArrayType, V>,
-    EInner::LinearOperation<'engine>: Clone
+    EInner::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, EInner>>
-        + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperation<'engine>>
+        + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
         + SupportsZero<ArrayType, Tracer<'engine, EInner>>
         + SupportsLinearRematerialize<ArrayType, Tracer<'engine, EInner>>,
 {
@@ -215,7 +215,7 @@ where
             let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
             exemplar
                 .context
-                .trace(EInner::Operation::rematerialize_operation(self.clone()), primal_input_refs.as_slice())?
+                .trace(EInner::OperationCarrier::rematerialize_operation(self.clone()), primal_input_refs.as_slice())?
         };
 
         if tangent_inputs.is_empty() && !self.body.output_types.is_empty() {
@@ -230,23 +230,23 @@ where
         let linear_remat = LinearRematerializeOperation::<
             ArrayType,
             Tracer<'engine, EInner>,
-            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
+            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
         >::new(
             FlatTracedRematerialize::<
                 ArrayType,
                 Tracer<'engine, EInner>,
-                <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
+                <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
             >::from_parts(body_input_types.clone(), body_output_types.clone(), pushforward),
             FlatTracedRematerialize::<
                 ArrayType,
                 Tracer<'engine, EInner>,
-                <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
+                <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
             >::from_parts(body_output_types, body_input_types, pullback),
         );
 
         let tangent_outputs = context.apply_operation(
             tangent_inputs.as_slice(),
-            <EInner::LinearOperation<'engine> as SupportsLinearRematerialize<
+            <EInner::LinearOperationCarrier<'engine> as SupportsLinearRematerialize<
                 ArrayType,
                 Tracer<'engine, EInner>,
             >>::rematerialize_operation(linear_remat),
@@ -267,14 +267,16 @@ impl<
         + crate::tracing_v2::operations::constants::Zero<ArrayType>
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    E: LinearEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>> + ?Sized + 'static,
+    E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V>>
+        + ?Sized
+        + 'static,
     O: Clone + Operation<ArrayType>,
-> DifferentiableOperation<E> for RematerializeOperation<ArrayType, V, O, E::LinearOperation>
+> DifferentiableOperation<E> for RematerializeOperation<ArrayType, V, O, E::LinearOperationCarrier>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     O: DifferentiableOperation<E>,
     O: InterpretableOperation<ArrayType, V>,
-    O: SupportsRematerialize<ArrayType, V, E::LinearOperation> + 'static,
+    O: SupportsRematerialize<ArrayType, V, E::LinearOperationCarrier> + 'static,
     LinearArrayOperation<V>:
         Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
 {
@@ -311,10 +313,11 @@ impl<
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     E: DifferentiableEngine<Type = ArrayType, Value = V> + TracingEngine + ?Sized,
 > InterpretableOperation<ArrayType, Tracer<'engine, E>>
-    for RematerializeOperation<ArrayType, V, E::Operation, E::LinearOperation>
+    for RematerializeOperation<ArrayType, V, E::OperationCarrier, E::LinearOperationCarrier>
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    E::Operation: InterpretableOperation<ArrayType, V> + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
+    E::OperationCarrier:
+        InterpretableOperation<ArrayType, V> + SupportsRematerialize<ArrayType, V, E::LinearOperationCarrier>,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         if inputs.is_empty() {
@@ -328,7 +331,7 @@ where
         let input_refs = inputs.iter().collect::<Vec<_>>();
         exemplar_input
             .context
-            .trace(E::Operation::rematerialize_operation(self.clone()), input_refs.as_slice())
+            .trace(E::OperationCarrier::rematerialize_operation(self.clone()), input_refs.as_slice())
     }
 }
 
@@ -499,7 +502,9 @@ where
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V> + DifferentiableOperation<E> + 'static,
     LinearArrayOperation<V>:
         Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
-    E: LinearEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>> + ?Sized + 'static,
+    E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V>>
+        + ?Sized
+        + 'static,
 {
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
@@ -555,7 +560,8 @@ where
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input, To<V> = Input::To<V>>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output, To<V> = Output::To<V>>,
-    E::Operation: InterpretableOperation<ArrayType, V> + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
+    E::OperationCarrier:
+        InterpretableOperation<ArrayType, V> + SupportsRematerialize<ArrayType, V, E::LinearOperationCarrier>,
 {
     fn invoke<F>(function: F, input: Input) -> Result<Output, TracingError>
     where
@@ -585,7 +591,7 @@ where
             .collect::<Vec<_>>();
         let output_types = exemplar_output_types.parameters().cloned().collect::<Vec<_>>();
         let Program { atoms, input_ids, output_ids, instructions, .. } = body_program;
-        let mut builder = ProgramBuilder::<ArrayType, V, E::Operation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, V, E::OperationCarrier>::new();
         builder.atoms = atoms;
         builder.input_ids = input_ids;
         builder.instructions = instructions;
@@ -599,7 +605,7 @@ where
 
         let traced_input_refs = traced_inputs.iter().collect::<Vec<_>>();
         let staged_outputs = exemplar_traced_input.context.trace(
-            E::Operation::rematerialize_operation(RematerializeOperation::new(body)),
+            E::OperationCarrier::rematerialize_operation(RematerializeOperation::new(body)),
             traced_input_refs.as_slice(),
         )?;
         Output::from_parameters(output_structure, staged_outputs).map_err(TracingError::from)
@@ -679,19 +685,19 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type Operation = ArrayOperation<f64>;
+        type OperationCarrier = ArrayOperation<f64>;
     }
 
-    impl crate::tracing_v2::LinearEngine for ArrayScalarEngine {
-        type LinearOperation = LinearArrayOperation<f64>;
+    impl crate::tracing_v2::LinearizableEngine for ArrayScalarEngine {
+        type LinearOperationCarrier = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperation = ArrayOperation<f64>;
+        type DifferentiableOperationCarrier = ArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
-        type LinearOperation<'engine>
+        type LinearOperationCarrier<'engine>
             = LinearArrayOperation<Tracer<'engine, Self>>
         where
             Self: 'engine;

@@ -310,7 +310,7 @@ impl ShardMapOperation<ShardMapTracer> {
         E: DifferentiableEngine<
                 Type = ArrayType,
                 Value = ShardMapTracer,
-                LinearOperation = LinearArrayOperation<ShardMapTracer>,
+                LinearOperationCarrier = LinearArrayOperation<ShardMapTracer>,
             > + ?Sized,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -379,7 +379,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
         E: DifferentiableEngine<
                 Type = ArrayType,
                 Value = ShardMapTracer,
-                LinearOperation = LinearArrayOperation<ShardMapTracer>,
+                LinearOperationCarrier = LinearArrayOperation<ShardMapTracer>,
             > + ?Sized,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -627,7 +627,7 @@ where
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTensor,
-            LinearOperation = LinearArrayOperation<ShardMapTensor>,
+            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor>,
         > + ?Sized,
     ShardMapTensor: Differentiable<ArrayType, Tangent = ShardMapTensor>,
 {
@@ -664,7 +664,7 @@ where
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTensor,
-            LinearOperation = LinearArrayOperation<ShardMapTensor>,
+            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor>,
         > + ?Sized,
     ShardMapTensor: Differentiable<ArrayType, Tangent = ShardMapTensor>,
 {
@@ -786,7 +786,7 @@ where
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTracer,
-            LinearOperation = LinearArrayOperation<ShardMapTracer>,
+            LinearOperationCarrier = LinearArrayOperation<ShardMapTracer>,
         > + ?Sized,
     ShardMapTracer: Differentiable<ArrayType, Tangent = ShardMapTracer>,
 {

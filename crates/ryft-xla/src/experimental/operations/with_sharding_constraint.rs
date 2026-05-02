@@ -146,7 +146,7 @@ where
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTensor,
-            LinearOperation = LinearArrayOperation<ShardMapTensor>,
+            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor>,
         > + ?Sized,
 {
     fn jvp(

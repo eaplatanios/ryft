@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
-use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearEngine};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearizableEngine};
 use ryft_core::types::{ArrayType, TypeError};
 
 use crate::arrays::{Array, NdArrayElement};
@@ -41,19 +41,19 @@ impl<T: NdArrayElement> Engine for NdArrayEngine<T> {
 }
 
 impl<T: NdArrayElement> TracingEngine for NdArrayEngine<T> {
-    type Operation = NdarrayOperation<Array<T>>;
+    type OperationCarrier = NdarrayOperation<Array<T>>;
 }
 
-impl<T: NdArrayElement> LinearEngine for NdArrayEngine<T> {
-    type LinearOperation = LinearNdarrayOperation<Array<T>>;
+impl<T: NdArrayElement> LinearizableEngine for NdArrayEngine<T> {
+    type LinearOperationCarrier = LinearNdarrayOperation<Array<T>>;
 }
 
 impl<T: NdArrayElement> DifferentiableEngine for NdArrayEngine<T> {
-    type DifferentiableOperation = NdarrayOperation<Array<T>>;
+    type DifferentiableOperationCarrier = NdarrayOperation<Array<T>>;
 }
 
 impl<T: NdArrayElement> DifferentiableTracingEngine for NdArrayEngine<T> {
-    type LinearOperation<'engine>
+    type LinearOperationCarrier<'engine>
         = LinearNdarrayOperation<Tracer<'engine, Self>>
     where
         Self: 'engine;

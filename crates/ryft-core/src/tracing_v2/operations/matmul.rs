@@ -4,7 +4,7 @@ use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearEngine};
+use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
 use crate::types::{ArrayType, Type, TypeError};
 
 use super::SupportsAdd;
@@ -61,9 +61,9 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
 
 impl<E> DifferentiableOperation<E> for MatMulOperation
 where
-    E: LinearEngine<Type = ArrayType> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType> + ?Sized,
     E::Value: MatrixValue + Differentiable<ArrayType, Tangent = E::Value>,
-    E::LinearOperation: SupportsAdd<ArrayType, E::Value>
+    E::LinearOperationCarrier: SupportsAdd<ArrayType, E::Value>
         + SupportsLeftMatMul<ArrayType, E::Value>
         + SupportsRightMatMul<ArrayType, E::Value>,
 {
@@ -79,7 +79,7 @@ where
         let left_term = context
             .apply_operation(
                 &[left.tangent],
-                <E::LinearOperation as SupportsRightMatMul<ArrayType, E::Value>>::right_matmul_operation(
+                <E::LinearOperationCarrier as SupportsRightMatMul<ArrayType, E::Value>>::right_matmul_operation(
                     right.primal.clone(),
                 ),
                 1,
@@ -90,7 +90,7 @@ where
         let right_term = context
             .apply_operation(
                 &[right.tangent],
-                <E::LinearOperation as SupportsLeftMatMul<ArrayType, E::Value>>::left_matmul_operation(
+                <E::LinearOperationCarrier as SupportsLeftMatMul<ArrayType, E::Value>>::left_matmul_operation(
                     left.primal.clone(),
                 ),
                 1,
@@ -101,7 +101,7 @@ where
         let tangent = context
             .apply_operation(
                 &[left_term, right_term],
-                <E::LinearOperation as SupportsAdd<ArrayType, E::Value>>::add_operation(),
+                <E::LinearOperationCarrier as SupportsAdd<ArrayType, E::Value>>::add_operation(),
                 1,
             )?
             .into_iter()

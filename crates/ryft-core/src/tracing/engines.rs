@@ -36,11 +36,14 @@ pub trait Engine {
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 }
 
-/// [`TracingEngine`] extends [`Engine`] with a closed [`Operation`] carrier type that can be used to trace
-/// and interpret [`Program`]s.
+/// Extension of [`Engine`] for backends that can trace staged [`Program`]s. A [`TracingEngine`] selects an
+/// [`Operation`] _carrier_: the concrete operation representation stored in each
+/// [`Instruction`](crate::tracing::Instruction) of traced programs for this backend. Carriers
+/// are usually closed enums whose variants wrap the primitive operations supported by the backend,
+/// though simple engines may use one primitive operation type directly.
 pub trait TracingEngine: Engine {
-    /// Staged [`Operation`] type supported by this [`TracingEngine`].
-    type Operation: Operation<Self::Type>;
+    /// [`Operation`] carrier selected by this [`TracingEngine`] for ordinary traced [`Program`]s.
+    type OperationCarrier: Operation<Self::Type>;
 
     /// Traces the provided `function` into a [`Program`] for the provided input types, returning the output types of
     /// the traced [`Program`] along with that traced [`Program`] itself. This is the most symbolic tracing entry
@@ -58,7 +61,10 @@ pub trait TracingEngine: Engine {
         function: F,
         input_types: I,
     ) -> Result<
-        (O::To<Self::Type>, Program<Self::Type, Self::Value, Self::Operation, I::To<Self::Value>, O::To<Self::Value>>),
+        (
+            O::To<Self::Type>,
+            Program<Self::Type, Self::Value, Self::OperationCarrier, I::To<Self::Value>, O::To<Self::Value>>,
+        ),
         TracingError,
     > {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
@@ -97,11 +103,11 @@ pub trait TracingEngine: Engine {
         function: F,
         input: I,
     ) -> Result<
-        (O::To<Self::Value>, Program<Self::Type, Self::Value, Self::Operation, I, O::To<Self::Value>>),
+        (O::To<Self::Value>, Program<Self::Type, Self::Value, Self::OperationCarrier, I, O::To<Self::Value>>),
         TracingError,
     >
     where
-        Self::Operation: Clone + InterpretableOperation<Self::Type, Self::Value>,
+        Self::OperationCarrier: Clone + InterpretableOperation<Self::Type, Self::Value>,
     {
         let input_structure = input.parameter_structure();
         let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -182,7 +188,7 @@ macro_rules! impl_tracing_engine_for_scalar {
         }
 
         impl TracingEngine for ScalarEngine<$ty> {
-            type Operation = ScalarOperation<$ty>;
+            type OperationCarrier = ScalarOperation<$ty>;
         }
     };
 }
@@ -208,13 +214,16 @@ pub struct TracingContext<'engine, E: TracingEngine + ?Sized> {
     pub engine: &'engine E,
 
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced.
-    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>,
+    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::OperationCarrier>>>,
 }
 
 impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
     /// Creates a new [`TracingContext`] that borrows the provided [`TracingEngine`].
     #[inline]
-    pub fn new(engine: &'engine E, builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>>) -> Self {
+    pub fn new(
+        engine: &'engine E,
+        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::OperationCarrier>>>,
+    ) -> Self {
         Self { engine, builder }
     }
 
@@ -260,7 +269,7 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
     /// inference to synthesize poisoned output [`Tracer`]s with the expected types.
     pub fn trace(
         &self,
-        operation: E::Operation,
+        operation: E::OperationCarrier,
         inputs: &[&Tracer<'engine, E>],
     ) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         if inputs.iter().any(|input| !Rc::ptr_eq(&self.builder, &input.context.builder)) {
@@ -359,7 +368,7 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
 
     /// Returns the [`ProgramBuilder`] associated with this [`Tracer`].
     #[inline]
-    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::Operation>>> {
+    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::OperationCarrier>>> {
         &self.context.builder
     }
 
@@ -376,7 +385,7 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
     /// Applies the provided _unary_ [`Operation`] to this [`Tracer`] returning the resulting [`Tracer`].
     /// _Unary_ operations are operations that have a single input and a single output. If the provided operation is not
     /// a unary operation then the resulting [`Tracer`] will contain a [`TracerState::Poison`].
-    pub fn unary(self, operation: E::Operation) -> Self {
+    pub fn unary(self, operation: E::OperationCarrier) -> Self {
         match self.context.trace(operation, &[&self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
@@ -394,7 +403,7 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
     /// resulting [`Tracer`]. _Binary_ operations are operations that have two inputs and a single output. If the
     /// provided operation is not a binary operation then the resulting [`Tracer`] will contain a
     /// [`TracerState::Poison`].
-    pub fn binary(self, rhs: Self, operation: E::Operation) -> Self {
+    pub fn binary(self, rhs: Self, operation: E::OperationCarrier) -> Self {
         match self.context.trace(operation, &[&self, &rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
@@ -981,7 +990,7 @@ mod tests {
         }
 
         impl TracingEngine for NoOutputEngine {
-            type Operation = NoOutputOperation;
+            type OperationCarrier = NoOutputOperation;
         }
 
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, NoOutputOperation>::new()));

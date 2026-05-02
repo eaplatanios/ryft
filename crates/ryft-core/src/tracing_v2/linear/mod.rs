@@ -69,19 +69,19 @@ mod tests {
     }
 
     impl TracingEngine for ArrayScalarEngine {
-        type Operation = ArrayOperation<f64>;
+        type OperationCarrier = ArrayOperation<f64>;
     }
 
-    impl crate::tracing_v2::LinearEngine for ArrayScalarEngine {
-        type LinearOperation = LinearArrayOperation<f64>;
+    impl crate::tracing_v2::LinearizableEngine for ArrayScalarEngine {
+        type LinearOperationCarrier = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperation = ArrayOperation<f64>;
+        type DifferentiableOperationCarrier = ArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
-        type LinearOperation<'engine>
+        type LinearOperationCarrier<'engine>
             = LinearArrayOperation<Tracer<'engine, Self>>
         where
             Self: 'engine;
@@ -233,15 +233,15 @@ mod tests {
     }
 
     impl TracingEngine for SplitCarrierEngine {
-        type Operation = OrdinaryAddOperation;
+        type OperationCarrier = OrdinaryAddOperation;
     }
 
-    impl crate::tracing_v2::LinearEngine for SplitCarrierEngine {
-        type LinearOperation = LinearArrayOperation<f64>;
+    impl crate::tracing_v2::LinearizableEngine for SplitCarrierEngine {
+        type LinearOperationCarrier = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableEngine for SplitCarrierEngine {
-        type DifferentiableOperation = DifferentiableAddOperation;
+        type DifferentiableOperationCarrier = DifferentiableAddOperation;
     }
 
     impl DifferentiableOperation<SplitCarrierEngine> for DifferentiableAddOperation {

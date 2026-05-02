@@ -7,7 +7,7 @@ use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearEngine};
+use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Synthesizes a typed zero value without an exemplar.
@@ -127,10 +127,10 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for ZeroOperation<E::Type>
 where
-    E: LinearEngine + ?Sized,
+    E: LinearizableEngine + ?Sized,
     ZeroOperation<E::Type>: Operation<E::Type>,
     E::Value: Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperation: SupportsZero<E::Type, E::Value>,
+    E::LinearOperationCarrier: SupportsZero<E::Type, E::Value>,
 {
     fn jvp(
         &self,
@@ -143,7 +143,9 @@ where
         let tangent = context
             .apply_operation(
                 &[],
-                <E::LinearOperation as SupportsZero<E::Type, E::Value>>::zero_operation(self.output_type.clone()),
+                <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(
+                    self.output_type.clone(),
+                ),
                 1,
             )?
             .into_iter()
@@ -260,10 +262,10 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for OneOperation<E::Type>
 where
-    E: LinearEngine + ?Sized,
+    E: LinearizableEngine + ?Sized,
     OneOperation<E::Type>: Operation<E::Type>,
     E::Value: Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperation: SupportsZero<E::Type, E::Value>,
+    E::LinearOperationCarrier: SupportsZero<E::Type, E::Value>,
 {
     fn jvp(
         &self,
@@ -276,7 +278,9 @@ where
         let tangent = context
             .apply_operation(
                 &[],
-                <E::LinearOperation as SupportsZero<E::Type, E::Value>>::zero_operation(self.output_type.clone()),
+                <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(
+                    self.output_type.clone(),
+                ),
                 1,
             )?
             .into_iter()
@@ -315,11 +319,11 @@ pub trait SupportsZeroLike<T: Type, V: Traceable<T>>: Clone {
 impl<'engine, E> ZeroLike for Tracer<'engine, E>
 where
     E: TracingEngine + ?Sized,
-    E::Operation: SupportsZeroLike<E::Type, E::Value>,
+    E::OperationCarrier: SupportsZeroLike<E::Type, E::Value>,
 {
     #[inline]
     fn zero_like(&self) -> Self {
-        self.clone().unary(E::Operation::zero_like_operation())
+        self.clone().unary(E::OperationCarrier::zero_like_operation())
     }
 }
 
@@ -384,10 +388,10 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for ZeroLikeOperation
 where
-    E: LinearEngine + ?Sized,
+    E: LinearizableEngine + ?Sized,
     ZeroLikeOperation: Operation<E::Type>,
     E::Value: ZeroLike + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperation: SupportsZeroLike<E::Type, E::Value>,
+    E::LinearOperationCarrier: SupportsZeroLike<E::Type, E::Value>,
 {
     fn jvp(
         &self,
@@ -400,7 +404,7 @@ where
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent],
-                <E::LinearOperation as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
+                <E::LinearOperationCarrier as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
                 1,
             )?
             .into_iter()
@@ -432,11 +436,11 @@ pub trait SupportsOneLike<T: Type, V: Traceable<T>>: Clone {
 impl<'engine, E> OneLike for Tracer<'engine, E>
 where
     E: TracingEngine + ?Sized,
-    E::Operation: SupportsOneLike<E::Type, E::Value>,
+    E::OperationCarrier: SupportsOneLike<E::Type, E::Value>,
 {
     #[inline]
     fn one_like(&self) -> Self {
-        self.clone().unary(E::Operation::one_like_operation())
+        self.clone().unary(E::OperationCarrier::one_like_operation())
     }
 }
 
@@ -499,10 +503,10 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for OneLikeOperation
 where
-    E: LinearEngine + ?Sized,
+    E: LinearizableEngine + ?Sized,
     OneLikeOperation: Operation<E::Type>,
     E::Value: OneLike + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperation: SupportsZeroLike<E::Type, E::Value>,
+    E::LinearOperationCarrier: SupportsZeroLike<E::Type, E::Value>,
 {
     fn jvp(
         &self,
@@ -515,7 +519,7 @@ where
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent],
-                <E::LinearOperation as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
+                <E::LinearOperationCarrier as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
                 1,
             )?
             .into_iter()

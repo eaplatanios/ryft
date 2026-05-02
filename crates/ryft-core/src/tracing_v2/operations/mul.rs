@@ -8,7 +8,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearEngine};
+use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{SupportsAdd, SupportsScale};
@@ -22,13 +22,13 @@ pub trait SupportsMul<T: Type, V: Traceable<T>>: Clone {
 
 impl<'engine, E: TracingEngine + ?Sized> Mul for Tracer<'engine, E>
 where
-    E::Operation: SupportsMul<E::Type, E::Value>,
+    E::OperationCarrier: SupportsMul<E::Type, E::Value>,
 {
     type Output = Self;
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, E::Operation::mul_operation())
+        self.binary(rhs, E::OperationCarrier::mul_operation())
     }
 }
 
@@ -127,10 +127,10 @@ impl<V: Typed<DataType> + Clone + Mul<Output = V>> InterpretableOperation<DataTy
 
 impl<E> DifferentiableOperation<E> for MulOperation
 where
-    E: LinearEngine + ?Sized,
+    E: LinearizableEngine + ?Sized,
     MulOperation: Operation<E::Type>,
     E::Value: Mul<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperation: SupportsAdd<E::Type, E::Value> + SupportsScale<E::Type, E::Value>,
+    E::LinearOperationCarrier: SupportsAdd<E::Type, E::Value> + SupportsScale<E::Type, E::Value>,
 {
     fn jvp(
         &self,
@@ -143,7 +143,7 @@ where
         let left_term = context
             .apply_operation(
                 &[left.tangent],
-                <E::LinearOperation as SupportsScale<E::Type, E::Value>>::scale_operation(right.primal.clone()),
+                <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(right.primal.clone()),
                 1,
             )?
             .into_iter()
@@ -152,7 +152,7 @@ where
         let right_term = context
             .apply_operation(
                 &[right.tangent],
-                <E::LinearOperation as SupportsScale<E::Type, E::Value>>::scale_operation(left.primal.clone()),
+                <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(left.primal.clone()),
                 1,
             )?
             .into_iter()
@@ -161,7 +161,7 @@ where
         let tangent = context
             .apply_operation(
                 &[left_term, right_term],
-                <E::LinearOperation as SupportsAdd<E::Type, E::Value>>::add_operation(),
+                <E::LinearOperationCarrier as SupportsAdd<E::Type, E::Value>>::add_operation(),
                 1,
             )?
             .into_iter()

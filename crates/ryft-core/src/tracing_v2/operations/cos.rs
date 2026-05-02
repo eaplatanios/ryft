@@ -8,7 +8,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearEngine};
+use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::sin::Sin;
@@ -104,10 +104,10 @@ impl<V: Typed<DataType> + Clone + Cos> InterpretableOperation<DataType, V> for C
 
 impl<E> DifferentiableOperation<E> for CosOperation
 where
-    E: LinearEngine + ?Sized,
+    E: LinearizableEngine + ?Sized,
     CosOperation: Operation<E::Type>,
     E::Value: Cos + Sin + Neg<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperation: SupportsNeg<E::Type, E::Value> + SupportsScale<E::Type, E::Value>,
+    E::LinearOperationCarrier: SupportsNeg<E::Type, E::Value> + SupportsScale<E::Type, E::Value>,
 {
     fn jvp(
         &self,
@@ -119,14 +119,20 @@ where
         let scaled = context
             .apply_operation(
                 &[input.tangent],
-                <E::LinearOperation as SupportsScale<E::Type, E::Value>>::scale_operation(input.primal.clone().sin()),
+                <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(
+                    input.primal.clone().sin(),
+                ),
                 1,
             )?
             .into_iter()
             .next()
             .expect("cos jvp scale should produce one tangent");
         let tangent = context
-            .apply_operation(&[scaled], <E::LinearOperation as SupportsNeg<E::Type, E::Value>>::neg_operation(), 1)?
+            .apply_operation(
+                &[scaled],
+                <E::LinearOperationCarrier as SupportsNeg<E::Type, E::Value>>::neg_operation(),
+                1,
+            )?
             .into_iter()
             .next()
             .expect("cos jvp neg should produce one tangent");
@@ -138,10 +144,10 @@ impl<'engine, E> Cos for Tracer<'engine, E>
 where
     E: TracingEngine + ?Sized,
     E::Value: Cos,
-    E::Operation: SupportsCos<E::Type, E::Value>,
+    E::OperationCarrier: SupportsCos<E::Type, E::Value>,
 {
     #[inline]
     fn cos(self) -> Self {
-        self.unary(E::Operation::cos_operation())
+        self.unary(E::OperationCarrier::cos_operation())
     }
 }
