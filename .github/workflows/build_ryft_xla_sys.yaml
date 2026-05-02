@@ -21,37 +21,37 @@ jobs:
             architecture: amd64
             device: cpu
             platform: linux_x86_64
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-full-x64/volume=120g/spot=false/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-full-x64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: amd64
             device: cuda-12
             platform: linux_x86_64
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: amd64
             device: cuda-13
             platform: linux_x86_64
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: arm64
             device: cpu
             platform: linux_aarch64
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu24-full-arm64/volume=120g/spot=false/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu24-full-arm64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: arm64
             device: cuda-12
             platform: linux_aarch64
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu24-full-arm64/volume=120g/spot=false/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu24-full-arm64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: arm64
             device: cuda-13
             platform: linux_aarch64
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu24-full-arm64/volume=120g/spot=false/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu24-full-arm64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: amd64
             device: rocm-7
             platform: linux_x86_64
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
           - os: macos
             architecture: arm64
             device: cpu
@@ -61,7 +61,7 @@ jobs:
             architecture: amd64
             device: cpu
             platform: windows
-            runner: runs-on=${{ github.run_id }}/image=windows22-base-x64/family=c7i-flex.16xlarge/volume=120g/spot=false/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/image=windows22-base-x64/family=c7i-flex.16xlarge/volume=120g/spot=true/extras=s3-cache
     outputs:
       xla_commit_id: ${{ steps.extract_xla_commit_id.outputs.xla_commit_id }}
     steps:
