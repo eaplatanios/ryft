@@ -7,7 +7,7 @@ use crate::operations::{ElementwiseArrayOperation, InterpretableOperation, Opera
 use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-/// [`Operation`] that consumes two values and produces their broadcasted elementwise sum.
+/// [`Operation`] that adds two values and typically supports broadcasting semantics for arrays.
 #[derive(Clone, Debug, Default)]
 pub struct AddOperation;
 
@@ -95,7 +95,6 @@ mod tests {
     #[test]
     fn test_add_operation() {
         let operation = AddOperation;
-
         assert_eq!(Operation::<DataType>::name(&operation), "add");
         assert_eq!(format!("{operation:?}"), "AddOperation");
         assert_eq!(format!("{operation}"), "add");
@@ -152,7 +151,6 @@ mod tests {
             ],
         )
         .unwrap();
-
         assert_eq!(
             output,
             vec![
@@ -171,7 +169,6 @@ mod tests {
             ],
         )
         .unwrap_err();
-
         assert_eq!(error, TypeError { message: "add input types are not broadcast-compatible".to_string() });
     }
 
@@ -186,7 +183,6 @@ mod tests {
             ],
         )
         .unwrap();
-
         assert_eq!(output, vec![ArrayType::scalar(DataType::F32)]);
     }
 
@@ -231,7 +227,6 @@ mod tests {
         .unwrap();
 
         let output = <AddOperation as Operation<ArrayType>>::infer_output_types(&AddOperation, &[left, right]).unwrap();
-
         assert_eq!(
             output[0].sharding.as_ref().unwrap().varying_manual_axes,
             BTreeSet::from(["x".to_string(), "y".to_string()])

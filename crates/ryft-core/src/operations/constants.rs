@@ -331,9 +331,22 @@ mod tests {
     };
 
     #[test]
-    fn test_zero_operation() {
-        let operation = ZeroOperation::new(DataType::F64);
+    fn test_zero() {
+        assert_eq!(bool::zero(&DataType::Boolean), Ok(false));
+        assert_eq!(i8::zero(&DataType::I8), Ok(0i8));
+        assert_eq!(i16::zero(&DataType::I16), Ok(0i16));
+        assert_eq!(i32::zero(&DataType::I32), Ok(0i32));
+        assert_eq!(i64::zero(&DataType::I64), Ok(0i64));
+        assert_eq!(u8::zero(&DataType::U8), Ok(0u8));
+        assert_eq!(u16::zero(&DataType::U16), Ok(0u16));
+        assert_eq!(u32::zero(&DataType::U32), Ok(0u32));
+        assert_eq!(u64::zero(&DataType::U64), Ok(0u64));
+        assert_eq!(bf16::zero(&DataType::BF16), Ok(bf16::ZERO));
+        assert_eq!(f16::zero(&DataType::F16), Ok(f16::ZERO));
+        assert_eq!(f32::zero(&DataType::F32), Ok(0.0f32));
+        assert_eq!(f64::zero(&DataType::F64), Ok(0.0f64));
 
+        let operation = ZeroOperation::new(DataType::F64);
         assert_eq!(Operation::<DataType>::name(&operation), "zero");
         assert_eq!(format!("{operation:?}"), "ZeroOperation { type: F64 }");
         assert_eq!(format!("{operation}"), "zero");
@@ -369,9 +382,66 @@ mod tests {
     }
 
     #[test]
-    fn test_one_operation() {
-        let operation = OneOperation::new(DataType::F64);
+    fn test_zero_like() {
+        assert_eq!(false.zero_like(), false);
+        assert_eq!(5i32.zero_like(), 0i32);
+        assert_eq!(5u32.zero_like(), 0u32);
+        assert_eq!(bf16::from_f32(5.0).zero_like(), bf16::ZERO);
+        assert_eq!(f16::from_f32(5.0).zero_like(), f16::ZERO);
+        assert_eq!(3.0f32.zero_like(), 0.0f32);
+        assert_eq!(7.0f64.zero_like(), 0.0f64);
 
+        let operation = ZeroLikeOperation;
+        assert_eq!(Operation::<DataType>::name(&operation), "zero_like");
+        assert_eq!(format!("{operation:?}"), "ZeroLikeOperation");
+        assert_eq!(format!("{operation}"), "zero_like");
+        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]), Ok(vec![0.0]));
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)]),
+            Ok(vec![ArrayType::scalar(DataType::F32)]),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[]),
+            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
+        );
+        assert_eq!(
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
+            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+        );
+
+        let mut builder = ProgramBuilder::<DataType, f64, ZeroLikeOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                    lambda %0:f64 .
+                    let %1:f64 = zero_like %0
+                    in (%1)
+                "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_one() {
+        assert_eq!(bool::one(&DataType::Boolean), Ok(true));
+        assert_eq!(i8::one(&DataType::I8), Ok(1i8));
+        assert_eq!(i16::one(&DataType::I16), Ok(1i16));
+        assert_eq!(i32::one(&DataType::I32), Ok(1i32));
+        assert_eq!(i64::one(&DataType::I64), Ok(1i64));
+        assert_eq!(u8::one(&DataType::U8), Ok(1u8));
+        assert_eq!(u16::one(&DataType::U16), Ok(1u16));
+        assert_eq!(u32::one(&DataType::U32), Ok(1u32));
+        assert_eq!(u64::one(&DataType::U64), Ok(1u64));
+        assert_eq!(bf16::one(&DataType::BF16), Ok(bf16::ONE));
+        assert_eq!(f16::one(&DataType::F16), Ok(f16::ONE));
+        assert_eq!(f32::one(&DataType::F32), Ok(1.0f32));
+        assert_eq!(f64::one(&DataType::F64), Ok(1.0f64));
+
+        let operation = OneOperation::new(DataType::F64);
         assert_eq!(Operation::<DataType>::name(&operation), "one");
         assert_eq!(format!("{operation:?}"), "OneOperation { type: F64 }");
         assert_eq!(format!("{operation}"), "one");
@@ -407,46 +477,16 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_like_operation() {
-        let operation = ZeroLikeOperation;
+    fn test_one_like() {
+        assert_eq!(false.one_like(), true);
+        assert_eq!(5i32.one_like(), 1i32);
+        assert_eq!(5u32.one_like(), 1u32);
+        assert_eq!(bf16::from_f32(5.0).one_like(), bf16::ONE);
+        assert_eq!(f16::from_f32(5.0).one_like(), f16::ONE);
+        assert_eq!(3.0f32.one_like(), 1.0f32);
+        assert_eq!(7.0f64.one_like(), 1.0f64);
 
-        assert_eq!(Operation::<DataType>::name(&operation), "zero_like");
-        assert_eq!(format!("{operation:?}"), "ZeroLikeOperation");
-        assert_eq!(format!("{operation}"), "zero_like");
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]), Ok(vec![0.0]));
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)]),
-            Ok(vec![ArrayType::scalar(DataType::F32)]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
-        );
-
-        let mut builder = ProgramBuilder::<DataType, f64, ZeroLikeOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
-        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = zero_like %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_one_like_operation() {
         let operation = OneLikeOperation;
-
         assert_eq!(Operation::<DataType>::name(&operation), "one_like");
         assert_eq!(format!("{operation:?}"), "OneLikeOperation");
         assert_eq!(format!("{operation}"), "one_like");
@@ -478,50 +518,5 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_scalar_constant_traits_report_expected_values() {
-        assert_eq!(bool::zero(&DataType::Boolean), Ok(false));
-        assert_eq!(bool::one(&DataType::Boolean), Ok(true));
-        assert_eq!(i8::zero(&DataType::I8), Ok(0i8));
-        assert_eq!(i8::one(&DataType::I8), Ok(1i8));
-        assert_eq!(i16::zero(&DataType::I16), Ok(0i16));
-        assert_eq!(i16::one(&DataType::I16), Ok(1i16));
-        assert_eq!(i32::zero(&DataType::I32), Ok(0i32));
-        assert_eq!(i32::one(&DataType::I32), Ok(1i32));
-        assert_eq!(i64::zero(&DataType::I64), Ok(0i64));
-        assert_eq!(i64::one(&DataType::I64), Ok(1i64));
-        assert_eq!(u8::zero(&DataType::U8), Ok(0u8));
-        assert_eq!(u8::one(&DataType::U8), Ok(1u8));
-        assert_eq!(u16::zero(&DataType::U16), Ok(0u16));
-        assert_eq!(u16::one(&DataType::U16), Ok(1u16));
-        assert_eq!(u32::zero(&DataType::U32), Ok(0u32));
-        assert_eq!(u32::one(&DataType::U32), Ok(1u32));
-        assert_eq!(u64::zero(&DataType::U64), Ok(0u64));
-        assert_eq!(u64::one(&DataType::U64), Ok(1u64));
-        assert_eq!(bf16::zero(&DataType::BF16), Ok(bf16::ZERO));
-        assert_eq!(bf16::one(&DataType::BF16), Ok(bf16::ONE));
-        assert_eq!(f16::zero(&DataType::F16), Ok(f16::ZERO));
-        assert_eq!(f16::one(&DataType::F16), Ok(f16::ONE));
-        assert_eq!(f32::zero(&DataType::F32), Ok(0.0f32));
-        assert_eq!(f32::one(&DataType::F32), Ok(1.0f32));
-        assert_eq!(f64::zero(&DataType::F64), Ok(0.0f64));
-        assert_eq!(f64::one(&DataType::F64), Ok(1.0f64));
-
-        assert_eq!(false.zero_like(), false);
-        assert_eq!(false.one_like(), true);
-        assert_eq!(5i32.zero_like(), 0i32);
-        assert_eq!(5i32.one_like(), 1i32);
-        assert_eq!(5u32.zero_like(), 0u32);
-        assert_eq!(5u32.one_like(), 1u32);
-        assert_eq!(bf16::from_f32(5.0).zero_like(), bf16::ZERO);
-        assert_eq!(bf16::from_f32(5.0).one_like(), bf16::ONE);
-        assert_eq!(f16::from_f32(5.0).zero_like(), f16::ZERO);
-        assert_eq!(f16::from_f32(5.0).one_like(), f16::ONE);
-        assert_eq!(3.0f32.zero_like(), 0.0f32);
-        assert_eq!(3.0f32.one_like(), 1.0f32);
-        assert_eq!(7.0f64.zero_like(), 0.0f64);
-        assert_eq!(7.0f64.one_like(), 1.0f64);
     }
 }
