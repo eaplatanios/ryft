@@ -1,9 +1,11 @@
 use half::{bf16, f16};
 use thiserror::Error;
 
+use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
-use crate::tracing::{InterpretableOperation, TracingError};
-use crate::tracing_v2::LinearOperation as LinearOperationTrait;
+use crate::tracing::transposition::LinearOperation as LinearOperationTrait;
+use crate::tracing::{AtomId, TracingError};
+use crate::tracing_v2::forward::{JvpContext, JvpTracer};
 use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale, SupportsZero};
 use crate::tracing_v2::{Differentiable, LinearScalarOperation, ScalarOperation};
 use crate::types::ArrayType;
@@ -56,6 +58,34 @@ pub enum DifferentiationError {
     /// Dense Jacobian materialization produced a column with an unexpected height.
     #[error("invalid Jacobian column height; expected {expected} but got {got}")]
     InvalidJacobianColumnHeight { expected: usize, got: usize },
+}
+
+/// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
+///
+/// A [`DifferentiableOperation`] is keyed by the [`DifferentiableEngine`] that supplies the value,
+/// type, and linear-operation families used while differentiating. Implementors consume
+/// [`JvpTracer`] inputs, each carrying a primal value and a tangent atom in the active linear
+/// builder, and return traced primal/tangent outputs.
+///
+/// Primitive rules usually stage tangent operations through [`JvpContext::apply_operation`].
+/// Higher-order rules use [`JvpContext::engine`] to recurse into nested programs with the same
+/// engine.
+pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E::Type> {
+    /// Applies this operation's forward-mode Jacobian-Vector Product (JVP) rule.
+    ///
+    /// The returned vector must be aligned with this operation's outputs and must carry both the
+    /// primal output values and the staged tangent atoms for those outputs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active JVP context used to stage tangent operations and access the
+    ///     differentiable engine.
+    ///   - `inputs`: Traced inputs aligned with this operation's inputs.
+    fn jvp(
+        &self,
+        context: &mut JvpContext<'_, E>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError>;
 }
 
 /// Optional extension for tracing engines that support differentiation inside an active trace.

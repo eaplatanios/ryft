@@ -1,18 +1,20 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::engines::{Tracer, TracingEngine};
-use crate::tracing::{Instruction, OperationFormatter, Program, ProgramBuilder, Traceable, TracingError, Value};
+use crate::tracing::transposition::LinearOperation;
+use crate::tracing::{Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
 use crate::tracing_v2::linear::{linearize_program, transpose_linear_program_with_output_examples};
 use crate::tracing_v2::operations::constants::{SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::tracing_v2::{
-    ArrayOperation, Differentiable, DifferentiableEngine, DifferentiableTracingEngine, DifferentiationError,
-    LinearArrayOperation,
+    ArrayOperation, Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine,
+    DifferentiationError, LinearArrayOperation,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd};
+use super::SupportsAdd;
 
 /// Hidden carrier capability for staging the `rematerialize` higher-order primitive.
 #[doc(hidden)]
@@ -433,7 +435,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         let transpose = self.transpose_op();
@@ -464,7 +466,7 @@ where
 /// is structurally zero. Linear higher-order rules use this when they must consume all output
 /// cotangents jointly (e.g. a nested transpose program that has a fixed input arity).
 fn materialize_optional_cotangent<T, V>(
-    context: &crate::tracing_v2::operations::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
+    context: &crate::tracing::transposition::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
     cotangent: Option<crate::tracing::AtomId>,
     input_type: &T,
 ) -> crate::tracing::AtomId
@@ -649,9 +651,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::tracing::engines::{Engine, Tracer, TracingEngine};
+    use crate::tracing::transposition::TranspositionContext;
     use crate::tracing::{Program, ProgramBuilder};
     use crate::tracing_v2::linear::{compile_grad, grad, value_and_grad};
-    use crate::tracing_v2::operations::TranspositionContext;
     use crate::tracing_v2::{DifferentiationError, JvpTracer, LinearArrayOperation, Sin};
 
     use super::*;

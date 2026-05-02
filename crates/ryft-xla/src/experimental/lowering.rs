@@ -9,9 +9,10 @@ use ryft_mlir::{
 #[cfg(feature = "ndarray")]
 use ryft_ndarray::Array as NdArrayValue;
 
+use ryft_core::operations::Operation;
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
-use ryft_core::tracing::{AtomId, Instruction, Operation, Program, Traceable, TracingError};
+use ryft_core::tracing::{AtomId, Instruction, Program, Traceable, TracingError};
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use ryft_core::tracing_v2::operations::{
     AddOperation, CosOperation, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation,
@@ -2504,10 +2505,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use ryft_core::operations::{InterpretableOperation, Operation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
-    use ryft_core::tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError};
+    use ryft_core::tracing::{ProgramBuilder, TracingError};
     use ryft_core::tracing_v2::operations::constants::{OneLike, ZeroLike};
     use ryft_core::tracing_v2::{
         ArrayOperation, Cos, CustomPrimitive, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation,

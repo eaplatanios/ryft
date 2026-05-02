@@ -3,19 +3,21 @@ use std::fmt::{Debug, Display};
 use half::{bf16, f16};
 use thiserror::Error;
 
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::Parameterized;
 use crate::tracing::engines::Tracer;
 use crate::tracing::engines::TracingEngine;
-use crate::tracing::{
-    Instruction, InterpretableOperation, Operation, OperationFormatter, Program, Traceable, TracingError, Value,
-};
+use crate::tracing::transposition::{LinearOperation, TranspositionContext};
+use crate::tracing::{Instruction, Program, Traceable, TracingError, Value};
 use crate::tracing_v2::forward::Differentiable;
 use crate::tracing_v2::linear::linearize_program;
 use crate::tracing_v2::operations::constants::{Zero, ZeroLike};
-use crate::tracing_v2::{ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, JvpContext, JvpTracer};
+use crate::tracing_v2::{
+    ArrayOperation, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, JvpContext, JvpTracer,
+};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-use super::{DifferentiableOperation, LinearOperation, SupportsAdd, TranspositionContext};
+use super::SupportsAdd;
 
 /// Flat nested program shape used by control-flow operations.
 pub type FlatProgram<V, O, T = ArrayType> = Program<T, V, O, Vec<V>, Vec<V>>;

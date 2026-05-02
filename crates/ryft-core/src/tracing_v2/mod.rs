@@ -23,7 +23,8 @@ pub(crate) mod test_support;
 
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
-    DifferentiableEngine, DifferentiableOperationTracingEngine, DifferentiableTracingEngine, DifferentiationError,
+    DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,
+    DifferentiationError,
 };
 pub use forward::{Differentiable, JvpContext, JvpTracer, jvp};
 pub use linear::{
@@ -35,7 +36,6 @@ pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::{
     ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, Cos,
-    CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation, FlatProgram,
-    LinearArrayOperation, LinearCustomPrimitive, LinearOperation, LinearScalarOperation, ScalarOperation, Sin,
-    WhileOperation,
+    CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, FlatProgram, LinearArrayOperation,
+    LinearCustomPrimitive, LinearScalarOperation, ScalarOperation, Sin, WhileOperation,
 };

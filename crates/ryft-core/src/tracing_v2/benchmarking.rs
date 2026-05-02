@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::operations::Operation;
 use crate::parameters::Parameterized;
-use crate::tracing::{Atom, AtomId, Operation, Program, Traceable, TracingError};
+use crate::tracing::{Atom, AtomId, Program, Traceable, TracingError};
 use crate::types::ArrayType;
 
 /// Error type returned by the IR benchmark tooling.

@@ -5,16 +5,16 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
 use crate::tracing::engines::{Tracer, TracingContext};
+use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::forward::{Differentiable, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::primitive::{ArrayOperation, LinearArrayOperation};
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
-
 /// Error type for rule-based custom staged operations.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CustomOperationError {
@@ -326,7 +326,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         self.transpose_rule
@@ -436,7 +436,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         self.primitive
@@ -458,8 +458,8 @@ mod tests {
     use super::*;
     use crate::tracing::engines::Tracer;
     use crate::tracing::engines::{Engine, TracingEngine};
+    use crate::tracing::transposition::TranspositionContext;
     use crate::tracing::{Program, ProgramBuilder};
-    use crate::tracing_v2::operations::TranspositionContext;
     use crate::tracing_v2::operations::constants::OneLike;
     use crate::tracing_v2::{
         ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, grad, jvp,
@@ -544,7 +544,7 @@ mod tests {
     impl LinearOperation<ArrayType, f64, LinearArrayOperation<f64>> for ShiftOp {
         fn transpose(
             &self,
-            _context: &mut crate::tracing_v2::operations::TranspositionContext<
+            _context: &mut crate::tracing::transposition::TranspositionContext<
                 ArrayType,
                 f64,
                 LinearArrayOperation<f64>,

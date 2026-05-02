@@ -452,8 +452,9 @@ mod tests {
 
     use ryft_macros::Parameter;
 
+    use crate::operations::{InterpretableOperation, Operation};
     use crate::tracing::engines::{ScalarEngine, Tracer};
-    use crate::tracing::{InterpretableOperation, Operation, Traceable, TracingError, Value};
+    use crate::tracing::{Traceable, TracingError, Value};
     use crate::tracing_v2::operations::add::{AddOperation, SupportsAdd};
     use crate::tracing_v2::operations::constants::{One, OneLike, Zero, ZeroLike};
     use crate::tracing_v2::operations::neg::SupportsNeg;
@@ -643,7 +644,7 @@ mod tests {
     impl LinearOperation<TestType, TestValue, TestLinearOperation> for TestLinearOperation {
         fn transpose(
             &self,
-            context: &mut crate::tracing_v2::operations::TranspositionContext<TestType, TestValue, TestLinearOperation>,
+            context: &mut crate::tracing::transposition::TranspositionContext<TestType, TestValue, TestLinearOperation>,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
             if output_cotangents.len() != 1 {

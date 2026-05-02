@@ -1,13 +1,15 @@
 use std::fmt::{Debug, Display};
 
 use crate::macros::check_input_count;
+use crate::operations::{InterpretableOperation, Operation};
+use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::DifferentiableEngine;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, Type, TypeError};
 
+use super::LinearArrayOperation;
 use super::matrix::{MatrixOps, MatrixValue, transpose_abstract};
-use super::{DifferentiableOperation, InterpretableOperation, LinearArrayOperation, LinearOperation, Operation};
 
 /// Hidden carrier capability for staging the matrix transposition primitive.
 #[doc(hidden)]
@@ -60,7 +62,7 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOpe
 impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for MatrixTransposeOperation {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1, TracingError);

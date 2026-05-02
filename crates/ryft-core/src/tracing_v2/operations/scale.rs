@@ -5,14 +5,18 @@ use std::ops::Mul;
 use indoc::indoc;
 
 use crate::macros::check_input_count;
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::engines::Tracer;
-use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
+use crate::tracing::transposition::LinearOperation;
+use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation};
+use crate::tracing_v2::{
+    DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, LinearArrayOperation,
+};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd};
+use super::SupportsAdd;
 
 /// Hidden carrier capability for staging the scaling primitive.
 ///
@@ -107,7 +111,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1, TracingError);
@@ -225,8 +229,8 @@ mod tests {
 
     use crate::parameters::Placeholder;
     use crate::tracing::ProgramBuilder;
+    use crate::tracing::transposition::TranspositionContext;
     use crate::tracing_v2::LinearArrayOperation;
-    use crate::tracing_v2::operations::TranspositionContext;
 
     use super::*;
 

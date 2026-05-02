@@ -2,19 +2,18 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
-use crate::tracing::{
-    Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
-    Value,
-};
+use crate::tracing::transposition::LinearOperation;
+use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
 use crate::tracing_v2::forward::JvpTracer;
 use crate::tracing_v2::operations::constants::{One, OneLike, SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::tracing_v2::operations::rematerialize::{FlatTracedRematerialize, RematerializeOperation};
-use crate::tracing_v2::operations::{AddOperation, DifferentiableOperation, SupportsAdd, SupportsRematerialize};
+use crate::tracing_v2::operations::{AddOperation, SupportsAdd, SupportsRematerialize};
 use crate::tracing_v2::{
-    Differentiable, DifferentiableEngine, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,
-    DifferentiationError, LinearOperation,
+    Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
+    DifferentiableTracingEngine, DifferentiationError,
 };
 use crate::types::{ArrayType, Type, Typed};
 
@@ -175,13 +174,14 @@ mod tests {
     use std::ops::{Add, Mul, Neg};
     use std::sync::Arc;
 
+    use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
     use crate::tracing::engines::ScalarEngine;
-    use crate::tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError};
-    use crate::tracing_v2::operations::TranspositionContext;
+    use crate::tracing::transposition::TranspositionContext;
+    use crate::tracing::{ProgramBuilder, TracingError};
     use crate::tracing_v2::{
         ArrayOperation, CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearArrayOperation,
-        LinearOperation, LinearScalarOperation, Sin, test_support,
+        LinearScalarOperation, Sin, test_support,
     };
     use crate::types::{ArrayType, DataType, TypeError, Typed};
     use indoc::indoc;

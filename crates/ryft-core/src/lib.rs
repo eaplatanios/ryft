@@ -1,6 +1,7 @@
 pub mod broadcasting;
 pub mod errors;
 pub mod macros;
+pub mod operations;
 pub mod parameters;
 pub mod sharding;
 pub mod tracing;
@@ -10,6 +11,7 @@ pub mod utilities;
 
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use errors::Error;
+pub use operations::{InterpretableOperation, Operation, OperationFormatter};
 pub use parameters::{
     Parameter, ParameterError, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
     PathPrefixedParameterIterator, Placeholder,
@@ -19,8 +21,8 @@ pub use sharding::{
     ShardingDimension, ShardingError, ShardingVisualization,
 };
 pub use tracing::{
-    Atom, AtomId, Engine, Instruction, InterpretableOperation, Operation, OperationFormatter, Program, ProgramBuilder,
-    ScalarEngine, Traceable, Tracer, TracerState, TracingContext, TracingEngine, TracingError, Value,
+    Atom, AtomId, Engine, Instruction, LinearOperation, Program, ProgramBuilder, ScalarEngine, Traceable, Tracer,
+    TracerState, TracingContext, TracingEngine, TracingError, TranspositionContext, Value,
 };
 pub use types::{
     ArrayType, DataType, DataTypeError, Layout, LayoutError, Shape, Size, StridedLayout, Tile, TileDimension,

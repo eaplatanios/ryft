@@ -472,10 +472,11 @@ mod tests {
     use ndarray::{arr0, arr1, arr2};
     use pretty_assertions::assert_eq;
     use ryft_core::parameters::Placeholder;
+    use ryft_core::tracing::transposition::{LinearOperation, TranspositionContext};
     use ryft_core::tracing::ProgramBuilder;
     use ryft_core::tracing::engines::TracingEngine;
-    use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation, TranspositionContext};
-    use ryft_core::tracing_v2::{LinearOperation, MatrixOps, ReshapeOps};
+    use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation};
+    use ryft_core::tracing_v2::{MatrixOps, ReshapeOps};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
     use crate::{LinearNdarrayOperation, NdArrayEngine};

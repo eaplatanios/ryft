@@ -2,13 +2,13 @@ use std::fmt::{Debug, Display};
 
 use half::{bf16, f16};
 
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::engines::{Tracer, TracingEngine};
-use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
+use crate::tracing::transposition::{LinearOperation, TranspositionContext};
+use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
-
-use super::{InterpretableOperation, LinearOperation, Operation, TranspositionContext};
 
 /// Synthesizes a typed zero value without an exemplar.
 ///
@@ -627,7 +627,8 @@ impl_scalar_value_traits!(f64, DataType::F64, 0.0f64, 1.0f64);
 mod tests {
     use half::{bf16, f16};
 
-    use crate::tracing::{InterpretableOperation, Operation, TracingError, Value};
+    use crate::operations::{InterpretableOperation, Operation};
+    use crate::tracing::{TracingError, Value};
     use crate::tracing_v2::{Cos, Sin, test_support};
     use crate::types::{ArrayType, DataType, TypeError, Typed};
 

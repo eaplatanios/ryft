@@ -4,17 +4,17 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
 use ryft_core::tracing::engines::TracingContext;
-use ryft_core::tracing::{
-    Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
-};
+use ryft_core::tracing::transposition::LinearOperation;
+use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use ryft_core::tracing_v2::forward::{Differentiable, JvpTracer};
 use ryft_core::tracing_v2::linear::{linearize_traced_program, transpose_traced_linear_program};
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearArrayOperation,
-    LinearCustomPrimitive, LinearOperation,
+    LinearCustomPrimitive,
 };
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
@@ -564,7 +564,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
 {
     fn transpose(
         &self,
-        context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
+        context: &mut ryft_core::tracing::transposition::TranspositionContext<
             ArrayType,
             ShardMapTensor,
             LinearArrayOperation<ShardMapTensor>,
@@ -600,7 +600,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
 /// structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
 fn materialize_optional_cotangent<V>(
-    context: &ryft_core::tracing_v2::operations::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
+    context: &ryft_core::tracing::transposition::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
     cotangent: &Option<AtomId>,
     output_type: &ArrayType,
 ) -> AtomId
@@ -750,7 +750,7 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
 {
     fn transpose(
         &self,
-        context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
+        context: &mut ryft_core::tracing::transposition::TranspositionContext<
             ArrayType,
             ShardMapTracer,
             LinearArrayOperation<ShardMapTracer>,
@@ -1649,9 +1649,9 @@ mod tests {
 
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+    use ryft_core::tracing::transposition::TranspositionContext;
     use ryft_core::tracing::{Atom, AtomId, ProgramBuilder, Traceable};
     use ryft_core::tracing_v2::forward::JvpTracer;
-    use ryft_core::tracing_v2::operations::TranspositionContext;
     use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext, LinearArrayOperation};
     use ryft_core::types::{ArrayType, DataType, Typed};
 
@@ -1907,8 +1907,9 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let mut context = test_transposition_context(builder);
 
-        let contributions = ryft_core::tracing_v2::LinearOperation::transpose(&operation, &mut context, &[])
-            .expect("zero-output linear shard_map transpose should succeed");
+        let contributions =
+            ryft_core::tracing::transposition::LinearOperation::transpose(&operation, &mut context, &[])
+                .expect("zero-output linear shard_map transpose should succeed");
 
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_none());
@@ -1920,8 +1921,9 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let mut context = test_transposition_context(builder);
 
-        let contributions = ryft_core::tracing_v2::LinearOperation::transpose(&operation, &mut context, &[])
-            .expect("zero-output traced linear shard_map transpose should succeed");
+        let contributions =
+            ryft_core::tracing::transposition::LinearOperation::transpose(&operation, &mut context, &[])
+                .expect("zero-output traced linear shard_map transpose should succeed");
 
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_none());

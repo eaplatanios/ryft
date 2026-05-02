@@ -5,9 +5,10 @@ use std::ops::{Add, Mul, Neg};
 use ryft_macros::Parameter;
 use thiserror::Error;
 
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::tracing::engines::Tracer;
-use crate::tracing::{InterpretableOperation, Operation, Program, Traceable, TracingError, Value};
+use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::{

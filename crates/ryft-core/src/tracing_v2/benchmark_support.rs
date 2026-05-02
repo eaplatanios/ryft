@@ -78,7 +78,7 @@ where
     V: Traceable<ArrayType>,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
-    O: Clone + crate::tracing::Operation<ArrayType>,
+    O: Clone + crate::operations::Operation<ArrayType>,
 {
     summarize_program(program, |_| Ok(Vec::new()))
 }
@@ -108,7 +108,7 @@ where
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
-    O: Clone + crate::tracing::Operation<ArrayType>,
+    O: Clone + crate::operations::Operation<ArrayType>,
 {
     Ok(record(case_id, tracing_category(case_id), surface, program.to_string(), summarize_tracing_program(program)?))
 }

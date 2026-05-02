@@ -3,14 +3,14 @@ use std::fmt::{Debug, Display};
 use half::{bf16, f16};
 
 use crate::macros::check_input_count;
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::engines::{Tracer, TracingEngine};
-use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError};
+use crate::tracing::transposition::LinearOperation;
+use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, LinearArrayOperation};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearArrayOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
-
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
 /// Hidden carrier capability for staging the reshape primitive.
 #[doc(hidden)]
@@ -301,7 +301,7 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
 impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for ReshapeOperation {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1, TracingError);

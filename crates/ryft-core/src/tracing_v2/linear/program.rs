@@ -1,7 +1,8 @@
 use super::*;
 
+use crate::tracing::transposition::TranspositionContext;
 use crate::tracing_v2::JvpContext;
-use crate::tracing_v2::operations::{SupportsZero, TranspositionContext};
+use crate::tracing_v2::operations::SupportsZero;
 
 /// Converts a staged primal program into a staged pushforward linear map.
 ///

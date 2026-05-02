@@ -2,12 +2,14 @@ use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
 use ryft_core::macros::check_input_count;
+use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::sharding::Sharding;
-use ryft_core::tracing::{AtomId, InterpretableOperation, Operation, Traceable, TracingError};
+use ryft_core::tracing::transposition::LinearOperation;
+use ryft_core::tracing::{AtomId, Traceable, TracingError};
 use ryft_core::tracing_v2::forward::JvpTracer;
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearArrayOperation,
-    LinearCustomPrimitive, LinearOperation,
+    LinearCustomPrimitive,
 };
 use ryft_core::types::{ArrayType, TypeError};
 use ryft_mlir::{Block, Operation as MlirOperation, Value};
@@ -118,7 +120,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
 {
     fn transpose(
         &self,
-        context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
+        context: &mut ryft_core::tracing::transposition::TranspositionContext<
             ArrayType,
             ShardMapTensor,
             LinearArrayOperation<ShardMapTensor>,
@@ -175,7 +177,7 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
 {
     fn transpose(
         &self,
-        context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
+        context: &mut ryft_core::tracing::transposition::TranspositionContext<
             ArrayType,
             ShardMapTracer,
             LinearArrayOperation<ShardMapTracer>,
@@ -221,11 +223,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use ryft_core::operations::Operation;
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing::{Operation, ProgramBuilder, Traceable};
-    use ryft_core::tracing_v2::operations::TranspositionContext;
-    use ryft_core::tracing_v2::{LinearArrayOperation, LinearOperation};
+    use ryft_core::tracing::transposition::{LinearOperation, TranspositionContext};
+    use ryft_core::tracing::{ProgramBuilder, Traceable};
+    use ryft_core::tracing_v2::LinearArrayOperation;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;

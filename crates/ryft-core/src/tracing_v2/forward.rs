@@ -5,22 +5,23 @@ use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::engines::{Engine, Tracer, TracingEngine};
-use crate::tracing::{
-    AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
-};
+use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
 use crate::tracing_v2::linear::{jvp_program, jvp_traced};
 use crate::tracing_v2::operations::constants::{SupportsZeroLike, Zero};
-use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperationTracingEngine, DifferentiableTracingEngine};
+use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
+use crate::tracing_v2::{
+    DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,
+};
 use crate::types::{Type, Typed};
 
 /// Concrete state threaded through forward-mode JVP rules.
 ///
 /// [`JvpContext`] owns the active linear-program builder where tangent ops are staged. It is the
 /// forward-mode counterpart of
-/// [`TranspositionContext`](crate::tracing_v2::operations::TranspositionContext): JVP rules call
+/// [`TranspositionContext`](crate::tracing::transposition::TranspositionContext): JVP rules call
 /// [`apply_operation`](Self::apply_operation) to stage tangent ops on the active builder.
 #[doc(hidden)]
 pub struct JvpContext<'a, E: DifferentiableEngine + ?Sized> {
@@ -296,7 +297,8 @@ mod tests {
     use crate::parameters::{ParameterError, Parameterized};
     use crate::tracing::ProgramBuilder;
     use crate::tracing::engines::{ScalarEngine, TracingContext};
-    use crate::tracing_v2::operations::{AddOperation, DifferentiableOperation};
+    use crate::tracing_v2::DifferentiableOperation;
+    use crate::tracing_v2::operations::AddOperation;
     use crate::tracing_v2::{LinearScalarOperation, ScalarOperation, test_support};
     use crate::types::DataType;
 

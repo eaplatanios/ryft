@@ -1,15 +1,16 @@
 use std::fmt::{Debug, Display};
 
 use crate::macros::check_input_count;
+use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::DifferentiableEngine;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, Type, TypeError};
 
+use super::SupportsAdd;
 use super::left_matmul::SupportsLeftMatMul;
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
 use super::right_matmul::SupportsRightMatMul;
-use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd};
 
 /// Hidden carrier capability for staging the matrix multiplication primitive.
 #[doc(hidden)]

@@ -4,14 +4,14 @@ use std::ops::Add;
 
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_input_count;
+use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
+use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, LinearArrayOperation};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearArrayOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
-
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
 /// Hidden carrier capability for staging the addition primitive.
 ///
@@ -135,7 +135,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<Array
 {
     fn transpose(
         &self,
-        _context: &mut crate::tracing_v2::operations::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
+        _context: &mut crate::tracing::transposition::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1, TracingError);
@@ -148,7 +148,7 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Add<Output = V> + Z
 {
     fn transpose(
         &self,
-        _context: &mut crate::tracing_v2::operations::TranspositionContext<
+        _context: &mut crate::tracing::transposition::TranspositionContext<
             DataType,
             V,
             LinearArrayOperation<V, DataType>,

@@ -1,16 +1,18 @@
 use std::fmt::{Debug, Display};
 
 use crate::macros::check_input_count;
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::engines::Tracer;
-use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
+use crate::tracing::transposition::LinearOperation;
+use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
+use super::SupportsAdd;
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
 use super::primitive::LinearArrayOperation;
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd};
 
 /// Hidden carrier capability for staging the right matrix-multiplication primitive.
 #[doc(hidden)]
@@ -91,7 +93,7 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for RightMatMulOperati
 impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for RightMatMulOperation<V> {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1, TracingError);

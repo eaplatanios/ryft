@@ -4,14 +4,15 @@ use std::ops::Neg;
 use half::{bf16, f16};
 
 use crate::macros::check_input_count;
+use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::DifferentiableEngine;
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::sin::Sin;
-use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsNeg, SupportsScale};
+use super::{SupportsNeg, SupportsScale};
 
 /// Hidden carrier capability for staging the cosine primitive.
 #[doc(hidden)]

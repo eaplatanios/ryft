@@ -8,8 +8,9 @@ use half::{bf16, f16};
 
 use ryft_macros::Parameter;
 
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
-use crate::tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError};
+use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::operations::primitive::ScalarOperation;
 use crate::types::{DataType, Type, TypeError, Typed};
 

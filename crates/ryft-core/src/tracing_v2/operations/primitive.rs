@@ -2,9 +2,11 @@ use std::fmt::{Debug, Display};
 use std::ops::{Add, Mul, Neg};
 use std::sync::Arc;
 
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::engines::Tracer;
-use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
+use crate::tracing::transposition::LinearOperation;
+use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::{
     One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
@@ -16,7 +18,9 @@ use crate::tracing_v2::operations::{
     AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
     NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
 };
-use crate::tracing_v2::{Cos, DifferentiableEngine, DifferentiableTracingEngine, MatrixOps, Sin};
+use crate::tracing_v2::{
+    Cos, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, MatrixOps, Sin,
+};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
 use super::add::SupportsAdd;
@@ -33,7 +37,6 @@ use super::reshape::SupportsReshape;
 use super::right_matmul::SupportsRightMatMul;
 use super::scale::SupportsScale;
 use super::sin::SupportsSin;
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
 /// Default closed carrier for ordinary staged programs.
 ///
@@ -1702,7 +1705,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<DataType, V, LinearScalarOperation<V>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<DataType, V, LinearScalarOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         match self {
@@ -1761,7 +1764,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
+        context: &mut crate::tracing::transposition::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         match self {
@@ -1797,7 +1800,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<
+        context: &mut crate::tracing::transposition::TranspositionContext<
             DataType,
             V,
             LinearArrayOperation<V, DataType>,
