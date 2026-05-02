@@ -128,10 +128,11 @@ pub struct TracedValueAndGrad;
 /// compact while allowing concrete replay, traced replay, and batched replay to specialize
 /// independently.
 #[doc(hidden)]
-pub(crate) trait ValueAndGradDispatch<E, Input, Mode>: Parameter + Sized
-where
+pub(crate) trait ValueAndGradDispatch<
     E: Engine,
-    Input: Parameterized<Self, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
+    Mode,
+>: Parameter + Sized
 {
     /// Primal scalar output value produced for the corresponding input regime.
     type Value;
@@ -147,42 +148,43 @@ where
         E: 'engine;
 
     /// Invokes [`value_and_grad`] for one concrete leaf regime.
-    fn invoke<'engine, F>(
+    fn invoke<'engine, F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>>(
         engine: &'engine E,
         function: F,
         primals: Input,
-    ) -> Result<(Self::Value, Input), TracingError>
-    where
-        F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>;
+    ) -> Result<(Self::Value, Input), TracingError>;
 }
 
 /// Concrete-value dispatch for [`value_and_grad`]: evaluates the user function via [`vjp`], checks
 /// that the output is a scalar, and pulls back a unit seed to obtain both the primal output and gradient.
 impl<
-    E,
+    E: DifferentiableEngine<
+            Value = V,
+            DifferentiableOperation: DifferentiableOperation<E>,
+            LinearOperation: Clone
+                                 + InterpretableOperation<E::Type, V>
+                                 + LinearOperation<E::Type, V, E::LinearOperation>
+                                 + SupportsZero<E::Type, V>,
+        > + 'static,
     V: Value<E::Type>
         + Differentiable<E::Type, Tangent = V>
         + Zero<E::Type>
         + One<E::Type>
-        + Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-> ValueAndGradDispatch<E, Input, ConcreteValueAndGrad> for V
-where
-    E: DifferentiableEngine<Value = V> + 'static,
-    V: for<'engine> Parameterized<
+        + for<'engine> Parameterized<
             V,
+            Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
             To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>> = Tracer<
                 'engine,
                 DifferentiableOperationTracingEngine<E>,
             >,
+            ParameterStructure: Debug + PartialEq,
         >,
-    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    V::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    E::DifferentiableOperation: DifferentiableOperation<E>,
-    E::LinearOperation: Clone
-        + InterpretableOperation<E::Type, V>
-        + LinearOperation<E::Type, V, E::LinearOperation>
-        + crate::tracing_v2::operations::SupportsZero<E::Type, V>,
+    Input: Parameterized<
+            V,
+            Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+> ValueAndGradDispatch<E, Input, ConcreteValueAndGrad> for V
 {
     type Value = V;
 
@@ -195,10 +197,11 @@ where
     where
         E: 'engine;
 
-    fn invoke<'engine, F>(engine: &'engine E, function: F, primals: Input) -> Result<(Self::Value, Input), TracingError>
-    where
-        F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>,
-    {
+    fn invoke<'engine, F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>>(
+        engine: &'engine E,
+        function: F,
+        primals: Input,
+    ) -> Result<(Self::Value, Input), TracingError> {
         let (output, pullback): (V, Program<E::Type, V, E::LinearOperation, V, Input>) =
             vjp(engine, |input| Ok(function(input)), primals)?;
         let gradient = pullback.interpret(<V as One<E::Type>>::one(output.r#type().as_ref())?)?;
@@ -210,25 +213,36 @@ where
 /// enclosing [`Tracer`] engine, linearizes, transposes, and stages the output and gradient.
 impl<
     'engine,
-    E,
+    E: DifferentiableTracingEngine<
+            Value = V,
+            Operation: DifferentiableOperation<TracingContext<'engine, E>>
+                           + SupportsAdd<E::Type, V>
+                           + SupportsZeroLike<E::Type, V>,
+            LinearOperation<'engine>: Clone
+                                          + InterpretableOperation<E::Type, Tracer<'engine, E>>
+                                          + LinearOperation<
+                E::Type,
+                Tracer<'engine, E>,
+                <E as DifferentiableTracingEngine>::LinearOperation<'engine>,
+            >,
+        > + 'static,
     V: Traceable<E::Type>
         + Differentiable<E::Type, Tangent = V>
         + One<E::Type>
-        + Parameterized<V, ParameterStructure: PartialEq>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: std::fmt::Debug + PartialEq>,
+        + Parameterized<
+            V,
+            Family: ParameterizedFamily<E::Type> + ParameterizedFamily<Tracer<'engine, E>>,
+            To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
+            ParameterStructure = Placeholder,
+        >,
+    Input: Parameterized<
+            Tracer<'engine, E>,
+            Family: ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
+            To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
+            ParameterStructure: Debug + PartialEq,
+        >,
 > ValueAndGradDispatch<E, Input, TracedValueAndGrad> for Tracer<'engine, E>
 where
-    E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
-    V: Parameterized<V, ParameterStructure = Placeholder>,
-    V::Family: ParameterizedFamily<E::Type> + ParameterizedFamily<Tracer<'engine, E>>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
-    Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
-    V::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
-    E::Operation:
-        DifferentiableOperation<TracingContext<'engine, E>> + SupportsAdd<E::Type, V> + SupportsZeroLike<E::Type, V>,
-    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
-        + InterpretableOperation<E::Type, Tracer<'engine, E>>
-        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
     AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     type Value = Tracer<'engine, E>;
@@ -242,10 +256,11 @@ where
     where
         E: 'call;
 
-    fn invoke<'call, F>(_engine: &'call E, function: F, primals: Input) -> Result<(Self::Value, Input), TracingError>
-    where
-        F: FnOnce(Self::FunctionInput<'call>) -> Self::FunctionOutput<'call>,
-    {
+    fn invoke<'call, F: FnOnce(Self::FunctionInput<'call>) -> Self::FunctionOutput<'call>>(
+        _engine: &'call E,
+        function: F,
+        primals: Input,
+    ) -> Result<(Self::Value, Input), TracingError> {
         let input_structure = primals.parameter_structure();
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
         let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
@@ -268,19 +283,20 @@ where
 /// gradient at the same primal point. The function must return exactly one rank-0 scalar array
 /// leaf. Use [`vjp`] directly for vector-valued functions that need an explicit output cotangent.
 #[allow(private_bounds, private_interfaces)]
-pub fn value_and_grad<'engine, E, F, Input, Leaf, Mode>(
-    engine: &'engine E,
-    function: F,
-    primals: Input,
-) -> Result<(<Leaf as ValueAndGradDispatch<E, Input, Mode>>::Value, Input), TracingError>
-where
+pub fn value_and_grad<
+    'engine,
     E: Engine,
-    Leaf: ValueAndGradDispatch<E, Input, Mode>,
-    Input: Parameterized<Leaf, ParameterStructure: std::fmt::Debug + PartialEq>,
     F: FnOnce(
         <Leaf as ValueAndGradDispatch<E, Input, Mode>>::FunctionInput<'engine>,
     ) -> <Leaf as ValueAndGradDispatch<E, Input, Mode>>::FunctionOutput<'engine>,
-{
+    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
+    Leaf: ValueAndGradDispatch<E, Input, Mode>,
+    Mode,
+>(
+    engine: &'engine E,
+    function: F,
+    primals: Input,
+) -> Result<(<Leaf as ValueAndGradDispatch<E, Input, Mode>>::Value, Input), TracingError> {
     Leaf::invoke(engine, function, primals)
 }
 
@@ -322,7 +338,7 @@ pub fn value_and_grad_with_aux<
             >,
             ParameterStructure: Debug + PartialEq,
         >,
-    V: Value<E::Type>
+    V: Traceable<E::Type>
         + Differentiable<E::Type, Tangent = V>
         + Zero<E::Type>
         + One<E::Type>
@@ -359,19 +375,20 @@ pub fn value_and_grad_with_aux<
 /// must return exactly one rank-0 scalar array leaf. Use [`vjp`] directly for vector-valued functions
 /// that need an explicit output cotangent.
 #[allow(private_bounds, private_interfaces)]
-pub fn grad<'engine, E, F, Input, Leaf, Mode>(
-    engine: &'engine E,
-    function: F,
-    primals: Input,
-) -> Result<Input, TracingError>
-where
+pub fn grad<
+    'engine,
     E: Engine,
-    Leaf: ValueAndGradDispatch<E, Input, Mode>,
-    Input: Parameterized<Leaf, ParameterStructure: std::fmt::Debug + PartialEq>,
     F: FnOnce(
         <Leaf as ValueAndGradDispatch<E, Input, Mode>>::FunctionInput<'engine>,
     ) -> <Leaf as ValueAndGradDispatch<E, Input, Mode>>::FunctionOutput<'engine>,
-{
+    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
+    Leaf: ValueAndGradDispatch<E, Input, Mode>,
+    Mode,
+>(
+    engine: &'engine E,
+    function: F,
+    primals: Input,
+) -> Result<Input, TracingError> {
     Leaf::invoke(engine, function, primals).map(|(_, gradient)| gradient)
 }
 
@@ -381,48 +398,56 @@ where
 /// `(gradient, aux)`, matching the common use case where auxiliary outputs are diagnostics or
 /// cached intermediates and the gradient remains the primary result.
 #[allow(private_bounds)]
-pub fn grad_with_aux<'engine, E, F, Input, Aux, V>(
-    engine: &'engine E,
-    function: F,
-    primals: Input,
-) -> Result<(Input, Aux), TracingError>
-where
-    E: DifferentiableEngine<Value = V> + 'static,
-    V: Value<E::Type>
-        + Differentiable<E::Type, Tangent = V>
-        + Zero<E::Type>
-        + One<E::Type>
-        + Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    V: Parameterized<
-            V,
-            To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>> = Tracer<
-                'engine,
-                DifferentiableOperationTracingEngine<E>,
-            >,
-        >,
-    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Aux: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Aux::Family: ParameterizedFamily<
-            Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
-            To = Aux::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-        >,
-    V::Family: ParameterizedFamily<
-            Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
-            To = Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
-        >,
-    E::DifferentiableOperation: DifferentiableOperation<E>,
+pub fn grad_with_aux<
+    'engine,
+    E: DifferentiableEngine<
+            Value = V,
+            DifferentiableOperation: DifferentiableOperation<E>,
+            LinearOperation: Clone
+                                 + InterpretableOperation<E::Type, V>
+                                 + LinearOperation<E::Type, V, E::LinearOperation>
+                                 + SupportsZero<E::Type, V>,
+        > + 'static,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> (
         Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
         Aux::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ),
-    E::LinearOperation: Clone
-        + InterpretableOperation<E::Type, V>
-        + LinearOperation<E::Type, V, E::LinearOperation>
-        + crate::tracing_v2::operations::SupportsZero<E::Type, V>,
-{
+    Input: Parameterized<
+            V,
+            Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    Aux: Parameterized<
+            V,
+            Family: ParameterizedFamily<
+                Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+                To = Aux::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            >,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    V: Traceable<E::Type>
+        + Differentiable<E::Type, Tangent = V>
+        + Zero<E::Type>
+        + One<E::Type>
+        + Parameterized<
+            V,
+            Family: ParameterizedFamily<
+                Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+                To = Tracer<'engine, DifferentiableOperationTracingEngine<E>>,
+            >,
+            To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>> = Tracer<
+                'engine,
+                DifferentiableOperationTracingEngine<E>,
+            >,
+            ParameterStructure: Debug + PartialEq,
+        >,
+>(
+    engine: &'engine E,
+    function: F,
+    primals: Input,
+) -> Result<(Input, Aux), TracingError> {
     value_and_grad_with_aux(engine, function, primals).map(|((_, aux), gradient)| (gradient, aux))
 }
 
