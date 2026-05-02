@@ -7,13 +7,13 @@ use half::{bf16, f16};
 use ryft_macros::Parameter;
 use thiserror::Error;
 
+use crate::operations::constants::{SupportsZero, Zero};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::operations::constants::Zero;
-use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale, SupportsZero};
+use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
 use crate::tracing_v2::{LinearScalarOperation, ScalarOperation};
 use crate::types::{ArrayType, Type, Typed};
 
@@ -72,8 +72,8 @@ pub enum DifferentiationError {
 /// The associated [`Tangent`](Self::Tangent) type makes the tangent representation explicit even
 /// though today's staged linear-program IR still requires `Tangent = Self` at the transform
 /// boundary. Code paths that need to synthesize zero tangents or unit gradient seeds from abstract
-/// type metadata add [`Zero`](crate::tracing_v2::operations::constants::Zero) and
-/// [`One`](crate::tracing_v2::operations::constants::One) bounds at those synthesis sites instead
+/// type metadata add [`Zero`](crate::operations::constants::Zero) and
+/// [`One`](crate::operations::constants::One) bounds at those synthesis sites instead
 /// of requiring every tangent representation to support metadata-only construction.
 pub trait Differentiable<T: Type>: Traceable<T> {
     /// Tangent and cotangent leaf type associated with this primal leaf.

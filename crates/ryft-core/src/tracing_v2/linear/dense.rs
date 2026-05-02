@@ -344,7 +344,7 @@ where
     E::LinearOperationCarrier: Clone
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, E::LinearOperationCarrier>
-        + crate::tracing_v2::operations::SupportsZero<ArrayType, V>,
+        + crate::operations::constants::SupportsZero<ArrayType, V>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();

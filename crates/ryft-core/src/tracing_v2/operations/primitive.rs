@@ -2,15 +2,14 @@ use std::fmt::{Debug, Display};
 use std::ops::{Add, Mul, Neg};
 use std::sync::Arc;
 
+use crate::operations::constants::{One, OneOperation, SupportsOne, SupportsZero, Zero, ZeroOperation};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::engines::Tracer;
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::operations::constants::{
-    One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
-};
+use crate::tracing_v2::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
 use crate::tracing_v2::operations::control_flow::{ConditionOperation, ControlFlowValue, WhileOperation};
 use crate::tracing_v2::operations::left_matmul::left_matmul_abstract_eval;
 use crate::tracing_v2::operations::right_matmul::right_matmul_abstract_eval;
@@ -24,7 +23,7 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
 use super::add::SupportsAdd;
-use super::constants::{SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike};
+use super::constants::{SupportsOneLike, SupportsZeroLike};
 use super::cos::SupportsCos;
 use super::custom::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, SupportsLinearCustom};
 use super::left_matmul::SupportsLeftMatMul;
@@ -127,7 +126,7 @@ where
     ///
     /// Emitted by the transpose pass at the boundary of pullbacks for primal inputs that receive
     /// no cotangent contribution from any output. Interpreting it requires
-    /// [`Zero<ArrayType>`](crate::tracing_v2::operations::constants::Zero) on the value type;
+    /// [`Zero<ArrayType>`](crate::operations::constants::Zero) on the value type;
     /// staged tracer programs must materialize these ops away before being interpreted.
     Zero(ZeroOperation<T>),
 

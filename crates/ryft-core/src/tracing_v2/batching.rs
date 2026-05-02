@@ -5,11 +5,12 @@ use std::ops::{Add, Mul, Neg};
 use ryft_macros::Parameter;
 use thiserror::Error;
 
+use crate::operations::constants::{One, Zero};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::tracing::engines::Tracer;
 use crate::tracing::{Program, Traceable, TracingError, Value};
-use crate::tracing_v2::operations::constants::{One, OneLike, Zero, ZeroLike};
+use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::{
     ArrayOperation, ControlFlowError, ControlFlowValue, Cos, LinearArrayOperation, MatrixOps, Sin,
@@ -775,7 +776,7 @@ mod tests {
         }
     }
 
-    impl crate::tracing_v2::operations::constants::Zero<ArrayType> for TestArray {
+    impl crate::operations::constants::Zero<ArrayType> for TestArray {
         fn zero(value_type: &ArrayType) -> Result<Self, TracingError> {
             let mut element_count = 1usize;
             for dim in &value_type.shape.dimensions {
@@ -787,7 +788,7 @@ mod tests {
         }
     }
 
-    impl crate::tracing_v2::operations::constants::One<ArrayType> for TestArray {
+    impl crate::operations::constants::One<ArrayType> for TestArray {
         fn one(value_type: &ArrayType) -> Result<Self, TracingError> {
             if value_type.rank() != 0 {
                 return Err(crate::tracing_v2::DifferentiationError::NonScalarGradientOutput {

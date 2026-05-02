@@ -2,10 +2,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::operations::Operation;
+use crate::operations::constants::SupportsZero;
 use crate::parameters::Parameterized;
 use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
 use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::operations::{SupportsAdd, SupportsZero};
+use crate::tracing_v2::operations::SupportsAdd;
 use crate::types::{Type, Typed};
 
 /// Context that is used while _transposing_ [`Program`](crate::Program)s. This context is threaded through the
@@ -228,9 +229,8 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     ///
     /// `output_examples` carries one representative value per primal output and is only used to
     /// validate the output count; cotangent input types come from this program's own atom metadata.
-    /// Disconnected primal inputs are emitted as zero operations, which the value type's
-    /// [`Zero`](crate::tracing_v2::operations::constants::Zero) implementation evaluates at
-    /// interpretation time.
+    /// Disconnected primal inputs are emitted as zero operations, which the value type's [`Zero`](crate::Zero)
+    /// implementation evaluates at interpretation time.
     ///
     /// # Parameters
     ///

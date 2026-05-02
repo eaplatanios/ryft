@@ -582,7 +582,7 @@ where
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(output_type.clone());
     builder_borrow.instructions.push(ryft_core::tracing::Instruction {
-        operation: LinearArrayOperation::Zero(ryft_core::tracing_v2::operations::constants::ZeroOperation::new(
+        operation: LinearArrayOperation::Zero(ryft_core::operations::constants::ZeroOperation::new(
             output_type.clone(),
         )),
         inputs: vec![],

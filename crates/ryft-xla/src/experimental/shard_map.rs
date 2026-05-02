@@ -13,12 +13,13 @@ use ryft_mlir::dialects::shardy::{
 };
 use thiserror::Error;
 
+use ryft_core::operations::constants::{One, Zero};
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::engines::{Tracer, TracingEngine};
 use ryft_core::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, TracingError, Value};
-use ryft_core::tracing_v2::operations::constants::{One, OneLike, ZeroLike};
+use ryft_core::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use ryft_core::tracing_v2::operations::{
     AddOperation, ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
 };
@@ -351,7 +352,7 @@ impl ZeroLike for ShardMapTensor {
     }
 }
 
-impl ryft_core::tracing_v2::operations::constants::Zero<ArrayType> for ShardMapTensor {
+impl Zero<ArrayType> for ShardMapTensor {
     #[inline]
     fn zero(value_type: &ArrayType) -> Result<Self, TracingError> {
         Ok(Self::zero(value_type.clone()))

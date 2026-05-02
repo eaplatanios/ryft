@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
+use ryft_core::operations::constants::{OneOperation, SupportsOne, SupportsZero, ZeroOperation};
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{AtomId, TracingError};
@@ -8,10 +9,10 @@ use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
     AddOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation, FlatTracedRematerialize,
     LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
-    OneLikeOperation, OneOperation, RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation,
-    SupportsAdd, SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg,
-    SupportsOne, SupportsOneLike, SupportsRematerialize, SupportsReshape, SupportsScale, SupportsSin, SupportsZero,
-    SupportsZeroLike, WhileOperation, ZeroLikeOperation, ZeroOperation,
+    OneLikeOperation, RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation, SupportsAdd, SupportsCos,
+    SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg, SupportsOneLike,
+    SupportsRematerialize, SupportsReshape, SupportsScale, SupportsSin, SupportsZeroLike, WhileOperation,
+    ZeroLikeOperation,
 };
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableEngine, DifferentiableOperation, DifferentiationError,

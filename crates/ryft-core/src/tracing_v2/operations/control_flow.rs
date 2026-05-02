@@ -3,6 +3,7 @@ use std::fmt::{Debug, Display};
 use half::{bf16, f16};
 use thiserror::Error;
 
+use crate::operations::constants::Zero;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::Parameterized;
 use crate::tracing::engines::Tracer;
@@ -10,7 +11,7 @@ use crate::tracing::engines::TracingEngine;
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{Instruction, Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
-use crate::tracing_v2::operations::constants::{Zero, ZeroLike};
+use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{
     ArrayOperation, DifferentiableOperation, DifferentiableTracingEngine, JvpContext, JvpTracer, LinearizableEngine,
 };
@@ -407,7 +408,7 @@ where
     O: Clone
         + LinearOperation<ArrayType, V, O>
         + SupportsAdd<ArrayType, V>
-        + crate::tracing_v2::operations::SupportsZero<ArrayType, V>
+        + crate::operations::constants::SupportsZero<ArrayType, V>
         + From<ConditionOperation<V, O>>,
 {
     fn transpose(
@@ -455,7 +456,7 @@ fn stage_optional_cotangent<V, O>(
 ) -> crate::tracing::AtomId
 where
     V: Traceable<ArrayType>,
-    O: Clone + Operation<ArrayType> + crate::tracing_v2::operations::SupportsZero<ArrayType, V>,
+    O: Clone + Operation<ArrayType> + crate::operations::constants::SupportsZero<ArrayType, V>,
 {
     if let Some(atom) = cotangent {
         return atom;
@@ -464,9 +465,7 @@ where
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(output_type.clone());
     builder_borrow.instructions.push(Instruction {
-        operation: <O as crate::tracing_v2::operations::SupportsZero<ArrayType, V>>::zero_operation(
-            output_type.clone(),
-        ),
+        operation: <O as crate::operations::constants::SupportsZero<ArrayType, V>>::zero_operation(output_type.clone()),
         inputs: vec![],
         outputs: vec![output],
     });
@@ -736,10 +735,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::operations::constants::{One, Zero};
     use crate::parameters::{Parameter, Placeholder};
     use crate::tracing::engines::{Engine, TracingEngine};
     use crate::tracing::{ProgramBuilder, Traceable, Value};
-    use crate::tracing_v2::operations::constants::{One, OneLike, Zero};
+    use crate::tracing_v2::operations::constants::OneLike;
     use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
     use crate::tracing_v2::{Differentiable, LinearArrayOperation};
     use crate::types::DataType;
@@ -1026,7 +1026,7 @@ mod tests {
         }
     }
 
-    impl crate::tracing_v2::operations::SupportsZero<ArrayType, TestValue> for TestLinearOperation {
+    impl crate::operations::constants::SupportsZero<ArrayType, TestValue> for TestLinearOperation {
         fn zero_operation(_type: ArrayType) -> Self {
             // Test linear carrier doesn't include a Zero variant; the tests below never disconnect
             // primal inputs, so this constructor is unreachable in practice.

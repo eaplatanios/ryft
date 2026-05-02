@@ -1,5 +1,10 @@
 use std::fmt::{Debug, Display};
 
+/// Type-driven constant operations and carrier capability traits.
+pub mod constants;
+
+pub use constants::*;
+
 use crate::parameters::Parameterized;
 use crate::tracing::{Program, Traceable, TracingError};
 use crate::types::{Type, TypeError, Typed};

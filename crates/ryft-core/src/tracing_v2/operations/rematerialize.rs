@@ -1,12 +1,13 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::operations::constants::{SupportsZero, Zero};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
-use crate::tracing_v2::operations::constants::{SupportsZero, SupportsZeroLike, Zero, ZeroLike};
+use crate::tracing_v2::operations::constants::{SupportsZeroLike, ZeroLike};
 use crate::tracing_v2::{
     ArrayOperation, Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine,
     DifferentiationError, LinearArrayOperation, LinearizableEngine,
@@ -158,7 +159,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: Value<ArrayType>
         + ZeroLike
-        + crate::tracing_v2::operations::constants::Zero<ArrayType>
+        + crate::operations::constants::Zero<ArrayType>
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
@@ -244,7 +245,7 @@ where
 impl<
     V: Value<ArrayType>
         + ZeroLike
-        + crate::tracing_v2::operations::constants::Zero<ArrayType>
+        + crate::operations::constants::Zero<ArrayType>
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
     E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V>>
@@ -452,7 +453,7 @@ where
     if let Some(atom) = cotangent {
         return atom;
     }
-    use crate::tracing_v2::operations::SupportsZero;
+    use crate::operations::constants::SupportsZero;
     let builder = &context.builder;
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(input_type.clone());
