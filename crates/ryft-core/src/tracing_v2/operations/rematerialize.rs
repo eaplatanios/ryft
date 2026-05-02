@@ -5,7 +5,7 @@ use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placehold
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{Instruction, OperationFormatter, Program, ProgramBuilder, Traceable, TracingError, Value};
 use crate::tracing_v2::linear::{linearize_program, transpose_linear_program_with_output_examples};
-use crate::tracing_v2::operations::constants::{SupportsZero, Zero, ZeroLike};
+use crate::tracing_v2::operations::constants::{SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::tracing_v2::{
     ArrayOperation, Differentiable, DifferentiableEngine, DifferentiableTracingEngine, DifferentiationError,
     LinearArrayOperation,
@@ -187,7 +187,8 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V>:
         Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
-    EInner::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner>,
+    EInner::Operation:
+        crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner> + SupportsZeroLike<ArrayType, V>,
     EInner::LinearOperation<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, EInner>>
         + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperation<'engine>>

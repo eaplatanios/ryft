@@ -427,6 +427,48 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
     }
 }
 
+fn lower_like_constant<'b, 'c: 'b, 't: 'c, B, L>(
+    input_values: &[ValueRef<'b, 'c, 't>],
+    output_types: &[ArrayType],
+    constant_kind: ShardMapConstantKind,
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+where
+    B: Block<'b, 'c, 't>,
+    L: Location<'c, 't> + Copy,
+{
+    if input_values.len() != 1 {
+        return Err(TracingError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+    }
+    let output_type = output_types
+        .first()
+        .ok_or_else(|| LoweringError::from(TracingError::InvalidOutputCount { expected: 1, got: 0 }))?;
+    if output_types.len() != 1 {
+        return Err(TracingError::InvalidOutputCount { expected: 1, got: output_types.len() }.into());
+    }
+    let tensor_type = lower_tensor_type(output_type, context, location)?;
+    if !output_type.shape.dimensions.is_empty() {
+        let scalar_tensor_type = context
+            .tensor_type(lower_element_type(output_type.data_type, context)?, &[], None, location)
+            .ok_or_else(|| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(output_type.data_type) })?;
+        let scalar_elements =
+            lower_constant_elements_attribute(output_type.data_type, scalar_tensor_type, constant_kind, context)?;
+        let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location));
+        let broadcast = block.append_operation(stable_hlo::broadcast(
+            scalar_constant.result(0).unwrap().as_ref(),
+            tensor_type,
+            &[],
+            location,
+        ));
+        return Ok(vec![broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()]);
+    }
+    let elements = lower_constant_elements_attribute(output_type.data_type, tensor_type, constant_kind, context)?;
+    let constant = block.append_operation(stable_hlo::constant(elements, location));
+    Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
+}
+
 impl LowerableXlaOperation<ShardMapTensor> for XlaOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -470,6 +512,22 @@ impl LowerableXlaOperation<ShardMapTensor> for XlaOperation {
                 output_types,
                 mode,
                 lowerer,
+            ),
+            Self::ZeroLike => lower_like_constant(
+                input_values,
+                output_types,
+                ShardMapConstantKind::Zero,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
+            Self::OneLike => lower_like_constant(
+                input_values,
+                output_types,
+                ShardMapConstantKind::One,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
             ),
             Self::MatrixMultiply => <MatMulOperation as LowerableXlaOperation<ShardMapTensor>>::lower_to_mlir(
                 &MatMulOperation,
@@ -635,6 +693,22 @@ impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for ArrayOperat
                 mode,
                 lowerer,
             ),
+            ArrayOperation::ZeroLike => lower_like_constant(
+                input_values,
+                output_types,
+                ShardMapConstantKind::Zero,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
+            ArrayOperation::OneLike => lower_like_constant(
+                input_values,
+                output_types,
+                ShardMapConstantKind::One,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
             ArrayOperation::Transpose => <MatrixTransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &MatrixTransposeOperation,
                 input_values,
@@ -743,6 +817,14 @@ impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for LinearArray
                     lowerer,
                 )
             }
+            LinearArrayOperation::ZeroLike => lower_like_constant(
+                input_values,
+                output_types,
+                ShardMapConstantKind::Zero,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
             LinearArrayOperation::Zero(zero) => {
                 if !input_values.is_empty() {
                     return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
@@ -1935,6 +2017,22 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
         }
+        XlaOperation::ZeroLike => lower_like_constant(
+            input_values,
+            output_types,
+            ShardMapConstantKind::Zero,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        ),
+        XlaOperation::OneLike => lower_like_constant(
+            input_values,
+            output_types,
+            ShardMapConstantKind::One,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        ),
         XlaOperation::MatrixMultiply => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
@@ -2482,17 +2580,17 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @kernel(%arg0: tensor<4x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) -> (tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {}]>] out_shardings=[<@mesh, [{"x"}, {}]>] manual_axes={"x"} (%arg1: tensor<2x4xf32>) {
+                      %1 = stablehlo.transpose %arg1, dims = [1, 0] : (tensor<2x4xf32>) -> tensor<4x2xf32>
+                      %2 = stablehlo.dot_general %1, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<4x2xf32>, tensor<2x4xf32>) -> tensor<4x4xf32>
+                      %3 = stablehlo.negate %2 : tensor<4x4xf32>
+                      %4 = stablehlo.cosine %3 : tensor<4x4xf32>
+                      %5 = stablehlo.sine %4 : tensor<4x4xf32>
                       %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                      %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
+                      %6 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
+                      %7 = stablehlo.multiply %5, %6 : tensor<4x4xf32>
                       %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                      %2 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
-                      %3 = stablehlo.transpose %arg1, dims = [1, 0] : (tensor<2x4xf32>) -> tensor<4x2xf32>
-                      %4 = stablehlo.dot_general %3, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<4x2xf32>, tensor<2x4xf32>) -> tensor<4x4xf32>
-                      %5 = stablehlo.negate %4 : tensor<4x4xf32>
-                      %6 = stablehlo.cosine %5 : tensor<4x4xf32>
-                      %7 = stablehlo.sine %6 : tensor<4x4xf32>
-                      %8 = stablehlo.multiply %7, %1 : tensor<4x4xf32>
-                      %9 = stablehlo.add %8, %2 : tensor<4x4xf32>
+                      %8 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
+                      %9 = stablehlo.add %7, %8 : tensor<4x4xf32>
                       sdy.return %9 : tensor<4x4xf32>
                     } : (tensor<4x4xf32>) -> tensor<8x4xf32>
                     return %0 : tensor<8x4xf32>

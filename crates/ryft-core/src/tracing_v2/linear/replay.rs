@@ -54,7 +54,8 @@ pub fn linearize_traced_program<'engine, V, E>(
 where
     V: Traceable<E::Type>,
     E: crate::tracing_v2::DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
-    E::Operation: TracedLinearizableOperation<'engine, E> + 'static,
+    E::Operation:
+        TracedLinearizableOperation<'engine, E> + crate::tracing_v2::operations::SupportsZeroLike<E::Type, V> + 'static,
 {
     fn tangent_for_atom<'engine, V, E>(
         primal_values: &[Option<Tracer<'engine, E>>],
@@ -73,6 +74,7 @@ where
     where
         V: Traceable<E::Type>,
         E: crate::tracing_v2::DifferentiableTracingEngine<Value = V> + ?Sized,
+        E::Operation: crate::tracing_v2::operations::SupportsZeroLike<E::Type, V>,
     {
         if let Some(atom) = tangents[atom_id.index] {
             return Ok(atom);

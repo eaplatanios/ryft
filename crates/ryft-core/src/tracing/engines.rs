@@ -555,7 +555,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64 .
                 let %1:f64 = mul %0 %0
-                    %2:f64 = const
+                    %2:f64 = one_like %0
                     %3:f64 = add %1 %2
                 in (%3)
             "}
@@ -641,23 +641,19 @@ mod tests {
             .trim_end(),
         );
 
-        // Test that [`TypeError`]s are returned in certain cases.
-        assert!(matches!(
-            engine.interpret_and_trace(
-                |x| Ok(Tracer { r#type: DataType::F32, ..x }.zero_like()),
-                2.0f64,
-            ),
-            Err(TracingError::Type(TypeError { message }))
-                if message == "scalar engine for f64 cannot synthesize zero for f32",
-        ));
-        assert!(matches!(
-            engine.interpret_and_trace(
-                |x| Ok(Tracer { r#type: DataType::F32, ..x }.one_like()),
-                2.0f64,
-            ),
-            Err(TracingError::Type(TypeError { message }))
-                if message == "scalar engine for f64 cannot synthesize one for f32",
-        ));
+        // Test tracing value-level identity helpers as ordinary operations.
+        let (output, program) = engine.interpret_and_trace(|x| Ok((x.zero_like(), x.one_like())), 2.0f64).unwrap();
+        assert_eq!(output, (0.0, 1.0));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = zero_like %0
+                    %2:f64 = one_like %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -880,17 +876,29 @@ mod tests {
         assert_eq!(poisoned.to_string(), "<poison:f64>");
         assert_eq!(format!("{poisoned:?}"), "Tracer { state: Poison, type: F64, .. }");
 
-        // Test that identity-construction failures poison the result and record the engine error.
-        let mismatched_type_tracer =
-            Tracer { state: TracerState::Live(atom), r#type: DataType::F32, context: tracing_context.clone() };
-        let output = mismatched_type_tracer.one_like();
-        assert!(matches!(&output.state, TracerState::Poison));
-        assert_eq!(output.r#type().into_owned(), DataType::F32);
-        assert!(matches!(
-            builder.borrow().error.clone(),
-            Some(TracingError::Type(TypeError { message }))
-                if message == "scalar engine for f64 cannot synthesize one for f32"
-        ));
+        // Test staging value-level identity helpers through the tracer convenience API.
+        let zero = tracer.zero_like();
+        let one = tracer.one_like();
+        assert_eq!(zero.r#type().into_owned(), DataType::F64);
+        assert_eq!(one.r#type().into_owned(), DataType::F64);
+        let zero_atom = zero.atom_id().expect("zero_like output should remain live");
+        let one_atom = one.atom_id().expect("one_like output should remain live");
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<f64, Vec<f64>>(vec![zero_atom, one_atom], Placeholder, vec![Placeholder, Placeholder])
+            .unwrap();
+        assert_eq!(program.interpret(2.0), Ok(vec![0.0, 1.0]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = zero_like %0
+                    %2:f64 = one_like %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
 
         // Test staging a unary operation through the tracer convenience API.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));

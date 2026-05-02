@@ -8,7 +8,10 @@ fn build_traced_gradient_program<'engine, E, Input, V>(
 where
     E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
     V: Value<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
-    E::Operation: InterpretableOperation<E::Type, V> + TracedLinearizableOperation<'engine, E> + 'static,
+    E::Operation: InterpretableOperation<E::Type, V>
+        + TracedLinearizableOperation<'engine, E>
+        + SupportsZeroLike<E::Type, V>
+        + 'static,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
         + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
@@ -59,7 +62,8 @@ pub fn compile_grad<'engine, E, F, Input, V>(
 where
     E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
     V: Value<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
-    E::Operation: InterpretableOperation<E::Type, V> + TracedLinearizableOperation<'engine, E>,
+    E::Operation:
+        InterpretableOperation<E::Type, V> + TracedLinearizableOperation<'engine, E> + SupportsZeroLike<E::Type, V>,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
         + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
@@ -137,6 +141,7 @@ where
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
     E::Operation: InterpretableOperation<ArrayType, V>
         + TracedLinearizableOperation<'engine, E>
+        + SupportsZeroLike<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, <E as DifferentiableEngine>::LinearOperation>,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E>>
@@ -184,6 +189,7 @@ where
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
     E::Operation: InterpretableOperation<ArrayType, V>
         + TracedLinearizableOperation<'engine, E>
+        + SupportsZeroLike<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, <E as DifferentiableEngine>::LinearOperation>,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E>>

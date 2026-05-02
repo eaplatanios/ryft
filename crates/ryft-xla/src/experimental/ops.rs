@@ -10,9 +10,10 @@ use ryft_core::tracing_v2::linear::{
 use ryft_core::tracing_v2::operations::{
     AddOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation, FlatTracedRematerialize,
     LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
-    RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation, SupportsAdd, SupportsCos, SupportsCustom,
-    SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg, SupportsRematerialize, SupportsReshape,
-    SupportsScale, SupportsSin, WhileOperation, lift_jit_constant,
+    OneLikeOperation, RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation, SupportsAdd, SupportsCos,
+    SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg, SupportsOneLike,
+    SupportsRematerialize, SupportsReshape, SupportsScale, SupportsSin, SupportsZeroLike, WhileOperation,
+    ZeroLikeOperation, lift_jit_constant,
 };
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableEngine, DifferentiableOperation, DifferentiationError,
@@ -148,6 +149,12 @@ pub enum XlaOperation {
     /// Elementwise cosine.
     Cos,
 
+    /// Exemplar-derived zero.
+    ZeroLike,
+
+    /// Exemplar-derived one.
+    OneLike,
+
     /// Matrix multiplication.
     MatrixMultiply,
 
@@ -190,6 +197,8 @@ impl Debug for XlaOperation {
             Self::Neg => write!(formatter, "Neg"),
             Self::Sin => write!(formatter, "Sin"),
             Self::Cos => write!(formatter, "Cos"),
+            Self::ZeroLike => write!(formatter, "ZeroLike"),
+            Self::OneLike => write!(formatter, "OneLike"),
             Self::MatrixMultiply => write!(formatter, "MatrixMultiply"),
             Self::Transpose => write!(formatter, "Transpose"),
             Self::Scale { .. } => write!(formatter, "Scale"),
@@ -224,6 +233,8 @@ impl Operation<ArrayType> for XlaOperation {
             Self::Neg => "neg",
             Self::Sin => "sin",
             Self::Cos => "cos",
+            Self::ZeroLike => "zero_like",
+            Self::OneLike => "one_like",
             Self::MatrixMultiply => "matmul",
             Self::Transpose => "matrix_transpose",
             Self::Scale { .. } => "scale",
@@ -245,6 +256,8 @@ impl Operation<ArrayType> for XlaOperation {
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
+            Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
+            Self::OneLike => OneLikeOperation.infer_output_types(input_types),
             Self::MatrixMultiply => MatMulOperation.infer_output_types(input_types),
             Self::Transpose => MatrixTransposeOperation.infer_output_types(input_types),
             Self::Scale { .. } => ScaleOperation::<ArrayType, ShardMapTensor>::abstract_eval_static(input_types),
@@ -270,6 +283,8 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaOperation {
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
+            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
+            Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::MatrixMultiply => MatMulOperation.interpret(inputs),
             Self::Transpose => MatrixTransposeOperation.interpret(inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
@@ -295,6 +310,8 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
+            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
+            Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::MatrixMultiply => MatMulOperation.interpret(inputs),
             Self::Transpose => MatrixTransposeOperation.interpret(inputs),
             Self::Scale { factor } => {
@@ -359,6 +376,8 @@ where
             Self::Neg => NegOperation.jvp(engine, context, inputs),
             Self::Sin => SinOperation.jvp(engine, context, inputs),
             Self::Cos => CosOperation.jvp(engine, context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
             Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
             Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
@@ -412,6 +431,8 @@ impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaOperation {
             Self::Neg => NegOperation.jvp(engine, context, inputs),
             Self::Sin => SinOperation.jvp(engine, context, inputs),
             Self::Cos => CosOperation.jvp(engine, context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
             Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
             Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
@@ -480,6 +501,18 @@ impl SupportsSin<ArrayType, ShardMapTensor> for XlaOperation {
 impl SupportsCos<ArrayType, ShardMapTensor> for XlaOperation {
     fn cos_operation() -> Self {
         XlaOperation::Cos
+    }
+}
+
+impl SupportsZeroLike<ArrayType, ShardMapTensor> for XlaOperation {
+    fn zero_like_operation() -> Self {
+        XlaOperation::ZeroLike
+    }
+}
+
+impl SupportsOneLike<ArrayType, ShardMapTensor> for XlaOperation {
+    fn one_like_operation() -> Self {
+        XlaOperation::OneLike
     }
 }
 

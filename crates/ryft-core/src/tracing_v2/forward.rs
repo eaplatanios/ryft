@@ -11,7 +11,7 @@ use crate::tracing::{
     AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
 };
 use crate::tracing_v2::linear::{jvp_program, jvp_traced};
-use crate::tracing_v2::operations::constants::Zero;
+use crate::tracing_v2::operations::constants::{SupportsZeroLike, Zero};
 use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperationTracingEngine, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, Typed};
@@ -252,7 +252,7 @@ where
     Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
     Output::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Output>,
-    E::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, E>,
+    E::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, E> + SupportsZeroLike<E::Type, V>,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     type FunctionInput<'call>

@@ -9,7 +9,7 @@ use crate::tracing::{
     Value,
 };
 use crate::tracing_v2::forward::JvpTracer;
-use crate::tracing_v2::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
+use crate::tracing_v2::operations::constants::{One, OneLike, SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::tracing_v2::operations::rematerialize::{FlatTracedRematerialize, RematerializeOperation};
 use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsRematerialize};
 use crate::tracing_v2::{
@@ -149,7 +149,7 @@ fn reverse_mode_scalar_traced_program<'engine, V, E>(
 where
     V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
     E: DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
-    E::Operation: TracedLinearizableOperation<'engine, E> + 'static,
+    E::Operation: TracedLinearizableOperation<'engine, E> + SupportsZeroLike<E::Type, V> + 'static,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
         + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>

@@ -59,7 +59,9 @@ pub mod scale;
 pub mod sin;
 
 pub use add::{AddOperation, SupportsAdd};
-pub use constants::{SupportsZero, ZeroOperation};
+pub use constants::{
+    OneLikeOperation, SupportsOneLike, SupportsZero, SupportsZeroLike, ZeroLikeOperation, ZeroOperation,
+};
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
     flat_program_input_types, flat_program_output_types,

@@ -2,9 +2,11 @@ use std::fmt::{Debug, Display};
 
 use half::{bf16, f16};
 
-use crate::tracing::engines::{Engine, Tracer, TracerState, TracingEngine};
+use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
+use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::primitive::LinearArrayOperation;
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{InterpretableOperation, LinearOperation, Operation, TranspositionContext};
@@ -34,35 +36,204 @@ pub trait OneLike {
     fn one_like(&self) -> Self;
 }
 
-impl<'engine, E: TracingEngine + ?Sized> ZeroLike for Tracer<'engine, E> {
+/// Hidden carrier capability for staging the exemplar-derived zero primitive.
+///
+/// `SupportsZeroLike` lets value-level helpers such as [`ZeroLike::zero_like`] stage a
+/// [`ZeroLikeOperation`] in the backend-owned carrier without coupling that helper to a concrete
+/// operation enum.
+#[doc(hidden)]
+pub trait SupportsZeroLike<T: Type, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the zero-like primitive.
+    fn zero_like_operation() -> Self;
+}
+
+/// Hidden carrier capability for staging the exemplar-derived one primitive.
+///
+/// `SupportsOneLike` is the multiplicative-identity counterpart to [`SupportsZeroLike`].
+#[doc(hidden)]
+pub trait SupportsOneLike<T: Type, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the one-like primitive.
+    fn one_like_operation() -> Self;
+}
+
+impl<'engine, E> ZeroLike for Tracer<'engine, E>
+where
+    E: TracingEngine + ?Sized,
+    E::Operation: SupportsZeroLike<E::Type, E::Value>,
+{
     #[inline]
     fn zero_like(&self) -> Self {
-        let r#type = self.r#type().into_owned();
-        let value = match Engine::zero(self.engine(), &r#type) {
-            Ok(value) => value,
-            Err(error) => {
-                self.context.error(error);
-                return Tracer { state: TracerState::Poison, r#type, context: self.context.clone() };
-            }
-        };
-        let atom = self.builder().borrow_mut().add_constant(value);
-        self.context.tracer(atom, Some(r#type))
+        self.clone().unary(E::Operation::zero_like_operation())
     }
 }
 
-impl<'engine, E: TracingEngine + ?Sized> OneLike for Tracer<'engine, E> {
+impl<'engine, E> OneLike for Tracer<'engine, E>
+where
+    E: TracingEngine + ?Sized,
+    E::Operation: SupportsOneLike<E::Type, E::Value>,
+{
     #[inline]
     fn one_like(&self) -> Self {
-        let r#type = self.r#type().into_owned();
-        let value = match Engine::one(self.engine(), &r#type) {
-            Ok(value) => value,
-            Err(error) => {
-                self.context.error(error);
-                return Tracer { state: TracerState::Poison, r#type, context: self.context.clone() };
-            }
-        };
-        let atom = self.builder().borrow_mut().add_constant(value);
-        self.context.tracer(atom, Some(r#type))
+        self.clone().unary(E::Operation::one_like_operation())
+    }
+}
+
+/// Exemplar-derived zero primitive.
+///
+/// [`ZeroLikeOperation`] is the staged form of [`ZeroLike::zero_like`]. It takes one exemplar input
+/// and produces one output with the same abstract type, leaving concrete interpretation to the
+/// value type's [`ZeroLike`] implementation.
+#[derive(Copy, Clone, Default)]
+pub struct ZeroLikeOperation;
+
+impl Debug for ZeroLikeOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ZeroLike")
+    }
+}
+
+impl Display for ZeroLikeOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "zero_like")
+    }
+}
+
+impl<T: Type> Operation<T> for ZeroLikeOperation {
+    fn name(&self) -> &'static str {
+        "zero_like"
+    }
+
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+        if input_types.len() != 1 {
+            return Err(TypeError {
+                message: format!("zero_like expected 1 input type but got {}", input_types.len()),
+            });
+        }
+        Ok(vec![input_types[0].clone()])
+    }
+}
+
+impl<T: Type, V: Typed<T> + ZeroLike> InterpretableOperation<T, V> for ZeroLikeOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        if inputs.len() != 1 {
+            return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
+        }
+        Ok(vec![inputs[0].zero_like()])
+    }
+}
+
+impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
+    for ZeroLikeOperation
+{
+    fn transpose(
+        &self,
+        _context: &mut TranspositionContext<'_, T, V, LinearCarrier>,
+        output_cotangents: &[Option<AtomId>],
+    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        if output_cotangents.len() != 1 {
+            return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
+        }
+        Ok(vec![None])
+    }
+}
+
+impl<E> DifferentiableOperation<E> for ZeroLikeOperation
+where
+    E: DifferentiableEngine + ?Sized,
+    ZeroLikeOperation: Operation<E::Type>,
+    E::Value: ZeroLike + Differentiable<E::Type, Tangent = E::Value>,
+    E::LinearOperation: SupportsZeroLike<E::Type, E::Value>,
+{
+    fn jvp(
+        &self,
+        _engine: &E,
+        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        if inputs.len() != 1 {
+            return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
+        }
+        let tangent = context
+            .apply_operation(
+                &[inputs[0].tangent],
+                <E::LinearOperation as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("zero_like jvp should produce one tangent");
+        Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent }])
+    }
+}
+
+/// Exemplar-derived one primitive.
+///
+/// [`OneLikeOperation`] is the staged form of [`OneLike::one_like`]. It takes one exemplar input
+/// and produces one output with the same abstract type, leaving concrete interpretation to the
+/// value type's [`OneLike`] implementation.
+#[derive(Copy, Clone, Default)]
+pub struct OneLikeOperation;
+
+impl Debug for OneLikeOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "OneLike")
+    }
+}
+
+impl Display for OneLikeOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "one_like")
+    }
+}
+
+impl<T: Type> Operation<T> for OneLikeOperation {
+    fn name(&self) -> &'static str {
+        "one_like"
+    }
+
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+        if input_types.len() != 1 {
+            return Err(TypeError { message: format!("one_like expected 1 input type but got {}", input_types.len()) });
+        }
+        Ok(vec![input_types[0].clone()])
+    }
+}
+
+impl<T: Type, V: Typed<T> + OneLike> InterpretableOperation<T, V> for OneLikeOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        if inputs.len() != 1 {
+            return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
+        }
+        Ok(vec![inputs[0].one_like()])
+    }
+}
+
+impl<E> DifferentiableOperation<E> for OneLikeOperation
+where
+    E: DifferentiableEngine + ?Sized,
+    OneLikeOperation: Operation<E::Type>,
+    E::Value: OneLike + Differentiable<E::Type, Tangent = E::Value>,
+    E::LinearOperation: SupportsZeroLike<E::Type, E::Value>,
+{
+    fn jvp(
+        &self,
+        _engine: &E,
+        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        if inputs.len() != 1 {
+            return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
+        }
+        let tangent = context
+            .apply_operation(
+                &[inputs[0].tangent],
+                <E::LinearOperation as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("one_like jvp should produce one tangent");
+        Ok(vec![JvpTracer { primal: inputs[0].primal.one_like(), tangent }])
     }
 }
 
@@ -295,11 +466,11 @@ impl_scalar_value_traits!(f64, DataType::F64, 0.0f64, 1.0f64);
 mod tests {
     use half::{bf16, f16};
 
-    use crate::tracing::Value;
+    use crate::tracing::{InterpretableOperation, Operation, TracingError, Value};
     use crate::tracing_v2::{Cos, Sin, test_support};
-    use crate::types::{ArrayType, DataType, Typed};
+    use crate::types::{ArrayType, DataType, TypeError, Typed};
 
-    use super::{OneLike, ZeroLike};
+    use super::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
 
     fn assert_scalar_value_type<V: Value<ArrayType>>(value: V, expected_type: DataType) {
         assert_eq!(value.r#type().into_owned(), ArrayType::scalar(expected_type));
@@ -315,6 +486,54 @@ mod tests {
     {
         assert_eq!(value.zero_like(), zero);
         assert_eq!(value.one_like(), one);
+    }
+
+    #[test]
+    fn test_zero_like_operation() {
+        let operation = ZeroLikeOperation;
+
+        assert_eq!(Operation::<DataType>::name(&operation), "zero_like");
+        assert_eq!(format!("{operation:?}"), "ZeroLike");
+        assert_eq!(format!("{operation}"), "zero_like");
+        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]), Ok(vec![0.0]));
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)]),
+            Ok(vec![ArrayType::scalar(DataType::F32)]),
+        );
+
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[]),
+            Err(TypeError { message: "zero_like expected 1 input type but got 0".to_string() }),
+        );
+        assert_eq!(
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
+            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+        );
+    }
+
+    #[test]
+    fn test_one_like_operation() {
+        let operation = OneLikeOperation;
+
+        assert_eq!(Operation::<DataType>::name(&operation), "one_like");
+        assert_eq!(format!("{operation:?}"), "OneLike");
+        assert_eq!(format!("{operation}"), "one_like");
+        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]), Ok(vec![1.0]));
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)]),
+            Ok(vec![ArrayType::scalar(DataType::F32)]),
+        );
+
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[]),
+            Err(TypeError { message: "one_like expected 1 input type but got 0".to_string() }),
+        );
+        assert_eq!(
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
+            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+        );
     }
 
     #[test]

@@ -317,6 +317,12 @@ where
             Self::Neg => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::NegOperation, inputs),
             Self::Sin => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::SinOperation, inputs),
             Self::Cos => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::CosOperation, inputs),
+            Self::ZeroLike => {
+                batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::ZeroLikeOperation, inputs)
+            }
+            Self::OneLike => {
+                batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::OneLikeOperation, inputs)
+            }
             Self::MatrixMultiply => {
                 batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::MatMulOperation, inputs)
             }

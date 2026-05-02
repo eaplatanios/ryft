@@ -55,7 +55,7 @@ where
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
     Output::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Output>,
-    E::Operation: TracedLinearizableOperation<'engine, E>,
+    E::Operation: TracedLinearizableOperation<'engine, E> + SupportsZeroLike<E::Type, V>,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
     F: FnOnce(Input) -> Result<Output, TracingError>,
 {
@@ -242,7 +242,7 @@ where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
     V::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
-    E::Operation: TracedLinearizableOperation<'engine, E>,
+    E::Operation: TracedLinearizableOperation<'engine, E> + SupportsZeroLike<E::Type, V>,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
         + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
