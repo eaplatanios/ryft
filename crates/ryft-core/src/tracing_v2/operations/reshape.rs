@@ -12,10 +12,12 @@ use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearizableEngine};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
-/// Hidden carrier capability for staging the reshape primitive.
+/// Trait that represents [`Operation`] carrier types that support/include [`ReshapeOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`ReshapeOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsReshape<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the reshape primitive.
+    /// Constructs the carrier-specific representation of the reshape [`Operation`].
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self;
 }
 

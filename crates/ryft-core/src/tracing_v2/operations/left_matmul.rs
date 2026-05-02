@@ -14,11 +14,12 @@ use super::SupportsAdd;
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
 use super::primitive::LinearArrayOperation;
 
-/// Hidden carrier capability for staging the left matrix-multiplication primitive.
+/// Trait that represents [`Operation`] carrier types that support/include [`LeftMatMulOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`LeftMatMulOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsLeftMatMul<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the left matrix-multiplication primitive
-    /// with a captured factor.
+    /// Constructs the carrier-specific representation of the left matrix multiplication [`Operation`].
     fn left_matmul_operation(factor: V) -> Self;
 }
 

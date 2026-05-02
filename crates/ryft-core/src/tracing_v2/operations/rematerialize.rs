@@ -15,19 +15,22 @@ use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::SupportsAdd;
 
-/// Hidden carrier capability for staging the `rematerialize` higher-order primitive.
+/// Trait that represents [`Operation`] carrier types that support/include [`RematerializeOperation`]. Backend-owned
+/// closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this
+/// trait so that generic transform code can stage [`RematerializeOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsRematerialize<T: Type + PartialEq, V: Traceable<T>, L>: Sized + Operation<T> {
-    /// Constructs the carrier-specific representation of the `rematerialize` higher-order primitive
-    /// with a captured traced body.
+    /// Constructs the carrier-specific representation of the rematerialization [`Operation`].
     fn rematerialize_operation(op: RematerializeOperation<T, V, Self, L>) -> Self;
 }
 
-/// Hidden carrier capability for staging the `rematerialize` higher-order primitive in linear programs.
+/// Trait that represents [`Operation`] carrier types that support/include [`LinearRematerializeOperation`].
+/// Backend-owned closed [`Operation`] carrier types (such as [`LinearArrayOperation`](super::LinearArrayOperation), for
+/// example) implement this trait so that generic transform code can stage [`LinearRematerializeOperation`] without
+/// knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsLinearRematerialize<T: Type + PartialEq, V: Traceable<T>>: Sized + Operation<T> {
-    /// Constructs the carrier-specific representation of the linear `rematerialize` higher-order
-    /// primitive with a captured linear traced body.
+    /// Constructs the carrier-specific representation of the linear rematerialization [`Operation`].
     fn rematerialize_operation(op: LinearRematerializeOperation<T, V, Self>) -> Self;
 }
 

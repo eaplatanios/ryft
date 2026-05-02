@@ -24,17 +24,14 @@ pub trait Zero<T: Type>: Sized {
     fn zero(r#type: &T) -> Result<Self, TracingError>;
 }
 
-/// Hidden carrier capability for staging the zero primitive.
-///
-/// `SupportsZero` lets generic transform code stage the typed-zero primitive on linear-program
-/// carriers without knowing the carrier type. The transpose pass uses it at the boundary to emit
-/// structural zeros for primal inputs that have no contribution accumulated onto them.
-#[doc(hidden)]
+/// Trait that represents [`Operation`] carrier types that support/include [`ZeroOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`ZeroOperation`] without knowing which carrier is in use.
 pub trait SupportsZero<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the typed-zero primitive.
+    /// Constructs the carrier-specific representation of the zero [`Operation`].
     fn zero_operation(r#type: T) -> Self;
 
-    /// Returns the type carried by a zero op, or `None` for any other op variant.
+    /// Returns the type carried by a zero [`Operation`], or `None` for any other operation variant.
     ///
     /// Higher-order passes (notably the traced reverse-mode pipeline that has to materialize
     /// `Zero` ops into outer-trace constants before its pullback can be interpreted) use this hook
@@ -166,17 +163,15 @@ pub trait One<T: Type>: Sized {
     fn one(r#type: &T) -> Result<Self, TracingError>;
 }
 
-/// Hidden carrier capability for staging the typed-one primitive.
-///
-/// `SupportsOne` is the multiplicative-identity counterpart to [`SupportsZero`]. It allows generic
-/// transforms and value-level APIs to construct a carrier-specific [`OneOperation`] without knowing
-/// the concrete operation enum.
+/// Trait that represents [`Operation`] carrier types that support/include [`OneOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`OneOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsOne<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the typed-one primitive.
+    /// Constructs the carrier-specific representation of the one [`Operation`].
     fn one_operation(r#type: T) -> Self;
 
-    /// Returns the type carried by a one op, or `None` for any other op variant.
+    /// Returns the type carried by a one [`Operation`], or `None` for any other operation variant.
     fn as_one(&self) -> Option<&T> {
         None
     }
@@ -305,14 +300,12 @@ pub trait ZeroLike {
     fn zero_like(&self) -> Self;
 }
 
-/// Hidden carrier capability for staging the exemplar-derived zero primitive.
-///
-/// `SupportsZeroLike` lets value-level helpers such as [`ZeroLike::zero_like`] stage a
-/// [`ZeroLikeOperation`] in the backend-owned carrier without coupling that helper to a concrete
-/// operation enum.
+/// Trait that represents [`Operation`] carrier types that support/include [`ZeroLikeOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`ZeroLikeOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsZeroLike<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the zero-like primitive.
+    /// Constructs the carrier-specific representation of the zero-like [`Operation`].
     fn zero_like_operation() -> Self;
 }
 
@@ -424,12 +417,12 @@ pub trait OneLike {
     fn one_like(&self) -> Self;
 }
 
-/// Hidden carrier capability for staging the exemplar-derived one primitive.
-///
-/// `SupportsOneLike` is the multiplicative-identity counterpart to [`SupportsZeroLike`].
+/// Trait that represents [`Operation`] carrier types that support/include [`OneLikeOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`OneLikeOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsOneLike<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the one-like primitive.
+    /// Constructs the carrier-specific representation of the one-like [`Operation`].
     fn one_like_operation() -> Self;
 }
 

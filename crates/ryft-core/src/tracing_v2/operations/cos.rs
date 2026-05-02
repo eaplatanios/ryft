@@ -14,10 +14,12 @@ use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 use super::sin::Sin;
 use super::{SupportsNeg, SupportsScale};
 
-/// Hidden carrier capability for staging the cosine primitive.
+/// Trait that represents [`Operation`] carrier types that support/include [`CosOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`CosOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsCos<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the cosine primitive.
+    /// Constructs the carrier-specific representation of the cosine [`Operation`].
     fn cos_operation() -> Self;
 }
 

@@ -11,10 +11,12 @@ use crate::types::{ArrayType, Type, TypeError};
 use super::LinearArrayOperation;
 use super::matrix::{MatrixOps, MatrixValue, transpose_abstract};
 
-/// Hidden carrier capability for staging the matrix transposition primitive.
+/// Trait that represents [`Operation`] carrier types that support/include [`MatrixTransposeOperation`]. Backend-owned
+/// closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this
+/// trait so that generic transform code can stage [`MatrixTransposeOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsMatrixTranspose<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the matrix transposition primitive.
+    /// Constructs the carrier-specific representation of the matrix transposition [`Operation`].
     fn matrix_transpose_operation() -> Self;
 }
 

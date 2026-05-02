@@ -13,10 +13,12 @@ use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 use super::SupportsScale;
 use super::cos::Cos;
 
-/// Hidden carrier capability for staging the sine primitive.
+/// Trait that represents [`Operation`] carrier types that support/include [`SinOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`SinOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsSin<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the sine primitive.
+    /// Constructs the carrier-specific representation of the sine [`Operation`].
     fn sin_operation() -> Self;
 }
 

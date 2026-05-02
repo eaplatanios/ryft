@@ -13,10 +13,12 @@ use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{SupportsAdd, SupportsScale};
 
-/// Hidden carrier capability for staging the multiplication primitive.
+/// Trait that represents [`Operation`] carrier types that support/include [`MulOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`MulOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsMul<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the multiplication primitive.
+    /// Constructs the carrier-specific representation of the multiplication [`Operation`].
     fn mul_operation() -> Self;
 }
 

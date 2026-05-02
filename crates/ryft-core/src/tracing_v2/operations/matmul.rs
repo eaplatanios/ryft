@@ -12,10 +12,12 @@ use super::left_matmul::SupportsLeftMatMul;
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
 use super::right_matmul::SupportsRightMatMul;
 
-/// Hidden carrier capability for staging the matrix multiplication primitive.
+/// Trait that represents [`Operation`] carrier types that support/include [`MatMulOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`MatMulOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsMatMul<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the matrix multiplication primitive.
+    /// Constructs the carrier-specific representation of the matrix multiplication [`Operation`].
     fn matmul_operation() -> Self;
 }
 

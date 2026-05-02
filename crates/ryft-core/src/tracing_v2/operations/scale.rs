@@ -18,17 +18,12 @@ use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::SupportsAdd;
 
-/// Hidden carrier capability for staging the scaling primitive.
-///
-/// Ordinary tracing carriers and linear-program carriers can both implement this trait when they
-/// support representing a captured-factor scale operation in their own operation universe.
-///
-/// This is intentionally separate from [`SupportsMul`](super::SupportsMul): multiplication is a
-/// binary operation over two input atoms, while scaling is a unary operation that carries one
-/// captured factor in the operation itself.
+/// Trait that represents [`Operation`] carrier types that support/include [`ScaleOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`ScaleOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsScale<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the scaling primitive with a captured factor.
+    /// Constructs the carrier-specific representation of the scaling [`Operation`].
     fn scale_operation(factor: V) -> Self;
 }
 

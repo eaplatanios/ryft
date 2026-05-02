@@ -11,10 +11,12 @@ use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearizableEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-/// Hidden carrier capability for staging the negation primitive.
+/// Trait that represents [`Operation`] carrier types that support/include [`NegOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`NegOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsNeg<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the negation primitive.
+    /// Constructs the carrier-specific representation of the negation [`Operation`].
     fn neg_operation() -> Self;
 }
 

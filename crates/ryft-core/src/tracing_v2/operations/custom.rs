@@ -24,20 +24,25 @@ pub enum CustomOperationError {
     MissingRule { op: &'static str, transform: &'static str },
 }
 
-/// Hidden carrier capability for staging the custom-primitive escape hatch.
+/// Trait that represents [`Operation`] carrier types that support/include [`CustomPrimitive`]. Backend-owned
+/// closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this
+/// trait so that generic transform code can stage [`CustomPrimitive`] without knowing which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsCustom<T: Type + PartialEq, V: Traceable<T> + Parameter> {
-    /// Constructs the carrier-specific representation of one custom primitive.
+    /// Constructs the carrier-specific representation of the custom-primitive [`Operation`].
     fn custom_operation(primitive: Arc<CustomPrimitive<T, V>>) -> Self;
 }
 
-/// Hidden carrier capability for staging the custom-primitive escape hatch in linear programs.
+/// Trait that represents [`Operation`] carrier types that support/include [`LinearCustomPrimitive`].
+/// Backend-owned closed [`Operation`] carrier types (such as [`LinearArrayOperation`](super::LinearArrayOperation), for
+/// example) implement this trait so that generic transform code can stage [`LinearCustomPrimitive`] without knowing
+/// which carrier is in use.
 #[doc(hidden)]
 pub trait SupportsLinearCustom<T: Type + PartialEq, V: Traceable<T> + Parameter>: Sized {
-    /// Constructs the carrier-specific representation of one custom primitive in the linear universe.
+    /// Constructs the carrier-specific representation of the linear custom-primitive [`Operation`].
     fn custom_operation(primitive: CustomPrimitive<T, V>) -> Result<Self, TracingError>;
 
-    /// Constructs the carrier-specific representation of one shared custom primitive in the linear universe.
+    /// Constructs the carrier-specific representation of the shared linear custom-primitive [`Operation`].
     fn custom_arc_operation(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TracingError>;
 }
 
