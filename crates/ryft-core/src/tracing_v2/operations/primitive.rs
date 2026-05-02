@@ -1284,14 +1284,14 @@ where
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    &zero.output_type
+                    &zero.r#type
                 ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
-                    &one.output_type
+                    &one.r#type
                 ),
             }
             .into()),
@@ -1491,14 +1491,14 @@ where
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    &zero.output_type
+                    &zero.r#type
                 ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
-                    &one.output_type
+                    &one.r#type
                 ),
             }
             .into()),
@@ -1543,14 +1543,14 @@ where
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    &zero.output_type
+                    &zero.r#type
                 ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
-                    &one.output_type
+                    &one.r#type
                 ),
             }
             .into()),

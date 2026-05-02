@@ -41,15 +41,13 @@ where
         let tangent = context
             .apply_operation(
                 &[],
-                <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(
-                    self.output_type.clone(),
-                ),
+                <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(self.r#type.clone()),
                 1,
             )?
             .into_iter()
             .next()
             .expect("zero jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: context.engine.zero(&self.output_type)?, tangent }])
+        Ok(vec![JvpTracer { primal: context.engine.zero(&self.r#type)?, tangent }])
     }
 }
 
@@ -82,15 +80,13 @@ where
         let tangent = context
             .apply_operation(
                 &[],
-                <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(
-                    self.output_type.clone(),
-                ),
+                <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(self.r#type.clone()),
                 1,
             )?
             .into_iter()
             .next()
             .expect("one jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: context.engine.one(&self.output_type)?, tangent }])
+        Ok(vec![JvpTracer { primal: context.engine.one(&self.r#type)?, tangent }])
     }
 }
 

@@ -288,7 +288,7 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
             {
                 // Zero ops in traced pullbacks have no inputs from which interpretation can recover a tracing
                 // context, so materialize each one as a constant in this outer trace and remap its uses.
-                let zero_tracer = self.constant(self.engine.zero(&zero_operation.output_type)?);
+                let zero_tracer = self.constant(self.engine.zero(&zero_operation.r#type)?);
                 let constant_atom = builder.add_constant(zero_tracer);
                 atom_remapping[instruction.outputs[0].index] = Some(constant_atom);
             } else {

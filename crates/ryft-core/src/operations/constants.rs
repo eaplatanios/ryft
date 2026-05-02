@@ -5,18 +5,10 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, TracingError};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-/// Synthesizes a typed zero value without an exemplar.
-///
-/// [`Zero`] is the type-driven counterpart to
-/// [`ZeroLike`](crate::tracing_v2::operations::constants::ZeroLike): it is what [`ZeroOperation`] needs in order to
-/// evaluate at interpretation time, since the op carries only the output type and has no input values to derive a shape
-/// from. Concrete leaf value types implement this trait directly.
-///
-/// Wrapper types that fundamentally cannot synthesize a zero from metadata alone should use exemplar-backed
-/// [`ZeroLike`](crate::tracing_v2::operations::constants::ZeroLike) where possible. Programs containing `Zero` ops over
-/// those value types must materialize them away before being interpreted.
+/// Synthesizes a _zero_ value for a given [`Type`]. [`Zero`] is the [`Type`]-driven counterpart to [`ZeroLike`]; it is
+/// what [`ZeroOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait Zero<T: Type>: Sized {
-    /// Returns a typed zero whose shape and dtype are described by `r#type`.
+    /// Returns a _zero_ value for the provided [`Type`].
     fn zero(r#type: &T) -> Result<Self, TracingError>;
 }
 
@@ -27,33 +19,29 @@ pub trait SupportsZero<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the zero [`Operation`].
     fn zero_operation(r#type: T) -> Self;
 
-    /// Returns the zero [`Operation`], or `None` for any other operation variant.
-    ///
-    /// Higher-order passes (notably the traced reverse-mode pipeline that has to materialize `Zero` ops into
-    /// outer-trace constants before its pullback can be interpreted) use this hook to identify zero ops without
-    /// pattern-matching on a concrete carrier enum.
+    /// Returns the [`ZeroOperation`] that this operation carrier holds, or `None` if it does not hold one.
+    /// Higher-order transformation passes (e.g., the traced reverse-mode pipeline that has to materialize
+    /// [`ZeroOperation`] instances into outer-trace constants before its pullback can be interpreted) use this hook
+    /// to identify [`ZeroOperation`] instances without pattern-matching on concrete operation carrier types.
     fn as_zero_operation(&self) -> Option<&ZeroOperation<T>> {
         None
     }
 }
 
-/// Typed-zero primitive: a 0-input, 1-output op that produces a value of the carried type metadata.
-///
-/// [`ZeroOperation`] is emitted by the linear-program transpose pass at the pullback boundary for primal inputs that
-/// have no cotangent contribution accumulated onto them. Closed carriers implement [`SupportsZero`] to construct the
-/// carrier-specific representation, and the carrier's own trait impls then delegate to this op for [`Operation`] and
-/// [`InterpretableOperation`] semantics.
+/// [`Operation`] that has no inputs and that produces a single output that corresponds to the _zero_ value for the
+/// [`Type`] that it holds (i.e., for [`ZeroOperation::r#type`]). Note that for arrays, this would typically correspond
+/// to an array of the right type and shape filled with zeros.
 #[derive(Clone, Debug)]
 pub struct ZeroOperation<T: Type = ArrayType> {
-    /// Type of the value produced when this op is interpreted.
-    pub output_type: T,
+    /// [`Type`] of the value produced when this operation is interpreted.
+    pub r#type: T,
 }
 
 impl<T: Type> ZeroOperation<T> {
-    /// Creates a zero op that produces values of `output_type`.
+    /// Creates a new [`ZeroOperation`].
     #[inline]
-    pub fn new(output_type: T) -> Self {
-        Self { output_type }
+    pub fn new(r#type: T) -> Self {
+        Self { r#type }
     }
 }
 
@@ -69,32 +57,31 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
         "zero"
     }
 
+    #[inline]
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         check_input_count!(input_types, 0, TypeError);
-        Ok(vec![self.output_type.clone()])
+        Ok(vec![self.r#type.clone()])
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("type", &self.output_type))
+            .bracketed(|operation| operation.field("type", &self.r#type))
     }
 }
 
 impl<T: Type, V: Typed<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperation<T> {
+    #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 0, TracingError);
-        Ok(vec![V::zero(&self.output_type)?])
+        Ok(vec![V::zero(&self.r#type)?])
     }
 }
 
-/// Synthesizes a typed unit cotangent seed without an exemplar.
-///
-/// [`One`] is the seed counterpart to [`Zero`]. It is intentionally fallible because not every abstract descriptor
-/// admits the unit seed required by scalar-output reverse-mode transforms. For example, the built-in [`ArrayType`]
-/// implementations reject non-rank-0 descriptors so `grad` keeps its scalar-output semantics even though the check
-/// depends on runtime metadata.
+/// Synthesizes a _one_ value for a given [`Type`]. [`One`] is the [`Type`]-driven counterpart to [`OneLike`]; it is
+/// what [`OneOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait One<T: Type>: Sized {
-    /// Returns the unit cotangent seed described by `r#type`.
+    /// Returns a _one_ value for the provided [`Type`].
     fn one(r#type: &T) -> Result<Self, TracingError>;
 }
 
@@ -107,21 +94,20 @@ pub trait SupportsOne<T: Type, V: Traceable<T>> {
     fn one_operation(r#type: T) -> Self;
 }
 
-/// Typed-one primitive: a 0-input, 1-output op that produces a value of the carried type metadata.
-///
-/// [`OneOperation`] is the staged form of [`One::one`]. It is used for unit cotangent seeds and any other type-driven
-/// multiplicative identity where no exemplar value is available.
+/// [`Operation`] that has no inputs and that produces a single output that corresponds to the _one_ value for the
+/// [`Type`] that it holds (i.e., for [`OneOperation::r#type`]). Note that for arrays, this would typically correspond
+/// to an array of the right type and shape filled with ones.
 #[derive(Clone, Debug)]
 pub struct OneOperation<T: Type = ArrayType> {
-    /// Type of the value produced when this op is interpreted.
-    pub output_type: T,
+    /// [`Type`] of the value produced when this operation is interpreted.
+    pub r#type: T,
 }
 
 impl<T: Type> OneOperation<T> {
-    /// Creates a one op that produces values of `output_type`.
+    /// Creates a new [`OneOperation`].
     #[inline]
-    pub fn new(output_type: T) -> Self {
-        Self { output_type }
+    pub fn new(r#type: T) -> Self {
+        Self { r#type }
     }
 }
 
@@ -137,20 +123,23 @@ impl<T: Type> Operation<T> for OneOperation<T> {
         "one"
     }
 
+    #[inline]
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         check_input_count!(input_types, 0, TypeError);
-        Ok(vec![self.output_type.clone()])
+        Ok(vec![self.r#type.clone()])
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("type", &self.output_type))
+            .bracketed(|operation| operation.field("type", &self.r#type))
     }
 }
 
 impl<T: Type, V: Typed<T> + One<T>> InterpretableOperation<T, V> for OneOperation<T> {
+    #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 0, TracingError);
-        Ok(vec![V::one(&self.output_type)?])
+        Ok(vec![V::one(&self.r#type)?])
     }
 }

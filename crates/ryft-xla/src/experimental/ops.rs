@@ -296,14 +296,14 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "typed zero operation over tracer values was not materialized before interpretation for {}",
-                    &zero.output_type
+                    &zero.r#type
                 ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
                 message: format!(
                     "typed one operation over tracer values was not materialized before interpretation for {}",
-                    &one.output_type
+                    &one.r#type
                 ),
             }
             .into()),
