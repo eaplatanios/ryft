@@ -2138,31 +2138,356 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_func_return_and_constant_module() {
+    fn test_file() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let mut body = context.block_with_no_arguments();
+        body.append_operation(include("stdint.h", true, location));
+        let op = file("generated.cc", body.into(), location);
+        assert_eq!(op.id().as_str().unwrap(), "generated.cc");
+        assert_eq!(op.body().blocks().count(), 1);
+        module.body().append_operation(op);
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.file "generated.cc" {
+                    include <"stdint.h">
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_address_of() {
         let context = Context::new();
         let location = context.unknown_location();
         let module = context.module(location);
         let i32_type = context.signless_integer_type(32);
-        let function_type = context.function_type::<TypeRef, _>(&[], &[i32_type]);
-
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let pointer_i32_type = context.emit_c_pointer_type(i32_type);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[pointer_i32_type.as_ref()]);
         module.body().append_operation({
             let mut block = context.block_with_no_arguments();
-            let lhs = block.append_operation(constant(context.integer_attribute(i32_type, 1), i32_type, location));
-            let rhs = block.append_operation(constant(context.integer_attribute(i32_type, 2), i32_type, location));
-            let op = add(lhs.result(0).unwrap(), rhs.result(0).unwrap(), i32_type, location);
-            assert_eq!(op.lhs(), lhs.result(0).unwrap().as_ref());
-            assert_eq!(op.rhs(), rhs.result(0).unwrap().as_ref());
-
+            let variable_op =
+                block.append_operation(variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location));
+            let op = address_of(variable_op.result(0).unwrap().as_ref(), pointer_i32_type, location);
+            assert_eq!(UnaryExpressionOperation::operand(&op), variable_op.result(0).unwrap().as_ref());
+            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_i32_type.as_ref());
             let op = block.append_operation(op);
-            let return_op = r#return(Some(op.result(0).unwrap().as_ref()), location);
-            assert_eq!(return_op.value(), Some(op.result(0).unwrap().as_ref()));
-            block.append_operation(return_op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("address_of", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @address_of() -> !emitc.ptr<i32> {
+                    %0 = "emitc.variable"() <{value = 0 : i32}> : () -> !emitc.lvalue<i32>
+                    %1 = address_of %0 : !emitc.lvalue<i32>
+                    return %1 : !emitc.ptr<i32>
+                  }
+                }
+            "#},
+        );
+    }
 
-            let op = func("main", function_type, block.into(), None, None, None, location);
-            assert_eq!(op.symbol_name().as_str().unwrap(), "main");
-            assert_eq!(op.function_type(), function_type);
-            assert!(op.specifiers().is_none());
-            op
+    #[test]
+    fn test_add() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = add(lhs, rhs, i32_type, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("add", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @add(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = add %arg0, %arg1 : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_apply() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let pointer_i32_type = context.emit_c_pointer_type(i32_type);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[pointer_i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let variable_op =
+                block.append_operation(variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location));
+            let variable_value = variable_op.result(0).unwrap().as_ref();
+            let op = apply("&", variable_value, pointer_i32_type, location);
+            assert_eq!(op.applicable_operator().as_str().unwrap(), "&");
+            assert_eq!(UnaryExpressionOperation::operand(&op), variable_value);
+            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("apply", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @apply() -> !emitc.ptr<i32> {
+                    %0 = "emitc.variable"() <{value = 0 : i32}> : () -> !emitc.lvalue<i32>
+                    %1 = apply "&"(%0) : (!emitc.lvalue<i32>) -> !emitc.ptr<i32>
+                    return %1 : !emitc.ptr<i32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_bitwise_and() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = bitwise_and(lhs, rhs, i32_type, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("bitwise_and", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @bitwise_and(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = bitwise_and %arg0, %arg1 : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_bitwise_left_shift() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = bitwise_left_shift(lhs, rhs, i32_type, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("bitwise_left_shift", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @bitwise_left_shift(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = bitwise_left_shift %arg0, %arg1 : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_bitwise_not() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let operand = block.argument(0).unwrap();
+            let op = bitwise_not(operand, i32_type, location);
+            assert_eq!(UnaryExpressionOperation::operand(&op), operand);
+            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("bitwise_not", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @bitwise_not(%arg0: i32) -> i32 {
+                    %0 = bitwise_not %arg0 : (i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_bitwise_or() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = bitwise_or(lhs, rhs, i32_type, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("bitwise_or", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @bitwise_or(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = bitwise_or %arg0, %arg1 : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_bitwise_right_shift() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = bitwise_right_shift(lhs, rhs, i32_type, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("bitwise_right_shift", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @bitwise_right_shift(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = bitwise_right_shift %arg0, %arg1 : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_bitwise_xor() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = bitwise_xor(lhs, rhs, i32_type, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("bitwise_xor", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @bitwise_xor(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = bitwise_xor %arg0, %arg1 : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_call_opaque() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let argument = block.argument(0).unwrap();
+            let op = call_opaque("opaque", &[argument.as_ref()], &[i32_type.as_ref()], None, None, location);
+            assert_eq!(op.callee().as_str().unwrap(), "opaque");
+            assert!(op.args().is_none());
+            assert!(op.template_args().is_none());
+            assert_eq!(op.arguments(), vec![argument.as_ref()]);
+            assert_eq!(op.outputs().len(), 1);
+            assert_eq!(op.outputs()[0].r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("call_opaque", function_type, block.into(), None, None, None, location)
         });
 
         assert!(module.verify());
@@ -2170,10 +2495,727 @@ mod tests {
             module.to_string(),
             indoc! {r#"
                 module {
-                  emitc.func @main() -> i32 {
+                  emitc.func @call_opaque(%arg0: i32) -> i32 {
+                    %0 = call_opaque "opaque"(%arg0) : (i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_cast() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let opaque_int_type = context.emit_c_opaque_type("int");
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[opaque_int_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let source = block.argument(0).unwrap();
+            let op = cast(source, opaque_int_type, location);
+            assert_eq!(UnaryExpressionOperation::operand(&op), source);
+            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), opaque_int_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("cast", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @cast(%arg0: i32) -> !emitc.opaque<"int"> {
+                    %0 = cast %arg0 : i32 to !emitc.opaque<"int">
+                    return %0 : !emitc.opaque<"int">
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_cmp() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i1_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = cmp(CmpPredicate::LessThan, lhs, rhs, i1_type, location);
+            assert_eq!(op.predicate(), CmpPredicate::LessThan);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("cmp", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @cmp(%arg0: i32, %arg1: i32) -> i1 {
+                    %0 = cmp lt, %arg0, %arg1 : (i32, i32) -> i1
+                    return %0 : i1
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_constant() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = constant(context.integer_attribute(i32_type, 3), i32_type, location);
+            assert_eq!(op.value().to_string(), "3 : i32");
+            assert_eq!(ConstantOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("constant", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @constant() -> i32 {
+                    %0 = "emitc.constant"() <{value = 3 : i32}> : () -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_dereference() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let pointer_i32_type = context.emit_c_pointer_type(i32_type);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let variable_op =
+                block.append_operation(variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location));
+            let address_op =
+                block.append_operation(address_of(variable_op.result(0).unwrap().as_ref(), pointer_i32_type, location));
+            let op = dereference(address_op.result(0).unwrap().as_ref(), lvalue_i32_type, location);
+            assert_eq!(UnaryExpressionOperation::operand(&op), address_op.result(0).unwrap().as_ref());
+            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+            let op = block.append_operation(op);
+            let load_op = block.append_operation(load(op.result(0).unwrap().as_ref(), i32_type, location));
+            block.append_operation(r#return(Some(load_op.result(0).unwrap().as_ref()), location));
+            func("dereference", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @dereference() -> i32 {
+                    %0 = "emitc.variable"() <{value = 0 : i32}> : () -> !emitc.lvalue<i32>
+                    %1 = address_of %0 : !emitc.lvalue<i32>
+                    %2 = dereference %1 : !emitc.ptr<i32>
+                    %3 = load %2 : <i32>
+                    return %3 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_div() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = div(lhs, rhs, i32_type, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("div", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @div(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = div %arg0, %arg1 : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_expression() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let mut region = context.region();
+            let mut body = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let body_lhs = body.argument(0).unwrap();
+            let body_rhs = body.argument(1).unwrap();
+            let add_op = body.append_operation(add(body_lhs, body_rhs, i32_type, location));
+            body.append_operation(r#yield(Some(add_op.result(0).unwrap().as_ref()), location));
+            region.append_block(body);
+            let op = expression(&[lhs.as_ref(), rhs.as_ref()], i32_type.as_ref(), region.into(), true, location);
+            assert_eq!(op.definitions(), vec![lhs.as_ref(), rhs.as_ref()]);
+            assert!(op.do_not_inline());
+            assert_eq!(ExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            assert_eq!(op.body().blocks().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("expression", function_type, block.into(), None, None, None, location)
+        });
+
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @expression(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = expression %arg0, %arg1 : (i32, i32) -> i32 {
+                      %1 = add %arg0, %arg1 : (i32, i32) -> i32
+                      yield %1 : i32
+                    }
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_for() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref(), i32_type.as_ref()], &[]);
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let lower_bound = block.argument(0).unwrap();
+            let upper_bound = block.argument(1).unwrap();
+            let step = block.argument(2).unwrap();
+            let mut body = context.block(&[(i32_type.as_ref(), location)]);
+            body.append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location));
+            let op = r#for(lower_bound, upper_bound, step, body.into(), location);
+            assert_eq!(op.lower_bound(), lower_bound);
+            assert_eq!(op.upper_bound(), upper_bound);
+            assert_eq!(op.step(), step);
+            assert_eq!(op.body().blocks().count(), 1);
+            block.append_operation(op);
+            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
+            func("for", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @for(%arg0: i32, %arg1: i32, %arg2: i32) {
+                    for %arg3 = %arg0 to %arg1 step %arg2  : i32 {
+                    }
+                    return
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_call() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let callee_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
+        let caller_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let argument = block.argument(0).unwrap();
+            block.append_operation(r#return(Some(argument.as_ref()), location));
+            func("callee", callee_type, block.into(), None, None, None, location)
+        });
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let argument = block.argument(0).unwrap();
+            let op = call("callee", &[argument.as_ref()], &[i32_type.as_ref()], None, None, location);
+            assert_eq!(op.callee().reference().as_str().unwrap(), "callee");
+            assert_eq!(op.arguments(), vec![argument.as_ref()]);
+            assert_eq!(op.outputs().len(), 1);
+            assert_eq!(op.outputs()[0].r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("caller", caller_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @callee(%arg0: i32) -> i32 {
+                    return %arg0 : i32
+                  }
+                  emitc.func @caller(%arg0: i32) -> i32 {
+                    %0 = call @callee(%arg0) : (i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_declare_func() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[]);
+        let op = declare_func("declared", location);
+        assert_eq!(op.symbol_name().reference().as_str().unwrap(), "declared");
+        module.body().append_operation(op);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
+            func("declared", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.declare_func @declared
+                  emitc.func @declared() {
+                    return
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_func() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[]);
+        let specifiers = context.array_attribute(&[context.string_attribute("static")]);
+        let mut block = context.block_with_no_arguments();
+        block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
+        let op = func("empty", function_type, block.into(), Some(specifiers), None, None, location);
+        assert_eq!(op.symbol_name().as_str().unwrap(), "empty");
+        assert_eq!(op.function_type(), function_type);
+        assert_eq!(op.specifiers().unwrap().len(), 1);
+        assert_eq!(op.body().blocks().count(), 1);
+        module.body().append_operation(op);
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @empty() attributes {specifiers = ["static"]} {
+                    return
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_return() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let constant_op =
+                block.append_operation(constant(context.integer_attribute(i32_type, 1), i32_type, location));
+            let op = r#return(Some(constant_op.result(0).unwrap().as_ref()), location);
+            assert_eq!(op.value(), Some(constant_op.result(0).unwrap().as_ref()));
+            block.append_operation(op);
+            func("return", function_type, block.into(), None, None, None, location)
+        });
+
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @return() -> i32 {
                     %0 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
-                    %1 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
-                    %2 = add %0, %1 : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_include() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let op = include("stdint.h", true, location);
+        assert_eq!(op.include().as_str().unwrap(), "stdint.h");
+        assert!(op.is_standard_include());
+        module.body().append_operation(op);
+
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.include <"stdint.h">
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_literal() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let opaque_pointer_type = context.emit_c_opaque_type("int *");
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[opaque_pointer_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = literal("nullptr", opaque_pointer_type, location);
+            assert_eq!(op.value().as_str().unwrap(), "nullptr");
+            assert_eq!(LiteralOperation::output(&op).r#type(), opaque_pointer_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("literal", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @literal() -> !emitc.opaque<"int *"> {
+                    %0 = literal "nullptr" : !emitc.opaque<"int *">
+                    return %0 : !emitc.opaque<"int *">
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_logical_and() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i1_type.as_ref(), i1_type.as_ref()], &[i1_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i1_type.as_ref(), location), (i1_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = logical_and(lhs, rhs, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("logical_and", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @logical_and(%arg0: i1, %arg1: i1) -> i1 {
+                    %0 = logical_and %arg0, %arg1 : i1, i1
+                    return %0 : i1
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_logical_not() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[i1_type.as_ref()], &[i1_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i1_type.as_ref(), location)]);
+            let operand = block.argument(0).unwrap();
+            let op = logical_not(operand, location);
+            assert_eq!(UnaryExpressionOperation::operand(&op), operand);
+            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("logical_not", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @logical_not(%arg0: i1) -> i1 {
+                    %0 = logical_not %arg0 : i1
+                    return %0 : i1
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_logical_or() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i1_type.as_ref(), i1_type.as_ref()], &[i1_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i1_type.as_ref(), location), (i1_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = logical_or(lhs, rhs, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("logical_or", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @logical_or(%arg0: i1, %arg1: i1) -> i1 {
+                    %0 = logical_or %arg0, %arg1 : i1, i1
+                    return %0 : i1
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_load() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let variable_op =
+                block.append_operation(variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location));
+            let variable_value = variable_op.result(0).unwrap().as_ref();
+            let op = load(variable_value, i32_type, location);
+            assert_eq!(UnaryExpressionOperation::operand(&op), variable_value);
+            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("load", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @load() -> i32 {
+                    %0 = "emitc.variable"() <{value = 0 : i32}> : () -> !emitc.lvalue<i32>
+                    %1 = load %0 : <i32>
+                    return %1 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_mul() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = mul(lhs, rhs, i32_type, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("mul", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @mul(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = mul %arg0, %arg1 : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_rem() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = rem(lhs, rhs, i32_type, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("rem", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @rem(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = rem %arg0, %arg1 : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_sub() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = sub(lhs, rhs, i32_type, location);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("sub", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @sub(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = sub %arg0, %arg1 : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_member() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let opaque_box_type = context.emit_c_opaque_type("Box");
+        let lvalue_box_type = context.emit_c_lvalue_type(opaque_box_type);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let variable_op =
+                block.append_operation(variable(context.emit_c_opaque_attribute("box"), lvalue_box_type, location));
+            let variable_value = variable_op.result(0).unwrap().as_ref();
+            let op = member("field", variable_value, lvalue_i32_type, location);
+            assert_eq!(op.member().as_str().unwrap(), "field");
+            assert_eq!(UnaryExpressionOperation::operand(&op), variable_value);
+            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+            let op = block.append_operation(op);
+            let load_op = block.append_operation(load(op.result(0).unwrap().as_ref(), i32_type, location));
+            block.append_operation(r#return(Some(load_op.result(0).unwrap().as_ref()), location));
+            func("member", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @member() -> i32 {
+                    %0 = "emitc.variable"() <{value = #emitc.opaque<"box">}> : () -> !emitc.lvalue<!emitc.opaque<"Box">>
+                    %1 = "emitc.member"(%0) <{member = "field"}> : (!emitc.lvalue<!emitc.opaque<"Box">>) -> !emitc.lvalue<i32>
+                    %2 = load %1 : <i32>
                     return %2 : i32
                   }
                 }
@@ -2182,273 +3224,270 @@ mod tests {
     }
 
     #[test]
-    fn test_expression_operation_constructors_and_accessors() {
+    fn test_member_of_ptr() {
         let context = Context::new();
         let location = context.unknown_location();
-        let i1_type = context.signless_integer_type(1);
+        let module = context.module(location);
         let i32_type = context.signless_integer_type(32);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
-        let pointer_i32_type = context.emit_c_pointer_type(i32_type);
-        let array_i32_type = context.emit_c_array_type(i32_type, &[4]);
         let opaque_box_type = context.emit_c_opaque_type("Box");
-        let lvalue_box_type = context.emit_c_lvalue_type(opaque_box_type);
         let pointer_box_type = context.emit_c_pointer_type(opaque_box_type);
         let lvalue_pointer_box_type = context.emit_c_lvalue_type(pointer_box_type);
-        let function_type =
-            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref(), i1_type.as_ref()], &[]);
-        let module = context.module(location);
-        let mut block = context.block(&[
-            (i32_type.as_ref(), location),
-            (i32_type.as_ref(), location),
-            (i1_type.as_ref(), location),
-        ]);
-        let lhs = block.argument(0).unwrap();
-        let rhs = block.argument(1).unwrap();
-        let condition = block.argument(2).unwrap();
-
-        let op = variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location);
-        assert_eq!(op.value().to_string(), "0 : i32");
-        assert_eq!(VariableOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-        let op = block.append_operation(op);
-        let lvalue = op.result(0).unwrap().as_ref();
-
-        let op = literal("values", array_i32_type, location);
-        assert_eq!(op.value().as_str().unwrap(), "values");
-        assert_eq!(LiteralOperation::output(&op).r#type(), array_i32_type.as_ref());
-        let op = block.append_operation(op);
-        let array = op.result(0).unwrap().as_ref();
-
-        let op = variable(context.emit_c_opaque_attribute("box"), lvalue_box_type, location);
-        assert_eq!(VariableOperation::output(&op).r#type(), lvalue_box_type.as_ref());
-        let op = block.append_operation(op);
-        let box_lvalue = op.result(0).unwrap().as_ref();
-
-        let op = address_of(box_lvalue, pointer_box_type, location);
-        assert_eq!(UnaryExpressionOperation::operand(&op), box_lvalue);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_box_type.as_ref());
-        block.append_operation(op);
-
-        let op = variable(context.emit_c_opaque_attribute("box_ptr"), lvalue_pointer_box_type, location);
-        assert_eq!(VariableOperation::output(&op).r#type(), lvalue_pointer_box_type.as_ref());
-        let op = block.append_operation(op);
-        let box_pointer_lvalue = op.result(0).unwrap().as_ref();
-
-        let op = address_of(lvalue, pointer_i32_type, location);
-        assert_eq!(UnaryExpressionOperation::operand(&op), lvalue);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_i32_type.as_ref());
-        let op = block.append_operation(op);
-        let pointer = op.result(0).unwrap().as_ref();
-
-        let op = apply("&", lvalue, pointer_i32_type, location);
-        assert_eq!(op.applicable_operator().as_str().unwrap(), "&");
-        assert_eq!(UnaryExpressionOperation::operand(&op), lvalue);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = bitwise_and(lhs, rhs, i32_type, location);
-        assert_eq!(op.lhs(), lhs);
-        assert_eq!(op.rhs(), rhs);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = bitwise_left_shift(lhs, rhs, i32_type, location);
-        assert_eq!(op.lhs(), lhs);
-        assert_eq!(op.rhs(), rhs);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = bitwise_not(lhs, i32_type, location);
-        assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = bitwise_or(lhs, rhs, i32_type, location);
-        assert_eq!(op.lhs(), lhs);
-        assert_eq!(op.rhs(), rhs);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = bitwise_right_shift(lhs, rhs, i32_type, location);
-        assert_eq!(op.lhs(), lhs);
-        assert_eq!(op.rhs(), rhs);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = bitwise_xor(lhs, rhs, i32_type, location);
-        assert_eq!(op.lhs(), lhs);
-        assert_eq!(op.rhs(), rhs);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = cast(lhs, context.emit_c_opaque_type("int"), location);
-        assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), context.emit_c_opaque_type("int").as_ref());
-        block.append_operation(op);
-
-        let op = cmp(CmpPredicate::LessThan, lhs, rhs, i1_type, location);
-        assert_eq!(op.predicate(), CmpPredicate::LessThan);
-        assert_eq!(op.lhs(), lhs);
-        assert_eq!(op.rhs(), rhs);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
-        block.append_operation(op);
-
-        let op = constant(context.integer_attribute(i32_type, 3), i32_type, location);
-        assert_eq!(op.value().to_string(), "3 : i32");
-        assert_eq!(ConstantOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = dereference(pointer, lvalue_i32_type, location);
-        assert_eq!(UnaryExpressionOperation::operand(&op), pointer);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = div(lhs, rhs, i32_type, location);
-        assert_eq!(op.lhs(), lhs);
-        assert_eq!(op.rhs(), rhs);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = logical_and(condition, condition, location);
-        assert_eq!(op.lhs(), condition);
-        assert_eq!(op.rhs(), condition);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
-        block.append_operation(op);
-
-        let op = logical_not(condition, location);
-        assert_eq!(UnaryExpressionOperation::operand(&op), condition);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
-        block.append_operation(op);
-
-        let op = logical_or(condition, condition, location);
-        assert_eq!(op.lhs(), condition);
-        assert_eq!(op.rhs(), condition);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
-        block.append_operation(op);
-
-        let op = load(lvalue, i32_type, location);
-        assert_eq!(UnaryExpressionOperation::operand(&op), lvalue);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = mul(lhs, rhs, i32_type, location);
-        assert_eq!(op.lhs(), lhs);
-        assert_eq!(op.rhs(), rhs);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = rem(lhs, rhs, i32_type, location);
-        assert_eq!(op.lhs(), lhs);
-        assert_eq!(op.rhs(), rhs);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = sub(lhs, rhs, i32_type, location);
-        assert_eq!(op.lhs(), lhs);
-        assert_eq!(op.rhs(), rhs);
-        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = member("field", box_lvalue, lvalue_i32_type, location);
-        assert_eq!(op.member().as_str().unwrap(), "field");
-        assert_eq!(UnaryExpressionOperation::operand(&op), box_lvalue);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = member_of_ptr("field", box_pointer_lvalue, lvalue_i32_type, location);
-        assert_eq!(op.member().as_str().unwrap(), "field");
-        assert_eq!(UnaryExpressionOperation::operand(&op), box_pointer_lvalue);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = conditional(condition, lhs, rhs, i32_type, location);
-        assert_eq!(op.condition(), condition);
-        assert_eq!(op.true_value(), lhs);
-        assert_eq!(op.false_value(), rhs);
-        assert_eq!(ConditionalOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = unary_minus(lhs, i32_type, location);
-        assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = unary_plus(lhs, i32_type, location);
-        assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
-        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = subscript(array, &[lhs.as_ref()], lvalue_i32_type, location);
-        assert_eq!(op.value(), array);
-        assert_eq!(op.indices(), vec![lhs.as_ref()]);
-        assert_eq!(SubscriptOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-        block.append_operation(op);
-
-        let op = assign(lvalue, lhs, location);
-        assert_eq!(op.variable(), lvalue);
-        assert_eq!(op.value(), lhs);
-        block.append_operation(op);
-
-        let op = verbatim("value = {}", &[lhs.as_ref()], location);
-        assert_eq!(op.value().as_str().unwrap(), "value = {}");
-        assert_eq!(op.format_arguments(), vec![lhs.as_ref()]);
-        block.append_operation(op);
-
-        let mut expression_region = context.region();
-        let mut expression_block = context.block_with_no_arguments();
-        let expression_value =
-            expression_block.append_operation(constant(context.integer_attribute(i32_type, 4), i32_type, location));
-        let op = r#yield(Some(expression_value.result(0).unwrap().as_ref()), location);
-        assert_eq!(op.value(), Some(expression_value.result(0).unwrap().as_ref()));
-        expression_block.append_operation(op);
-        expression_region.append_block(expression_block);
-        let op = expression(&[lhs.as_ref()], i32_type.as_ref(), expression_region.into(), true, location);
-        assert_eq!(op.definitions(), vec![lhs.as_ref()]);
-        assert!(op.do_not_inline());
-        assert_eq!(ExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        assert_eq!(op.body().blocks().count(), 1);
-
-        block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
-        module
-            .body()
-            .append_operation(func("expression_ops", function_type, block.into(), None, None, None, location));
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let variable_op = block.append_operation(variable(
+                context.emit_c_opaque_attribute("box_ptr"),
+                lvalue_pointer_box_type,
+                location,
+            ));
+            let variable_value = variable_op.result(0).unwrap().as_ref();
+            let op = member_of_ptr("field", variable_value, lvalue_i32_type, location);
+            assert_eq!(op.member().as_str().unwrap(), "field");
+            assert_eq!(UnaryExpressionOperation::operand(&op), variable_value);
+            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+            let op = block.append_operation(op);
+            let load_op = block.append_operation(load(op.result(0).unwrap().as_ref(), i32_type, location));
+            block.append_operation(r#return(Some(load_op.result(0).unwrap().as_ref()), location));
+            func("member_of_ptr", function_type, block.into(), None, None, None, location)
+        });
         assert!(module.verify());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
                 module {
-                  emitc.func @expression_ops(%arg0: i32, %arg1: i32, %arg2: i1) {
+                  emitc.func @member_of_ptr() -> i32 {
+                    %0 = "emitc.variable"() <{value = #emitc.opaque<"box_ptr">}> : () -> !emitc.lvalue<!emitc.ptr<!emitc.opaque<"Box">>>
+                    %1 = "emitc.member_of_ptr"(%0) <{member = "field"}> : (!emitc.lvalue<!emitc.ptr<!emitc.opaque<"Box">>>) -> !emitc.lvalue<i32>
+                    %2 = load %1 : <i32>
+                    return %2 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_conditional() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        let function_type = context.function_type::<TypeRef, TypeRef>(
+            &[i1_type.as_ref(), i32_type.as_ref(), i32_type.as_ref()],
+            &[i32_type.as_ref()],
+        );
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i1_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let condition = block.argument(0).unwrap();
+            let true_value = block.argument(1).unwrap();
+            let false_value = block.argument(2).unwrap();
+            let op = conditional(condition, true_value, false_value, i32_type, location);
+            assert_eq!(op.condition(), condition);
+            assert_eq!(op.true_value(), true_value);
+            assert_eq!(op.false_value(), false_value);
+            assert_eq!(ConditionalOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("conditional", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @conditional(%arg0: i1, %arg1: i32, %arg2: i32) -> i32 {
+                    %0 = conditional %arg0, %arg1, %arg2 : i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_unary_minus() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let operand = block.argument(0).unwrap();
+            let op = unary_minus(operand, i32_type, location);
+            assert_eq!(UnaryExpressionOperation::operand(&op), operand);
+            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("unary_minus", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @unary_minus(%arg0: i32) -> i32 {
+                    %0 = unary_minus %arg0 : (i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_unary_plus() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let operand = block.argument(0).unwrap();
+            let op = unary_plus(operand, i32_type, location);
+            assert_eq!(UnaryExpressionOperation::operand(&op), operand);
+            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("unary_plus", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @unary_plus(%arg0: i32) -> i32 {
+                    %0 = unary_plus %arg0 : (i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_variable() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[]);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location);
+            assert_eq!(op.value().to_string(), "0 : i32");
+            assert_eq!(VariableOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+            block.append_operation(op);
+            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
+            func("variable", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @variable() {
                     %0 = "emitc.variable"() <{value = 0 : i32}> : () -> !emitc.lvalue<i32>
-                    %1 = literal "values" : !emitc.array<4xi32>
-                    %2 = "emitc.variable"() <{value = #emitc.opaque<"box">}> : () -> !emitc.lvalue<!emitc.opaque<"Box">>
-                    %3 = address_of %2 : !emitc.lvalue<!emitc.opaque<"Box">>
-                    %4 = "emitc.variable"() <{value = #emitc.opaque<"box_ptr">}> : () -> !emitc.lvalue<!emitc.ptr<!emitc.opaque<"Box">>>
-                    %5 = address_of %0 : !emitc.lvalue<i32>
-                    %6 = apply "&"(%0) : (!emitc.lvalue<i32>) -> !emitc.ptr<i32>
-                    %7 = bitwise_and %arg0, %arg1 : (i32, i32) -> i32
-                    %8 = bitwise_left_shift %arg0, %arg1 : (i32, i32) -> i32
-                    %9 = bitwise_not %arg0 : (i32) -> i32
-                    %10 = bitwise_or %arg0, %arg1 : (i32, i32) -> i32
-                    %11 = bitwise_right_shift %arg0, %arg1 : (i32, i32) -> i32
-                    %12 = bitwise_xor %arg0, %arg1 : (i32, i32) -> i32
-                    %13 = cast %arg0 : i32 to !emitc.opaque<"int">
-                    %14 = cmp lt, %arg0, %arg1 : (i32, i32) -> i1
-                    %15 = "emitc.constant"() <{value = 3 : i32}> : () -> i32
-                    %16 = dereference %5 : !emitc.ptr<i32>
-                    %17 = div %arg0, %arg1 : (i32, i32) -> i32
-                    %18 = logical_and %arg2, %arg2 : i1, i1
-                    %19 = logical_not %arg2 : i1
-                    %20 = logical_or %arg2, %arg2 : i1, i1
-                    %21 = load %0 : <i32>
-                    %22 = mul %arg0, %arg1 : (i32, i32) -> i32
-                    %23 = rem %arg0, %arg1 : (i32, i32) -> i32
-                    %24 = sub %arg0, %arg1 : (i32, i32) -> i32
-                    %25 = "emitc.member"(%2) <{member = "field"}> : (!emitc.lvalue<!emitc.opaque<"Box">>) -> !emitc.lvalue<i32>
-                    %26 = "emitc.member_of_ptr"(%4) <{member = "field"}> : (!emitc.lvalue<!emitc.ptr<!emitc.opaque<"Box">>>) -> !emitc.lvalue<i32>
-                    %27 = conditional %arg2, %arg0, %arg1 : i32
-                    %28 = unary_minus %arg0 : (i32) -> i32
-                    %29 = unary_plus %arg0 : (i32) -> i32
-                    %30 = subscript %1[%arg0] : (!emitc.array<4xi32>, i32) -> !emitc.lvalue<i32>
-                    assign %arg0 : i32 to %0 : <i32>
+                    return
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_global() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let initial_value = context.integer_attribute(i32_type, 7).as_ref();
+        let op = global("counter", i32_type, Some(initial_value), false, true, true, location);
+        assert_eq!(op.symbol_name().as_str().unwrap(), "counter");
+        assert_eq!(op.r#type(), i32_type.as_ref());
+        assert_eq!(op.initial_value(), Some(initial_value));
+        assert!(!op.extern_specifier());
+        assert!(op.static_specifier());
+        assert!(op.const_specifier());
+        module.body().append_operation(op);
+
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.global static const @counter : i32 = 7
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_get_global() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
+        module.body().append_operation(global("counter", i32_type, None, true, false, false, location));
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = get_global("counter", lvalue_i32_type, location);
+            assert_eq!(GetGlobalOperation::name(&op).reference().as_str().unwrap(), "counter");
+            assert_eq!(GetGlobalOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+            let op = block.append_operation(op);
+            let load_op = block.append_operation(load(op.result(0).unwrap().as_ref(), i32_type, location));
+            block.append_operation(r#return(Some(load_op.result(0).unwrap().as_ref()), location));
+            func("get_global", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.global extern @counter : i32
+                  emitc.func @get_global() -> i32 {
+                    %0 = get_global @counter : !emitc.lvalue<i32>
+                    %1 = load %0 : <i32>
+                    return %1 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_verbatim() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let argument = block.argument(0).unwrap();
+            let op = verbatim("value = {}", &[argument.as_ref()], location);
+            assert_eq!(op.value().as_str().unwrap(), "value = {}");
+            assert_eq!(op.format_arguments(), vec![argument.as_ref()]);
+            block.append_operation(op);
+            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
+            func("verbatim", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @verbatim(%arg0: i32) {
                     verbatim "value = {}" args %arg0 : i32
                     return
                   }
@@ -2458,203 +3497,349 @@ mod tests {
     }
 
     #[test]
-    fn test_call_symbol_and_region_operation_constructors_and_accessors() {
+    fn test_assign() {
         let context = Context::new();
         let location = context.unknown_location();
-        let i32_type = context.signless_integer_type(32);
-        let block = context.block(&[(i32_type.as_ref(), location)]);
-        let argument = block.argument(0).unwrap();
-
-        let empty_array_attribute = context.array_attribute::<AttributeRef>(&[]);
-        let op = call_opaque(
-            "opaque",
-            &[argument.as_ref()],
-            &[i32_type.as_ref()],
-            Some(empty_array_attribute),
-            Some(empty_array_attribute),
-            location,
-        );
-        assert_eq!(op.callee().as_str().unwrap(), "opaque");
-        assert!(op.args().unwrap().is_empty());
-        assert!(op.template_args().unwrap().is_empty());
-        assert_eq!(op.arguments(), vec![argument.as_ref()]);
-        assert_eq!(op.outputs().len(), 1);
-        assert_eq!(op.outputs()[0].r#type(), i32_type.as_ref());
-
-        let op = call("callee", &[argument.as_ref()], &[i32_type.as_ref()], None, None, location);
-        assert_eq!(op.callee().reference().as_str().unwrap(), "callee");
-        assert_eq!(op.arguments(), vec![argument.as_ref()]);
-        assert_eq!(op.outputs().len(), 1);
-        assert_eq!(op.outputs()[0].r#type(), i32_type.as_ref());
-
-        let op = declare_func("external", location);
-        assert_eq!(op.symbol_name().reference().as_str().unwrap(), "external");
-
-        let op = include("stdint.h", true, location);
-        assert_eq!(op.include().as_str().unwrap(), "stdint.h");
-        assert!(op.is_standard_include());
-
-        let op = include("local.h", false, location);
-        assert_eq!(op.include().as_str().unwrap(), "local.h");
-        assert!(!op.is_standard_include());
-
-        let op = literal("nullptr", context.emit_c_opaque_type("int *"), location);
-        assert_eq!(op.value().as_str().unwrap(), "nullptr");
-        assert_eq!(LiteralOperation::output(&op).r#type(), context.emit_c_opaque_type("int *").as_ref());
-
-        let op = expression(
-            &[argument.as_ref()],
-            i32_type.as_ref(),
-            context.block_with_no_arguments().into(),
-            true,
-            location,
-        );
-        assert_eq!(op.definitions(), vec![argument.as_ref()]);
-        assert!(op.do_not_inline());
-        assert_eq!(ExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-        assert_eq!(op.body().blocks().count(), 1);
-
-        let op = expression(
-            &[argument.as_ref()],
-            i32_type.as_ref(),
-            context.block_with_no_arguments().into(),
-            false,
-            location,
-        );
-        assert_eq!(op.definitions(), vec![argument.as_ref()]);
-        assert!(!op.do_not_inline());
-        assert_eq!(ExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-
-        let op = r#for(argument, argument, argument, context.block_with_no_arguments().into(), location);
-        assert_eq!(op.lower_bound(), argument);
-        assert_eq!(op.upper_bound(), argument);
-        assert_eq!(op.step(), argument);
-        assert_eq!(op.body().blocks().count(), 1);
-
-        let op = file("generated.cc", context.block_with_no_arguments().into(), location);
-        assert_eq!(op.id().as_str().unwrap(), "generated.cc");
-        assert_eq!(op.body().blocks().count(), 1);
-
-        let initial_value = context.integer_attribute(i32_type, 7).as_ref();
-        let op = global("counter", i32_type, Some(initial_value), false, true, true, location);
-        assert_eq!(op.symbol_name().as_str().unwrap(), "counter");
-        assert_eq!(op.r#type(), i32_type.as_ref());
-        assert_eq!(op.initial_value(), Some(initial_value));
-        assert!(!op.extern_specifier());
-        assert!(op.static_specifier());
-        assert!(op.const_specifier());
-
-        let op = global("external_counter", i32_type, None, true, false, false, location);
-        assert_eq!(op.symbol_name().as_str().unwrap(), "external_counter");
-        assert_eq!(op.r#type(), i32_type.as_ref());
-        assert!(op.initial_value().is_none());
-        assert!(op.extern_specifier());
-        assert!(!op.static_specifier());
-        assert!(!op.const_specifier());
-
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
-        let op = get_global("counter", lvalue_i32_type, location);
-        assert_eq!(GetGlobalOperation::name(&op).reference().as_str().unwrap(), "counter");
-        assert_eq!(GetGlobalOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-
-        let op = r#if(
-            argument,
-            context.block_with_no_arguments().into(),
-            context.block_with_no_arguments().into(),
-            location,
-        );
-        assert_eq!(op.condition(), argument);
-        assert_eq!(op.then_region().blocks().count(), 1);
-        assert_eq!(op.else_region().blocks().count(), 1);
-
-        let op = switch(
-            argument,
-            &[1, 2],
-            context.block_with_no_arguments().into(),
-            vec![context.block_with_no_arguments().into(), context.block_with_no_arguments().into()],
-            location,
-        );
-        assert_eq!(op.argument(), argument);
-        assert_eq!(op.cases().values().collect::<Vec<_>>(), vec![1, 2]);
-        assert_eq!(op.default_region().blocks().count(), 1);
-        assert_eq!(op.case_regions().len(), 2);
-
-        let op = field("value", i32_type, Some(initial_value), location);
-        assert_eq!(op.symbol_name().as_str().unwrap(), "value");
-        assert_eq!(op.r#type(), i32_type.as_ref());
-        assert_eq!(op.initial_value(), Some(initial_value));
-
-        let op = field("empty", i32_type, None, location);
-        assert_eq!(op.symbol_name().as_str().unwrap(), "empty");
-        assert_eq!(op.r#type(), i32_type.as_ref());
-        assert!(op.initial_value().is_none());
-
-        let op = class("Box", true, context.block_with_no_arguments().into(), location);
-        assert_eq!(op.symbol_name().as_str().unwrap(), "Box");
-        assert!(op.final_specifier());
-        assert_eq!(op.body().blocks().count(), 1);
-
-        let op = class("OpenBox", false, context.block_with_no_arguments().into(), location);
-        assert_eq!(op.symbol_name().as_str().unwrap(), "OpenBox");
-        assert!(!op.final_specifier());
-        assert_eq!(op.body().blocks().count(), 1);
-
-        let op = get_field("value", i32_type, location);
-        assert_eq!(op.field_name().reference().as_str().unwrap(), "value");
-        assert_eq!(GetFieldOperation::output(&op).r#type(), i32_type.as_ref());
-
-        let op = r#do(context.block_with_no_arguments().into(), context.block_with_no_arguments().into(), location);
-        assert_eq!(op.body().blocks().count(), 1);
-        assert_eq!(op.condition().blocks().count(), 1);
-
-        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[]);
-        let op = func("empty", function_type, context.block_with_no_arguments().into(), None, None, None, location);
-        assert_eq!(op.symbol_name().as_str().unwrap(), "empty");
-        assert_eq!(op.function_type(), function_type);
-        assert!(op.specifiers().is_none());
-
-        let specifiers = context.array_attribute(&[context.string_attribute("static")]);
-        let op = func(
-            "static_empty",
-            function_type,
-            context.block_with_no_arguments().into(),
-            Some(specifiers),
-            None,
-            None,
-            location,
-        );
-        assert_eq!(op.symbol_name().as_str().unwrap(), "static_empty");
-        assert_eq!(op.function_type(), function_type);
-        assert_eq!(op.specifiers().unwrap().len(), 1);
-
-        let op = r#return(Option::<ValueRef<'_, '_, '_>>::None, location);
-        assert!(op.value().is_none());
-
-        let op = r#yield(Option::<ValueRef<'_, '_, '_>>::None, location);
-        assert!(op.value().is_none());
-
         let module = context.module(location);
-        module.body().append_operation(include("stdint.h", true, location));
-        module.body().append_operation(include("local.h", false, location));
-        module.body().append_operation(declare_func("empty", location));
-        module
-            .body()
-            .append_operation(global("counter", i32_type, Some(initial_value), false, true, true, location));
-        let mut body = context.block_with_no_arguments();
-        body.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
-        module
-            .body()
-            .append_operation(func("empty", function_type, body.into(), None, None, None, location));
+        let i32_type = context.signless_integer_type(32);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let value = block.argument(0).unwrap();
+            let variable_op =
+                block.append_operation(variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location));
+            let variable_value = variable_op.result(0).unwrap().as_ref();
+            let op = assign(variable_value, value, location);
+            assert_eq!(op.variable(), variable_value);
+            assert_eq!(op.value(), value);
+            block.append_operation(op);
+            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
+            func("assign", function_type, block.into(), None, None, None, location)
+        });
         assert!(module.verify());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
                 module {
-                  emitc.include <"stdint.h">
-                  emitc.include "local.h"
-                  emitc.declare_func @empty
-                  emitc.global static const @counter : i32 = 7
-                  emitc.func @empty() {
+                  emitc.func @assign(%arg0: i32) {
+                    %0 = "emitc.variable"() <{value = 0 : i32}> : () -> !emitc.lvalue<i32>
+                    assign %arg0 : i32 to %0 : <i32>
+                    return
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_yield() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let mut region = context.region();
+            let mut body = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let body_lhs = body.argument(0).unwrap();
+            let body_rhs = body.argument(1).unwrap();
+            let add_op = body.append_operation(add(body_lhs, body_rhs, i32_type, location));
+            let op = r#yield(Some(add_op.result(0).unwrap().as_ref()), location);
+            assert_eq!(op.value(), Some(add_op.result(0).unwrap().as_ref()));
+            body.append_operation(op);
+            region.append_block(body);
+            let expression_op = block.append_operation(expression(
+                &[lhs.as_ref(), rhs.as_ref()],
+                i32_type.as_ref(),
+                region.into(),
+                true,
+                location,
+            ));
+            block.append_operation(r#return(Some(expression_op.result(0).unwrap().as_ref()), location));
+            func("yield", function_type, block.into(), None, None, None, location)
+        });
+
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @yield(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = expression %arg0, %arg1 : (i32, i32) -> i32 {
+                      %1 = add %arg0, %arg1 : (i32, i32) -> i32
+                      yield %1 : i32
+                    }
+                    return %0 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_if() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[i1_type.as_ref()], &[]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i1_type.as_ref(), location)]);
+            let condition = block.argument(0).unwrap();
+            let mut then_region = context.block_with_no_arguments();
+            then_region.append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location));
+            let mut else_region = context.block_with_no_arguments();
+            else_region.append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location));
+            let op = r#if(condition, then_region.into(), else_region.into(), location);
+            assert_eq!(op.condition(), condition);
+            assert_eq!(op.then_region().blocks().count(), 1);
+            assert_eq!(op.else_region().blocks().count(), 1);
+            block.append_operation(op);
+            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
+            func("if", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @if(%arg0: i1) {
+                    if %arg0 {
+                    } else {
+                    }
+                    return
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_subscript() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let array_i32_type = context.emit_c_array_type(i32_type, &[4]);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let index = block.argument(0).unwrap();
+            let array_op = block.append_operation(literal("values", array_i32_type, location));
+            let array_value = array_op.result(0).unwrap().as_ref();
+            let op = subscript(array_value, &[index.as_ref()], lvalue_i32_type, location);
+            assert_eq!(op.value(), array_value);
+            assert_eq!(op.indices(), vec![index.as_ref()]);
+            assert_eq!(SubscriptOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+            let op = block.append_operation(op);
+            let load_op = block.append_operation(load(op.result(0).unwrap().as_ref(), i32_type, location));
+            block.append_operation(r#return(Some(load_op.result(0).unwrap().as_ref()), location));
+            func("subscript", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @subscript(%arg0: i32) -> i32 {
+                    %0 = literal "values" : !emitc.array<4xi32>
+                    %1 = subscript %0[%arg0] : (!emitc.array<4xi32>, i32) -> !emitc.lvalue<i32>
+                    %2 = load %1 : <i32>
+                    return %2 : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_switch() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[]);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let argument = block.argument(0).unwrap();
+            let mut default_region = context.block_with_no_arguments();
+            default_region.append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location));
+            let mut case_region = context.block_with_no_arguments();
+            case_region.append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location));
+            let op = switch(argument, &[1], default_region.into(), vec![case_region.into()], location);
+            assert_eq!(op.argument(), argument);
+            assert_eq!(op.cases().values().collect::<Vec<_>>(), vec![1]);
+            assert_eq!(op.default_region().blocks().count(), 1);
+            assert_eq!(op.case_regions().len(), 1);
+            block.append_operation(op);
+            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
+            func("switch", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            // The MLIR printer currently emits a trailing space after the `emitc.switch` argument type.
+            concat!(
+                "module {\n",
+                "  emitc.func @switch(%arg0: i32) {\n",
+                "    switch %arg0 : i32 \n",
+                "    case 1 {\n",
+                "      yield\n",
+                "    }\n",
+                "    default {\n",
+                "    }\n",
+                "    return\n",
+                "  }\n",
+                "}\n",
+            ),
+        );
+    }
+
+    #[test]
+    fn test_class() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let mut body = context.block_with_no_arguments();
+        body.append_operation(field("value", context.signless_integer_type(32), None, location));
+        let op = class("Box", true, body.into(), location);
+        assert_eq!(op.symbol_name().as_str().unwrap(), "Box");
+        assert!(op.final_specifier());
+        assert_eq!(op.body().blocks().count(), 1);
+        module.body().append_operation(op);
+
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.class final @Box {
+                    emitc.field @value : i32
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_field() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let initial_value = context.integer_attribute(i32_type, 7).as_ref();
+        let mut body = context.block_with_no_arguments();
+        let op = field("value", i32_type, Some(initial_value), location);
+        assert_eq!(op.symbol_name().as_str().unwrap(), "value");
+        assert_eq!(op.r#type(), i32_type.as_ref());
+        assert_eq!(op.initial_value(), Some(initial_value));
+        body.append_operation(op);
+        module.body().append_operation(class("Box", false, body.into(), location));
+
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.class @Box {
+                    emitc.field @value : i32 = 7
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_get_field() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
+        let mut class_body = context.block_with_no_arguments();
+        class_body.append_operation(field("value", i32_type, None, location));
+        class_body.append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = get_field("value", i32_type, location);
+            assert_eq!(op.field_name().reference().as_str().unwrap(), "value");
+            assert_eq!(GetFieldOperation::output(&op).r#type(), i32_type.as_ref());
+            let op = block.append_operation(op);
+            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
+            func("get_field", function_type, block.into(), None, None, None, location)
+        });
+        module.body().append_operation(class("Box", false, class_body.into(), location));
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.class @Box {
+                    emitc.field @value : i32
+                    emitc.func @get_field() -> i32 {
+                      %0 = get_field @value : i32
+                      return %0 : i32
+                    }
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_do() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[]);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let mut body = context.block_with_no_arguments();
+            body.append_operation(verbatim("side_effect()", &[], location));
+
+            let mut condition = context.block_with_no_arguments();
+            let mut expression_region = context.region();
+            let mut expression_body = context.block_with_no_arguments();
+            let literal_op = expression_body.append_operation(literal("true", i1_type, location));
+            expression_body.append_operation(r#yield(Some(literal_op.result(0).unwrap().as_ref()), location));
+            expression_region.append_block(expression_body);
+            let expression_op = condition.append_operation(expression(
+                &[],
+                i1_type.as_ref(),
+                expression_region.into(),
+                false,
+                location,
+            ));
+            condition.append_operation(r#yield(Some(expression_op.result(0).unwrap().as_ref()), location));
+
+            let op = r#do(body.into(), condition.into(), location);
+            assert_eq!(op.body().blocks().count(), 1);
+            assert_eq!(op.condition().blocks().count(), 1);
+            block.append_operation(op);
+            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
+            func("do", function_type, block.into(), None, None, None, location)
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @do() {
+                    do {
+                      verbatim "side_effect()"
+                    } while {
+                      %0 = expression  : () -> i1 {
+                        %1 = literal "true" : i1
+                        yield %1 : i1
+                      }
+                      yield %0 : i1
+                    }
                     return
                   }
                 }
