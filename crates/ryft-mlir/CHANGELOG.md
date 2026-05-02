@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the Triton `tt` dialect.
 - Added support for the Mosaic GPU dialect.
 - Added support for the Mosaic TPU dialect.
+- Added StableHLO mesh and sub-axis attribute wrappers.
 
 ### Changed
 

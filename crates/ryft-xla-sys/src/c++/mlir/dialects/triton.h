@@ -33,7 +33,15 @@ MlirType mlirTritonTtPointerTypeGetPointeeType(MlirType type);
 int32_t mlirTritonTtPointerTypeGetAddressSpace(MlirType type);
 
 bool mlirTypeIsATritonTtTensorDescType(MlirType type);
-MlirType mlirTritonTtTensorDescTypeGet(MlirType blockType);
+MlirType mlirTritonTtTensorDescTypeGet(
+    const int64_t *shape,
+    intptr_t shapeSize,
+    MlirType elementType,
+    MlirAttribute sharedLayout);
+intptr_t mlirTritonTtTensorDescTypeGetNumDims(MlirType type);
+int64_t mlirTritonTtTensorDescTypeGetDimSize(MlirType type, intptr_t dimension);
+MlirType mlirTritonTtTensorDescTypeGetElementType(MlirType type);
+MlirAttribute mlirTritonTtTensorDescTypeGetSharedLayout(MlirType type);
 MlirType mlirTritonTtTensorDescTypeGetBlockType(MlirType type);
 
 bool mlirAttributeIsATritonTtEnumAttr(MlirAttribute attribute, enum MlirTritonTtEnumAttribute kind);

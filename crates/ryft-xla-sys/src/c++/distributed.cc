@@ -16,7 +16,7 @@ const PJRT_Error *PJRT_Distributed_Runtime_Service_New(PJRT_Distributed_Runtime_
       std::unique_ptr<xla::DistributedRuntimeService> service,
       GetDistributedRuntimeService(std::string(args->address), options));
   args->service = service.release();
-  return new PJRT_Error{absl::Status()};
+  return nullptr;
 }
 
 void PJRT_Distributed_Runtime_Service_Shutdown(PJRT_Distributed_Runtime_Service_Shutdown_Args *args) {
@@ -37,7 +37,7 @@ const PJRT_Error *PJRT_Distributed_Runtime_Client_New(PJRT_Distributed_Runtime_C
   options.missed_heartbeat_callback =
       [user_arg = args->missed_heartbeat_callback_user_arg,
        callback = args->missed_heartbeat_callback](absl::Status status) {
-        auto error = new PJRT_Error{status};
+        PJRT_Error *error = pjrt::StatusToPjRtError(std::move(status));
         callback(error, user_arg);
       };
   options.shutdown_on_destruction = args->shutdown_on_destruction;
@@ -45,11 +45,11 @@ const PJRT_Error *PJRT_Distributed_Runtime_Client_New(PJRT_Distributed_Runtime_C
   auto channel = xla::GetDistributedRuntimeClientChannel(
       std::string(args->address), tsl::GetClientCredentials(false), args->use_compression);
   args->client = GetDistributedRuntimeClient(channel, options).release();
-  return new PJRT_Error{absl::Status()};
+  return nullptr;
 }
 
 PJRT_Error *PJRT_Distributed_Runtime_Client_Connect(PJRT_Distributed_Runtime_Client_Connect_Args *args) {
-  return new PJRT_Error{args->client->Connect()};
+  return pjrt::StatusToPjRtError(args->client->Connect());
 }
 
 PJRT_Error *PJRT_Distributed_Runtime_Client_Blocking_Key_Value_Get(
@@ -60,7 +60,7 @@ PJRT_Error *PJRT_Distributed_Runtime_Client_Blocking_Key_Value_Get(
   char *value = new char[_value.size() + 1];
   std::strcpy(value, _value.c_str());
   args->value = value;
-  return new PJRT_Error{absl::Status()};
+  return nullptr;
 }
 
 PJRT_Error *PJRT_Distributed_Runtime_Client_Key_Value_Try_Get(
@@ -69,16 +69,16 @@ PJRT_Error *PJRT_Distributed_Runtime_Client_Key_Value_Try_Get(
   char *value = new char[_value.size() + 1];
   std::strcpy(value, _value.c_str());
   args->value = value;
-  return new PJRT_Error{absl::Status()};
+  return nullptr;
 }
 
 PJRT_Error *PJRT_Distributed_Runtime_Client_Key_Value_Set(
     PJRT_Distributed_Runtime_Client_Key_Value_Set_Args *args) {
-  return new PJRT_Error{args->client->KeyValueSet(std::string(args->key), std::string(args->value))};
+  return pjrt::StatusToPjRtError(args->client->KeyValueSet(std::string(args->key), std::string(args->value)));
 }
 
 PJRT_Error *PJRT_Distributed_Runtime_Client_Shutdown(PJRT_Distributed_Runtime_Client_Shutdown_Args *args) {
-  return new PJRT_Error{args->client->Shutdown()};
+  return pjrt::StatusToPjRtError(args->client->Shutdown());
 }
 
 void PJRT_Distributed_Runtime_Client_Destroy(PJRT_Distributed_Runtime_Client_Destroy_Args *args) {

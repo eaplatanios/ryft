@@ -1,11 +1,14 @@
 use ryft_xla_sys::bindings::MlirType;
 use ryft_xla_sys::mlir::dialects::triton::tt::{
     mlirTritonTtPointerTypeGet, mlirTritonTtPointerTypeGetAddressSpace, mlirTritonTtPointerTypeGetPointeeType,
-    mlirTritonTtTensorDescTypeGet, mlirTritonTtTensorDescTypeGetBlockType, mlirTypeIsATritonTtPointerType,
-    mlirTypeIsATritonTtTensorDescType,
+    mlirTritonTtTensorDescTypeGet, mlirTritonTtTensorDescTypeGetBlockType, mlirTritonTtTensorDescTypeGetDimSize,
+    mlirTritonTtTensorDescTypeGetElementType, mlirTritonTtTensorDescTypeGetNumDims,
+    mlirTritonTtTensorDescTypeGetSharedLayout, mlirTypeIsATritonTtPointerType, mlirTypeIsATritonTtTensorDescType,
 };
 
-use crate::{Context, DialectHandle, TensorTypeRef, Type, TypeRef, mlir_subtype_trait_impls};
+use crate::{
+    Attribute, AttributeRef, Context, DialectHandle, Size, TensorTypeRef, Type, TypeRef, mlir_subtype_trait_impls,
+};
 
 /// Triton `tt` pointer [`Type`]. Pointer types represent addresses in a Triton address space and may point only to
 /// scalar element types.
@@ -56,9 +59,8 @@ impl<'c, 't> Type<'c, 't> for PointerTypeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(PointerTypeRef<'c, 't> as Type, mlir_type = Type);
 
-/// Triton `tt` tensor descriptor [`Type`]. Tensor descriptors represent tiled tensor memory access metadata.
-///
-/// The Triton version pinned by this repository models descriptors with a ranked tensor block type.
+/// Triton `tt` tensor descriptor [`Type`]. Tensor descriptors represent tiled tensor memory access metadata and are
+/// parameterized by a block shape, an element [`Type`], and an optional shared-memory layout attribute.
 ///
 /// Refer to the [official Triton dialect documentation](https://triton-lang.org/main/dialects/TritonDialect.html)
 /// for more information.
@@ -72,7 +74,28 @@ pub struct TensorDescTypeRef<'c, 't> {
 }
 
 impl<'c, 't> TensorDescTypeRef<'c, 't> {
-    /// Returns the ranked tensor block [`Type`] described by this descriptor.
+    /// Returns the block shape described by this descriptor.
+    pub fn shape(&self) -> Vec<Size> {
+        let dimension_count = unsafe { mlirTritonTtTensorDescTypeGetNumDims(self.handle) };
+        (0..dimension_count)
+            .map(|dimension| unsafe { Size::from_c_api(mlirTritonTtTensorDescTypeGetDimSize(self.handle, dimension)) })
+            .collect()
+    }
+
+    /// Returns the element [`Type`] described by this descriptor.
+    pub fn element_type(&self) -> TypeRef<'c, 't> {
+        unsafe {
+            TypeRef::from_c_api(mlirTritonTtTensorDescTypeGetElementType(self.handle), self.context)
+                .expect("invalid `!tt.tensordesc` element type")
+        }
+    }
+
+    /// Returns the optional shared-memory layout attribute described by this descriptor.
+    pub fn shared_layout(&self) -> Option<AttributeRef<'c, 't>> {
+        unsafe { AttributeRef::from_c_api(mlirTritonTtTensorDescTypeGetSharedLayout(self.handle), self.context) }
+    }
+
+    /// Returns the ranked tensor block [`Type`] derived from this descriptor's shape and element type.
     pub fn block_type(&self) -> TensorTypeRef<'c, 't> {
         unsafe {
             TensorTypeRef::from_c_api(mlirTritonTtTensorDescTypeGetBlockType(self.handle), self.context)
@@ -116,11 +139,25 @@ impl<'t> Context<'t> {
     }
 
     /// Creates a new Triton `tt` [`TensorDescTypeRef`] owned by this [`Context`].
-    pub fn triton_tt_tensor_desc_type<'c>(&'c self, block_type: TensorTypeRef<'c, 't>) -> TensorDescTypeRef<'c, 't> {
+    pub fn triton_tt_tensor_desc_type<'c, T: Type<'c, 't>>(
+        &'c self,
+        shape: &[Size],
+        element_type: T,
+        shared_layout: Option<AttributeRef<'c, 't>>,
+    ) -> TensorDescTypeRef<'c, 't> {
         self.load_dialect(DialectHandle::triton_tt());
+        let dimensions = shape.iter().map(|dimension| unsafe { dimension.to_c_api() }).collect::<Vec<_>>();
         unsafe {
-            TensorDescTypeRef::from_c_api(mlirTritonTtTensorDescTypeGet(block_type.to_c_api()), self)
-                .expect("invalid arguments to `Context::triton_tt_tensor_desc_type`")
+            TensorDescTypeRef::from_c_api(
+                mlirTritonTtTensorDescTypeGet(
+                    dimensions.as_ptr(),
+                    dimensions.len().cast_signed(),
+                    element_type.to_c_api(),
+                    shared_layout.unwrap_or_else(|| self.null_attribute()).to_c_api(),
+                ),
+                self,
+            )
+            .expect("invalid arguments to `Context::triton_tt_tensor_desc_type`")
         }
     }
 }
@@ -192,76 +229,61 @@ mod tests {
     fn test_tensor_desc_type() {
         let context = Context::new();
         let location = context.unknown_location();
-        let block_type = context
-            .tensor_type(context.float32_type(), &[Size::Static(16), Size::Static(32)], None, location)
-            .unwrap();
-        let tensor_desc_type = context.triton_tt_tensor_desc_type(block_type);
+        let shape = [Size::Static(16), Size::Static(32)];
+        let block_type = context.tensor_type(context.float32_type(), &shape, None, location).unwrap();
+        let tensor_desc_type = context.triton_tt_tensor_desc_type(&shape, context.float32_type(), None);
         assert_eq!(&context, tensor_desc_type.context());
         assert_eq!(tensor_desc_type.dialect().namespace().unwrap(), "tt");
+        assert_eq!(tensor_desc_type.shape(), shape.to_vec());
+        assert_eq!(tensor_desc_type.element_type(), context.float32_type());
+        assert_eq!(tensor_desc_type.shared_layout(), None);
         assert_eq!(tensor_desc_type.block_type(), block_type);
     }
 
     #[test]
     fn test_tensor_desc_type_equality() {
         let context = Context::new();
-        let location = context.unknown_location();
-        let block_type = context
-            .tensor_type(context.float32_type(), &[Size::Static(16), Size::Static(32)], None, location)
-            .unwrap();
+        let shape = [Size::Static(16), Size::Static(32)];
 
         // Same types from the same context must be equal because they are "uniqued".
-        let tensor_desc_type_1 = context.triton_tt_tensor_desc_type(block_type);
-        let tensor_desc_type_2 = context.triton_tt_tensor_desc_type(block_type);
+        let tensor_desc_type_1 = context.triton_tt_tensor_desc_type(&shape, context.float32_type(), None);
+        let tensor_desc_type_2 = context.triton_tt_tensor_desc_type(&shape, context.float32_type(), None);
         assert_eq!(tensor_desc_type_1, tensor_desc_type_2);
 
         // Different types from the same context must not be equal.
-        let block_type = context
-            .tensor_type(context.float32_type(), &[Size::Static(8), Size::Static(32)], None, location)
-            .unwrap();
-        let tensor_desc_type_2 = context.triton_tt_tensor_desc_type(block_type);
+        let shape = [Size::Static(8), Size::Static(32)];
+        let tensor_desc_type_2 = context.triton_tt_tensor_desc_type(&shape, context.float32_type(), None);
         assert_ne!(tensor_desc_type_1, tensor_desc_type_2);
 
         // Same types from different contexts must not be equal.
         let context = Context::new();
-        let location = context.unknown_location();
-        let block_type = context
-            .tensor_type(context.float32_type(), &[Size::Static(16), Size::Static(32)], None, location)
-            .unwrap();
-        let tensor_desc_type_2 = context.triton_tt_tensor_desc_type(block_type);
+        let shape = [Size::Static(16), Size::Static(32)];
+        let tensor_desc_type_2 = context.triton_tt_tensor_desc_type(&shape, context.float32_type(), None);
         assert_ne!(tensor_desc_type_1, tensor_desc_type_2);
     }
 
     #[test]
     fn test_tensor_desc_type_display_and_debug() {
         let context = Context::new();
-        let location = context.unknown_location();
-        let block_type = context
-            .tensor_type(context.float32_type(), &[Size::Static(16), Size::Static(32)], None, location)
-            .unwrap();
-        let tensor_desc_type = context.triton_tt_tensor_desc_type(block_type);
-        test_type_display_and_debug(tensor_desc_type, "!tt.tensordesc<tensor<16x32xf32>>");
+        let shape = [Size::Static(16), Size::Static(32)];
+        let tensor_desc_type = context.triton_tt_tensor_desc_type(&shape, context.float32_type(), None);
+        test_type_display_and_debug(tensor_desc_type, "!tt.tensordesc<16x32xf32>");
     }
 
     #[test]
     fn test_tensor_desc_type_parsing() {
         let context = Context::new();
         context.load_dialect(DialectHandle::triton_tt());
-        let location = context.unknown_location();
-        let block_type = context
-            .tensor_type(context.float32_type(), &[Size::Static(16), Size::Static(32)], None, location)
-            .unwrap();
-        let tensor_desc_type = context.triton_tt_tensor_desc_type(block_type);
-        assert_eq!(context.parse_type("!tt.tensordesc<tensor<16x32xf32>>").unwrap(), tensor_desc_type);
+        let shape = [Size::Static(16), Size::Static(32)];
+        let tensor_desc_type = context.triton_tt_tensor_desc_type(&shape, context.float32_type(), None);
+        assert_eq!(context.parse_type("!tt.tensordesc<16x32xf32>").unwrap(), tensor_desc_type);
     }
 
     #[test]
     fn test_tensor_desc_type_casting() {
         let context = Context::new();
-        let location = context.unknown_location();
-        let block_type = context
-            .tensor_type(context.float32_type(), &[Size::Static(16), Size::Static(32)], None, location)
-            .unwrap();
-        let tensor_desc_type = context.triton_tt_tensor_desc_type(block_type);
+        let shape = [Size::Static(16), Size::Static(32)];
+        let tensor_desc_type = context.triton_tt_tensor_desc_type(&shape, context.float32_type(), None);
         test_type_casting(tensor_desc_type);
     }
 }

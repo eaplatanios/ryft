@@ -15,7 +15,7 @@ use ryft_xla_sys::bindings::{
     mlirOperationGetSuccessor, mlirOperationGetTypeID, mlirOperationHasInherentAttributeByName, mlirOperationHashValue,
     mlirOperationIsBeforeInBlock, mlirOperationMoveAfter, mlirOperationMoveBefore, mlirOperationPrint,
     mlirOperationPrintWithFlags, mlirOperationPrintWithState, mlirOperationRemoveAttributeByName,
-    mlirOperationRemoveDiscardableAttributeByName, mlirOperationSetAttributeByName,
+    mlirOperationRemoveDiscardableAttributeByName, mlirOperationReplaceUsesOfWith, mlirOperationSetAttributeByName,
     mlirOperationSetDiscardableAttributeByName, mlirOperationSetInherentAttributeByName, mlirOperationSetLocation,
     mlirOperationSetOperand, mlirOperationSetOperands, mlirOperationSetSuccessor, mlirOperationVerify,
     mlirOperationWalk, mlirOperationWriteBytecode, mlirOperationWriteBytecodeWithConfig,
@@ -520,6 +520,25 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
             };
             true
         }
+    }
+
+    /// Replaces all uses of the `target` [`Value`] inside this [`Operation`] with the provided `replacement`.
+    ///
+    /// Note that this function is marked as _unsafe_ because if the provided `replacement` does not _dominate_ this
+    /// [`Operation`] according to MLIR's dominance rules (i.e., it is not defined before/above it in the current
+    /// control flow of the program), then calling this function results in undefined behavior.
+    unsafe fn replace_uses_of_with<'a, 'b, A: Value<'a, 'c, 't>, B: Value<'b, 'c, 't>>(
+        &mut self,
+        target: A,
+        replacement: B,
+    ) where
+        'c: 'a + 'b,
+    {
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
+        // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
+        // internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow_mut();
+        unsafe { mlirOperationReplaceUsesOfWith(self.to_c_api(), target.to_c_api(), replacement.to_c_api()) }
     }
 
     /// Returns the number of results of this [`Operation`].
@@ -1349,6 +1368,18 @@ mod tests {
         assert_eq!(op.operand(0).map(|operand| operand.value()), Some(argument_1));
         assert_eq!(op.operand(1).map(|operand| operand.value()), Some(argument_2));
         assert!(unsafe { !op.replace_operands(&[argument_2]) });
+
+        // Try replacing all uses of one value inside an operation.
+        let mut op = OperationBuilder::new("foo", context.unknown_location())
+            .add_operand(argument_0)
+            .add_operand(argument_2)
+            .add_operand(argument_0)
+            .build()
+            .unwrap();
+        unsafe { op.replace_uses_of_with(argument_0, argument_2) };
+        assert_eq!(op.operand(0).map(|operand| operand.value()), Some(argument_2));
+        assert_eq!(op.operand(1).map(|operand| operand.value()), Some(argument_2));
+        assert_eq!(op.operand(2).map(|operand| operand.value()), Some(argument_2));
     }
 
     #[test]

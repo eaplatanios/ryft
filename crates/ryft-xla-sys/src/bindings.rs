@@ -3204,6 +3204,70 @@ unsafe extern "C" {
     pub fn stablehloResultAccuracyAttrGetMode(attr: MlirAttribute) -> MlirAttribute;
 }
 unsafe extern "C" {
+    pub fn stablehloSubAxisInfoAttrGet(ctx: MlirContext, preSize: i64, size: i64) -> MlirAttribute;
+}
+unsafe extern "C" {
+    pub fn stablehloAttributeIsASubAxisInfoAttr(attr: MlirAttribute) -> bool;
+}
+unsafe extern "C" {
+    pub fn stablehloSubAxisInfoAttrGetPreSize(attr: MlirAttribute) -> i64;
+}
+unsafe extern "C" {
+    pub fn stablehloSubAxisInfoAttrGetSize(attr: MlirAttribute) -> i64;
+}
+unsafe extern "C" {
+    pub fn stablehloAxisRefAttrGet(ctx: MlirContext, name: MlirStringRef, subAxisInfo: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
+    pub fn stablehloAttributeIsAnAxisRefAttr(attr: MlirAttribute) -> bool;
+}
+unsafe extern "C" {
+    pub fn stablehloAxisRefAttrGetName(attr: MlirAttribute) -> MlirStringRef;
+}
+unsafe extern "C" {
+    pub fn stablehloAxisRefAttrGetSubAxisInfo(attr: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
+    pub fn stablehloReplicaGroupMeshAxesAttrGet(
+        ctx: MlirContext,
+        mesh: MlirAttribute,
+        axes: MlirAttribute,
+    ) -> MlirAttribute;
+}
+unsafe extern "C" {
+    pub fn stablehloAttributeIsAReplicaGroupMeshAxesAttr(attr: MlirAttribute) -> bool;
+}
+unsafe extern "C" {
+    pub fn stablehloReplicaGroupMeshAxesAttrGetMesh(attr: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
+    pub fn stablehloReplicaGroupMeshAxesAttrGetAxes(attr: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
+    pub fn stablehloMeshAxisAttrGet(ctx: MlirContext, name: MlirStringRef, size: i64) -> MlirAttribute;
+}
+unsafe extern "C" {
+    pub fn stablehloAttributeIsAMeshAxisAttr(attr: MlirAttribute) -> bool;
+}
+unsafe extern "C" {
+    pub fn stablehloMeshAxisAttrGetName(attr: MlirAttribute) -> MlirStringRef;
+}
+unsafe extern "C" {
+    pub fn stablehloMeshAxisAttrGetSize(attr: MlirAttribute) -> i64;
+}
+unsafe extern "C" {
+    pub fn stablehloMeshAttrGet(ctx: MlirContext, axes: MlirAttribute, deviceIds: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
+    pub fn stablehloAttributeIsAMeshAttr(attr: MlirAttribute) -> bool;
+}
+unsafe extern "C" {
+    pub fn stablehloMeshAttrGetAxes(attr: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
+    pub fn stablehloMeshAttrGetDeviceIds(attr: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
     pub fn mlirGetDialectHandle__stablehlo__() -> MlirDialectHandle;
 }
 unsafe extern "C" {
