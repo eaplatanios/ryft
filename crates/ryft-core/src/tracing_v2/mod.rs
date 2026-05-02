@@ -20,7 +20,7 @@ pub mod operations;
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
     Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
-    DifferentiableTracingEngine, DifferentiationError, JvpContext, JvpTracer,
+    DifferentiableTracingEngine, DifferentiationError, JvpContext, JvpTracer, LinearEngine,
 };
 pub use forward::jvp;
 pub use linear::{

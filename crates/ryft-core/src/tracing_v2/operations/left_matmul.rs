@@ -7,7 +7,7 @@ use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiableTracingEngine, LinearEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::SupportsAdd;
@@ -117,7 +117,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for 
 impl<V, E> DifferentiableOperation<E> for LeftMatMulOperation<V>
 where
     V: MatrixValue + ZeroLike + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: LinearEngine<Type = ArrayType, Value = V> + ?Sized,
     E::LinearOperation: SupportsLeftMatMul<ArrayType, V>,
 {
     fn jvp(

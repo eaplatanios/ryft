@@ -9,7 +9,7 @@ use crate::tracing::{Instruction, Program, ProgramBuilder, Traceable, TracingErr
 use crate::tracing_v2::operations::constants::{SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::tracing_v2::{
     ArrayOperation, Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine,
-    DifferentiationError, LinearArrayOperation,
+    DifferentiationError, LinearArrayOperation, LinearEngine,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -267,7 +267,7 @@ impl<
         + crate::tracing_v2::operations::constants::Zero<ArrayType>
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    E: DifferentiableEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>> + ?Sized + 'static,
+    E: LinearEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>> + ?Sized + 'static,
     O: Clone + Operation<ArrayType>,
 > DifferentiableOperation<E> for RematerializeOperation<ArrayType, V, O, E::LinearOperation>
 where
@@ -499,7 +499,7 @@ where
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V> + DifferentiableOperation<E> + 'static,
     LinearArrayOperation<V>:
         Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>> + ?Sized + 'static,
+    E: LinearEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>> + ?Sized + 'static,
 {
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
@@ -682,9 +682,12 @@ mod tests {
         type Operation = ArrayOperation<f64>;
     }
 
+    impl crate::tracing_v2::LinearEngine for ArrayScalarEngine {
+        type LinearOperation = LinearArrayOperation<f64>;
+    }
+
     impl DifferentiableEngine for ArrayScalarEngine {
         type DifferentiableOperation = ArrayOperation<f64>;
-        type LinearOperation = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {

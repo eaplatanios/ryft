@@ -2505,7 +2505,7 @@ mod tests {
     use ryft_core::tracing_v2::operations::constants::{OneLike, ZeroLike};
     use ryft_core::tracing_v2::{
         ArrayOperation, Cos, CustomPrimitive, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation,
-        MatrixOps, Sin,
+        LinearEngine, MatrixOps, Sin,
     };
     use ryft_core::types::{Shape, TypeError};
     #[cfg(feature = "ndarray")]
@@ -2808,9 +2808,12 @@ mod tests {
         type Operation = ArrayOperation<f64>;
     }
 
+    impl LinearEngine for ArrayScalarEngine {
+        type LinearOperation = LinearArrayOperation<f64>;
+    }
+
     impl DifferentiableEngine for ArrayScalarEngine {
         type DifferentiableOperation = ArrayOperation<f64>;
-        type LinearOperation = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {

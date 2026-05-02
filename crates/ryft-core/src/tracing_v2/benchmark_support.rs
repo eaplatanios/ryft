@@ -7,8 +7,8 @@ use crate::tracing_v2::benchmarking::{
 };
 use crate::tracing_v2::operations::constants::OneLike;
 use crate::tracing_v2::{
-    ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, Sin, grad, jvp, linearize,
-    value_and_grad, vjp,
+    ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, LinearizingEngine, Sin,
+    grad, jvp, linearize, value_and_grad, vjp,
 };
 use crate::types::ArrayType;
 
@@ -32,9 +32,12 @@ impl TracingEngine for ArrayScalarEngine {
     type Operation = ArrayOperation<f64>;
 }
 
+impl LinearizingEngine for ArrayScalarEngine {
+    type LinearOperation = LinearArrayOperation<f64>;
+}
+
 impl DifferentiableEngine for ArrayScalarEngine {
     type DifferentiableOperation = ArrayOperation<f64>;
-    type LinearOperation = LinearArrayOperation<f64>;
 }
 
 impl DifferentiableTracingEngine for ArrayScalarEngine {

@@ -287,7 +287,6 @@ where
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>,
 {
     let input_structure = primals.parameter_structure();
@@ -342,7 +341,6 @@ where
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: Clone
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, E::LinearOperation>
@@ -391,7 +389,6 @@ where
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>,
 {
     jacfwd::<E, F, Input, Input, V>(engine, gradient_function, primals)
@@ -434,9 +431,12 @@ mod tests {
         type Operation = ArrayOperation<f64>;
     }
 
+    impl crate::tracing_v2::LinearEngine for ArrayScalarEngine {
+        type LinearOperation = LinearArrayOperation<f64>;
+    }
+
     impl DifferentiableEngine for ArrayScalarEngine {
         type DifferentiableOperation = ArrayOperation<f64>;
-        type LinearOperation = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {

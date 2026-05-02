@@ -7,7 +7,7 @@ use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableOperation, LinearEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Synthesizes a typed zero value without an exemplar.
@@ -127,7 +127,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for ZeroOperation<E::Type>
 where
-    E: DifferentiableEngine + ?Sized,
+    E: LinearEngine + ?Sized,
     ZeroOperation<E::Type>: Operation<E::Type>,
     E::Value: Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperation: SupportsZero<E::Type, E::Value>,
@@ -260,7 +260,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for OneOperation<E::Type>
 where
-    E: DifferentiableEngine + ?Sized,
+    E: LinearEngine + ?Sized,
     OneOperation<E::Type>: Operation<E::Type>,
     E::Value: Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperation: SupportsZero<E::Type, E::Value>,
@@ -384,7 +384,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for ZeroLikeOperation
 where
-    E: DifferentiableEngine + ?Sized,
+    E: LinearEngine + ?Sized,
     ZeroLikeOperation: Operation<E::Type>,
     E::Value: ZeroLike + Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperation: SupportsZeroLike<E::Type, E::Value>,
@@ -499,7 +499,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for OneLikeOperation
 where
-    E: DifferentiableEngine + ?Sized,
+    E: LinearEngine + ?Sized,
     OneLikeOperation: Operation<E::Type>,
     E::Value: OneLike + Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperation: SupportsZeroLike<E::Type, E::Value>,

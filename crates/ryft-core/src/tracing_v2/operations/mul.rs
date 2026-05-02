@@ -8,7 +8,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableOperation, LinearEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::{SupportsAdd, SupportsScale};
@@ -127,7 +127,7 @@ impl<V: Typed<DataType> + Clone + Mul<Output = V>> InterpretableOperation<DataTy
 
 impl<E> DifferentiableOperation<E> for MulOperation
 where
-    E: DifferentiableEngine + ?Sized,
+    E: LinearEngine + ?Sized,
     MulOperation: Operation<E::Type>,
     E::Value: Mul<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperation: SupportsAdd<E::Type, E::Value> + SupportsScale<E::Type, E::Value>,

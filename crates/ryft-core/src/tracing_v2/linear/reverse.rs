@@ -9,7 +9,7 @@ use crate::tracing_v2::DifferentiationError;
 /// linear operations that can be replayed later on any tangent with the same parameter structure.
 pub fn linearize<
     'engine,
-    E: DifferentiableEngine<Value = V, DifferentiableOperation: DifferentiableOperation<E>> + 'static,
+    E: DifferentiableEngine<Value = V> + 'static,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
@@ -51,7 +51,6 @@ pub fn vjp<
     'engine,
     E: DifferentiableEngine<
             Value = V,
-            DifferentiableOperation: DifferentiableOperation<E>,
             LinearOperation: Clone
                                  + InterpretableOperation<E::Type, V>
                                  + LinearOperation<E::Type, V, E::LinearOperation>
@@ -175,7 +174,6 @@ pub(crate) trait ValueAndGradDispatch<
 impl<
     E: DifferentiableEngine<
             Value = V,
-            DifferentiableOperation: DifferentiableOperation<E>,
             LinearOperation: Clone
                                  + InterpretableOperation<E::Type, V>
                                  + LinearOperation<E::Type, V, E::LinearOperation>
@@ -328,7 +326,6 @@ pub fn value_and_grad_with_aux<
     'engine,
     E: DifferentiableEngine<
             Value = V,
-            DifferentiableOperation: DifferentiableOperation<E>,
             LinearOperation: Clone
                                  + InterpretableOperation<E::Type, V>
                                  + LinearOperation<E::Type, V, E::LinearOperation>
@@ -417,7 +414,6 @@ pub fn grad_with_aux<
     'engine,
     E: DifferentiableEngine<
             Value = V,
-            DifferentiableOperation: DifferentiableOperation<E>,
             LinearOperation: Clone
                                  + InterpretableOperation<E::Type, V>
                                  + LinearOperation<E::Type, V, E::LinearOperation>
@@ -710,9 +706,12 @@ mod tests {
         type Operation = AddOperation;
     }
 
+    impl crate::tracing_v2::LinearEngine for TestEngine {
+        type LinearOperation = TestLinearOperation;
+    }
+
     impl DifferentiableEngine for TestEngine {
         type DifferentiableOperation = AddOperation;
-        type LinearOperation = TestLinearOperation;
     }
 
     #[test]

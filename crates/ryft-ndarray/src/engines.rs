@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
-use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearEngine};
 use ryft_core::types::{ArrayType, TypeError};
 
 use crate::arrays::{Array, NdArrayElement};
@@ -44,9 +44,12 @@ impl<T: NdArrayElement> TracingEngine for NdArrayEngine<T> {
     type Operation = NdarrayOperation<Array<T>>;
 }
 
+impl<T: NdArrayElement> LinearEngine for NdArrayEngine<T> {
+    type LinearOperation = LinearNdarrayOperation<Array<T>>;
+}
+
 impl<T: NdArrayElement> DifferentiableEngine for NdArrayEngine<T> {
     type DifferentiableOperation = NdarrayOperation<Array<T>>;
-    type LinearOperation = LinearNdarrayOperation<Array<T>>;
 }
 
 impl<T: NdArrayElement> DifferentiableTracingEngine for NdArrayEngine<T> {

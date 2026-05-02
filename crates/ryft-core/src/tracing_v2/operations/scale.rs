@@ -12,7 +12,7 @@ use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{
-    DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, LinearArrayOperation,
+    DifferentiableOperation, DifferentiableTracingEngine, LinearArrayOperation, LinearEngine,
 };
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -131,7 +131,7 @@ where
 impl<V, E> DifferentiableOperation<E> for ScaleOperation<ArrayType, V>
 where
     V: Differentiable<ArrayType, Tangent = V> + Mul<Output = V>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: LinearEngine<Type = ArrayType, Value = V> + ?Sized,
     E::LinearOperation: SupportsScale<ArrayType, V>,
 {
     fn jvp(
@@ -157,7 +157,7 @@ where
 impl<V, E> DifferentiableOperation<E> for ScaleOperation<DataType, V>
 where
     V: Differentiable<DataType, Tangent = V> + Mul<Output = V>,
-    E: DifferentiableEngine<Type = DataType, Value = V> + ?Sized,
+    E: LinearEngine<Type = DataType, Value = V> + ?Sized,
     E::LinearOperation: SupportsScale<DataType, V>,
 {
     fn jvp(

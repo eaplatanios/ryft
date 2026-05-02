@@ -58,7 +58,6 @@ pub(crate) trait JvpDispatch<
 impl<
     E: DifferentiableEngine<
             Value = V,
-            DifferentiableOperation: DifferentiableOperation<E>,
             LinearOperation: InterpretableOperation<E::Type, V>
                                  + SupportsAdd<E::Type, V>
                                  + SupportsNeg<E::Type, V>

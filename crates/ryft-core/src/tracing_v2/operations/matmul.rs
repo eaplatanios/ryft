@@ -4,7 +4,7 @@ use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableOperation, LinearEngine};
 use crate::types::{ArrayType, Type, TypeError};
 
 use super::SupportsAdd;
@@ -61,7 +61,7 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
 
 impl<E> DifferentiableOperation<E> for MatMulOperation
 where
-    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
+    E: LinearEngine<Type = ArrayType> + ?Sized,
     E::Value: MatrixValue + Differentiable<ArrayType, Tangent = E::Value>,
     E::LinearOperation: SupportsAdd<ArrayType, E::Value>
         + SupportsLeftMatMul<ArrayType, E::Value>

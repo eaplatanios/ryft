@@ -8,7 +8,7 @@ use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearArrayOperation};
+use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Hidden carrier capability for staging the negation primitive.
@@ -124,7 +124,7 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + Z
 
 impl<E> DifferentiableOperation<E> for NegOperation
 where
-    E: DifferentiableEngine + ?Sized,
+    E: LinearEngine + ?Sized,
     NegOperation: Operation<E::Type>,
     E::Value: Neg<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperation: SupportsNeg<E::Type, E::Value>,

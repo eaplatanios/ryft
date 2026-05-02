@@ -5,7 +5,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableOperation, LinearEngine};
 use crate::types::{ArrayType, Type, TypeError};
 
 use super::LinearArrayOperation;
@@ -81,7 +81,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for 
 
 impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
 where
-    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
+    E: LinearEngine<Type = ArrayType> + ?Sized,
     E::Value: MatrixValue + Differentiable<ArrayType, Tangent = E::Value>,
     E::LinearOperation: SupportsMatrixTranspose<ArrayType, E::Value>,
 {

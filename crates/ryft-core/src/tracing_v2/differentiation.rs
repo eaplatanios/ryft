@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
-use crate::tracing::transposition::LinearOperation as LinearOperationTrait;
+use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::operations::constants::Zero;
 use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale, SupportsZero};
@@ -88,7 +88,25 @@ where
     type Tangent = Self;
 }
 
-/// Extension of [`Engine`] for backends that support automatic differentiation.
+/// Extension of [`Engine`] for backends that can stage linear tangent and cotangent programs.
+///
+/// [`LinearizingEngine`] is the part of the automatic-differentiation contract needed by
+/// operation-level JVP rules: it selects the linear operation carrier used by
+/// [`JvpContext`]. Backends that also support tracing differentiable primal programs implement
+/// [`DifferentiableEngine`].
+pub trait LinearizingEngine: Engine {
+    /// Linear staged operation type selected by this engine for tangent and cotangent programs.
+    ///
+    /// Linear programs produced by [`linearize`](crate::tracing_v2::linearize),
+    /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
+    type LinearOperation: Clone
+        + LinearOperation<Self::Type, Self::Value, Self::LinearOperation>
+        + SupportsAdd<Self::Type, Self::Value>
+        + SupportsNeg<Self::Type, Self::Value>
+        + SupportsScale<Self::Type, Self::Value>;
+}
+
+/// Extension of [`LinearizingEngine`] for backends that support automatic differentiation.
 ///
 /// Engines that only need ordinary tracing implement [`TracingEngine`] without this extension. AD
 /// transforms such as [`grad`](crate::tracing_v2::grad), [`jvp`](crate::tracing_v2::jvp), and
@@ -99,19 +117,11 @@ where
 /// [`TracingEngine::Operation`] is [`DifferentiableEngine::DifferentiableOperation`]. That keeps
 /// ordinary tracing free to use a wider operation carrier while making differentiation reject
 /// unsupported operations at type-check time when the differentiation carrier omits them.
-pub trait DifferentiableEngine: Engine {
+pub trait DifferentiableEngine: LinearizingEngine {
     /// Staged operation type selected by this engine for tracing differentiable primal programs.
-    type DifferentiableOperation: Clone + InterpretableOperation<Self::Type, Self::Value>;
-
-    /// Linear staged operation type selected by this engine for tangent and cotangent programs.
-    ///
-    /// Linear programs produced by [`linearize`](crate::tracing_v2::linearize),
-    /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
-    type LinearOperation: Clone
-        + LinearOperationTrait<Self::Type, Self::Value, Self::LinearOperation>
-        + SupportsAdd<Self::Type, Self::Value>
-        + SupportsNeg<Self::Type, Self::Value>
-        + SupportsScale<Self::Type, Self::Value>;
+    type DifferentiableOperation: Clone
+        + InterpretableOperation<Self::Type, Self::Value>
+        + DifferentiableOperation<Self>;
 }
 
 /// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
@@ -124,7 +134,7 @@ pub trait DifferentiableEngine: Engine {
 /// Primitive rules usually stage tangent operations through [`JvpContext::apply_operation`].
 /// Higher-order rules use [`JvpContext::engine`] to recurse into nested programs with the same
 /// engine.
-pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E::Type> {
+pub trait DifferentiableOperation<E: LinearizingEngine + ?Sized>: Operation<E::Type> {
     /// Applies this operation's forward-mode Jacobian-Vector Product (JVP) rule.
     ///
     /// The returned vector must be aligned with this operation's outputs and must carry both the
@@ -149,9 +159,8 @@ pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E
 /// [`TranspositionContext`](crate::tracing::transposition::TranspositionContext): JVP rules call
 /// [`apply_operation`](Self::apply_operation) to stage tangent ops on the active builder.
 #[doc(hidden)]
-pub struct JvpContext<'a, E: DifferentiableEngine + ?Sized> {
-    /// [`DifferentiableEngine`] borrowed by this [`JvpContext`] for type-driven value synthesis and operation
-    /// selection.
+pub struct JvpContext<'a, E: LinearizingEngine + ?Sized> {
+    /// [`LinearizingEngine`] borrowed by this [`JvpContext`] for type-driven value synthesis and operation selection.
     pub engine: &'a E,
 
     /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::tracing::Program) that is currently being
@@ -159,7 +168,7 @@ pub struct JvpContext<'a, E: DifferentiableEngine + ?Sized> {
     pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::LinearOperation>>>,
 }
 
-impl<'a, E: DifferentiableEngine + ?Sized> JvpContext<'a, E> {
+impl<'a, E: LinearizingEngine + ?Sized> JvpContext<'a, E> {
     /// Creates a JVP context that stages into `builder`.
     #[doc(hidden)]
     pub fn new(engine: &'a E, builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::LinearOperation>>>) -> Self {
@@ -239,10 +248,10 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     ///
     /// # Parameters
     ///
-    ///   - `engine`: Differentiable engine that supplies the linear operation carrier and primitive
+    ///   - `engine`: Linearizing engine that supplies the linear operation carrier and primitive
     ///     JVP rules.
     ///   - `input_primals`: Concrete primal values aligned with this program's input atoms.
-    pub fn linearize<E: DifferentiableEngine<Type = T, Value = V> + ?Sized>(
+    pub fn linearize<E: LinearizingEngine<Type = T, Value = V> + ?Sized>(
         &self,
         engine: &E,
         input_primals: Vec<V>,
@@ -359,7 +368,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
 pub trait DifferentiableTracingEngine: TracingEngine {
     /// Linear operation carrier used for tangent and cotangent programs over traced values.
     type LinearOperation<'engine>: Clone
-        + LinearOperationTrait<Self::Type, Tracer<'engine, Self>, Self::LinearOperation<'engine>>
+        + LinearOperation<Self::Type, Tracer<'engine, Self>, Self::LinearOperation<'engine>>
         + SupportsAdd<Self::Type, Tracer<'engine, Self>>
         + SupportsNeg<Self::Type, Tracer<'engine, Self>>
         + SupportsScale<Self::Type, Tracer<'engine, Self>>
@@ -438,9 +447,23 @@ impl<E: DifferentiableEngine + ?Sized> TracingEngine for DifferentiableOperation
     type Operation = E::DifferentiableOperation;
 }
 
-impl<E: DifferentiableEngine + ?Sized> DifferentiableEngine for DifferentiableOperationTracingEngine<E> {
-    type DifferentiableOperation = E::DifferentiableOperation;
+impl<E: DifferentiableEngine + ?Sized> LinearizingEngine for DifferentiableOperationTracingEngine<E> {
     type LinearOperation = E::LinearOperation;
+}
+
+impl<
+    E: DifferentiableEngine<DifferentiableOperation: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>>
+        + ?Sized,
+> DifferentiableEngine for DifferentiableOperationTracingEngine<E>
+{
+    type DifferentiableOperation = E::DifferentiableOperation;
+}
+
+impl<'engine, E> LinearizingEngine for TracingContext<'engine, E>
+where
+    E: DifferentiableTracingEngine + ?Sized,
+{
+    type LinearOperation = E::LinearOperation<'engine>;
 }
 
 impl<'engine, E> DifferentiableEngine for TracingContext<'engine, E>
@@ -451,14 +474,16 @@ where
     crate::tracing_v2::operations::AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     type DifferentiableOperation = crate::tracing_v2::operations::AddOperation;
-    type LinearOperation = E::LinearOperation<'engine>;
 }
 
 macro_rules! impl_differentiable_engine_for_scalar {
     ($ty:ty) => {
+        impl LinearizingEngine for ScalarEngine<$ty> {
+            type LinearOperation = LinearScalarOperation<$ty>;
+        }
+
         impl DifferentiableEngine for ScalarEngine<$ty> {
             type DifferentiableOperation = ScalarOperation<$ty>;
-            type LinearOperation = LinearScalarOperation<$ty>;
         }
 
         impl DifferentiableTracingEngine for ScalarEngine<$ty> {

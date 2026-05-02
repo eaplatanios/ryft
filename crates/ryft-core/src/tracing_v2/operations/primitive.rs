@@ -18,9 +18,7 @@ use crate::tracing_v2::operations::{
     AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
     NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
 };
-use crate::tracing_v2::{
-    Cos, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, MatrixOps, Sin,
-};
+use crate::tracing_v2::{Cos, DifferentiableOperation, DifferentiableTracingEngine, LinearEngine, MatrixOps, Sin};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
 use super::add::SupportsAdd;
@@ -1842,12 +1840,7 @@ impl<
         + Parameterized<V>
         + Differentiable<DataType, Tangent = V>
         + 'static,
-    E: DifferentiableEngine<
-            Type = DataType,
-            Value = V,
-            DifferentiableOperation = ScalarOperation<V>,
-            LinearOperation = LinearScalarOperation<V>,
-        > + 'static,
+    E: LinearEngine<Type = DataType, Value = V, LinearOperation = LinearScalarOperation<V>> + 'static,
 > DifferentiableOperation<E> for ScalarOperation<V>
 where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
@@ -1984,12 +1977,7 @@ impl<
         + ControlFlowValue
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    E: DifferentiableEngine<
-            Type = ArrayType,
-            Value = V,
-            DifferentiableOperation = ArrayOperation<V>,
-            LinearOperation = LinearArrayOperation<V>,
-        > + 'static,
+    E: LinearEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>> + 'static,
 > DifferentiableOperation<E> for ArrayOperation<V>
 where
     V: Differentiable<ArrayType, Tangent = V>,
@@ -2049,12 +2037,7 @@ impl<
         + Parameterized<V>
         + Differentiable<DataType, Tangent = V>
         + 'static,
-    E: DifferentiableEngine<
-            Type = DataType,
-            Value = V,
-            DifferentiableOperation = ArrayOperation<V, DataType>,
-            LinearOperation = LinearArrayOperation<V, DataType>,
-        > + 'static,
+    E: LinearEngine<Type = DataType, Value = V, LinearOperation = LinearArrayOperation<V, DataType>> + 'static,
 > DifferentiableOperation<E> for ArrayOperation<V, DataType>
 where
     V::ParameterStructure: std::fmt::Debug + PartialEq,

@@ -7,7 +7,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableOperation, LinearEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::SupportsScale;
@@ -104,7 +104,7 @@ impl<V: Typed<DataType> + Clone + Sin> InterpretableOperation<DataType, V> for S
 
 impl<E> DifferentiableOperation<E> for SinOperation
 where
-    E: DifferentiableEngine + ?Sized,
+    E: LinearEngine + ?Sized,
     SinOperation: Operation<E::Type>,
     E::Value: Sin + Cos + Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperation: SupportsScale<E::Type, E::Value>,

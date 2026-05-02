@@ -883,9 +883,12 @@ mod tests {
         type Operation = ArrayOperation<TestArray>;
     }
 
+    impl crate::tracing_v2::LinearEngine for TestArrayEngine {
+        type LinearOperation = LinearArrayOperation<TestArray>;
+    }
+
     impl DifferentiableEngine for TestArrayEngine {
         type DifferentiableOperation = ArrayOperation<TestArray>;
-        type LinearOperation = LinearArrayOperation<TestArray>;
     }
 
     #[derive(Clone, Debug)]

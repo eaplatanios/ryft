@@ -23,7 +23,9 @@ mod tests {
     use ryft_core::ArrayType;
     use ryft_core::tracing::TracingError;
     use ryft_core::tracing::engines::{Engine, TracingEngine};
-    use ryft_core::tracing_v2::{ArrayOperation, DifferentiableEngine, LinearArrayOperation, Sin, jacfwd};
+    use ryft_core::tracing_v2::{
+        ArrayOperation, DifferentiableEngine, LinearArrayOperation, LinearEngine, Sin, jacfwd,
+    };
 
     use super::DenseJacobianNdArrayExt;
 
@@ -47,9 +49,12 @@ mod tests {
         type Operation = ArrayOperation<f64>;
     }
 
+    impl LinearEngine for ArrayScalarEngine {
+        type LinearOperation = LinearArrayOperation<f64>;
+    }
+
     impl DifferentiableEngine for ArrayScalarEngine {
         type DifferentiableOperation = ArrayOperation<f64>;
-        type LinearOperation = LinearArrayOperation<f64>;
     }
 
     #[test]

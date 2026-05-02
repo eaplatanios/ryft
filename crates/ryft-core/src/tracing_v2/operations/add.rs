@@ -10,7 +10,7 @@ use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::constants::ZeroLike;
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearArrayOperation};
+use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Hidden carrier capability for staging the addition primitive.
@@ -162,7 +162,7 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Add<Output = V> + Z
 
 impl<E> DifferentiableOperation<E> for AddOperation
 where
-    E: DifferentiableEngine + ?Sized,
+    E: LinearEngine + ?Sized,
     AddOperation: Operation<E::Type>,
     E::Value: Add<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperation: SupportsAdd<E::Type, E::Value>,

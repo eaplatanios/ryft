@@ -11,7 +11,7 @@ use crate::tracing::engines::{Tracer, TracingContext};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiableTracingEngine, LinearEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::primitive::{ArrayOperation, LinearArrayOperation};
@@ -77,11 +77,11 @@ impl<T: Type, V: Traceable<T>> CustomPrimitiveExtensions<T, V> {
 ///
 /// Custom primitives now key JVP rules by the concrete engine type instead of the `(O, L)` carrier
 /// family pair so the public differentiation surface stays fully engine-driven.
-struct JvpRule<E: DifferentiableEngine<Type = ArrayType> + 'static>(Arc<dyn DifferentiableOperation<E>>)
+struct JvpRule<E: LinearEngine<Type = ArrayType> + 'static>(Arc<dyn DifferentiableOperation<E>>)
 where
     E::Value: Differentiable<ArrayType, Tangent = E::Value>;
 
-impl<E: DifferentiableEngine<Type = ArrayType> + 'static> JvpRule<E>
+impl<E: LinearEngine<Type = ArrayType> + 'static> JvpRule<E>
 where
     E::Value: Differentiable<ArrayType, Tangent = E::Value>,
 {
@@ -172,7 +172,7 @@ impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> Custo
     /// Registers one engine-specific forward-mode JVP rule.
     pub fn with_jvp_rule_for<E, Rule>(mut self, rule: Rule) -> Self
     where
-        E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
+        E: LinearEngine<Type = ArrayType, Value = V> + 'static,
         V: Differentiable<ArrayType, Tangent = V>,
         Rule: DifferentiableOperation<E> + 'static,
     {
@@ -208,7 +208,7 @@ impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> Custo
 
     fn jvp_rule<E>(&self) -> Result<&dyn DifferentiableOperation<E>, TracingError>
     where
-        E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
+        E: LinearEngine<Type = ArrayType, Value = V> + 'static,
         V: Differentiable<ArrayType, Tangent = V>,
     {
         self.extensions
@@ -233,12 +233,7 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
     /// Registers one forward-mode JVP rule for the canonical core staged carriers.
     pub fn with_jvp_rule<E, Rule>(self, rule: Rule) -> Self
     where
-        E: DifferentiableEngine<
-                Type = ArrayType,
-                Value = V,
-                DifferentiableOperation = ArrayOperation<V>,
-                LinearOperation = LinearArrayOperation<V>,
-            > + 'static,
+        E: LinearEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>> + 'static,
         V: Differentiable<ArrayType, Tangent = V>,
         Rule: DifferentiableOperation<E> + 'static,
     {
@@ -270,12 +265,8 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
     pub fn with_derivative_rule<E, Rule>(self, rule: Rule) -> Self
     where
         V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-        E: DifferentiableEngine<
-                Type = ArrayType,
-                Value = V,
-                DifferentiableOperation = ArrayOperation<V>,
-                LinearOperation = LinearArrayOperation<V>,
-            > + DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>>
+        E: LinearEngine<Type = ArrayType, Value = V, LinearOperation = LinearArrayOperation<V>>
+            + DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>>
             + 'static,
         Rule: Clone + DifferentiableOperation<E> + CustomTracedLinearizationRule<V, E> + 'static,
     {
@@ -339,7 +330,7 @@ where
 impl<V, E> DifferentiableOperation<E> for CustomPrimitive<ArrayType, V>
 where
     V: Differentiable<ArrayType, Tangent = V> + 'static,
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
+    E: LinearEngine<Type = ArrayType, Value = V> + 'static,
 {
     fn jvp(
         &self,
@@ -486,9 +477,12 @@ mod tests {
         type Operation = ArrayOperation<f64>;
     }
 
+    impl crate::tracing_v2::LinearEngine for ArrayScalarEngine {
+        type LinearOperation = LinearArrayOperation<f64>;
+    }
+
     impl DifferentiableEngine for ArrayScalarEngine {
         type DifferentiableOperation = ArrayOperation<f64>;
-        type LinearOperation = LinearArrayOperation<f64>;
     }
 
     impl DifferentiableTracingEngine for ArrayScalarEngine {
