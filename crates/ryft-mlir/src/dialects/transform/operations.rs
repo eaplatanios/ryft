@@ -9,16 +9,19 @@ use super::{FailurePropagationMode, FailurePropagationModeAttributeRef, MatchCmp
 /// Name of the attribute used by Transform dialect operations with multiple variadic operand groups.
 pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operand_segment_sizes";
 
+/// Creates a builder for a Transform dialect operation and loads the dialect into the owning context.
 fn build_transform_op<'c, 't: 'c, L: Location<'c, 't>>(operation_name: &str, location: L) -> OperationBuilder<'c, 't> {
     location.context().load_dialect(DialectHandle::transform());
     OperationBuilder::new(operation_name, location)
 }
 
+/// Builds an MLIR array attribute containing string attributes for `values`.
 fn build_string_array_attribute<'c, 't>(context: &'c crate::Context<'t>, values: &[&str]) -> ArrayAttributeRef<'c, 't> {
     let attributes = values.iter().map(|value| context.string_attribute(*value)).collect::<Vec<_>>();
     context.array_attribute(&attributes)
 }
 
+/// Builds an MLIR array attribute containing flat symbol references for `values`.
 fn build_symbol_ref_array_attribute<'c, 't>(
     context: &'c crate::Context<'t>,
     values: &[&str],
@@ -27,11 +30,12 @@ fn build_symbol_ref_array_attribute<'c, 't>(
     context.array_attribute(&attributes)
 }
 
+/// Builds a signless 64-bit integer attribute.
 fn i64_attribute<'c, 't>(context: &'c crate::Context<'t>, value: i64) -> IntegerAttributeRef<'c, 't> {
     context.integer_attribute(context.signless_integer_type(64), value)
 }
 
-#[doc = "Operation trait for `transform.alternatives`."]
+/// Operation trait for `transform.alternatives`.
 pub trait AlternativesOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the optional transform scope operand.
     fn scope(&self) -> Option<ValueRef<'o, 'c, 't>> {
@@ -73,7 +77,7 @@ pub fn alternatives<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the `transform.annotate` attribute that stores the payload attribute name.
 pub const NAME_ATTRIBUTE: &str = "name";
 
-#[doc = "Operation trait for `transform.annotate`."]
+/// Operation trait for `transform.annotate`.
 pub trait AnnotateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target handle to annotate.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -117,7 +121,7 @@ pub fn annotate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::annotate`")
 }
 
-#[doc = "Operation trait for `transform.apply_cse`."]
+/// Operation trait for `transform.apply_cse`.
 pub trait ApplyCommonSubexpressionEliminationOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target handle whose nested payload IR is rewritten.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -158,7 +162,7 @@ pub const PARTIAL_CONVERSION_ATTRIBUTE: &str = "partial_conversion";
 /// Name of the `transform.apply_conversion_patterns` preserve-handles marker attribute.
 pub const PRESERVE_HANDLES_ATTRIBUTE: &str = "preserve_handles";
 
-#[doc = "Operation trait for `transform.apply_conversion_patterns`."]
+/// Operation trait for `transform.apply_conversion_patterns`.
 pub trait ApplyConversionPatternsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target handle whose nested payload IR is converted.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -220,7 +224,7 @@ pub fn apply_conversion_patterns<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the `transform.apply_conversion_patterns.dialect_to_llvm` dialect-name attribute.
 pub const DIALECT_NAME_ATTRIBUTE: &str = "dialect_name";
 
-#[doc = "Operation trait for `transform.apply_conversion_patterns.dialect_to_llvm`."]
+/// Operation trait for `transform.apply_conversion_patterns.dialect_to_llvm`.
 pub trait ApplyToLlvmConversionPatternsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source dialect whose operations are converted to LLVM dialect operations.
     fn dialect_name(&self) -> StringRef<'c> {
@@ -249,7 +253,7 @@ pub fn apply_to_llvm_conversion_patterns<'c, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::apply_to_llvm_conversion_patterns`")
 }
 
-#[doc = "Operation trait for `transform.apply_dce`."]
+/// Operation trait for `transform.apply_dce`.
 pub trait ApplyDeadCodeEliminationOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target handle whose nested payload IR is rewritten.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -281,7 +285,7 @@ pub const MAX_ITERATIONS_ATTRIBUTE: &str = "max_iterations";
 /// Name of the `transform.apply_patterns` maximum-rewrite attribute.
 pub const MAX_NUM_REWRITES_ATTRIBUTE: &str = "max_num_rewrites";
 
-#[doc = "Operation trait for `transform.apply_patterns`."]
+/// Operation trait for `transform.apply_patterns`.
 pub trait ApplyPatternsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target handle whose nested payload IR is rewritten.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -328,7 +332,7 @@ pub fn apply_patterns<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::apply_patterns`")
 }
 
-#[doc = "Operation trait for `transform.apply_patterns.canonicalization`."]
+/// Operation trait for `transform.apply_patterns.canonicalization`.
 pub trait ApplyCanonicalizationPatternsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {}
 
 mlir_op!(ApplyCanonicalizationPatterns);
@@ -344,7 +348,7 @@ pub fn apply_canonicalization_patterns<'c, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::apply_canonicalization_patterns`")
 }
 
-#[doc = "Operation trait for `transform.apply_licm`."]
+/// Operation trait for `transform.apply_licm`.
 pub trait ApplyLoopInvariantCodeMotionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target loop-like payload handle.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -373,7 +377,7 @@ pub const PASS_NAME_ATTRIBUTE: &str = "pass_name";
 /// Name of the `transform.apply_registered_pass` static options attribute.
 pub const OPTIONS_ATTRIBUTE: &str = "options";
 
-#[doc = "Operation trait for `transform.apply_registered_pass`."]
+/// Operation trait for `transform.apply_registered_pass`.
 pub trait ApplyRegisteredPassOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target handle passed to the pass or pass pipeline.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -418,7 +422,7 @@ pub fn apply_registered_pass<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::apply_registered_pass`")
 }
 
-#[doc = "Operation trait for `transform.cast`."]
+/// Operation trait for `transform.cast`.
 pub trait CastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input handle being cast.
     fn input(&self) -> ValueRef<'o, 'c, 't> {
@@ -448,7 +452,7 @@ pub fn cast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::cast`")
 }
 
-#[doc = "Operation trait for `transform.num_associations`."]
+/// Operation trait for `transform.num_associations`.
 pub trait NumAssociationsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the handle or parameter whose payload associations are counted.
     fn handle(&self) -> ValueRef<'o, 'c, 't> {
@@ -481,7 +485,7 @@ pub fn num_associations<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the symbolic matcher attribute used by `transform.collect_matching`.
 pub const MATCHER_ATTRIBUTE: &str = "matcher";
 
-#[doc = "Operation trait for `transform.collect_matching`."]
+/// Operation trait for `transform.collect_matching`.
 pub trait CollectMatchingOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the root handle under which matching is performed.
     fn root(&self) -> ValueRef<'o, 'c, 't> {
@@ -526,7 +530,7 @@ pub const MATCHERS_ATTRIBUTE: &str = "matchers";
 /// Name of the `transform.foreach_match` action-symbols attribute.
 pub const ACTIONS_ATTRIBUTE: &str = "actions";
 
-#[doc = "Operation trait for `transform.foreach_match`."]
+/// Operation trait for `transform.foreach_match`.
 pub trait ForeachMatchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the root handle walked for matcher/action pairs.
     fn root(&self) -> ValueRef<'o, 'c, 't> {
@@ -585,7 +589,7 @@ pub fn foreach_match<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the `transform.foreach` zip-shortest marker attribute.
 pub const WITH_ZIP_SHORTEST_ATTRIBUTE: &str = "with_zip_shortest";
 
-#[doc = "Operation trait for `transform.foreach`."]
+/// Operation trait for `transform.foreach`.
 pub trait ForeachOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target handles and parameters iterated by this operation.
     fn targets(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
@@ -631,7 +635,7 @@ pub fn foreach<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the `transform.get_consumers_of_result` result-number attribute.
 pub const RESULT_NUMBER_ATTRIBUTE: &str = "result_number";
 
-#[doc = "Operation trait for `transform.get_consumers_of_result`."]
+/// Operation trait for `transform.get_consumers_of_result`.
 pub trait GetConsumersOfResultOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the payload operation handle whose result consumers are queried.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -669,7 +673,7 @@ pub fn get_consumers_of_result<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::get_consumers_of_result`")
 }
 
-#[doc = "Operation trait for `transform.get_defining_op`."]
+/// Operation trait for `transform.get_defining_op`.
 pub trait GetDefiningOpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the value handle whose defining operation is queried.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -709,7 +713,7 @@ pub const DEDUPLICATE_ATTRIBUTE: &str = "deduplicate";
 /// Name of the `transform.get_parent_op` parent-depth attribute.
 pub const NTH_PARENT_ATTRIBUTE: &str = "nth_parent";
 
-#[doc = "Operation trait for `transform.get_parent_op`."]
+/// Operation trait for `transform.get_parent_op`.
 pub trait GetParentOpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target handle whose parent operations are queried.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -765,7 +769,7 @@ pub fn get_parent_op<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the `transform.get_producer_of_operand` operand-number attribute.
 pub const OPERAND_NUMBER_ATTRIBUTE: &str = "operand_number";
 
-#[doc = "Operation trait for `transform.get_producer_of_operand`."]
+/// Operation trait for `transform.get_producer_of_operand`.
 pub trait GetProducerOfOperandOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the payload operation handle whose operand producer is queried.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -812,7 +816,7 @@ pub const IS_INVERTED_ATTRIBUTE: &str = "is_inverted";
 /// Name of the `transform.get_operand` / `transform.get_result` all-positions marker attribute.
 pub const IS_ALL_ATTRIBUTE: &str = "is_all";
 
-#[doc = "Operation trait for `transform.get_operand`."]
+/// Operation trait for `transform.get_operand`.
 pub trait GetOperandOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the payload operation handle whose operands are queried.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -856,7 +860,7 @@ pub fn get_operand<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::get_operand`")
 }
 
-#[doc = "Operation trait for `transform.get_result`."]
+/// Operation trait for `transform.get_result`.
 pub trait GetResultOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the payload operation handle whose results are queried.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -903,7 +907,7 @@ pub fn get_result<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the `transform.get_type` elemental marker attribute.
 pub const ELEMENTAL_ATTRIBUTE: &str = "elemental";
 
-#[doc = "Operation trait for `transform.get_type`."]
+/// Operation trait for `transform.get_type`.
 pub trait GetTypeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the value handle whose associated payload types are extracted.
     fn value(&self) -> ValueRef<'o, 'c, 't> {
@@ -943,7 +947,7 @@ pub const TARGET_ATTRIBUTE: &str = "target";
 /// Name of the failure-propagation-mode attribute used by transform container operations.
 pub const FAILURE_PROPAGATION_MODE_ATTRIBUTE: &str = "failure_propagation_mode";
 
-#[doc = "Operation trait for `transform.include`."]
+/// Operation trait for `transform.include`.
 pub trait IncludeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the operands forwarded to the included named sequence.
     fn operands(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
@@ -989,7 +993,7 @@ pub fn include<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the `transform.match.operation_empty` operand-handle.
 pub const OPERAND_HANDLE_ATTRIBUTE: &str = "operand_handle";
 
-#[doc = "Operation trait for `transform.match.operation_empty`."]
+/// Operation trait for `transform.match.operation_empty`.
 pub trait MatchOperationEmptyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the handle being matched.
     fn operand_handle(&self) -> ValueRef<'o, 'c, 't> {
@@ -1015,7 +1019,7 @@ pub fn match_operation_empty<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the `transform.match.operation_name` operation-names attribute.
 pub const OP_NAMES_ATTRIBUTE: &str = "op_names";
 
-#[doc = "Operation trait for `transform.match.operation_name`."]
+/// Operation trait for `transform.match.operation_name`.
 pub trait MatchOperationNameOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the handle being matched.
     fn operand_handle(&self) -> ValueRef<'o, 'c, 't> {
@@ -1044,7 +1048,7 @@ pub fn match_operation_name<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the `transform.match.param.cmpi` predicate attribute.
 pub const PREDICATE_ATTRIBUTE: &str = "predicate";
 
-#[doc = "Operation trait for `transform.match.param.cmpi`."]
+/// Operation trait for `transform.match.param.cmpi`.
 pub trait MatchParamCmpiOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the parameter being matched.
     fn param(&self) -> ValueRef<'o, 'c, 't> {
@@ -1085,7 +1089,7 @@ pub fn match_param_cmpi<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::match_param_cmpi`")
 }
 
-#[doc = "Operation trait for `transform.merge_handles`."]
+/// Operation trait for `transform.merge_handles`.
 pub trait MergeHandlesOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the handles or parameters being merged.
     fn handles(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
@@ -1127,7 +1131,7 @@ pub const SYMBOL_NAME_ATTRIBUTE: &str = "sym_name";
 /// Name of the function-type attribute used by `transform.named_sequence`.
 pub const FUNCTION_TYPE_ATTRIBUTE: &str = "function_type";
 
-#[doc = "Operation trait for `transform.named_sequence`."]
+/// Operation trait for `transform.named_sequence`.
 pub trait NamedSequenceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the body region containing the named sequence.
     fn body(&self) -> RegionRef<'o, 'c, 't> {
@@ -1164,7 +1168,7 @@ pub const FAIL_ON_PAYLOAD_TOO_SMALL_ATTRIBUTE: &str = "fail_on_payload_too_small
 /// Name of the `transform.split_handle` overflow-result attribute.
 pub const OVERFLOW_RESULT_ATTRIBUTE: &str = "overflow_result";
 
-#[doc = "Operation trait for `transform.split_handle`."]
+/// Operation trait for `transform.split_handle`.
 pub trait SplitHandleOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the handle or parameter being split.
     fn handle(&self) -> ValueRef<'o, 'c, 't> {
@@ -1205,7 +1209,7 @@ pub fn split_handle<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// Name of the `transform.param.constant` value attribute.
 pub const VALUE_ATTRIBUTE: &str = "value";
 
-#[doc = "Operation trait for `transform.param.constant`."]
+/// Operation trait for `transform.param.constant`.
 pub trait ParamConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the produced transform parameter.
     fn param(&self) -> ValueRef<'o, 'c, 't> {
@@ -1239,7 +1243,7 @@ pub const USE_LOCAL_SCOPE_ATTRIBUTE: &str = "use_local_scope";
 /// Name of the `transform.print` skip-regions marker attribute.
 pub const SKIP_REGIONS_ATTRIBUTE: &str = "skip_regions";
 
-#[doc = "Operation trait for `transform.print`."]
+/// Operation trait for `transform.print`.
 pub trait PrintOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the optional target handle to print.
     fn target(&self) -> Option<ValueRef<'o, 'c, 't>> {
@@ -1282,7 +1286,7 @@ pub fn print<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::print`")
 }
 
-#[doc = "Operation trait for `transform.replicate`."]
+/// Operation trait for `transform.replicate`.
 pub trait ReplicateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the pattern handle that determines the replication count.
     fn pattern(&self) -> ValueRef<'o, 'c, 't> {
@@ -1314,7 +1318,7 @@ pub fn replicate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::replicate`")
 }
 
-#[doc = "Operation trait for `transform.select`."]
+/// Operation trait for `transform.select`.
 pub trait SelectOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target handle whose payload operations are filtered.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -1350,7 +1354,7 @@ pub fn select<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::select`")
 }
 
-#[doc = "Operation trait for `transform.sequence`."]
+/// Operation trait for `transform.sequence`.
 pub trait SequenceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the optional root handle operand.
     fn root(&self) -> Option<ValueRef<'o, 'c, 't>> {
@@ -1409,7 +1413,7 @@ pub fn sequence<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::sequence`")
 }
 
-#[doc = "Operation trait for `transform.verify`."]
+/// Operation trait for `transform.verify`.
 pub trait VerifyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target handle being verified.
     fn target(&self) -> ValueRef<'o, 'c, 't> {
@@ -1432,7 +1436,7 @@ pub fn verify<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .expect("invalid arguments to `transform::verify`")
 }
 
-#[doc = "Operation trait for `transform.yield`."]
+/// Operation trait for `transform.yield`.
 pub trait YieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the transform values yielded back to the parent operation.
     fn yielded_values(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {

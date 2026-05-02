@@ -1,125 +1,209 @@
 use ryft_xla_sys::bindings::MlirAttribute;
+use ryft_xla_sys::mlir::dialects::transform::{
+    MlirTransformEnumAttribute, mlirAttributeIsATransformEnumAttr, mlirAttributeIsATransformParamOperandAttr,
+    mlirTransformEnumAttrGet, mlirTransformEnumAttrGetValue, mlirTransformParamOperandAttrGet,
+    mlirTransformParamOperandAttrGetIndex,
+};
 
-use crate::{Attribute, AttributeRef, Context, DialectHandle, IntegerAttributeRef, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, DialectHandle, IntegerAttributeRef, mlir_subtype_trait_impls};
 
-macro_rules! transform_enum_attribute {
-    (
-        enum_name = $enum_name:ident,
-        attribute_name = $attribute_name:ident,
-        context_method = $context_method:ident,
-        doc = $doc:literal,
-        variants = { $($variant:ident => ($value:literal, $string:literal)),+ $(,)* } $(,)?
-    ) => {
-        #[doc = $doc]
-        #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub enum $enum_name {
-            $($variant,)+
-        }
+/// Policy used by Transform dialect container operations when nested operations produce silenceable failures.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FailurePropagationMode {
+    /// Propagates silenceable failures from nested operations to the parent operation.
+    Propagate,
 
-        impl $enum_name {
-            /// Returns the integer value used by the MLIR enum attribute.
-            pub fn value(&self) -> u32 {
-                match self {
-                    $(Self::$variant => $value,)+
-                }
-            }
-
-            /// Returns the textual spelling used in MLIR assembly.
-            pub fn as_str(&self) -> &'static str {
-                match self {
-                    $(Self::$variant => $string,)+
-                }
-            }
-
-            /// Returns the enum value corresponding to the provided MLIR integer value.
-            pub fn from_value(value: u32) -> Option<Self> {
-                match value {
-                    $($value => Some(Self::$variant),)+
-                    _ => None,
-                }
-            }
-        }
-
-        #[doc = "Transform dialect [`Attribute`] that stores a [`"]
-        #[doc = stringify!($enum_name)]
-        #[doc = "`]."]
-        #[derive(Copy, Clone)]
-        pub struct $attribute_name<'c, 't> {
-            /// Handle that represents this [`Attribute`] in the MLIR C API.
-            handle: MlirAttribute,
-
-            /// [`Context`] that owns this [`Attribute`].
-            context: &'c Context<'t>,
-        }
-
-        impl $attribute_name<'_, '_> {
-            /// Returns the enum value stored in this attribute.
-            pub fn value(&self) -> $enum_name {
-                let attribute = unsafe { IntegerAttributeRef::from_c_api(self.handle, self.context).unwrap() };
-                $enum_name::from_value(attribute.signless_value() as u32).expect("invalid Transform enum attribute value")
-            }
-        }
-
-        impl<'c, 't> Attribute<'c, 't> for $attribute_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-                let attribute = unsafe { IntegerAttributeRef::from_c_api(handle, context)? };
-                let value = attribute.signless_value();
-                if value >= 0 && attribute.value_bit_width() == 32 && $enum_name::from_value(value as u32).is_some() {
-                    Some(Self { handle, context })
-                } else {
-                    None
-                }
-            }
-
-            unsafe fn to_c_api(&self) -> MlirAttribute {
-                self.handle
-            }
-
-            fn context(&self) -> &'c Context<'t> {
-                self.context
-            }
-        }
-
-        mlir_subtype_trait_impls!($attribute_name<'c, 't> as Attribute, mlir_type = Attribute);
-
-        impl<'t> Context<'t> {
-            #[doc = "Creates a new [`"]
-            #[doc = stringify!($attribute_name)]
-            #[doc = "`] owned by this [`Context`]."]
-            pub fn $context_method<'c>(&'c self, value: $enum_name) -> $attribute_name<'c, 't> {
-                self.load_dialect(DialectHandle::transform());
-                let attribute = self.integer_attribute(self.signless_integer_type(32), value.value() as i64);
-                unsafe { $attribute_name::from_c_api(attribute.to_c_api(), self).unwrap() }
-            }
-        }
-    };
+    /// Suppresses silenceable failures from nested operations after the parent operation handles them.
+    Suppress,
 }
 
-transform_enum_attribute!(
-    enum_name = FailurePropagationMode,
-    attribute_name = FailurePropagationModeAttributeRef,
-    context_method = transform_failure_propagation_mode_attribute,
-    doc = "Policy used by Transform dialect container operations when nested operations produce silenceable failures.",
-    variants = {
-        Propagate => (1, "propagate"),
-        Suppress => (2, "suppress"),
-    },
-);
+impl FailurePropagationMode {
+    /// Returns the integer value used by the MLIR enum attribute.
+    pub fn value(&self) -> u32 {
+        match self {
+            Self::Propagate => 1,
+            Self::Suppress => 2,
+        }
+    }
 
-transform_enum_attribute!(
-    enum_name = MatchCmpIPredicate,
-    attribute_name = MatchCmpIPredicateAttributeRef,
-    context_method = transform_match_cmp_i_predicate_attribute,
-    doc = "Signed integer comparison predicate used by `transform.match.param.cmpi`.",
-    variants = {
-        Equal => (0, "eq"),
-        NotEqual => (1, "ne"),
-        LessThan => (2, "lt"),
-        LessThanOrEqual => (3, "le"),
-        GreaterThan => (4, "gt"),
-        GreaterThanOrEqual => (5, "ge"),
-    },
-);
+    /// Returns the textual spelling used in MLIR assembly.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Propagate => "propagate",
+            Self::Suppress => "suppress",
+        }
+    }
+
+    /// Returns the enum value corresponding to the provided MLIR integer value.
+    pub fn from_value(value: u32) -> Option<Self> {
+        match value {
+            1 => Some(Self::Propagate),
+            2 => Some(Self::Suppress),
+            _ => None,
+        }
+    }
+}
+
+/// Transform dialect [`Attribute`] that stores a [`FailurePropagationMode`].
+#[derive(Copy, Clone)]
+pub struct FailurePropagationModeAttributeRef<'c, 't> {
+    /// Handle that represents this [`Attribute`] in the MLIR C API.
+    handle: MlirAttribute,
+
+    /// [`Context`] that owns this [`Attribute`].
+    context: &'c Context<'t>,
+}
+
+impl FailurePropagationModeAttributeRef<'_, '_> {
+    /// Returns the enum value stored in this attribute.
+    pub fn value(&self) -> FailurePropagationMode {
+        let value = unsafe {
+            mlirTransformEnumAttrGetValue(
+                self.handle,
+                MlirTransformEnumAttribute::MLIR_TRANSFORM_ENUM_ATTRIBUTE_FAILURE_PROPAGATION_MODE,
+            )
+        };
+        FailurePropagationMode::from_value(value).expect("invalid Transform failure propagation mode attribute")
+    }
+}
+
+impl<'c, 't> Attribute<'c, 't> for FailurePropagationModeAttributeRef<'c, 't> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+        if !handle.ptr.is_null()
+            && unsafe {
+                mlirAttributeIsATransformEnumAttr(
+                    handle,
+                    MlirTransformEnumAttribute::MLIR_TRANSFORM_ENUM_ATTRIBUTE_FAILURE_PROPAGATION_MODE,
+                )
+            }
+        {
+            Some(Self { handle, context })
+        } else {
+            None
+        }
+    }
+
+    unsafe fn to_c_api(&self) -> MlirAttribute {
+        self.handle
+    }
+
+    fn context(&self) -> &'c Context<'t> {
+        self.context
+    }
+}
+
+mlir_subtype_trait_impls!(FailurePropagationModeAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
+
+/// Signed integer comparison predicate used by `transform.match.param.cmpi`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MatchCmpIPredicate {
+    /// Tests whether the left parameter is equal to the right parameter.
+    Equal,
+
+    /// Tests whether the left parameter is not equal to the right parameter.
+    NotEqual,
+
+    /// Tests whether the left parameter is less than the right parameter.
+    LessThan,
+
+    /// Tests whether the left parameter is less than or equal to the right parameter.
+    LessThanOrEqual,
+
+    /// Tests whether the left parameter is greater than the right parameter.
+    GreaterThan,
+
+    /// Tests whether the left parameter is greater than or equal to the right parameter.
+    GreaterThanOrEqual,
+}
+
+impl MatchCmpIPredicate {
+    /// Returns the integer value used by the MLIR enum attribute.
+    pub fn value(&self) -> u32 {
+        match self {
+            Self::Equal => 0,
+            Self::NotEqual => 1,
+            Self::LessThan => 2,
+            Self::LessThanOrEqual => 3,
+            Self::GreaterThan => 4,
+            Self::GreaterThanOrEqual => 5,
+        }
+    }
+
+    /// Returns the textual spelling used in MLIR assembly.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Equal => "eq",
+            Self::NotEqual => "ne",
+            Self::LessThan => "lt",
+            Self::LessThanOrEqual => "le",
+            Self::GreaterThan => "gt",
+            Self::GreaterThanOrEqual => "ge",
+        }
+    }
+
+    /// Returns the enum value corresponding to the provided MLIR integer value.
+    pub fn from_value(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Equal),
+            1 => Some(Self::NotEqual),
+            2 => Some(Self::LessThan),
+            3 => Some(Self::LessThanOrEqual),
+            4 => Some(Self::GreaterThan),
+            5 => Some(Self::GreaterThanOrEqual),
+            _ => None,
+        }
+    }
+}
+
+/// Transform dialect [`Attribute`] that stores a [`MatchCmpIPredicate`].
+#[derive(Copy, Clone)]
+pub struct MatchCmpIPredicateAttributeRef<'c, 't> {
+    /// Handle that represents this [`Attribute`] in the MLIR C API.
+    handle: MlirAttribute,
+
+    /// [`Context`] that owns this [`Attribute`].
+    context: &'c Context<'t>,
+}
+
+impl MatchCmpIPredicateAttributeRef<'_, '_> {
+    /// Returns the enum value stored in this attribute.
+    pub fn value(&self) -> MatchCmpIPredicate {
+        let value = unsafe {
+            mlirTransformEnumAttrGetValue(
+                self.handle,
+                MlirTransformEnumAttribute::MLIR_TRANSFORM_ENUM_ATTRIBUTE_MATCH_CMP_I_PREDICATE,
+            )
+        };
+        MatchCmpIPredicate::from_value(value).expect("invalid Transform match comparison predicate attribute")
+    }
+}
+
+impl<'c, 't> Attribute<'c, 't> for MatchCmpIPredicateAttributeRef<'c, 't> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+        if !handle.ptr.is_null()
+            && unsafe {
+                mlirAttributeIsATransformEnumAttr(
+                    handle,
+                    MlirTransformEnumAttribute::MLIR_TRANSFORM_ENUM_ATTRIBUTE_MATCH_CMP_I_PREDICATE,
+                )
+            }
+        {
+            Some(Self { handle, context })
+        } else {
+            None
+        }
+    }
+
+    unsafe fn to_c_api(&self) -> MlirAttribute {
+        self.handle
+    }
+
+    fn context(&self) -> &'c Context<'t> {
+        self.context
+    }
+}
+
+mlir_subtype_trait_impls!(MatchCmpIPredicateAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
 /// Transform dialect [`Attribute`] that refers to a specific parameter operand by index.
 ///
@@ -137,24 +221,20 @@ pub struct ParamOperandAttributeRef<'c, 't> {
 impl<'c, 't> ParamOperandAttributeRef<'c, 't> {
     /// Returns the integer attribute that stores the referenced parameter operand index.
     pub fn index(&self) -> IntegerAttributeRef<'c, 't> {
-        let source = self.to_string();
-        let index = source
-            .strip_prefix("#transform.param_operand<index = ")
-            .and_then(|source| source.strip_suffix(">"))
-            .expect("invalid `#transform.param_operand` assembly");
-        self.context
-            .parse_attribute(index)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .expect("invalid `index` parameter in `#transform.param_operand`")
+        unsafe {
+            IntegerAttributeRef::from_c_api(mlirTransformParamOperandAttrGetIndex(self.handle), self.context)
+                .expect("invalid `#transform.param_operand` index")
+        }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for ParamOperandAttributeRef<'c, 't> {
     unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        let attribute = unsafe { AttributeRef::from_c_api(handle, context)? };
-        let is_param_operand = attribute.dialect().namespace().ok() == Some("transform")
-            && attribute.to_string().starts_with("#transform.param_operand<");
-        if is_param_operand { Some(Self { handle, context }) } else { None }
+        if !handle.ptr.is_null() && unsafe { mlirAttributeIsATransformParamOperandAttr(handle) } {
+            Some(Self { handle, context })
+        } else {
+            None
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -169,16 +249,57 @@ impl<'c, 't> Attribute<'c, 't> for ParamOperandAttributeRef<'c, 't> {
 mlir_subtype_trait_impls!(ParamOperandAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
 impl<'t> Context<'t> {
+    /// Creates a new [`FailurePropagationModeAttributeRef`] owned by this [`Context`].
+    pub fn transform_failure_propagation_mode_attribute<'c>(
+        &'c self,
+        value: FailurePropagationMode,
+    ) -> FailurePropagationModeAttributeRef<'c, 't> {
+        self.load_dialect(DialectHandle::transform());
+        unsafe {
+            FailurePropagationModeAttributeRef::from_c_api(
+                mlirTransformEnumAttrGet(
+                    *self.handle.borrow_mut(),
+                    MlirTransformEnumAttribute::MLIR_TRANSFORM_ENUM_ATTRIBUTE_FAILURE_PROPAGATION_MODE,
+                    value.value(),
+                ),
+                self,
+            )
+            .expect("invalid arguments to `Context::transform_failure_propagation_mode_attribute`")
+        }
+    }
+
+    /// Creates a new [`MatchCmpIPredicateAttributeRef`] owned by this [`Context`].
+    pub fn transform_match_cmp_i_predicate_attribute<'c>(
+        &'c self,
+        value: MatchCmpIPredicate,
+    ) -> MatchCmpIPredicateAttributeRef<'c, 't> {
+        self.load_dialect(DialectHandle::transform());
+        unsafe {
+            MatchCmpIPredicateAttributeRef::from_c_api(
+                mlirTransformEnumAttrGet(
+                    *self.handle.borrow_mut(),
+                    MlirTransformEnumAttribute::MLIR_TRANSFORM_ENUM_ATTRIBUTE_MATCH_CMP_I_PREDICATE,
+                    value.value(),
+                ),
+                self,
+            )
+            .expect("invalid arguments to `Context::transform_match_cmp_i_predicate_attribute`")
+        }
+    }
+
     /// Creates a new [`ParamOperandAttributeRef`] owned by this [`Context`].
     pub fn transform_param_operand_attribute<'c>(
         &'c self,
         index: IntegerAttributeRef<'c, 't>,
     ) -> ParamOperandAttributeRef<'c, 't> {
         self.load_dialect(DialectHandle::transform());
-        let source = format!("#transform.param_operand<index = {index}>");
-        self.parse_attribute(&source)
-            .and_then(|attribute| attribute.cast())
+        unsafe {
+            ParamOperandAttributeRef::from_c_api(
+                mlirTransformParamOperandAttrGet(*self.handle.borrow_mut(), index.to_c_api()),
+                self,
+            )
             .expect("invalid arguments to `Context::transform_param_operand_attribute`")
+        }
     }
 }
 
@@ -225,6 +346,19 @@ mod tests {
     }
 
     #[test]
+    fn test_failure_propagation_mode_attribute_parsing() {
+        let context = Context::new();
+        let attribute = context
+            .parse_attribute("1 : i32")
+            .and_then(|attribute| attribute.cast::<FailurePropagationModeAttributeRef>())
+            .unwrap();
+        assert_eq!(attribute.value(), FailurePropagationMode::Propagate);
+
+        let attribute = context.parse_attribute("0 : i32").unwrap();
+        assert_eq!(attribute.cast::<FailurePropagationModeAttributeRef>(), None);
+    }
+
+    #[test]
     fn test_failure_propagation_mode_attribute_casting() {
         let context = Context::new();
         let attribute = context.transform_failure_propagation_mode_attribute(FailurePropagationMode::Propagate);
@@ -262,6 +396,19 @@ mod tests {
         let context = Context::new();
         let attribute = context.transform_match_cmp_i_predicate_attribute(MatchCmpIPredicate::LessThanOrEqual);
         test_attribute_display_and_debug(attribute, "3 : i32");
+    }
+
+    #[test]
+    fn test_match_cmp_i_predicate_attribute_parsing() {
+        let context = Context::new();
+        let attribute = context
+            .parse_attribute("3 : i32")
+            .and_then(|attribute| attribute.cast::<MatchCmpIPredicateAttributeRef>())
+            .unwrap();
+        assert_eq!(attribute.value(), MatchCmpIPredicate::LessThanOrEqual);
+
+        let attribute = context.parse_attribute("6 : i32").unwrap();
+        assert_eq!(attribute.cast::<MatchCmpIPredicateAttributeRef>(), None);
     }
 
     #[test]
