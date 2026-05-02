@@ -54,12 +54,13 @@ mod tests {
     #[test]
     fn test_dialect_handle() {
         assert_eq!(DialectHandle::affine().namespace().unwrap(), "affine");
+        assert_eq!(DialectHandle::r#async().namespace().unwrap(), "async");
+        assert_eq!(DialectHandle::func().namespace().unwrap(), "func");
         assert_eq!(DialectHandle::gpu().namespace().unwrap(), "gpu");
         assert_eq!(DialectHandle::linalg().namespace().unwrap(), "linalg");
         assert_eq!(DialectHandle::nvgpu().namespace().unwrap(), "nvgpu");
         assert_eq!(DialectHandle::sparse_tensor().namespace().unwrap(), "sparse_tensor");
-        assert_eq!(DialectHandle::func().namespace().unwrap(), "func");
-        assert_eq!(DialectHandle::r#async().namespace().unwrap(), "async");
+        assert_eq!(DialectHandle::tensor().namespace().unwrap(), "tensor");
 
         // Check that we can construct multiple handles for the same dialect.
         let handle_1 = DialectHandle::gpu();

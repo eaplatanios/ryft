@@ -123,8 +123,8 @@ fn main() {
         - [ ] Add support for types: `QuantizedType`, `AnyQuantizedType`, `CalibratedQuantizedType`,
           `UniformQuantizedPerAxisType`, `UniformQuantizedType`, `UniformQuantizedSubChannelType`.
         - [ ] Add support for operations.
-    - [ ] `scf`
-    - [ ] `shape`
+    - [x] `scf`
+    - [x] `shape`
     - [/] `shardy`: Current support for the Shardy dialect is only partial and aimed at attributes and operations that
       are relevant when building StableHLO programs to be compiled by XLA, and not covering attributes and operations
       that are internal to the Shardy compiler. Also, the current support was added hastily and is likely to change as
@@ -142,7 +142,7 @@ fn main() {
         - [ ] Add checks for operation arguments when constructing them to prevent panics and return informative errors:
             - https://openxla.org/stablehlo/spec
             - https://github.com/openxla/stablehlo/blob/4c0d4841519aed22e3689c30b72a0e4228051249/stablehlo/dialect/StablehloOps.cpp
-    - [ ] `tensor`
+    - [x] `tensor`
     - [/] `triton`
       - [x] `tt`
       - [ ] `tti`
