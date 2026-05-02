@@ -257,17 +257,6 @@ impl<'engine, E: TracingEngine<OperationCarrier: SupportsOneLike<E::Type, E::Val
     }
 }
 
-// TODO(eaplatanios): Inline this.
-fn ensure_scalar_data_type(r#type: DataType, expected: DataType) -> Result<(), TracingError> {
-    if r#type != expected {
-        return Err(TypeError {
-            message: format!("scalar value expected data type {expected} but got {type_}", type_ = r#type),
-        }
-        .into());
-    }
-    Ok(())
-}
-
 macro_rules! impl_constants_for_scalar {
     ($ty:ty, $data_type:path, $zero:expr, $one:expr) => {
         impl ZeroLike for $ty {
@@ -287,7 +276,12 @@ macro_rules! impl_constants_for_scalar {
         impl Zero<DataType> for $ty {
             #[inline]
             fn zero(r#type: &DataType) -> Result<Self, TracingError> {
-                ensure_scalar_data_type(*r#type, $data_type)?;
+                if *r#type != $data_type {
+                    return Err(TypeError {
+                        message: format!("scalar value expected data type {} but got {}", $data_type, r#type),
+                    }
+                    .into());
+                }
                 Ok($zero)
             }
         }
@@ -295,7 +289,12 @@ macro_rules! impl_constants_for_scalar {
         impl One<DataType> for $ty {
             #[inline]
             fn one(r#type: &DataType) -> Result<Self, TracingError> {
-                ensure_scalar_data_type(*r#type, $data_type)?;
+                if *r#type != $data_type {
+                    return Err(TypeError {
+                        message: format!("scalar value expected data type {} but got {}", $data_type, r#type),
+                    }
+                    .into());
+                }
                 Ok($one)
             }
         }
