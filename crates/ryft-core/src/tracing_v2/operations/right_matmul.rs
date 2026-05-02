@@ -83,7 +83,7 @@ impl<V: MatrixValue> Operation<ArrayType> for RightMatMulOperation<V> {
 
 impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for RightMatMulOperation<V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().matmul(self.factor.clone())])
     }
 }
@@ -94,7 +94,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for 
         context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1);
+        check_input_count!(output_cotangents, 1, TracingError);
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
@@ -124,7 +124,7 @@ where
         context: &mut JvpContext<'_, V, E::LinearOperation>,
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().matmul(self.factor().clone());
         let tangent = context
             .apply_operation(
@@ -162,7 +162,7 @@ where
         >,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         let factor_tracer = engine.constant(self.factor().clone());
         let primal = inputs[0].primal.clone().matmul(factor_tracer.clone());
         let tangent = context

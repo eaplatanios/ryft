@@ -4,7 +4,7 @@ use std::rc::Rc;
 use crate::tracing::{AtomId, Instruction, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableEngine;
 use crate::tracing_v2::forward::{JvpContext, JvpTracer};
-use crate::types::{Type, TypeError, Typed};
+use crate::types::{Type, Typed};
 
 /// Elementwise addition.
 pub mod add;
@@ -85,14 +85,6 @@ pub use reshape::{ReshapeOperation, SupportsReshape};
 pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
 pub use scale::{ScaleOperation, SupportsScale};
 pub use sin::{Sin, SinOperation, SupportsSin};
-
-/// Propagates one unary input type through a shape-preserving staged op.
-pub fn unary_abstract<T: Type>(inputs: &[T]) -> Result<T, TypeError> {
-    if inputs.len() != 1 {
-        return Err(TypeError { message: format!("expected 1 input type but got {}", inputs.len()) });
-    }
-    Ok(inputs[0].clone())
-}
 
 /// Semantic contract for staged operations that can live in linear programs.
 ///

@@ -9,7 +9,7 @@ use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableEngine, LinearArrayOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, unary_abstract};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
 /// Hidden carrier capability for staging the negation primitive.
 #[doc(hidden)]
@@ -55,20 +55,21 @@ impl<T: Type> Operation<T> for NegOperation {
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        Ok(vec![unary_abstract(input_types)?])
+        check_input_count!(input_types, 1, TypeError);
+        Ok(vec![input_types[0].clone()])
     }
 }
 
 impl<V: Typed<ArrayType> + Clone + Neg<Output = V>> InterpretableOperation<ArrayType, V> for NegOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![-inputs[0].clone()])
     }
 }
 
 impl<V: Typed<DataType> + Clone + Neg<Output = V>> InterpretableOperation<DataType, V> for NegOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![-inputs[0].clone()])
     }
 }
@@ -81,7 +82,7 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<Array
         context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1);
+        check_input_count!(output_cotangents, 1, TracingError);
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
@@ -108,7 +109,7 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + Z
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1);
+        check_input_count!(output_cotangents, 1, TracingError);
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
@@ -135,7 +136,7 @@ where
         context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent],

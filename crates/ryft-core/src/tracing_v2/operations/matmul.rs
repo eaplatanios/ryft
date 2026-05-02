@@ -53,7 +53,7 @@ impl Operation<ArrayType> for MatMulOperation {
 
 impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 2);
+        check_input_count!(inputs, 2, TracingError);
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
     }
 }
@@ -72,7 +72,7 @@ where
         context: &mut JvpContext<'_, E::Value, E::LinearOperation>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 2);
+        check_input_count!(inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
         let primal = left.primal.clone().matmul(right.primal.clone());

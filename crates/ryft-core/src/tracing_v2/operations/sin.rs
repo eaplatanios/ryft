@@ -10,7 +10,7 @@ use crate::tracing_v2::forward::{Differentiable, JvpContext, JvpTracer};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::cos::Cos;
-use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsScale, unary_abstract};
+use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsScale};
 
 /// Hidden carrier capability for staging the sine primitive.
 #[doc(hidden)]
@@ -82,20 +82,21 @@ impl<T: Type> Operation<T> for SinOperation {
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        Ok(vec![unary_abstract(input_types)?])
+        check_input_count!(input_types, 1, TypeError);
+        Ok(vec![input_types[0].clone()])
     }
 }
 
 impl<V: Typed<ArrayType> + Clone + Sin> InterpretableOperation<ArrayType, V> for SinOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().sin()])
     }
 }
 
 impl<V: Typed<DataType> + Clone + Sin> InterpretableOperation<DataType, V> for SinOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().sin()])
     }
 }
@@ -113,7 +114,7 @@ where
         context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         let input = &inputs[0];
         let tangent = context
             .apply_operation(

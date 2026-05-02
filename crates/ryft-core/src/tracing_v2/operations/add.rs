@@ -118,14 +118,14 @@ impl Operation<DataType> for AddOperation {
 
 impl<V: Typed<ArrayType> + Clone + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 2);
+        check_input_count!(inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }
 }
 
 impl<V: Typed<DataType> + Clone + Add<Output = V>> InterpretableOperation<DataType, V> for AddOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 2);
+        check_input_count!(inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }
 }
@@ -138,7 +138,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<Array
         _context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1);
+        check_input_count!(output_cotangents, 1, TracingError);
         Ok(vec![output_cotangents[0], output_cotangents[0]])
     }
 }
@@ -156,7 +156,7 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Add<Output = V> + Z
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1);
+        check_input_count!(output_cotangents, 1, TracingError);
         Ok(vec![output_cotangents[0], output_cotangents[0]])
     }
 }
@@ -174,7 +174,7 @@ where
         context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 2);
+        check_input_count!(inputs, 2, TracingError);
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent, inputs[1].tangent],

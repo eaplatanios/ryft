@@ -112,14 +112,14 @@ impl Operation<DataType> for MulOperation {
 
 impl<V: Typed<ArrayType> + Clone + Mul<Output = V>> InterpretableOperation<ArrayType, V> for MulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 2);
+        check_input_count!(inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
     }
 }
 
 impl<V: Typed<DataType> + Clone + Mul<Output = V>> InterpretableOperation<DataType, V> for MulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 2);
+        check_input_count!(inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
     }
 }
@@ -137,7 +137,7 @@ where
         context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 2);
+        check_input_count!(inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
         let left_term = context

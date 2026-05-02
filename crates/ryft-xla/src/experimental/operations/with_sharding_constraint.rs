@@ -5,7 +5,6 @@ use ryft_core::macros::check_input_count;
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing::{AtomId, InterpretableOperation, Operation, Traceable, TracingError};
 use ryft_core::tracing_v2::forward::JvpTracer;
-use ryft_core::tracing_v2::operations::unary_abstract;
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearArrayOperation,
     LinearCustomPrimitive, LinearOperation,
@@ -89,7 +88,8 @@ impl Operation<ArrayType> for WithShardingConstraintOperation {
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        let mut output = unary_abstract(input_types)?;
+        check_input_count!(input_types, 1, TypeError);
+        let mut output = input_types[0].clone();
         if output.rank() != self.sharding().rank() {
             return Err(TypeError {
                 message: "with_sharding_constraint rank does not match the requested sharding rank".to_string(),
@@ -108,7 +108,7 @@ impl Operation<ArrayType> for WithShardingConstraintOperation {
 
 impl InterpretableOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperation {
     fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![inputs[0].clone()])
     }
 }
@@ -126,7 +126,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1);
+        check_input_count!(output_cotangents, 1, TracingError);
         match output_cotangents[0] {
             Some(atom) => {
                 let contribution = context
@@ -155,7 +155,7 @@ where
         context: &mut JvpContext<'_, ShardMapTensor, LinearArrayOperation<ShardMapTensor>>,
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         let tangent = context
             .apply_operation(&[inputs[0].tangent], LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, 1)?
             .into_iter()
@@ -167,7 +167,7 @@ where
 
 impl InterpretableOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperation {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![inputs[0].clone()])
     }
 }
@@ -185,7 +185,7 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1);
+        check_input_count!(output_cotangents, 1, TracingError);
         match output_cotangents[0] {
             Some(atom) => {
                 let contribution = context

@@ -52,7 +52,7 @@ impl Operation<ArrayType> for MatrixTransposeOperation {
 
 impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().transpose_matrix()])
     }
 }
@@ -63,7 +63,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for 
         context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1);
+        check_input_count!(output_cotangents, 1, TracingError);
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
@@ -89,7 +89,7 @@ where
         context: &mut JvpContext<'_, E::Value, E::LinearOperation>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().transpose_matrix();
         let tangent = context
             .apply_operation(

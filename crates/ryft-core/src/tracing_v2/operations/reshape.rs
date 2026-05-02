@@ -293,7 +293,7 @@ impl Operation<ArrayType> for ReshapeOperation {
 
 impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().reshape(self.output_shape().clone())?])
     }
 }
@@ -304,7 +304,7 @@ impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V>> for
         context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1);
+        check_input_count!(output_cotangents, 1, TracingError);
         let Some(atom) = output_cotangents[0] else {
             return Ok(vec![None]);
         };
@@ -340,7 +340,7 @@ where
         context: &mut JvpContext<'_, E::Value, E::LinearOperation>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().reshape(self.output_shape().clone())?;
         let tangent = context
             .apply_operation(

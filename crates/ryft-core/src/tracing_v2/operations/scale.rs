@@ -12,7 +12,7 @@ use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd, unary_abstract};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd};
 
 /// Hidden carrier capability for staging the scaling primitive.
 ///
@@ -61,7 +61,8 @@ impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
     /// This is mainly used by carrier-level wrappers that want to construct or validate a scale op
     /// from type information before they have committed to a concrete `ScaleOperation` value.
     pub fn abstract_eval_static(inputs: &[T]) -> Result<Vec<T>, TypeError> {
-        Ok(vec![unary_abstract(inputs)?])
+        check_input_count!(inputs, 1, TypeError);
+        Ok(vec![inputs[0].clone()])
     }
 }
 
@@ -94,7 +95,7 @@ impl<T: Type, V: Typed<T> + Display> Operation<T> for ScaleOperation<T, V> {
 
 impl<T: Type, V: Typed<T> + Display + Clone + Mul<Output = V>> InterpretableOperation<T, V> for ScaleOperation<T, V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![self.factor().clone() * inputs[0].clone()])
     }
 }
@@ -109,7 +110,7 @@ where
         context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1);
+        check_input_count!(output_cotangents, 1, TracingError);
         match output_cotangents[0] {
             Some(atom) => Ok(vec![Some(
                 context
@@ -135,7 +136,7 @@ where
         context: &mut JvpContext<'_, V, E::LinearOperation>,
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         let input = &inputs[0];
         let tangent = context
             .apply_operation(
@@ -162,7 +163,7 @@ where
         context: &mut JvpContext<'_, V, E::LinearOperation, DataType>,
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         let input = &inputs[0];
         let tangent = context
             .apply_operation(
@@ -204,7 +205,7 @@ where
         >,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1);
+        check_input_count!(inputs, 1, TracingError);
         let input = &inputs[0];
         let factor_tracer = engine.constant(self.factor().clone());
         let tangent = context
