@@ -63,11 +63,7 @@ pub trait TracingEngine: Engine {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let input_structure = input_types.parameter_structure();
         let input = input_types
-            .map_parameters(|r#type| Tracer {
-                state: TracerState::Live(builder.borrow_mut().add_input(r#type.clone())),
-                r#type,
-                context: TracingContext::new(self, builder.clone()),
-            })
+            .map_parameters(|r#type| TracingContext::new(self, builder.clone()).input(r#type))
             .map_err(TracingError::from)?;
         let output = function(input).map_err(|error| match builder.borrow_mut().error.take() {
             Some(error) => error,
@@ -221,11 +217,18 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
         Self { engine, builder }
     }
 
-    /// Lifts a concrete value into a [`Tracer`] constant in this [`TracingContext`].
+    /// Creates a constant [`Tracer`] in this [`TracingContext`] for the provided concrete value.
     #[inline]
-    pub fn lift(&self, value: E::Value) -> Tracer<'engine, E> {
+    pub fn constant(&self, value: E::Value) -> Tracer<'engine, E> {
         let r#type = value.r#type().into_owned();
         let atom = self.builder.borrow_mut().add_constant(value);
+        self.tracer(atom, Some(r#type))
+    }
+
+    /// Creates an input [`Tracer`] in this [`TracingContext`] for the provided type.
+    #[inline]
+    pub fn input(&self, r#type: E::Type) -> Tracer<'engine, E> {
+        let atom = self.builder.borrow_mut().add_input(r#type.clone());
         self.tracer(atom, Some(r#type))
     }
 
@@ -286,15 +289,7 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
                     }
                 }
             };
-            let builder = self.builder.borrow();
-            Ok(output_atom_ids
-                .into_iter()
-                .map(|atom| Tracer {
-                    state: TracerState::Live(atom),
-                    r#type: builder.atoms[atom.index].r#type().into_owned(),
-                    context: self.clone(),
-                })
-                .collect::<Vec<_>>())
+            Ok(output_atom_ids.into_iter().map(|atom| self.tracer(atom, None)).collect::<Vec<_>>())
         }
     }
 }
@@ -317,16 +312,12 @@ impl<'engine, E: TracingEngine + ?Sized> Engine for TracingContext<'engine, E> {
 
     #[inline]
     fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        let value = self.engine.zero(r#type)?;
-        let atom = self.builder.borrow_mut().add_constant(value);
-        Ok(self.tracer(atom, Some(r#type.clone())))
+        Ok(self.constant(self.engine.zero(r#type)?))
     }
 
     #[inline]
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        let value = self.engine.one(r#type)?;
-        let atom = self.builder.borrow_mut().add_constant(value);
-        Ok(self.tracer(atom, Some(r#type.clone())))
+        Ok(self.constant(self.engine.one(r#type)?))
     }
 }
 
@@ -692,15 +683,15 @@ mod tests {
         assert!(Rc::ptr_eq(&cloned_context.builder, &builder));
         assert_eq!(format!("{tracing_context:?}"), "TracingContext { .. }");
 
-        // Test lifting a concrete value into the staged program.
-        let lifted = tracing_context.lift(2.5f64);
-        assert_eq!(lifted.r#type().into_owned(), DataType::F64);
-        let lifted_atom = lifted.atom_id().expect("lifted tracer should remain live");
-        assert_eq!(lifted_atom.index, 0);
+        // Test creating a concrete constant in the staged program.
+        let constant = tracing_context.constant(2.5f64);
+        assert_eq!(constant.r#type().into_owned(), DataType::F64);
+        let constant_atom = constant.atom_id().expect("constant tracer should remain live");
+        assert_eq!(constant_atom.index, 0);
         let program = builder
             .borrow()
             .clone()
-            .build::<Vec<f64>, f64>(vec![lifted_atom], Vec::<Placeholder>::new(), Placeholder)
+            .build::<Vec<f64>, f64>(vec![constant_atom], Vec::<Placeholder>::new(), Placeholder)
             .unwrap();
         assert_eq!(program.interpret(Vec::new()), Ok(2.5));
         assert_eq!(
@@ -994,9 +985,8 @@ mod tests {
 
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, NoOutputOperation>::new()));
         let input_type = DataType::F64;
-        let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = NoOutputEngine;
-        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, Some(input_type));
+        let tracer = TracingContext::new(&engine, builder.clone()).input(input_type);
         let output = tracer.unary(NoOutputOperation);
         assert!(matches!(&output.state, TracerState::Poison));
         assert_eq!(output.r#type().into_owned(), DataType::F64);
