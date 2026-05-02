@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::operations::Operation;
 use crate::parameters::Parameterized;
 use crate::tracing::{Atom, AtomId, Program, Traceable, TracingError};
-use crate::types::ArrayType;
+use crate::types::Type;
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]
@@ -218,15 +218,16 @@ pub(crate) fn normalize_op_name(name: &str) -> String {
 ///   - `program`: Program to summarize.
 ///   - `nested_regions_for_op`: Callback that returns the immediate nested regions carried by one
 ///     staged op.
-pub fn summarize_program<V, Input, Output, O, F>(
-    program: &Program<ArrayType, V, O, Input, Output>,
+pub fn summarize_program<T, V, Input, Output, O, F>(
+    program: &Program<T, V, O, Input, Output>,
     nested_regions_for_op: F,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
-    V: Traceable<ArrayType>,
+    T: Type,
+    V: Traceable<T>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
-    O: Clone + Operation<ArrayType>,
+    O: Clone + Operation<T>,
     F: Fn(&O) -> Result<Vec<IrNestedRegionSummary>, BenchmarkError>,
 {
     let mut op_histogram = BTreeMap::new();
@@ -305,47 +306,27 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::operations::constants::OneLike;
     use crate::tracing::Program;
-    use crate::tracing::engines::{Engine, TracingEngine};
+    use crate::tracing::engines::{ScalarEngine, TracingEngine};
+    use crate::tracing_v2::ScalarOperation;
     use crate::tracing_v2::Sin;
+    use crate::types::DataType;
 
     use super::*;
-
-    #[derive(Copy, Clone, Debug)]
-    struct ArrayScalarEngine;
-
-    impl Engine for ArrayScalarEngine {
-        type Type = ArrayType;
-        type Value = f64;
-
-        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(0.0)
-        }
-
-        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(1.0)
-        }
-    }
-
-    impl TracingEngine for ArrayScalarEngine {
-        type OperationCarrier = crate::tracing_v2::ArrayOperation<f64, ArrayType>;
-    }
 
     /// Summarizes a small scalar program and verifies the structural metrics.
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
-        let engine = ArrayScalarEngine;
-        let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ArrayOperation<f64, ArrayType>, f64, f64>) =
-            engine
-                .interpret_and_trace(
-                    |x| {
-                        let with_constant = x.clone() + x.one_like();
-                        Ok(with_constant.sin())
-                    },
-                    2.0f64,
-                )
-                .unwrap();
+        let engine = ScalarEngine::<f64>::new();
+        let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
+            .interpret_and_trace(
+                |x| {
+                    let with_constant = x.clone() + x.context.constant(1.0);
+                    Ok(with_constant.sin())
+                },
+                2.0f64,
+            )
+            .unwrap();
 
         let summary = summarize_program(&compiled, |_| Ok(Vec::new())).unwrap();
         assert_eq!(
@@ -386,10 +367,10 @@ mod tests {
         assert_eq!(
             records[0].raw_ir.trim_end(),
             indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = mul %0 %1
-                    %3:f64[] = sin %0
-                    %4:f64[] = add %2 %3
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = mul %0 %1
+                    %3:f64 = sin %0
+                    %4:f64 = add %2 %3
                 in (%4)
             "}
             .trim_end(),

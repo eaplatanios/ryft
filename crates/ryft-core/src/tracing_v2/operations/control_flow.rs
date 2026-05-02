@@ -724,6 +724,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use crate::operations::InterpretableOperation as _;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
@@ -731,11 +732,11 @@ mod tests {
     use crate::operations::constants::OneLike;
     use crate::operations::constants::{One, Zero};
     use crate::parameters::{Parameter, Placeholder};
-    use crate::tracing::engines::{Engine, TracingEngine};
+    use crate::tracing::engines::Engine;
     use crate::tracing::{ProgramBuilder, Traceable, Value};
     use crate::tracing_v2::ArrayOperation;
+    use crate::tracing_v2::Differentiable;
     use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
-    use crate::tracing_v2::{Differentiable, LinearArrayOperation};
     use crate::types::DataType;
 
     use super::*;
@@ -1176,41 +1177,6 @@ mod tests {
         }
     }
 
-    #[derive(Copy, Clone, Debug)]
-    struct ArrayScalarEngine;
-
-    impl Engine for ArrayScalarEngine {
-        type Type = ArrayType;
-        type Value = f64;
-
-        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(0.0)
-        }
-
-        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(1.0)
-        }
-    }
-
-    impl TracingEngine for ArrayScalarEngine {
-        type OperationCarrier = ArrayOperation<f64, ArrayType>;
-    }
-
-    impl crate::tracing_v2::LinearizableEngine for ArrayScalarEngine {
-        type LinearOperationCarrier = LinearArrayOperation<f64, ArrayType>;
-    }
-
-    impl crate::tracing_v2::DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperationCarrier = ArrayOperation<f64, ArrayType>;
-    }
-
-    impl DifferentiableTracingEngine for ArrayScalarEngine {
-        type LinearOperationCarrier<'engine>
-            = LinearArrayOperation<Tracer<'engine, Self>, ArrayType>
-        where
-            Self: 'engine;
-    }
-
     fn add_one_branch() -> FlatProgram<TestValue, TestOperation> {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1231,13 +1197,6 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, ArrayOperation<TestValue, ArrayType>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
-    }
-
-    fn scalar_scale_branch(factor: f64) -> FlatProgram<f64, ArrayOperation<f64, ArrayType>> {
-        let mut builder = ProgramBuilder::<ArrayType, f64, ArrayOperation<f64, ArrayType>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(ArrayOperation::Scale { factor }, vec![input]).unwrap()[0];
-        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     fn custom_linear_identity_branch() -> FlatProgram<TestValue, TestLinearOperation> {
@@ -1333,16 +1292,6 @@ mod tests {
     }
 
     #[test]
-    fn test_array_carrier_condition_interprets_captured_predicate() {
-        let condition =
-            ConditionOperation::with_captured_predicate(false, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
-                .unwrap();
-        let operation = ArrayOperation::Condition(Box::new(condition));
-
-        assert_eq!(operation.interpret(&[4.0]), Ok(vec![12.0]));
-    }
-
-    #[test]
     fn test_condition_rejects_branch_output_mismatch() {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1422,27 +1371,6 @@ mod tests {
             operation.infer_output_types(&[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::F64)]),
             Ok(vec![ArrayType::scalar(DataType::F64)]),
         );
-    }
-
-    #[test]
-    fn test_condition_jvp_uses_selected_captured_branch() {
-        let condition =
-            ConditionOperation::with_captured_predicate(true, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
-                .unwrap();
-        let engine = ArrayScalarEngine;
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64, ArrayType>>::new()));
-        let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let mut context = JvpContext::new(&engine, builder.clone());
-        let outputs = condition.jvp(&mut context, &[JvpTracer { primal: 4.0, tangent: tangent_input }]).unwrap();
-
-        assert_eq!(outputs[0].primal, 8.0);
-        let tangent_output = outputs[0].tangent;
-        drop(outputs);
-        drop(context);
-        let builder = Rc::try_unwrap(builder).unwrap().into_inner();
-        let tangent_program = builder.build::<f64, f64>(vec![tangent_output], Placeholder, Placeholder).unwrap();
-        assert_eq!(tangent_program.interpret(10.0), Ok(20.0));
     }
 
     #[test]

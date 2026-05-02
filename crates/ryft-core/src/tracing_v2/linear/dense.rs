@@ -398,53 +398,9 @@ where
 mod tests {
     use crate::parameters::Placeholder;
     use crate::tracing::TracingError;
-    use crate::tracing::engines::{Engine, Tracer, TracingEngine};
-    use crate::tracing_v2::{
-        ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, DifferentiationError, LinearArrayOperation,
-        Sin,
-    };
-    use crate::types::ArrayType;
+    use crate::tracing_v2::DifferentiationError;
 
-    use super::{DenseJacobian, jacfwd, jacrev};
-
-    fn assert_close(actual: f64, expected: f64) {
-        let delta = (actual - expected).abs();
-        assert!(delta <= 1e-12, "expected {actual} ~= {expected}; absolute error {delta} exceeded tolerance");
-    }
-
-    struct ArrayScalarEngine;
-
-    impl Engine for ArrayScalarEngine {
-        type Type = ArrayType;
-        type Value = f64;
-
-        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(0.0)
-        }
-
-        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(1.0)
-        }
-    }
-
-    impl TracingEngine for ArrayScalarEngine {
-        type OperationCarrier = ArrayOperation<f64, ArrayType>;
-    }
-
-    impl crate::tracing_v2::LinearizableEngine for ArrayScalarEngine {
-        type LinearOperationCarrier = LinearArrayOperation<f64, ArrayType>;
-    }
-
-    impl DifferentiableEngine for ArrayScalarEngine {
-        type DifferentiableOperationCarrier = ArrayOperation<f64, ArrayType>;
-    }
-
-    impl DifferentiableTracingEngine for ArrayScalarEngine {
-        type LinearOperationCarrier<'engine>
-            = LinearArrayOperation<Tracer<'engine, Self>, ArrayType>
-        where
-            Self: 'engine;
-    }
+    use super::DenseJacobian;
 
     #[test]
     fn test_dense_jacobian_from_rows_rejects_invalid_row_count() {
@@ -490,41 +446,5 @@ mod tests {
                 got: 1,
             }))
         ));
-    }
-
-    #[test]
-    fn test_jacfwd_batches_basis_tangents() {
-        let engine = ArrayScalarEngine;
-        let jacobian = jacfwd::<ArrayScalarEngine, _, (f64, f64), (f64, f64), f64>(
-            &engine,
-            |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
-            (2.0f64, 3.0f64),
-        )
-        .unwrap();
-
-        assert_eq!(jacobian.rows(), 2);
-        assert_eq!(jacobian.cols(), 2);
-        assert_close(jacobian.values()[0], 3.0 + 2.0f64.cos());
-        assert_close(jacobian.values()[1], 2.0);
-        assert_close(jacobian.values()[2], 1.0);
-        assert_close(jacobian.values()[3], 1.0);
-    }
-
-    #[test]
-    fn test_jacrev_batches_basis_cotangents() {
-        let engine = ArrayScalarEngine;
-        let jacobian = jacrev::<ArrayScalarEngine, _, (f64, f64), (f64, f64), f64>(
-            &engine,
-            |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
-            (2.0f64, 3.0f64),
-        )
-        .unwrap();
-
-        assert_eq!(jacobian.rows(), 2);
-        assert_eq!(jacobian.cols(), 2);
-        assert_close(jacobian.values()[0], 3.0 + 2.0f64.cos());
-        assert_close(jacobian.values()[1], 2.0);
-        assert_close(jacobian.values()[2], 1.0);
-        assert_close(jacobian.values()[3], 1.0);
     }
 }

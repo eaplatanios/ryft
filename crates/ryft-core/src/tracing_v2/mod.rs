@@ -17,6 +17,8 @@ pub mod linear;
 /// Per-op staging stays on small operation-local capability traits rather than on catch-all
 /// `Supports*` bundles.
 pub mod operations;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
     Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
