@@ -151,8 +151,7 @@ where
 {
     fn jvp(
         &self,
-        _engine: &E,
-        context: &mut JvpContext<'_, ShardMapTensor, LinearArrayOperation<ShardMapTensor>>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);

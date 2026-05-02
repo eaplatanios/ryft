@@ -197,12 +197,7 @@ where
 {
     fn jvp(
         &self,
-        engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
-        context: &mut crate::tracing_v2::JvpContext<
-            '_,
-            Tracer<'engine, EInner>,
-            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
-        >,
+        context: &mut crate::tracing_v2::JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         inputs: &[crate::tracing_v2::JvpTracer<Tracer<'engine, EInner>, crate::tracing::AtomId>],
     ) -> Result<Vec<crate::tracing_v2::JvpTracer<Tracer<'engine, EInner>, crate::tracing::AtomId>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -226,11 +221,12 @@ where
         }
 
         let (_, pushforward) = crate::tracing_v2::linear::linearize_traced_program(
-            (*engine).clone(),
+            (*context.engine).clone(),
             self.body().program(),
             primal_inputs,
         )?;
-        let pullback = crate::tracing_v2::linear::transpose_traced_linear_program((*engine).clone(), &pushforward)?;
+        let pullback =
+            crate::tracing_v2::linear::transpose_traced_linear_program((*context.engine).clone(), &pushforward)?;
 
         let body_input_types = self.body().input_types().to_vec();
         let body_output_types = self.body().output_types().to_vec();
@@ -287,8 +283,7 @@ where
 {
     fn jvp(
         &self,
-        engine: &E,
-        context: &mut crate::tracing_v2::JvpContext<'_, V, E::LinearOperation>,
+        context: &mut crate::tracing_v2::JvpContext<'_, E>,
         inputs: &[crate::tracing_v2::JvpTracer<V, crate::tracing::AtomId>],
     ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -300,7 +295,7 @@ where
         let tangent_outputs = context.apply_operation(
             tangent_inputs.as_slice(),
             LinearArrayOperation::Rematerialize(Box::new(make_linear_rematerialize(
-                engine,
+                context.engine,
                 &self.body,
                 primal_inputs,
             )?)),
@@ -737,10 +732,10 @@ mod tests {
         let operation = RematerializeOperation::<ArrayType, f64>::new(empty_traced_body());
         let inputs: Vec<JvpTracer<f64, crate::tracing::AtomId>> = Vec::new();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new()));
-        let mut context = crate::tracing_v2::JvpContext::new(builder);
+        let mut context = crate::tracing_v2::JvpContext::new(&engine, builder);
 
         assert!(matches!(
-            operation.jvp(&engine, &mut context, inputs.as_slice()),
+            operation.jvp(&mut context, inputs.as_slice()),
             Err(TracingError::Differentiation(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves))
         ));
     }

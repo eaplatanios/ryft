@@ -336,8 +336,7 @@ where
 {
     fn jvp(
         &self,
-        _engine: &E,
-        context: &mut JvpContext<'_, E::Value, E::LinearOperation>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);

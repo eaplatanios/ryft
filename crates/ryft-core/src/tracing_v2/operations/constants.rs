@@ -134,8 +134,7 @@ where
 {
     fn jvp(
         &self,
-        engine: &E,
-        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         if !inputs.is_empty() {
@@ -150,7 +149,7 @@ where
             .into_iter()
             .next()
             .expect("zero jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: engine.zero(&self.output_type)?, tangent }])
+        Ok(vec![JvpTracer { primal: context.engine.zero(&self.output_type)?, tangent }])
     }
 }
 
@@ -268,8 +267,7 @@ where
 {
     fn jvp(
         &self,
-        engine: &E,
-        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         if !inputs.is_empty() {
@@ -284,7 +282,7 @@ where
             .into_iter()
             .next()
             .expect("one jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: engine.one(&self.output_type)?, tangent }])
+        Ok(vec![JvpTracer { primal: context.engine.one(&self.output_type)?, tangent }])
     }
 }
 
@@ -393,8 +391,7 @@ where
 {
     fn jvp(
         &self,
-        _engine: &E,
-        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         if inputs.len() != 1 {
@@ -509,8 +506,7 @@ where
 {
     fn jvp(
         &self,
-        _engine: &E,
-        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         if inputs.len() != 1 {

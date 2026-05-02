@@ -1858,21 +1858,20 @@ where
 {
     fn jvp(
         &self,
-        engine: &E,
-        context: &mut JvpContext<'_, V, E::LinearOperation, DataType>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
         match self {
-            Self::Zero(zero) => zero.jvp(engine, context, inputs),
-            Self::One(one) => one.jvp(engine, context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
-            Self::Add => AddOperation.jvp(engine, context, inputs),
-            Self::Mul => MulOperation.jvp(engine, context, inputs),
-            Self::Neg => NegOperation.jvp(engine, context, inputs),
-            Self::Sin => SinOperation.jvp(engine, context, inputs),
-            Self::Cos => CosOperation.jvp(engine, context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::Zero(zero) => zero.jvp(context, inputs),
+            Self::One(one) => one.jvp(context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(context, inputs),
+            Self::Add => AddOperation.jvp(context, inputs),
+            Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Neg => NegOperation.jvp(context, inputs),
+            Self::Sin => SinOperation.jvp(context, inputs),
+            Self::Cos => CosOperation.jvp(context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::Custom(_) => {
                 Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
                     .into())
@@ -1925,31 +1924,25 @@ where
 {
     fn jvp(
         &self,
-        engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
-        context: &mut JvpContext<
-            '_,
-            Tracer<'engine, EInner>,
-            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
-            DataType,
-        >,
+        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         match self {
-            Self::Zero(zero) => zero.jvp(engine, context, inputs),
-            Self::One(one) => one.jvp(engine, context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
-            Self::Add => AddOperation.jvp(engine, context, inputs),
-            Self::Mul => MulOperation.jvp(engine, context, inputs),
-            Self::Neg => NegOperation.jvp(engine, context, inputs),
-            Self::Sin => SinOperation.jvp(engine, context, inputs),
-            Self::Cos => CosOperation.jvp(engine, context, inputs),
+            Self::Zero(zero) => zero.jvp(context, inputs),
+            Self::One(one) => one.jvp(context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(context, inputs),
+            Self::Add => AddOperation.jvp(context, inputs),
+            Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Neg => NegOperation.jvp(context, inputs),
+            Self::Sin => SinOperation.jvp(context, inputs),
+            Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => {
                 if inputs.len() != 1 {
                     return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
                 }
                 let input = &inputs[0];
-                let factor_tracer = engine.constant(factor.clone());
+                let factor_tracer = context.engine.constant(factor.clone());
                 let tangent = context
                     .apply_operation(
                         &[input.tangent],
@@ -2012,30 +2005,29 @@ where
 {
     fn jvp(
         &self,
-        engine: &E,
-        context: &mut JvpContext<'_, V, E::LinearOperation>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
         match self {
-            Self::Zero(zero) => zero.jvp(engine, context, inputs),
-            Self::One(one) => one.jvp(engine, context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
-            Self::Add => AddOperation.jvp(engine, context, inputs),
-            Self::Mul => MulOperation.jvp(engine, context, inputs),
-            Self::Neg => NegOperation.jvp(engine, context, inputs),
-            Self::Sin => SinOperation.jvp(engine, context, inputs),
-            Self::Cos => CosOperation.jvp(engine, context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
-            Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
+            Self::Zero(zero) => zero.jvp(context, inputs),
+            Self::One(one) => one.jvp(context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(context, inputs),
+            Self::Add => AddOperation.jvp(context, inputs),
+            Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Neg => NegOperation.jvp(context, inputs),
+            Self::Sin => SinOperation.jvp(context, inputs),
+            Self::Cos => CosOperation.jvp(context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
+            Self::MatrixMultiply => MatMulOperation.jvp(context, inputs),
+            Self::Transpose => MatrixTransposeOperation.jvp(context, inputs),
             Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(engine, context, inputs)
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
             }
-            Self::Rematerialize(remat) => remat.as_ref().jvp(engine, context, inputs),
-            Self::Condition(condition) => condition.as_ref().jvp(engine, context, inputs),
-            Self::While(while_operation) => while_operation.as_ref().jvp(engine, context, inputs),
-            Self::Custom(op) => op.jvp(engine, context, inputs),
+            Self::Rematerialize(remat) => remat.as_ref().jvp(context, inputs),
+            Self::Condition(condition) => condition.as_ref().jvp(context, inputs),
+            Self::While(while_operation) => while_operation.as_ref().jvp(context, inputs),
+            Self::Custom(op) => op.jvp(context, inputs),
         }
     }
 }
@@ -2073,21 +2065,20 @@ where
 {
     fn jvp(
         &self,
-        engine: &E,
-        context: &mut JvpContext<'_, V, E::LinearOperation, DataType>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
         match self {
-            Self::Zero(zero) => zero.jvp(engine, context, inputs),
-            Self::One(one) => one.jvp(engine, context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
-            Self::Add => AddOperation.jvp(engine, context, inputs),
-            Self::Mul => MulOperation.jvp(engine, context, inputs),
-            Self::Neg => NegOperation.jvp(engine, context, inputs),
-            Self::Sin => SinOperation.jvp(engine, context, inputs),
-            Self::Cos => CosOperation.jvp(engine, context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::Zero(zero) => zero.jvp(context, inputs),
+            Self::One(one) => one.jvp(context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(context, inputs),
+            Self::Add => AddOperation.jvp(context, inputs),
+            Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Neg => NegOperation.jvp(context, inputs),
+            Self::Sin => SinOperation.jvp(context, inputs),
+            Self::Cos => CosOperation.jvp(context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::MatrixMultiply
             | Self::Transpose
             | Self::Reshape { .. }
@@ -2166,34 +2157,29 @@ where
 {
     fn jvp(
         &self,
-        engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
-        context: &mut JvpContext<
-            '_,
-            Tracer<'engine, EInner>,
-            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
-        >,
+        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         match self {
-            Self::Zero(zero) => zero.jvp(engine, context, inputs),
-            Self::One(one) => one.jvp(engine, context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
-            Self::Add => AddOperation.jvp(engine, context, inputs),
-            Self::Mul => MulOperation.jvp(engine, context, inputs),
-            Self::Neg => NegOperation.jvp(engine, context, inputs),
-            Self::Sin => SinOperation.jvp(engine, context, inputs),
-            Self::Cos => CosOperation.jvp(engine, context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
-            Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
-            Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
+            Self::Zero(zero) => zero.jvp(context, inputs),
+            Self::One(one) => one.jvp(context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(context, inputs),
+            Self::Add => AddOperation.jvp(context, inputs),
+            Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Neg => NegOperation.jvp(context, inputs),
+            Self::Sin => SinOperation.jvp(context, inputs),
+            Self::Cos => CosOperation.jvp(context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
+            Self::MatrixMultiply => MatMulOperation.jvp(context, inputs),
+            Self::Transpose => MatrixTransposeOperation.jvp(context, inputs),
             Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(engine, context, inputs)
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
             }
-            Self::Rematerialize(remat) => remat.as_ref().jvp(engine, context, inputs),
-            Self::Condition(condition) => condition.as_ref().jvp(engine, context, inputs),
-            Self::While(while_operation) => while_operation.as_ref().jvp(engine, context, inputs),
-            Self::Custom(op) => op.jvp(engine, context, inputs),
+            Self::Rematerialize(remat) => remat.as_ref().jvp(context, inputs),
+            Self::Condition(condition) => condition.as_ref().jvp(context, inputs),
+            Self::While(while_operation) => while_operation.as_ref().jvp(context, inputs),
+            Self::Custom(op) => op.jvp(context, inputs),
         }
     }
 }
@@ -2244,31 +2230,25 @@ where
 {
     fn jvp(
         &self,
-        engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
-        context: &mut JvpContext<
-            '_,
-            Tracer<'engine, EInner>,
-            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
-            DataType,
-        >,
+        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         match self {
-            Self::Zero(zero) => zero.jvp(engine, context, inputs),
-            Self::One(one) => one.jvp(engine, context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
-            Self::Add => AddOperation.jvp(engine, context, inputs),
-            Self::Mul => MulOperation.jvp(engine, context, inputs),
-            Self::Neg => NegOperation.jvp(engine, context, inputs),
-            Self::Sin => SinOperation.jvp(engine, context, inputs),
-            Self::Cos => CosOperation.jvp(engine, context, inputs),
+            Self::Zero(zero) => zero.jvp(context, inputs),
+            Self::One(one) => one.jvp(context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(context, inputs),
+            Self::Add => AddOperation.jvp(context, inputs),
+            Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Neg => NegOperation.jvp(context, inputs),
+            Self::Sin => SinOperation.jvp(context, inputs),
+            Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => {
                 if inputs.len() != 1 {
                     return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
                 }
                 let input = &inputs[0];
-                let factor_tracer = engine.constant(factor.clone());
+                let factor_tracer = context.engine.constant(factor.clone());
                 let tangent = context
                     .apply_operation(
                         &[input.tangent],
@@ -2305,16 +2285,11 @@ where
 {
     fn jvp_traced_linearization(
         &self,
-        engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
-        context: &mut JvpContext<
-            '_,
-            Tracer<'engine, EInner>,
-            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
-        >,
+        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         <Self as DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>>::jvp(
-            self, engine, context, inputs,
+            self, context, inputs,
         )
     }
 }
@@ -2327,17 +2302,11 @@ where
 {
     fn jvp_traced_linearization(
         &self,
-        engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
-        context: &mut JvpContext<
-            '_,
-            Tracer<'engine, EInner>,
-            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
-            DataType,
-        >,
+        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         <Self as DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>>::jvp(
-            self, engine, context, inputs,
+            self, context, inputs,
         )
     }
 }
@@ -2353,17 +2322,11 @@ where
 {
     fn jvp_traced_linearization(
         &self,
-        engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
-        context: &mut JvpContext<
-            '_,
-            Tracer<'engine, EInner>,
-            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
-            DataType,
-        >,
+        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         <Self as DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>>::jvp(
-            self, engine, context, inputs,
+            self, context, inputs,
         )
     }
 }

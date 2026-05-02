@@ -60,7 +60,7 @@ where
         }
     }
 
-    let mut context = JvpContext::<'_, V, E::LinearOperation, E::Type>::new(builder.clone());
+    let mut context = JvpContext::new(engine, builder.clone());
     for instruction in &program.instructions {
         let input_duals = instruction
             .inputs
@@ -78,7 +78,7 @@ where
                 })
             })
             .collect::<Result<Vec<_>, TracingError>>()?;
-        let output_duals = instruction.operation.jvp(engine, &mut context, input_duals.as_slice())?;
+        let output_duals = instruction.operation.jvp(&mut context, input_duals.as_slice())?;
         if output_duals.len() != instruction.outputs.len() {
             return Err(TracingError::InvalidOutputCount {
                 expected: instruction.outputs.len(),

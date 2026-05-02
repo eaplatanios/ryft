@@ -100,12 +100,7 @@ pub trait CustomTracedLinearizationRule<
     /// Applies the custom primitive's traced-linearization JVP rule.
     fn jvp_traced_linearization<'engine>(
         &self,
-        engine: &TracingContext<'engine, E>,
-        context: &mut crate::tracing_v2::JvpContext<
-            '_,
-            Tracer<'engine, E>,
-            <E as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
-        >,
+        context: &mut crate::tracing_v2::JvpContext<'_, TracingContext<'engine, E>>,
         inputs: &[JvpTracer<Tracer<'engine, E>, crate::tracing::AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, E>, crate::tracing::AtomId>>, TracingError>;
 }
@@ -348,11 +343,10 @@ where
 {
     fn jvp(
         &self,
-        engine: &E,
-        context: &mut crate::tracing_v2::JvpContext<'_, V, E::LinearOperation>,
+        context: &mut crate::tracing_v2::JvpContext<'_, E>,
         inputs: &[JvpTracer<V, crate::tracing::AtomId>],
     ) -> Result<Vec<JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
-        self.jvp_rule::<E>()?.jvp(engine, context, inputs)
+        self.jvp_rule::<E>()?.jvp(context, inputs)
     }
 }
 
@@ -365,15 +359,10 @@ where
 {
     fn jvp(
         &self,
-        _engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
-        context: &mut crate::tracing_v2::JvpContext<
-            '_,
-            Tracer<'engine, EInner>,
-            <EInner as DifferentiableTracingEngine>::LinearOperation<'engine>,
-        >,
+        context: &mut crate::tracing_v2::JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, crate::tracing::AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, crate::tracing::AtomId>>, TracingError> {
-        self.traced_linearization_rule::<EInner>()?.jvp_traced_linearization(_engine, context, inputs)
+        self.traced_linearization_rule::<EInner>()?.jvp_traced_linearization(context, inputs)
     }
 }
 
@@ -573,8 +562,7 @@ mod tests {
     impl DifferentiableOperation<ArrayScalarEngine> for ShiftOp {
         fn jvp(
             &self,
-            _engine: &ArrayScalarEngine,
-            _context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearArrayOperation<f64>>,
+            _context: &mut crate::tracing_v2::JvpContext<'_, ArrayScalarEngine>,
             inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
             if inputs.len() != 1 {
@@ -587,12 +575,7 @@ mod tests {
     impl CustomTracedLinearizationRule<f64, ArrayScalarEngine> for ShiftOp {
         fn jvp_traced_linearization<'engine>(
             &self,
-            _engine: &TracingContext<'engine, ArrayScalarEngine>,
-            _context: &mut crate::tracing_v2::JvpContext<
-                '_,
-                Tracer<'engine, ArrayScalarEngine>,
-                LinearArrayOperation<Tracer<'engine, ArrayScalarEngine>>,
-            >,
+            _context: &mut crate::tracing_v2::JvpContext<'_, TracingContext<'engine, ArrayScalarEngine>>,
             inputs: &[JvpTracer<Tracer<'engine, ArrayScalarEngine>, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<Tracer<'engine, ArrayScalarEngine>, crate::tracing::AtomId>>, TracingError> {
             if inputs.len() != 1 {

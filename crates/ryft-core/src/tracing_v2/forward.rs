@@ -14,7 +14,7 @@ use crate::tracing_v2::linear::{jvp_program, jvp_traced};
 use crate::tracing_v2::operations::constants::{SupportsZeroLike, Zero};
 use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperationTracingEngine, DifferentiableTracingEngine};
-use crate::types::{ArrayType, Type, Typed};
+use crate::types::{Type, Typed};
 
 /// Concrete state threaded through forward-mode JVP rules.
 ///
@@ -23,43 +23,28 @@ use crate::types::{ArrayType, Type, Typed};
 /// [`TranspositionContext`](crate::tracing_v2::operations::TranspositionContext): JVP rules call
 /// [`apply_operation`](Self::apply_operation) to stage tangent ops on the active builder.
 #[doc(hidden)]
-pub struct JvpContext<'a, V, LinearCarrier, T = ArrayType>
-where
-    T: Type,
-    V: Traceable<T>,
-    LinearCarrier: Clone + Operation<T>,
-{
-    /// Builder for the currently active linear program.
-    builder: Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>,
+pub struct JvpContext<'a, E: DifferentiableEngine + ?Sized> {
+    /// [`DifferentiableEngine`] borrowed by this [`JvpContext`] for type-driven value synthesis and operation
+    /// selection.
+    pub engine: &'a E,
 
-    /// Phantom marker reserving a context lifetime for future per-pass borrows without forcing an
-    /// API change when one is added.
-    marker: std::marker::PhantomData<&'a ()>,
+    /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::tracing::Program) that is currently being
+    /// traced.
+    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::LinearOperation>>>,
 }
 
-impl<'a, T, V, LinearCarrier> JvpContext<'a, V, LinearCarrier, T>
-where
-    T: Type,
-    V: Traceable<T>,
-    LinearCarrier: Clone + Operation<T>,
-{
+impl<'a, E: DifferentiableEngine + ?Sized> JvpContext<'a, E> {
     /// Creates a JVP context that stages into `builder`.
     #[doc(hidden)]
-    pub fn new(builder: Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>) -> Self {
-        Self { builder, marker: std::marker::PhantomData }
-    }
-
-    /// Returns the builder for the currently active linear program.
-    #[inline]
-    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>> {
-        &self.builder
+    pub fn new(engine: &'a E, builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::LinearOperation>>>) -> Self {
+        Self { engine, builder }
     }
 
     /// Stages one operation in the currently active linear program.
     pub fn apply_operation(
         &self,
         inputs: &[AtomId],
-        operation: LinearCarrier,
+        operation: E::LinearOperation,
         output_count: usize,
     ) -> Result<Vec<AtomId>, TracingError> {
         let mut builder_borrow = self.builder.borrow_mut();
@@ -77,7 +62,7 @@ where
     }
 
     /// Stages a constant tangent on the active linear builder.
-    pub fn add_constant(&self, value: V) -> AtomId {
+    pub fn add_constant(&self, value: E::Value) -> AtomId {
         self.builder.borrow_mut().add_constant(value)
     }
 }
@@ -252,8 +237,11 @@ where
     Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
     Output::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Output>,
-    E::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, E> + SupportsZeroLike<E::Type, V>,
+    E::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, E>
+        + SupportsAdd<E::Type, V>
+        + SupportsZeroLike<E::Type, V>,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+    crate::tracing_v2::operations::AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     type FunctionInput<'call>
         = Input
@@ -334,11 +322,10 @@ mod tests {
         >::new()));
         let tangent_a = linear_builder.borrow_mut().add_input(crate::types::DataType::F64);
         let tangent_b = linear_builder.borrow_mut().add_input(crate::types::DataType::F64);
-        let mut context = JvpContext::new(linear_builder.clone());
+        let mut context = JvpContext::new(&outer_tracing_context, linear_builder.clone());
 
         let outputs = AddOperation
             .jvp(
-                &outer_tracing_context,
                 &mut context,
                 &[
                     JvpTracer { primal: primal_a, tangent: tangent_a },

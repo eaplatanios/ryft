@@ -132,8 +132,7 @@ where
 {
     fn jvp(
         &self,
-        _engine: &E,
-        context: &mut JvpContext<'_, V, E::LinearOperation>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
@@ -159,8 +158,7 @@ where
 {
     fn jvp(
         &self,
-        _engine: &E,
-        context: &mut JvpContext<'_, V, E::LinearOperation, DataType>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
@@ -197,17 +195,12 @@ where
 {
     fn jvp(
         &self,
-        engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
-        context: &mut JvpContext<
-            '_,
-            Tracer<'engine, EInner>,
-            <EInner as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
-        >,
+        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
         let input = &inputs[0];
-        let factor_tracer = engine.constant(self.factor().clone());
+        let factor_tracer = context.engine.constant(self.factor().clone());
         let tangent = context
             .apply_operation(
                 &[input.tangent],

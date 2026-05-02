@@ -96,9 +96,8 @@ fn replay_xla_program_with_tracers(
 
 fn interpret_xla_condition_jvp<E>(
     condition: &ConditionOperation<ShardMapTensor, XlaOperation>,
-    context: &mut JvpContext<'_, ShardMapTensor, LinearXlaOperation>,
+    context: &mut JvpContext<'_, E>,
     inputs: &[JvpTracer<ShardMapTensor, AtomId>],
-    engine: &E,
 ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
@@ -114,8 +113,8 @@ where
 
     let selected_branch = if *predicate { condition.true_branch() } else { condition.false_branch() };
     let primal_outputs = selected_branch.interpret(primal_inputs.clone())?;
-    let true_pushforward = linearize_program(engine, condition.true_branch(), primal_inputs.clone())?;
-    let false_pushforward = linearize_program(engine, condition.false_branch(), primal_inputs)?;
+    let true_pushforward = linearize_program(context.engine, condition.true_branch(), primal_inputs.clone())?;
+    let false_pushforward = linearize_program(context.engine, condition.false_branch(), primal_inputs)?;
     let linear_condition = ConditionOperation::with_captured_predicate(*predicate, true_pushforward, false_pushforward)
         .map_err(TracingError::from)?;
     let tangent_outputs = context.apply_operation(
@@ -394,25 +393,24 @@ where
 {
     fn jvp(
         &self,
-        engine: &E,
-        context: &mut JvpContext<'_, ShardMapTensor, LinearXlaOperation>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         match self {
-            Self::Zero(zero) => zero.jvp(engine, context, inputs),
-            Self::One(one) => one.jvp(engine, context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
-            Self::Add => AddOperation.jvp(engine, context, inputs),
-            Self::Mul => MulOperation.jvp(engine, context, inputs),
-            Self::Neg => NegOperation.jvp(engine, context, inputs),
-            Self::Sin => SinOperation.jvp(engine, context, inputs),
-            Self::Cos => CosOperation.jvp(engine, context, inputs),
-            Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
-            Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::Zero(zero) => zero.jvp(context, inputs),
+            Self::One(one) => one.jvp(context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(context, inputs),
+            Self::Add => AddOperation.jvp(context, inputs),
+            Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Neg => NegOperation.jvp(context, inputs),
+            Self::Sin => SinOperation.jvp(context, inputs),
+            Self::Cos => CosOperation.jvp(context, inputs),
+            Self::MatrixMultiply => MatMulOperation.jvp(context, inputs),
+            Self::Transpose => MatrixTransposeOperation.jvp(context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(engine, context, inputs)
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
             }
             Self::Rematerialize(remat) => {
                 let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -424,7 +422,7 @@ where
                 let tangent_outputs = context.apply_operation(
                     tangent_inputs.as_slice(),
                     LinearArrayOperation::Rematerialize(Box::new(make_linear_xla_rematerialize(
-                        engine,
+                        context.engine,
                         remat.body(),
                         primal_inputs,
                     )?)),
@@ -436,11 +434,11 @@ where
                     .map(|(primal, tangent)| JvpTracer { primal, tangent })
                     .collect::<Vec<_>>())
             }
-            Self::Condition(condition) => interpret_xla_condition_jvp::<E>(condition, context, inputs, engine),
+            Self::Condition(condition) => interpret_xla_condition_jvp::<E>(condition, context, inputs),
             Self::While(_) => Err(ControlFlowError::MissingTransformRule { transform: "while jvp" }.into()),
-            Self::ShardMap(op) => op.jvp(engine, context, inputs),
-            Self::LinearShardMap(op) => op.jvp(engine, context, inputs),
-            Self::WithShardingConstraint(op) => op.jvp(engine, context, inputs),
+            Self::ShardMap(op) => op.jvp(context, inputs),
+            Self::LinearShardMap(op) => op.jvp(context, inputs),
+            Self::WithShardingConstraint(op) => op.jvp(context, inputs),
             Self::Custom(op) => {
                 Err(ryft_core::tracing_v2::CustomOperationError::MissingRule { op: op.name(), transform: "jvp" }.into())
             }
@@ -451,34 +449,33 @@ where
 impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaOperation {
     fn jvp_traced_linearization(
         &self,
-        engine: &TracingContext<'static, XlaEngine<'static>>,
-        context: &mut JvpContext<'_, ShardMapTracer, LinearArrayOperation<ShardMapTracer>>,
+        context: &mut JvpContext<'_, TracingContext<'static, XlaEngine<'static>>>,
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
         match self {
-            Self::Zero(zero) => zero.jvp(engine, context, inputs),
-            Self::One(one) => one.jvp(engine, context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(engine, context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(engine, context, inputs),
-            Self::Add => AddOperation.jvp(engine, context, inputs),
-            Self::Mul => MulOperation.jvp(engine, context, inputs),
-            Self::Neg => NegOperation.jvp(engine, context, inputs),
-            Self::Sin => SinOperation.jvp(engine, context, inputs),
-            Self::Cos => CosOperation.jvp(engine, context, inputs),
-            Self::MatrixMultiply => MatMulOperation.jvp(engine, context, inputs),
-            Self::Transpose => MatrixTransposeOperation.jvp(engine, context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::Zero(zero) => zero.jvp(context, inputs),
+            Self::One(one) => one.jvp(context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(context, inputs),
+            Self::Add => AddOperation.jvp(context, inputs),
+            Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Neg => NegOperation.jvp(context, inputs),
+            Self::Sin => SinOperation.jvp(context, inputs),
+            Self::Cos => CosOperation.jvp(context, inputs),
+            Self::MatrixMultiply => MatMulOperation.jvp(context, inputs),
+            Self::Transpose => MatrixTransposeOperation.jvp(context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(engine, context, inputs)
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
             }
-            Self::Rematerialize(remat) => remat.jvp(engine, context, inputs),
-            Self::Condition(condition) => condition.jvp(engine, context, inputs),
-            Self::While(while_operation) => while_operation.jvp(engine, context, inputs),
+            Self::Rematerialize(remat) => remat.jvp(context, inputs),
+            Self::Condition(condition) => condition.jvp(context, inputs),
+            Self::While(while_operation) => while_operation.jvp(context, inputs),
             Self::ShardMap(op) => {
                 let traced_op = ShardMapOperation::<ShardMapTracer>::new(op.body().clone());
-                traced_op.jvp_with_builders(engine.builder.clone(), context, inputs)
+                traced_op.jvp_with_builders(context.engine.builder.clone(), context, inputs)
             }
-            Self::LinearShardMap(op) => op.jvp_traced_with_builders(engine.builder.clone(), context, inputs),
+            Self::LinearShardMap(op) => op.jvp_traced_with_builders(context.engine.builder.clone(), context, inputs),
             Self::WithShardingConstraint(op) => {
                 let input = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 let primal = input
@@ -659,13 +656,10 @@ mod tests {
         let tangent_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, LinearXlaOperation>::new()));
         let tangent_atom = tangent_builder.borrow_mut().add_input(scalar_type());
-        let mut context = JvpContext::new(tangent_builder.clone());
+        let engine = crate::experimental::engines::XlaEngine::token();
+        let mut context = JvpContext::new(engine, tangent_builder.clone());
         let outputs = operation
-            .jvp(
-                crate::experimental::engines::XlaEngine::token(),
-                &mut context,
-                &[JvpTracer { primal: ShardMapTensor::new(scalar_type()), tangent: tangent_atom }],
-            )
+            .jvp(&mut context, &[JvpTracer { primal: ShardMapTensor::new(scalar_type()), tangent: tangent_atom }])
             .expect("xla rematerialize jvp should succeed");
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal.r#type().into_owned(), scalar_type());

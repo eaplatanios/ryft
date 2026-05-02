@@ -47,7 +47,7 @@ pub(crate) fn jvp_traced<'engine, F, Input, Output, V, E>(
     tangents: Input,
 ) -> Result<(Output, Output), TracingError>
 where
-    V: Traceable<E::Type> + Parameterized<V, ParameterStructure = Placeholder>,
+    V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: std::fmt::Debug + PartialEq>,
     Output: Parameterized<Tracer<'engine, E>>,
     E: DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
@@ -55,8 +55,9 @@ where
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
     Output::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Output>,
-    E::Operation: TracedLinearizableOperation<'engine, E> + SupportsZeroLike<E::Type, V>,
+    E::Operation: TracedLinearizableOperation<'engine, E> + SupportsAdd<E::Type, V> + SupportsZeroLike<E::Type, V>,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+    AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
     F: FnOnce(Input) -> Result<Output, TracingError>,
 {
     let primal_structure = primals.parameter_structure();
@@ -242,10 +243,11 @@ where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
     V::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
-    E::Operation: TracedLinearizableOperation<'engine, E> + SupportsZeroLike<E::Type, V>,
+    E::Operation: TracedLinearizableOperation<'engine, E> + SupportsAdd<E::Type, V> + SupportsZeroLike<E::Type, V>,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
         + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>,
+    AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     type Value = Tracer<'engine, E>;
 

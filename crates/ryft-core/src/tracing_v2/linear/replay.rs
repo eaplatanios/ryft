@@ -11,20 +11,18 @@ use crate::tracing_v2::JvpContext;
 #[doc(hidden)]
 pub trait TracedLinearizableOperation<'engine, E>: Clone + Operation<E::Type>
 where
-    E: crate::tracing_v2::DifferentiableTracingEngine + ?Sized,
+    E: crate::tracing_v2::DifferentiableTracingEngine + ?Sized + 'engine,
 {
     /// Applies this operation's JVP rule to traced primals inside the active linearization pass.
     fn jvp_traced_linearization(
         &self,
-        engine: &TracingContext<'engine, E>,
-        context: &mut JvpContext<
-            '_,
-            Tracer<'engine, E>,
-            <E as crate::tracing_v2::DifferentiableTracingEngine>::LinearOperation<'engine>,
-            E::Type,
-        >,
+        context: &mut JvpContext<'_, TracingContext<'engine, E>>,
         inputs: &[JvpTracer<Tracer<'engine, E>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, E>, AtomId>>, TracingError>;
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, E>, AtomId>>, TracingError>
+    where
+        E::Value: Differentiable<E::Type, Tangent = E::Value>,
+        E::Operation: SupportsAdd<E::Type, E::Value>,
+        crate::tracing_v2::operations::AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>;
 }
 
 /// Builds a staged linear program by replaying a traced primal program on symbolic dual inputs.
@@ -52,10 +50,13 @@ pub fn linearize_traced_program<'engine, V, E>(
     TracingError,
 >
 where
-    V: Traceable<E::Type>,
+    V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V>,
     E: crate::tracing_v2::DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
-    E::Operation:
-        TracedLinearizableOperation<'engine, E> + crate::tracing_v2::operations::SupportsZeroLike<E::Type, V> + 'static,
+    E::Operation: TracedLinearizableOperation<'engine, E>
+        + crate::tracing_v2::operations::SupportsZeroLike<E::Type, V>
+        + SupportsAdd<E::Type, V>
+        + 'static,
+    crate::tracing_v2::operations::AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     fn tangent_for_atom<'engine, V, E>(
         primal_values: &[Option<Tracer<'engine, E>>],
@@ -108,7 +109,7 @@ where
         }
     }
 
-    let mut context = JvpContext::new(builder.clone());
+    let mut context = JvpContext::new(&tracing_context, builder.clone());
     for instruction in &program.instructions {
         let input_duals = instruction
             .inputs
@@ -128,10 +129,7 @@ where
                 })
             })
             .collect::<Result<Vec<_>, TracingError>>()?;
-        let output_duals =
-            instruction
-                .operation
-                .jvp_traced_linearization(&tracing_context, &mut context, input_duals.as_slice())?;
+        let output_duals = instruction.operation.jvp_traced_linearization(&mut context, input_duals.as_slice())?;
         if output_duals.len() != instruction.outputs.len() {
             return Err(TracingError::InvalidOutputCount {
                 expected: instruction.outputs.len(),

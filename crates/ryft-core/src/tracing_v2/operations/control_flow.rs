@@ -195,9 +195,9 @@ fn ensure_input_count(expected: usize, got: usize, operation: &'static str) -> R
 
 /// Replays one staged linear program by inlining its instructions into an existing linear builder
 /// owned by a [`JvpContext`].
-fn replay_linear_program_on_atoms<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>>(
-    context: &JvpContext<'_, V, O>,
-    program: &FlatProgram<V, O>,
+fn replay_linear_program_on_atoms<E: DifferentiableEngine<Type = ArrayType> + ?Sized>(
+    context: &JvpContext<'_, E>,
+    program: &FlatProgram<E::Value, E::LinearOperation>,
     inputs: &[crate::tracing::AtomId],
 ) -> Result<Vec<crate::tracing::AtomId>, TracingError> {
     if inputs.len() != program.input_ids.len() {
@@ -207,7 +207,7 @@ fn replay_linear_program_on_atoms<V: Traceable<ArrayType>, O: Clone + Operation<
         return Ok(Vec::new());
     }
 
-    let builder = context.builder().clone();
+    let builder = context.builder.clone();
     let mut values: Vec<Option<crate::tracing::AtomId>> = vec![None; program.atoms.len()];
     for (input_id, input) in program.input_ids.iter().copied().zip(inputs.iter().copied()) {
         values[input_id.index] = Some(input);
@@ -502,8 +502,7 @@ where
 {
     fn jvp(
         &self,
-        engine: &E,
-        context: &mut crate::tracing_v2::JvpContext<'_, V, E::LinearOperation>,
+        context: &mut crate::tracing_v2::JvpContext<'_, E>,
         inputs: &[JvpTracer<V, crate::tracing::AtomId>],
     ) -> Result<Vec<JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
         let operand_count = self.input_types().len();
@@ -519,7 +518,7 @@ where
         let tangent_operands = operands.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let branch = self.selected_branch(predicate);
         let primal_outputs = branch.interpret(primal_operands.clone())?;
-        let pushforward = linearize_program(engine, branch, primal_operands)?;
+        let pushforward = linearize_program(context.engine, branch, primal_operands)?;
         let tangent_outputs = replay_linear_program_on_atoms(context, &pushforward, tangent_operands.as_slice())?;
         Ok(primal_outputs
             .into_iter()
@@ -545,12 +544,7 @@ where
 {
     fn jvp(
         &self,
-        _engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
-        _context: &mut crate::tracing_v2::JvpContext<
-            '_,
-            crate::tracing::engines::Tracer<'engine, EInner>,
-            <EInner as DifferentiableTracingEngine>::LinearOperation<'engine>,
-        >,
+        _context: &mut crate::tracing_v2::JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         _inputs: &[JvpTracer<crate::tracing::engines::Tracer<'engine, EInner>, crate::tracing::AtomId>],
     ) -> Result<Vec<JvpTracer<crate::tracing::engines::Tracer<'engine, EInner>, crate::tracing::AtomId>>, TracingError>
     {
@@ -707,12 +701,7 @@ where
 {
     fn jvp(
         &self,
-        _engine: &crate::tracing::engines::TracingContext<'engine, EInner>,
-        _context: &mut crate::tracing_v2::JvpContext<
-            '_,
-            crate::tracing::engines::Tracer<'engine, EInner>,
-            <EInner as DifferentiableTracingEngine>::LinearOperation<'engine>,
-        >,
+        _context: &mut crate::tracing_v2::JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         _inputs: &[JvpTracer<crate::tracing::engines::Tracer<'engine, EInner>, crate::tracing::AtomId>],
     ) -> Result<Vec<JvpTracer<crate::tracing::engines::Tracer<'engine, EInner>, crate::tracing::AtomId>>, TracingError>
     {
@@ -730,8 +719,7 @@ where
 {
     fn jvp(
         &self,
-        engine: &E,
-        context: &mut crate::tracing_v2::JvpContext<'_, V, E::LinearOperation>,
+        context: &mut crate::tracing_v2::JvpContext<'_, E>,
         inputs: &[JvpTracer<V, crate::tracing::AtomId>],
     ) -> Result<Vec<JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
         let state_count = self.state_types().len();
@@ -754,7 +742,7 @@ where
                     .collect());
             }
 
-            let pushforward = linearize_program(engine, self.body(), state_primals.clone())?;
+            let pushforward = linearize_program(context.engine, self.body(), state_primals.clone())?;
             let next_primals = self.body.interpret(state_primals)?;
             let next_tangents = replay_linear_program_on_atoms(context, &pushforward, state_tangents.as_slice())?;
             if next_primals.len() != state_count {
@@ -1191,8 +1179,7 @@ mod tests {
     impl DifferentiableOperation<TestEngine> for TestDifferentiableOperation {
         fn jvp(
             &self,
-            _engine: &TestEngine,
-            context: &mut JvpContext<'_, TestValue, TestLinearOperation>,
+            context: &mut JvpContext<'_, TestEngine>,
             inputs: &[JvpTracer<TestValue, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<TestValue, crate::tracing::AtomId>>, TracingError> {
             match self {
@@ -1473,9 +1460,8 @@ mod tests {
         let engine = ArrayScalarEngine;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearArrayOperation<f64>>::new()));
         let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let mut context = JvpContext::new(builder.clone());
-        let outputs =
-            condition.jvp(&engine, &mut context, &[JvpTracer { primal: 4.0, tangent: tangent_input }]).unwrap();
+        let mut context = JvpContext::new(&engine, builder.clone());
+        let outputs = condition.jvp(&mut context, &[JvpTracer { primal: 4.0, tangent: tangent_input }]).unwrap();
 
         assert_eq!(outputs[0].primal, 8.0);
         let tangent_output = outputs[0].tangent;
@@ -1491,11 +1477,12 @@ mod tests {
         let condition =
             ConditionOperation::with_captured_predicate(true, custom_scale_branch(2.0), custom_scale_branch(3.0))
                 .unwrap();
+        let engine = TestEngine;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let mut context = JvpContext::new(builder.clone());
+        let mut context = JvpContext::new(&engine, builder.clone());
         let outputs = condition
-            .jvp(&TestEngine, &mut context, &[JvpTracer { primal: TestValue::Number(4.0), tangent: tangent_input }])
+            .jvp(&mut context, &[JvpTracer { primal: TestValue::Number(4.0), tangent: tangent_input }])
             .unwrap();
 
         assert_eq!(outputs[0].primal, TestValue::Number(8.0));
@@ -1512,13 +1499,13 @@ mod tests {
     #[test]
     fn test_generic_while_jvp_propagates_tangents_through_iterations() {
         let while_operation = WhileOperation::new(custom_while_condition_branch(), custom_while_body_branch()).unwrap();
+        let engine = TestEngine;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let counter_tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let value_tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let mut context = JvpContext::new(builder.clone());
+        let mut context = JvpContext::new(&engine, builder.clone());
         let outputs = while_operation
             .jvp(
-                &TestEngine,
                 &mut context,
                 &[
                     JvpTracer { primal: TestValue::Number(3.0), tangent: counter_tangent_input },

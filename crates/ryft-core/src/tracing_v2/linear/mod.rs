@@ -11,7 +11,7 @@ use crate::tracing::{
 use crate::tracing_v2::forward::JvpTracer;
 use crate::tracing_v2::operations::constants::{One, OneLike, SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::tracing_v2::operations::rematerialize::{FlatTracedRematerialize, RematerializeOperation};
-use crate::tracing_v2::operations::{DifferentiableOperation, SupportsAdd, SupportsRematerialize};
+use crate::tracing_v2::operations::{AddOperation, DifferentiableOperation, SupportsAdd, SupportsRematerialize};
 use crate::tracing_v2::{
     Differentiable, DifferentiableEngine, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,
     DifferentiationError, LinearOperation,
@@ -149,11 +149,13 @@ fn reverse_mode_scalar_traced_program<'engine, V, E>(
 where
     V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
     E: DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
-    E::Operation: TracedLinearizableOperation<'engine, E> + SupportsZeroLike<E::Type, V> + 'static,
+    E::Operation:
+        TracedLinearizableOperation<'engine, E> + SupportsAdd<E::Type, V> + SupportsZeroLike<E::Type, V> + 'static,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
         + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>
         + SupportsZero<E::Type, Tracer<'engine, E>>,
+    AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     let (outputs, pushforward) = linearize_traced_program(tracing_context.clone(), traced_program, traced_primals)?;
     ensure_single_gradient_output::<E::Type, _>(outputs.as_slice())?;
@@ -288,8 +290,7 @@ mod tests {
     impl DifferentiableOperation<ArrayScalarEngine> for PanicReplayOp {
         fn jvp(
             &self,
-            _engine: &ArrayScalarEngine,
-            _context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearArrayOperation<f64>>,
+            _context: &mut crate::tracing_v2::JvpContext<'_, ArrayScalarEngine>,
             inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
             if inputs.len() != 1 {
@@ -394,11 +395,10 @@ mod tests {
     impl DifferentiableOperation<SplitCarrierEngine> for DifferentiableAddOperation {
         fn jvp(
             &self,
-            engine: &SplitCarrierEngine,
-            context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearArrayOperation<f64>>,
+            context: &mut crate::tracing_v2::JvpContext<'_, SplitCarrierEngine>,
             inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
-            crate::tracing_v2::operations::AddOperation.jvp(engine, context, inputs)
+            crate::tracing_v2::operations::AddOperation.jvp(context, inputs)
         }
     }
 

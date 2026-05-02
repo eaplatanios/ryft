@@ -212,13 +212,12 @@ pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone + Opera
 /// Primitive JVP rules consume `JvpTracer<E::Value, AtomId>` inputs — primal value plus tangent
 /// atom id in the active linear-program builder — and stage tangent ops via
 /// [`JvpContext::apply_operation`]. Higher-order rules (e.g., the rematerialization and
-/// control-flow ops) use `engine` to recurse into nested sub-programs.
+/// control-flow ops) use [`JvpContext::engine`] to recurse into nested sub-programs.
 pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E::Type> {
-    /// Applies the forward-mode JVP rule.
+    /// Applies the forward-mode Jacobian-Vector Product (JVP) rule.
     fn jvp(
         &self,
-        engine: &E,
-        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError>;
 }
