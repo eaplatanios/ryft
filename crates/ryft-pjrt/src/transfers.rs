@@ -191,9 +191,9 @@ impl<'c> HostToDeviceTransferManager<'c> {
     ///   2. `data` must point to a contiguous buffer large enough for the literal's dense array storage, including
     ///      layout padding. In XLA terms this corresponds to [`ShapeUtil::ByteSizeOf`](
     ///      https://github.com/openxla/xla/blob/main/xla/shape_util.h#L177-L183).
-    ///   3. Element ordering must follow the provided `specification.layout` (or XLA's default dense layout if
-    ///      `specification.layout` is [`None`]). For untiled layouts, linearization follows minor-to-major dimension
-    ///      ordering as documented by [`IndexUtil::MultidimensionalIndexToLinearIndex`](
+    ///   3. Element ordering must follow the provided `specification.layout`. For untiled layouts, linearization
+    ///      follows minor-to-major dimension ordering as documented by
+    ///      [`IndexUtil::MultidimensionalIndexToLinearIndex`](
     ///      https://github.com/openxla/xla/blob/main/xla/index_util.h#L41-L114). For tiled layouts, bytes must follow
     ///      XLA tiled-layout rules (i.e., tile-major ordering, within-tile ordering, and edge padding) as described in
     ///      the [official documentation](
@@ -230,8 +230,7 @@ impl<'c> HostToDeviceTransferManager<'c> {
                 shape_dims = dimensions.as_ptr(),
                 shape_num_dims = dimensions.len(),
                 shape_element_type = specification.element_type.to_c_api(),
-                shape_layout = specification.layout.map(|layout| &layout.to_c_api() as *const _ as *mut _)
-                    .unwrap_or(std::ptr::null_mut()),
+                shape_layout = &specification.layout.to_c_api() as *const _ as *mut _,
             },
             { done_with_h2d_transfer },
         )?;
@@ -364,11 +363,11 @@ impl<'s> Client<'s> {
             .collect::<Vec<_>>();
         let layouts = buffer_specifications
             .iter()
-            .map(|specification| specification.layout.as_ref().map(|layout| unsafe { layout.to_c_api() }))
+            .map(|specification| unsafe { specification.layout.to_c_api() })
             .collect::<Vec<_>>();
         let layouts = layouts
             .iter()
-            .map(|layout| layout.as_ref().map(|layout| layout as *const _ as *mut _).unwrap_or(std::ptr::null_mut()))
+            .map(|layout| layout as *const _ as *mut _)
             .collect::<Vec<*mut crate::buffers::ffi::PJRT_Buffer_MemoryLayout>>();
         invoke_pjrt_api_error_fn!(
             self.api(),
@@ -1009,7 +1008,7 @@ mod tests {
         test_for_each_platform!(|_plugin, client, _platform| {
             let device = client.addressable_devices().unwrap().remove(0);
             let memory = device.default_memory().unwrap();
-            let specification = BufferSpecification { element_type: BufferType::U8, dimensions: [8u64], layout: None };
+            let specification = BufferSpecification::new(BufferType::U8, [8u64]);
 
             // Test a successful transfer.
             let manager = client.host_to_device_transfer_manager(vec![specification.clone()], memory).unwrap();
