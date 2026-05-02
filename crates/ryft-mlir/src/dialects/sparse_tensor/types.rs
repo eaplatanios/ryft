@@ -235,8 +235,10 @@ mod tests {
 
     use super::*;
 
-    fn sparse_vector_encoding<'c, 't>(context: &'c Context<'t>) -> SparseTensorEncodingAttributeRef<'c, 't> {
-        context.sparse_tensor_encoding_attribute(
+    #[test]
+    fn test_storage_specifier_type() {
+        let context = Context::new();
+        let encoding = context.sparse_tensor_encoding_attribute(
             &[LevelType::from(LevelFormat::Compressed)],
             Some(context.identity_affine_map(1)),
             None,
@@ -245,13 +247,7 @@ mod tests {
             None,
             None,
             &[],
-        )
-    }
-
-    #[test]
-    fn test_storage_specifier_type() {
-        let context = Context::new();
-        let encoding = sparse_vector_encoding(&context);
+        );
         let r#type = context.sparse_tensor_storage_specifier_type(encoding);
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.encoding(), encoding);
@@ -260,7 +256,16 @@ mod tests {
     #[test]
     fn test_storage_specifier_type_equality() {
         let context = Context::new();
-        let encoding = sparse_vector_encoding(&context);
+        let encoding = context.sparse_tensor_encoding_attribute(
+            &[LevelType::from(LevelFormat::Compressed)],
+            Some(context.identity_affine_map(1)),
+            None,
+            0,
+            0,
+            None,
+            None,
+            &[],
+        );
         let type_1 = context.sparse_tensor_storage_specifier_type(encoding);
         let type_2 = context.sparse_tensor_storage_specifier_type(encoding);
         assert_eq!(type_1, type_2);
@@ -279,14 +284,32 @@ mod tests {
         assert_ne!(type_1, type_2);
 
         let context = Context::new();
-        let type_2 = context.sparse_tensor_storage_specifier_type(sparse_vector_encoding(&context));
+        let type_2 = context.sparse_tensor_storage_specifier_type(context.sparse_tensor_encoding_attribute(
+            &[LevelType::from(LevelFormat::Compressed)],
+            Some(context.identity_affine_map(1)),
+            None,
+            0,
+            0,
+            None,
+            None,
+            &[],
+        ));
         assert_ne!(type_1, type_2);
     }
 
     #[test]
     fn test_storage_specifier_type_display_and_debug() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_storage_specifier_type(sparse_vector_encoding(&context));
+        let r#type = context.sparse_tensor_storage_specifier_type(context.sparse_tensor_encoding_attribute(
+            &[LevelType::from(LevelFormat::Compressed)],
+            Some(context.identity_affine_map(1)),
+            None,
+            0,
+            0,
+            None,
+            None,
+            &[],
+        ));
         test_type_display_and_debug(
             r#type,
             "!sparse_tensor.storage_specifier<#sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>>",
@@ -297,7 +320,16 @@ mod tests {
     fn test_storage_specifier_type_parsing() {
         let context = Context::new();
         context.load_dialect(DialectHandle::sparse_tensor());
-        let r#type = context.sparse_tensor_storage_specifier_type(sparse_vector_encoding(&context));
+        let r#type = context.sparse_tensor_storage_specifier_type(context.sparse_tensor_encoding_attribute(
+            &[LevelType::from(LevelFormat::Compressed)],
+            Some(context.identity_affine_map(1)),
+            None,
+            0,
+            0,
+            None,
+            None,
+            &[],
+        ));
         assert_eq!(
             context
                 .parse_type(
@@ -313,14 +345,32 @@ mod tests {
     #[test]
     fn test_storage_specifier_type_casting() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_storage_specifier_type(sparse_vector_encoding(&context));
+        let r#type = context.sparse_tensor_storage_specifier_type(context.sparse_tensor_encoding_attribute(
+            &[LevelType::from(LevelFormat::Compressed)],
+            Some(context.identity_affine_map(1)),
+            None,
+            0,
+            0,
+            None,
+            None,
+            &[],
+        ));
         test_type_casting(r#type);
     }
 
     #[test]
     fn test_iteration_space_type() {
         let context = Context::new();
-        let encoding = sparse_vector_encoding(&context);
+        let encoding = context.sparse_tensor_encoding_attribute(
+            &[LevelType::from(LevelFormat::Compressed)],
+            Some(context.identity_affine_map(1)),
+            None,
+            0,
+            0,
+            None,
+            None,
+            &[],
+        );
         let r#type = context.sparse_tensor_iteration_space_type(encoding, 0, 1);
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.encoding(), encoding);
@@ -332,7 +382,16 @@ mod tests {
     #[test]
     fn test_iteration_space_type_equality() {
         let context = Context::new();
-        let encoding = sparse_vector_encoding(&context);
+        let encoding = context.sparse_tensor_encoding_attribute(
+            &[LevelType::from(LevelFormat::Compressed)],
+            Some(context.identity_affine_map(1)),
+            None,
+            0,
+            0,
+            None,
+            None,
+            &[],
+        );
         let type_1 = context.sparse_tensor_iteration_space_type(encoding, 0, 1);
         let type_2 = context.sparse_tensor_iteration_space_type(encoding, 0, 1);
         assert_eq!(type_1, type_2);
@@ -341,14 +400,40 @@ mod tests {
         assert_ne!(type_1, type_2);
 
         let context = Context::new();
-        let type_2 = context.sparse_tensor_iteration_space_type(sparse_vector_encoding(&context), 0, 1);
+        let type_2 = context.sparse_tensor_iteration_space_type(
+            context.sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            ),
+            0,
+            1,
+        );
         assert_ne!(type_1, type_2);
     }
 
     #[test]
     fn test_iteration_space_type_display_and_debug() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_iteration_space_type(sparse_vector_encoding(&context), 0, 1);
+        let r#type = context.sparse_tensor_iteration_space_type(
+            context.sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            ),
+            0,
+            1,
+        );
         test_type_display_and_debug(
             r#type,
             "!sparse_tensor.iter_space<#sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>, lvls = 0 to 1>",
@@ -359,7 +444,20 @@ mod tests {
     fn test_iteration_space_type_parsing() {
         let context = Context::new();
         context.load_dialect(DialectHandle::sparse_tensor());
-        let r#type = context.sparse_tensor_iteration_space_type(sparse_vector_encoding(&context), 0, 1);
+        let r#type = context.sparse_tensor_iteration_space_type(
+            context.sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            ),
+            0,
+            1,
+        );
         assert_eq!(
             context
                 .parse_type(
@@ -375,14 +473,36 @@ mod tests {
     #[test]
     fn test_iteration_space_type_casting() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_iteration_space_type(sparse_vector_encoding(&context), 0, 1);
+        let r#type = context.sparse_tensor_iteration_space_type(
+            context.sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            ),
+            0,
+            1,
+        );
         test_type_casting(r#type);
     }
 
     #[test]
     fn test_iterator_type() {
         let context = Context::new();
-        let encoding = sparse_vector_encoding(&context);
+        let encoding = context.sparse_tensor_encoding_attribute(
+            &[LevelType::from(LevelFormat::Compressed)],
+            Some(context.identity_affine_map(1)),
+            None,
+            0,
+            0,
+            None,
+            None,
+            &[],
+        );
         let r#type = context.sparse_tensor_iterator_type(encoding, 0, 1);
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.encoding(), encoding);
@@ -394,7 +514,16 @@ mod tests {
     #[test]
     fn test_iterator_type_equality() {
         let context = Context::new();
-        let encoding = sparse_vector_encoding(&context);
+        let encoding = context.sparse_tensor_encoding_attribute(
+            &[LevelType::from(LevelFormat::Compressed)],
+            Some(context.identity_affine_map(1)),
+            None,
+            0,
+            0,
+            None,
+            None,
+            &[],
+        );
         let type_1 = context.sparse_tensor_iterator_type(encoding, 0, 1);
         let type_2 = context.sparse_tensor_iterator_type(encoding, 0, 1);
         assert_eq!(type_1, type_2);
@@ -403,14 +532,40 @@ mod tests {
         assert_ne!(type_1, type_2);
 
         let context = Context::new();
-        let type_2 = context.sparse_tensor_iterator_type(sparse_vector_encoding(&context), 0, 1);
+        let type_2 = context.sparse_tensor_iterator_type(
+            context.sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            ),
+            0,
+            1,
+        );
         assert_ne!(type_1, type_2);
     }
 
     #[test]
     fn test_iterator_type_display_and_debug() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_iterator_type(sparse_vector_encoding(&context), 0, 1);
+        let r#type = context.sparse_tensor_iterator_type(
+            context.sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            ),
+            0,
+            1,
+        );
         test_type_display_and_debug(
             r#type,
             "!sparse_tensor.iterator<#sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>, lvls = 0 to 1>",
@@ -421,7 +576,20 @@ mod tests {
     fn test_iterator_type_parsing() {
         let context = Context::new();
         context.load_dialect(DialectHandle::sparse_tensor());
-        let r#type = context.sparse_tensor_iterator_type(sparse_vector_encoding(&context), 0, 1);
+        let r#type = context.sparse_tensor_iterator_type(
+            context.sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            ),
+            0,
+            1,
+        );
         assert_eq!(
             context
                 .parse_type(
@@ -437,7 +605,20 @@ mod tests {
     #[test]
     fn test_iterator_type_casting() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_iterator_type(sparse_vector_encoding(&context), 0, 1);
+        let r#type = context.sparse_tensor_iterator_type(
+            context.sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            ),
+            0,
+            1,
+        );
         test_type_casting(r#type);
     }
 }
