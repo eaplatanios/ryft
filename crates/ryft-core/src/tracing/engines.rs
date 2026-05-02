@@ -787,7 +787,7 @@ mod tests {
         assert_eq!(builder.borrow().error, Some(builder_error.clone()));
         assert!(matches!(
             tracing_context.trace(ScalarOperation::Add, &[&tracer]),
-            Err(TracingError::Type(TypeError { message })) if message == "add expected 2 input types but got 1"
+            Err(TracingError::Type(TypeError { message })) if message == "expected 2 inputs but got 1",
         ));
         assert_eq!(builder.borrow().error, Some(builder_error));
 

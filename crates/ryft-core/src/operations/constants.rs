@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, TracingError};
 use crate::types::{ArrayType, Type, TypeError, Typed};
@@ -69,9 +70,7 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        if !input_types.is_empty() {
-            return Err(TypeError { message: format!("zero expected 0 input types but got {}", input_types.len()) });
-        }
+        check_input_count!(input_types, 0, TypeError);
         Ok(vec![self.output_type.clone()])
     }
 
@@ -83,9 +82,7 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
 
 impl<T: Type, V: Typed<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperation<T> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        if !inputs.is_empty() {
-            return Err(TracingError::InvalidInputCount { expected: 0, got: inputs.len() });
-        }
+        check_input_count!(inputs, 0, TracingError);
         Ok(vec![V::zero(&self.output_type)?])
     }
 }
@@ -141,9 +138,7 @@ impl<T: Type> Operation<T> for OneOperation<T> {
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        if !input_types.is_empty() {
-            return Err(TypeError { message: format!("one expected 0 input types but got {}", input_types.len()) });
-        }
+        check_input_count!(input_types, 0, TypeError);
         Ok(vec![self.output_type.clone()])
     }
 
@@ -155,9 +150,7 @@ impl<T: Type> Operation<T> for OneOperation<T> {
 
 impl<T: Type, V: Typed<T> + One<T>> InterpretableOperation<T, V> for OneOperation<T> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        if !inputs.is_empty() {
-            return Err(TracingError::InvalidInputCount { expected: 0, got: inputs.len() });
-        }
+        check_input_count!(inputs, 0, TracingError);
         Ok(vec![V::one(&self.output_type)?])
     }
 }

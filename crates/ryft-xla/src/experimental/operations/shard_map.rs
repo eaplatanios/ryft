@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use ryft_core::macros::check_input_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
@@ -450,16 +451,7 @@ fn infer_shard_map_output_types(
     captured_output_types: &[ArrayType],
     input_types: &[ArrayType],
 ) -> Result<Vec<ArrayType>, TypeError> {
-    if input_types.len() != captured_input_types.len() {
-        return Err(TypeError {
-            message: format!(
-                "{} expected {} input types but got {}",
-                operation_name,
-                captured_input_types.len(),
-                input_types.len()
-            ),
-        });
-    }
+    check_input_count!(input_types, captured_input_types.len(), TypeError);
     if !input_types
         .iter()
         .zip(captured_input_types.iter())
@@ -535,12 +527,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        if output_cotangents.len() != self.output_types.len() {
-            return Err(TracingError::InvalidInputCount {
-                expected: self.output_types.len(),
-                got: output_cotangents.len(),
-            });
-        }
+        check_input_count!(output_cotangents, self.output_types.len(), TracingError);
         if output_cotangents.is_empty() {
             return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
         }
@@ -723,12 +710,7 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        if output_cotangents.len() != self.output_types.len() {
-            return Err(TracingError::InvalidInputCount {
-                expected: self.output_types.len(),
-                got: output_cotangents.len(),
-            });
-        }
+        check_input_count!(output_cotangents, self.output_types.len(), TracingError);
         if output_cotangents.is_empty() {
             return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
         }

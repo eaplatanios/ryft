@@ -447,6 +447,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::macros::check_input_count;
     use crate::tracing::engines::Tracer;
     use crate::tracing::engines::{Engine, TracingEngine};
     use crate::tracing::transposition::TranspositionContext;
@@ -518,20 +519,14 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-            if input_types.len() != 1 {
-                return Err(TypeError {
-                    message: format!("test_shift expected 1 input type but got {}", input_types.len()),
-                });
-            }
+            check_input_count!(input_types, 1, TypeError);
             Ok(vec![input_types[0].clone()])
         }
     }
 
     impl InterpretableOperation<ArrayType, f64> for ShiftOp {
         fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
-            if inputs.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-            }
+            check_input_count!(inputs, 1, TracingError);
             Ok(vec![inputs[0] + self.amount])
         }
     }
@@ -546,9 +541,7 @@ mod tests {
             >,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-            if output_cotangents.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
-            }
+            check_input_count!(output_cotangents, 1, TracingError);
             Ok(vec![output_cotangents[0]])
         }
     }
@@ -559,9 +552,7 @@ mod tests {
             _context: &mut crate::tracing_v2::JvpContext<'_, ArrayScalarEngine>,
             inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
-            if inputs.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-            }
+            check_input_count!(inputs, 1, TracingError);
             Ok(vec![JvpTracer { primal: inputs[0].primal + self.amount, tangent: inputs[0].tangent }])
         }
     }
@@ -572,9 +563,7 @@ mod tests {
             _context: &mut crate::tracing_v2::JvpContext<'_, TracingContext<'engine, ArrayScalarEngine>>,
             inputs: &[JvpTracer<Tracer<'engine, ArrayScalarEngine>, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<Tracer<'engine, ArrayScalarEngine>, crate::tracing::AtomId>>, TracingError> {
-            if inputs.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-            }
+            check_input_count!(inputs, 1, TracingError);
             let primal = apply_custom_traced_unary(
                 inputs[0].primal.clone(),
                 CustomPrimitive::<ArrayType, f64>::new(self.clone()),

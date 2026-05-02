@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::macros::check_input_count;
 use crate::operations::constants::{SupportsZero, Zero};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
@@ -105,15 +106,7 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>, L: Clone + D
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        if input_types.len() != self.body.input_types.len() {
-            return Err(TypeError {
-                message: format!(
-                    "rematerialize expected {} input types but got {}",
-                    self.body.input_types.len(),
-                    input_types.len()
-                ),
-            });
-        }
+        check_input_count!(input_types, self.body.input_types.len(), TypeError);
         if input_types != self.body.input_types.as_slice() {
             return Err(TypeError {
                 message: "rematerialize input types do not match the captured body signature".to_string(),
@@ -360,15 +353,7 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> Operation<T>
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        if input_types.len() != self.body.input_types.len() {
-            return Err(TypeError {
-                message: format!(
-                    "rematerialize expected {} input types but got {}",
-                    self.body.input_types.len(),
-                    input_types.len()
-                ),
-            });
-        }
+        check_input_count!(input_types, self.body.input_types.len(), TypeError);
         if input_types != self.body.input_types.as_slice() {
             return Err(TypeError {
                 message: "rematerialize input types do not match the captured body signature".to_string(),

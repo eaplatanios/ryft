@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 
 use ryft_macros::Parameter;
 
+use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::tracing::TracingError;
@@ -368,9 +369,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         let Program { atoms, input_ids, output_ids, instructions, input_structure, output_structure, marker: _ } = self;
 
         let expected_input_count = input_structure.parameter_count();
-        if input_ids.len() != expected_input_count {
-            return Err(TracingError::InvalidInputCount { expected: expected_input_count, got: input_ids.len() });
-        }
+        check_input_count!(input_ids, expected_input_count, TracingError);
 
         let expected_output_count = output_structure.parameter_count();
         if output_ids.len() != expected_output_count {
@@ -745,9 +744,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         }
 
         let expected_input_count = input_structure.parameter_count();
-        if self.input_ids.len() != expected_input_count {
-            return Err(TracingError::InvalidInputCount { expected: expected_input_count, got: self.input_ids.len() });
-        }
+        check_input_count!(self.input_ids, expected_input_count, TracingError);
 
         let expected_output_count = output_structure.parameter_count();
         if output_ids.len() != expected_output_count {
@@ -815,6 +812,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::macros::check_input_count;
     use crate::operations::OperationFormatter;
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::tracing::TracingError;
@@ -841,9 +839,7 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            if input_types.len() != 1 {
-                return Err(TypeError { message: format!("expected 1 input type but got {}", input_types.len()) });
-            }
+            check_input_count!(input_types, 1, TypeError);
             Ok(vec![input_types[0].clone()])
         }
 

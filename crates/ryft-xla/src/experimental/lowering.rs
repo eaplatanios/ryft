@@ -2491,6 +2491,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use ryft_core::macros::check_input_count;
     use ryft_core::operations::{InterpretableOperation, Operation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -2560,20 +2561,14 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-            if input_types.len() != 1 {
-                return Err(TypeError {
-                    message: format!("test_custom_lowered expected 1 input type but got {}", input_types.len()),
-                });
-            }
+            check_input_count!(input_types, 1, TypeError);
             Ok(vec![input_types[0].clone()])
         }
     }
 
     impl InterpretableOperation<ArrayType, ShardMapTensor> for TestCustomLoweredOp {
         fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
-            if inputs.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-            }
+            check_input_count!(inputs, 1, TracingError);
             Ok(vec![inputs[0].clone()])
         }
     }

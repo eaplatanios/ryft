@@ -46,9 +46,7 @@ impl<V: MatrixValue> LeftMatMulOperation<V> {
 /// Backend carriers use this helper when they need the metadata rule for a captured left-matmul
 /// operation without first constructing a concrete [`LeftMatMulOperation`].
 pub fn left_matmul_abstract_eval(factor_type: &ArrayType, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-    if inputs.len() != 1 {
-        return Err(TypeError { message: format!("left_matmul expected 1 input type but got {}", inputs.len()) });
-    }
+    check_input_count!(inputs, 1, TypeError);
     Ok(vec![matmul_abstract(factor_type, &inputs[0], "left_matmul")?])
 }
 

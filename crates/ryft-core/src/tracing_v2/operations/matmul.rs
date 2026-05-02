@@ -42,9 +42,7 @@ impl Operation<ArrayType> for MatMulOperation {
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        if input_types.len() != 2 {
-            return Err(TypeError { message: format!("matmul expected 2 input types but got {}", input_types.len()) });
-        }
+        check_input_count!(input_types, 2, TypeError);
         Ok(vec![matmul_abstract(&input_types[0], &input_types[1], "matmul")?])
     }
 }

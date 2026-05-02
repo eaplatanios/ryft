@@ -473,6 +473,7 @@ mod tests {
 
     use ryft_macros::Parameter;
 
+    use crate::macros::check_input_count;
     use crate::operations::constants::{One, Zero};
     use crate::operations::{InterpretableOperation, Operation};
     use crate::tracing::engines::{ScalarEngine, Tracer};
@@ -584,18 +585,14 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[TestType]) -> Result<Vec<TestType>, TypeError> {
-            if input_types.len() != 2 {
-                return Err(TypeError { message: format!("add expected 2 input types but got {}", input_types.len()) });
-            }
+            check_input_count!(input_types, 2, TypeError);
             Ok(vec![TestType])
         }
     }
 
     impl InterpretableOperation<TestType, TestValue> for AddOperation {
         fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
-            if inputs.len() != 2 {
-                return Err(TracingError::InvalidInputCount { expected: 2, got: inputs.len() });
-            }
+            check_input_count!(inputs, 2, TracingError);
             Ok(vec![inputs[0].clone() + inputs[1].clone()])
         }
     }
@@ -621,11 +618,7 @@ mod tests {
                 Self::Add => 2,
                 Self::Neg | Self::Scale { .. } => 1,
             };
-            if input_types.len() != expected {
-                return Err(TypeError {
-                    message: format!("{} expected {expected} input types but got {}", self.name(), input_types.len()),
-                });
-            }
+            check_input_count!(input_types, expected, TypeError);
             Ok(vec![TestType])
         }
     }
@@ -636,9 +629,7 @@ mod tests {
                 Self::Add => 2,
                 Self::Neg | Self::Scale { .. } => 1,
             };
-            if inputs.len() != expected {
-                return Err(TracingError::InvalidInputCount { expected, got: inputs.len() });
-            }
+            check_input_count!(inputs, expected, TracingError);
             Ok(vec![match self {
                 Self::Add => inputs[0].clone() + inputs[1].clone(),
                 Self::Neg => -inputs[0].clone(),
@@ -671,9 +662,7 @@ mod tests {
             context: &mut crate::tracing::transposition::TranspositionContext<TestType, TestValue, TestLinearOperation>,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-            if output_cotangents.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
-            }
+            check_input_count!(output_cotangents, 1, TracingError);
             Ok(match self {
                 Self::Add => vec![output_cotangents[0], output_cotangents[0]],
                 Self::Neg => match output_cotangents[0] {

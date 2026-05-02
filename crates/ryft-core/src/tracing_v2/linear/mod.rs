@@ -36,6 +36,7 @@ mod tests {
     use std::fmt::{Debug, Display};
     use std::sync::Arc;
 
+    use crate::macros::check_input_count;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
     use crate::tracing::engines::ScalarEngine;
@@ -104,11 +105,7 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-            if input_types.len() != 1 {
-                return Err(TypeError {
-                    message: format!("panic_replay expected 1 input type but got {}", input_types.len()),
-                });
-            }
+            check_input_count!(input_types, 1, TypeError);
             Ok(vec![input_types[0].clone()])
         }
     }
@@ -125,9 +122,7 @@ mod tests {
             _context: &mut TranspositionContext<ArrayType, f64, LinearArrayOperation<f64>>,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-            if output_cotangents.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
-            }
+            check_input_count!(output_cotangents, 1, TracingError);
             Ok(vec![output_cotangents[0]])
         }
     }
@@ -138,9 +133,7 @@ mod tests {
             _context: &mut crate::tracing_v2::JvpContext<'_, ArrayScalarEngine>,
             inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
         ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
-            if inputs.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-            }
+            check_input_count!(inputs, 1, TracingError);
             Ok(vec![inputs[0].clone()])
         }
     }

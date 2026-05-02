@@ -7,6 +7,7 @@ use half::{bf16, f16};
 use ryft_macros::Parameter;
 use thiserror::Error;
 
+use crate::macros::check_input_count;
 use crate::operations::constants::{SupportsZero, Zero};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized};
@@ -289,9 +290,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             Ok(atom)
         }
 
-        if input_primals.len() != self.input_ids.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: input_primals.len() });
-        }
+        check_input_count!(input_primals, self.input_ids.len(), TracingError);
         let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, E::LinearOperationCarrier>::new()));
         let mut primals: Vec<Option<V>> = vec![None; self.atoms.len()];
         let mut tangents: Vec<Option<AtomId>> = vec![None; self.atoms.len()];

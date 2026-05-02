@@ -45,9 +45,7 @@ impl<V: MatrixValue> RightMatMulOperation<V> {
 /// Backend carriers use this helper when they need the metadata rule for a captured right-matmul
 /// operation without first constructing a concrete [`RightMatMulOperation`].
 pub fn right_matmul_abstract_eval(factor_type: &ArrayType, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-    if inputs.len() != 1 {
-        return Err(TypeError { message: format!("right_matmul expected 1 input type but got {}", inputs.len()) });
-    }
+    check_input_count!(inputs, 1, TypeError);
     Ok(vec![matmul_abstract(&inputs[0], factor_type, "right_matmul")?])
 }
 

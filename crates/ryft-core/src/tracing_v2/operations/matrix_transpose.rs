@@ -40,11 +40,7 @@ impl Operation<ArrayType> for MatrixTransposeOperation {
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        if input_types.len() != 1 {
-            return Err(TypeError {
-                message: format!("matrix_transpose expected 1 input type but got {}", input_types.len()),
-            });
-        }
+        check_input_count!(input_types, 1, TypeError);
         Ok(vec![transpose_abstract(&input_types[0], "matrix_transpose")?])
     }
 }

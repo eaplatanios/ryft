@@ -258,9 +258,7 @@ impl Operation<ArrayType> for ReshapeOperation {
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        if input_types.len() != 1 {
-            return Err(TypeError { message: format!("reshape expected 1 input type but got {}", input_types.len()) });
-        }
+        check_input_count!(input_types, 1, TypeError);
         if input_types[0].shape != *&self.input_shape {
             return Err(TypeError {
                 message: format!("reshape expected input shape {} but got {}", &self.input_shape, input_types[0].shape),

@@ -2,6 +2,7 @@ use std::fmt::{Debug, Display};
 use std::ops::{Add, Mul, Neg};
 use std::sync::Arc;
 
+use crate::macros::check_input_count;
 use crate::operations::constants::{One, OneOperation, SupportsOne, SupportsZero, Zero, ZeroOperation};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
@@ -1590,23 +1591,17 @@ where
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => {
-                if output_cotangents.len() != 1 {
-                    return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
-                }
+                check_input_count!(output_cotangents, 1, TracingError);
                 Ok(vec![output_cotangents[0], output_cotangents[0]])
             }
             Self::Neg => {
-                if output_cotangents.len() != 1 {
-                    return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
-                }
+                check_input_count!(output_cotangents, 1, TracingError);
                 output_cotangents[0]
                     .map(|atom| context.stage(Self::Neg, &[atom]).map(|outputs| vec![Some(outputs[0])]))
                     .unwrap_or_else(|| Ok(vec![None]))
             }
             Self::Scale { factor } => {
-                if output_cotangents.len() != 1 {
-                    return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
-                }
+                check_input_count!(output_cotangents, 1, TracingError);
                 output_cotangents[0]
                     .map(|atom| {
                         context
@@ -1813,9 +1808,7 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => {
-                if inputs.len() != 1 {
-                    return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-                }
+                check_input_count!(inputs, 1, TracingError);
                 let input = &inputs[0];
                 let factor_tracer = context.engine.constant(factor.clone());
                 let tangent =
@@ -2113,9 +2106,7 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => {
-                if inputs.len() != 1 {
-                    return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-                }
+                check_input_count!(inputs, 1, TracingError);
                 let input = &inputs[0];
                 let factor_tracer = context.engine.constant(factor.clone());
                 let tangent =

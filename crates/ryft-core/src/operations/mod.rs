@@ -147,6 +147,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::macros::check_input_count;
     use crate::parameters::Placeholder;
     use crate::tracing::{Program, ProgramBuilder};
     use crate::types::DataType;
@@ -163,20 +164,14 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            if input_types.len() != 1 {
-                return Err(TypeError {
-                    message: format!("identity expected 1 input type but got {}", input_types.len()),
-                });
-            }
+            check_input_count!(input_types, 1, TypeError);
             Ok(vec![input_types[0]])
         }
     }
 
     impl InterpretableOperation<DataType, f64> for IdentityOperation {
         fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
-            if inputs.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-            }
+            check_input_count!(inputs, 1, TracingError);
             Ok(vec![inputs[0]])
         }
     }
@@ -284,7 +279,7 @@ mod tests {
         assert_eq!(operation.infer_output_types(&[DataType::F64]), Ok(vec![DataType::F64]));
         assert_eq!(
             operation.infer_output_types(&[]),
-            Err(TypeError { message: "identity expected 1 input type but got 0".to_string() })
+            Err(TypeError { message: "expected 1 input but got 0".to_string() })
         );
         assert_eq!(operation.interpret(&[3.0f64]), Ok(vec![3.0f64]));
         assert_eq!(operation.interpret(&[]), Err(TracingError::InvalidInputCount { expected: 1, got: 0 }));

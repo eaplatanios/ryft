@@ -49,9 +49,7 @@ impl Operation<ArrayType> for AddOperation {
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        if input_types.len() != 2 {
-            return Err(TypeError { message: format!("add expected 2 input types but got {}", input_types.len()) });
-        }
+        check_input_count!(input_types, 2, TypeError);
         match input_types[0].broadcast(&input_types[1]) {
             Ok(output) => Ok(vec![output]),
             Err(_) => {
@@ -95,9 +93,7 @@ impl Operation<DataType> for AddOperation {
     }
 
     fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        if input_types.len() != 2 {
-            return Err(TypeError { message: format!("add expected 2 input types but got {}", input_types.len()) });
-        }
+        check_input_count!(input_types, 2, TypeError);
         input_types[0]
             .broadcast(&input_types[1])
             .map(|output| vec![output])

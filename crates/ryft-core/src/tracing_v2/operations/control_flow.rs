@@ -3,6 +3,7 @@ use std::fmt::{Debug, Display};
 use half::{bf16, f16};
 use thiserror::Error;
 
+use crate::macros::check_input_count;
 use crate::operations::constants::Zero;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::Parameterized;
@@ -202,9 +203,7 @@ fn replay_linear_program_on_atoms<E: LinearizableEngine<Type = ArrayType> + ?Siz
     program: &FlatProgram<E::Value, E::LinearOperationCarrier>,
     inputs: &[crate::tracing::AtomId],
 ) -> Result<Vec<crate::tracing::AtomId>, TracingError> {
-    if inputs.len() != program.input_ids.len() {
-        return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: inputs.len() });
-    }
+    check_input_count!(inputs, program.input_ids.len(), TracingError);
     if inputs.is_empty() && program.output_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -486,9 +485,7 @@ where
     ) -> Result<Vec<JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
         let operand_count = self.input_types().len();
         let expected_count = operand_count + usize::from(matches!(self.predicate, ConditionPredicate::RuntimeInput(_)));
-        if inputs.len() != expected_count {
-            return Err(TracingError::InvalidInputCount { expected: expected_count, got: inputs.len() });
-        }
+        check_input_count!(inputs, expected_count, TracingError);
         let (predicate, operands) = match self.predicate {
             ConditionPredicate::RuntimeInput(_) => (inputs[0].primal.control_flow_predicate()?, &inputs[1..]),
             ConditionPredicate::Captured(predicate) => (predicate, inputs),
@@ -689,9 +686,7 @@ where
         inputs: &[JvpTracer<V, crate::tracing::AtomId>],
     ) -> Result<Vec<JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
         let state_count = self.state_types().len();
-        if inputs.len() != state_count {
-            return Err(TracingError::InvalidInputCount { expected: state_count, got: inputs.len() });
-        }
+        check_input_count!(inputs, state_count, TracingError);
         let mut state_primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let mut state_tangents = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
 

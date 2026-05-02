@@ -2,6 +2,7 @@ use std::fmt::{Debug, Display};
 
 use half::{bf16, f16};
 
+use crate::macros::check_input_count;
 use crate::operations::constants::{One, OneOperation, SupportsZero, Zero, ZeroOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
@@ -19,9 +20,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
         _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        if output_cotangents.len() != 1 {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
-        }
+        check_input_count!(output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
 }
@@ -38,9 +37,7 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        if !inputs.is_empty() {
-            return Err(TracingError::InvalidInputCount { expected: 0, got: inputs.len() });
-        }
+        check_input_count!(inputs, 0, TracingError);
         let tangent = context
             .apply_operation(
                 &[],
@@ -64,9 +61,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
         _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        if output_cotangents.len() != 1 {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
-        }
+        check_input_count!(output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
 }
@@ -83,9 +78,7 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        if !inputs.is_empty() {
-            return Err(TracingError::InvalidInputCount { expected: 0, got: inputs.len() });
-        }
+        check_input_count!(inputs, 0, TracingError);
         let tangent = context
             .apply_operation(
                 &[],
@@ -157,20 +150,14 @@ impl<T: Type> Operation<T> for ZeroLikeOperation {
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        if input_types.len() != 1 {
-            return Err(TypeError {
-                message: format!("zero_like expected 1 input type but got {}", input_types.len()),
-            });
-        }
+        check_input_count!(input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
 }
 
 impl<T: Type, V: Typed<T> + ZeroLike> InterpretableOperation<T, V> for ZeroLikeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        if inputs.len() != 1 {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-        }
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![inputs[0].zero_like()])
     }
 }
@@ -183,9 +170,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
         _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        if output_cotangents.len() != 1 {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
-        }
+        check_input_count!(output_cotangents, 1, TracingError);
         Ok(vec![None])
     }
 }
@@ -202,9 +187,7 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        if inputs.len() != 1 {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-        }
+        check_input_count!(inputs, 1, TracingError);
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent],
@@ -269,18 +252,14 @@ impl<T: Type> Operation<T> for OneLikeOperation {
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        if input_types.len() != 1 {
-            return Err(TypeError { message: format!("one_like expected 1 input type but got {}", input_types.len()) });
-        }
+        check_input_count!(input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
 }
 
 impl<T: Type, V: Typed<T> + OneLike> InterpretableOperation<T, V> for OneLikeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        if inputs.len() != 1 {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-        }
+        check_input_count!(inputs, 1, TracingError);
         Ok(vec![inputs[0].one_like()])
     }
 }
@@ -293,9 +272,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
         _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        if output_cotangents.len() != 1 {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
-        }
+        check_input_count!(output_cotangents, 1, TracingError);
         Ok(vec![None])
     }
 }
@@ -312,9 +289,7 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        if inputs.len() != 1 {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-        }
+        check_input_count!(inputs, 1, TracingError);
         let tangent = context
             .apply_operation(
                 &[inputs[0].tangent],
@@ -466,7 +441,7 @@ mod tests {
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![0.0]));
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
-            Err(TypeError { message: "zero expected 0 input types but got 1".to_string() }),
+            Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]),
@@ -485,7 +460,7 @@ mod tests {
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![1.0]));
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
-            Err(TypeError { message: "one expected 0 input types but got 1".to_string() }),
+            Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]),
@@ -509,7 +484,7 @@ mod tests {
 
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[]),
-            Err(TypeError { message: "zero_like expected 1 input type but got 0".to_string() }),
+            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
@@ -533,7 +508,7 @@ mod tests {
 
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[]),
-            Err(TypeError { message: "one_like expected 1 input type but got 0".to_string() }),
+            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
