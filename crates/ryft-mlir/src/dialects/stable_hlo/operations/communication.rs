@@ -4,10 +4,13 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::{
-    Attribute, BooleanAttributeRef, Context, DenseIntegerElementsAttributeRef, DetachedOp, DetachedRegion,
-    DialectHandle, IntegerAttributeRef, IntoWithContext, Location, OneRegion, Operation, OperationBuilder, RegionRef,
-    Size, StringAttributeRef, StringRef, TensorTypeRef, Type, Value, mlir_op, mlir_op_trait, mlir_subtype_trait_impls,
+    Attribute, AttributeRef, BooleanAttributeRef, Context, DenseIntegerElementsAttributeRef, DetachedOp,
+    DetachedRegion, DialectHandle, IntegerAttributeRef, IntoWithContext, Location, OneRegion, Operation,
+    OperationBuilder, RegionRef, Size, StringAttributeRef, StringRef, TensorTypeRef, Type, Value, mlir_op,
+    mlir_op_trait, mlir_subtype_trait_impls,
 };
+
+use crate::dialects::stable_hlo::ReplicaGroupMeshAxesAttributeRef;
 
 /// Represents the type of a StableHLO communication channel.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -632,42 +635,94 @@ pub const COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE: &str = "replica_groups";
 /// Name of the [`Attribute`] that is used to store [`HasReplicaGroups::use_global_device_ids`].
 pub const COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE: &str = "use_global_device_ids";
 
+/// StableHLO collective replica groups.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplicaGroups<'c, 't> {
+    /// Replica groups represented explicitly as device IDs.
+    Dense(Vec<Vec<usize>>),
+
+    /// Replica groups represented by a mesh and mesh-axis references.
+    MeshAxes(ReplicaGroupMeshAxesAttributeRef<'c, 't>),
+}
+
+impl<'c, 't> ReplicaGroups<'c, 't> {
+    /// Creates dense replica groups from a slice of device-id groups.
+    pub fn dense(replica_groups: &[&[usize]]) -> Self {
+        Self::Dense(replica_groups.iter().map(|group| group.to_vec()).collect())
+    }
+
+    /// Creates mesh-axis replica groups from the corresponding StableHLO attribute.
+    pub fn mesh_axes(replica_groups: ReplicaGroupMeshAxesAttributeRef<'c, 't>) -> Self {
+        Self::MeshAxes(replica_groups)
+    }
+
+    /// Returns the MLIR [`Attribute`] representation of these replica groups.
+    fn to_attribute<L: Location<'c, 't>>(&self, context: &'c Context<'t>, location: L) -> AttributeRef<'c, 't> {
+        match self {
+            Self::Dense(replica_groups) => {
+                context.stable_hlo_replica_groups_attribute(replica_groups, location).as_ref()
+            }
+            Self::MeshAxes(replica_groups) => replica_groups.as_ref(),
+        }
+    }
+}
+
+impl<'c, 't> From<ReplicaGroupMeshAxesAttributeRef<'c, 't>> for ReplicaGroups<'c, 't> {
+    fn from(replica_groups: ReplicaGroupMeshAxesAttributeRef<'c, 't>) -> Self {
+        Self::mesh_axes(replica_groups)
+    }
+}
+
 /// Trait that represents collective [`Operation`]s that support specifying and operating over replica groups.
 pub trait HasReplicaGroups<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
-    /// Returns the optional replica groups of this [`Operation`]. This must be non-empty if
+    /// Returns the replica groups of this [`Operation`]. This must be non-empty if
     /// [`HasReplicaGroups::use_global_device_ids`] is `true`.
     ///
-    /// This a [`Vec`] over replica groups where each group is represented as a [`Vec`] of device IDs. In most cases,
-    /// the groups must all have the same size. The only exception is [`all_reduce`] which supports non-uniform replica
-    /// groups. These groups determine the order in which the gather operation is performed and which devices
-    /// communicate with which other devices during the gather operation.
-    fn replica_groups(&self) -> Vec<Vec<usize>> {
+    /// The returned [`ReplicaGroups`] may contain either explicit device-id groups or mesh-axis replica groups.
+    fn replica_groups(&self) -> ReplicaGroups<'c, 't> {
         self.attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseIntegerElementsAttributeRef>())
-            .and_then(|attribute| {
-                let attribute_type = attribute.r#type().cast::<TensorTypeRef>();
-                let device_ids = unsafe { attribute.i64_elements() };
-                attribute_type.and_then(|tensor_type| {
-                    tensor_type.dimension(1).value().map(|max_group_size| {
-                        let mut groups = Vec::new();
-                        let mut device_ids = device_ids.peekable();
-                        while device_ids.peek().is_some() {
-                            // We filter for non-negative values after the chunking below because the value `-1` is
-                            // used as a "null" device padding value for when dealing with non-uniform replica groups.
-                            groups.push(
-                                device_ids
-                                    .by_ref()
-                                    .take(max_group_size)
-                                    .filter(|id| *id >= 0)
-                                    .map(|id| id as usize)
-                                    .collect(),
-                            );
-                        }
-                        groups
-                    })
-                })
+            .map(|attribute| {
+                if let Some(attribute) = attribute.cast::<DenseIntegerElementsAttributeRef>() {
+                    let attribute_type = attribute.r#type().cast::<TensorTypeRef>();
+                    let device_ids = unsafe { attribute.i64_elements() };
+                    ReplicaGroups::Dense(
+                        attribute_type
+                            .and_then(|tensor_type| {
+                                tensor_type.dimension(1).value().map(|max_group_size| {
+                                    let mut groups = Vec::new();
+                                    let mut device_ids = device_ids.peekable();
+                                    while device_ids.peek().is_some() {
+                                        // We filter for non-negative values after the chunking below because the value
+                                        // `-1` is used as a "null" device padding value for when dealing with
+                                        // non-uniform replica groups.
+                                        groups.push(
+                                            device_ids
+                                                .by_ref()
+                                                .take(max_group_size)
+                                                .filter(|id| *id >= 0)
+                                                .map(|id| id as usize)
+                                                .collect(),
+                                        );
+                                    }
+                                    groups
+                                })
+                            })
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "invalid '{COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE}' dense attribute in StableHLO \
+                                     collective operation",
+                                )
+                            }),
+                    )
+                } else if let Some(attribute) = attribute.cast::<ReplicaGroupMeshAxesAttributeRef>() {
+                    ReplicaGroups::MeshAxes(attribute)
+                } else {
+                    panic!(
+                        "invalid '{COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE}' attribute in StableHLO collective operation",
+                    )
+                }
             })
-            .unwrap_or(Vec::new())
+            .unwrap_or_else(|| ReplicaGroups::Dense(Vec::new()))
     }
 
     /// Returns `true` if this [`Operation`] uses global device IDs. Defaults to `false` if not specified.
@@ -678,11 +733,11 @@ pub trait HasReplicaGroups<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 }
 
 impl<'t> Context<'t> {
-    /// Internal helper for constructing the [`DenseIntegerElementsAttributeRef`] that is used to store
+    /// Internal helper for constructing the [`DenseIntegerElementsAttributeRef`] that is used to store dense
     /// [`HasReplicaGroups::replica_groups`].
     fn stable_hlo_replica_groups_attribute<'c, L: Location<'c, 't>>(
         &'c self,
-        replica_groups: &[&[usize]],
+        replica_groups: &[Vec<usize>],
         location: L,
     ) -> DenseIntegerElementsAttributeRef<'c, 't> {
         let i64_type = self.signless_integer_type(64);
@@ -694,7 +749,7 @@ impl<'t> Context<'t> {
         let mut attribute_values = Vec::with_capacity(group_count * max_group_size);
         for group in replica_groups {
             let group_size = group.len();
-            for id in *group {
+            for id in group {
                 attribute_values.push(self.integer_attribute(i64_type, *id as i64));
             }
             if group_size < max_group_size {
@@ -768,7 +823,7 @@ mlir_op_trait!(AllGather, @local SupportsChannelHandle);
 pub fn all_gather<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     inputs: &[V],
     all_gather_dimension: usize,
-    replica_groups: &[&[usize]],
+    replica_groups: ReplicaGroups<'c, 't>,
     channel_id: Option<usize>,
     channel_type: Option<ChannelHandleType>,
     use_global_device_ids: bool,
@@ -781,10 +836,7 @@ pub fn all_gather<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: 
     let mut builder = OperationBuilder::new("stablehlo.all_gather", location)
         .add_operands(inputs)
         .add_attribute(ALL_GATHER_DIMENSION_ATTRIBUTE, context.integer_attribute(i64_type, all_gather_dimension as i64))
-        .add_attribute(
-            COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE,
-            context.stable_hlo_replica_groups_attribute(replica_groups, location),
-        );
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location));
     if let Some(channel_id) = channel_id {
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
@@ -861,7 +913,7 @@ mlir_op_trait!(AllReduce, @local SupportsChannelHandle);
 /// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn all_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     inputs: &[V],
-    replica_groups: &[&[usize]],
+    replica_groups: ReplicaGroups<'c, 't>,
     channel_id: Option<usize>,
     channel_type: Option<ChannelHandleType>,
     use_global_device_ids: bool,
@@ -870,10 +922,9 @@ pub fn all_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
 ) -> DetachedAllReduceOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo());
-    let mut builder = OperationBuilder::new("stablehlo.all_reduce", location).add_operands(inputs).add_attribute(
-        COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE,
-        context.stable_hlo_replica_groups_attribute(replica_groups, location),
-    );
+    let mut builder = OperationBuilder::new("stablehlo.all_reduce", location)
+        .add_operands(inputs)
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location));
     if let Some(channel_id) = channel_id {
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
@@ -990,7 +1041,7 @@ pub fn all_to_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
     split_dimension: usize,
     split_count: usize,
     concatenation_dimension: usize,
-    replica_groups: &[&[usize]],
+    replica_groups: ReplicaGroups<'c, 't>,
     channel_id: Option<usize>,
     channel_type: Option<ChannelHandleType>,
     use_global_device_ids: bool,
@@ -1010,10 +1061,7 @@ pub fn all_to_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
             ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE,
             context.integer_attribute(i64_type, concatenation_dimension as i64),
         )
-        .add_attribute(
-            COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE,
-            context.stable_hlo_replica_groups_attribute(replica_groups, location),
-        );
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location));
     if let Some(channel_id) = channel_id {
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
@@ -1080,18 +1128,16 @@ mlir_op_trait!(CollectiveBroadcast, @local SupportsChannelHandle);
 /// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn collective_broadcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
-    replica_groups: &[&[usize]],
+    replica_groups: ReplicaGroups<'c, 't>,
     channel_id: Option<usize>,
     channel_type: Option<ChannelHandleType>,
     location: L,
 ) -> DetachedCollectiveBroadcastOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo());
-    let mut builder =
-        OperationBuilder::new("stablehlo.collective_broadcast", location).add_operand(input).add_attribute(
-            COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE,
-            context.stable_hlo_replica_groups_attribute(replica_groups, location),
-        );
+    let mut builder = OperationBuilder::new("stablehlo.collective_broadcast", location)
+        .add_operand(input)
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location));
     if let Some(channel_id) = channel_id {
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
@@ -1256,7 +1302,7 @@ mlir_op_trait!(ReduceScatter, @local SupportsChannelHandle);
 pub fn reduce_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     operand: V,
     dimension: usize,
-    replica_groups: &[&[usize]],
+    replica_groups: ReplicaGroups<'c, 't>,
     channel_id: Option<usize>,
     channel_type: Option<ChannelHandleType>,
     use_global_device_ids: bool,
@@ -1272,10 +1318,7 @@ pub fn reduce_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>,
             REDUCE_SCATTER_DIMENSION_ATTRIBUTE,
             location.context().integer_attribute(context.signless_integer_type(64), dimension as i64),
         )
-        .add_attribute(
-            COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE,
-            context.stable_hlo_replica_groups_attribute(replica_groups, location),
-        );
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location));
     if let Some(channel_id) = channel_id {
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
@@ -1658,7 +1701,7 @@ mod tests {
             let op = all_gather(
                 &[block.argument(0).unwrap()],
                 1,
-                &[&[0, 2], &[1, 3]],
+                ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
                 Some(0),
                 Some(ChannelHandleType::DeviceToDevice),
                 true,
@@ -1666,7 +1709,7 @@ mod tests {
                 location,
             );
             assert_eq!(op.all_gather_dimension(), 1);
-            assert_eq!(op.replica_groups(), vec![vec![0, 2], vec![1, 3]]);
+            assert_eq!(op.replica_groups(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]]));
             assert_eq!(op.channel_id(), Some(0));
             assert_eq!(op.channel_type(), Some(ChannelHandleType::DeviceToDevice));
             assert!(op.use_global_device_ids());
@@ -1700,6 +1743,63 @@ mod tests {
                 }
             "},
         );
+
+        // Test using mesh axis replica groups.
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let input_tensor_type =
+            context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
+        let output_tensor_type =
+            context.tensor_type(i64_type, &[Size::Static(2), Size::Static(4)], None, location).unwrap();
+        let mesh_axis_x = context.stable_hlo_mesh_axis("x", 2);
+        let mesh_axis_y = context.stable_hlo_mesh_axis("y", 2);
+        let mesh = context.stable_hlo_mesh(context.array_attribute(&[mesh_axis_x, mesh_axis_y]), None);
+        let replica_axis = context.stable_hlo_axis_ref("x", None);
+        let replica_groups = context.stable_hlo_replica_group_mesh_axes(mesh, context.array_attribute(&[replica_axis]));
+        module.body().append_operation({
+            let mut block = context.block(&[(input_tensor_type, location)]);
+            let op = all_gather(
+                &[block.argument(0).unwrap()],
+                1,
+                replica_groups.into(),
+                None,
+                None,
+                false,
+                &[output_tensor_type],
+                location,
+            );
+            assert_eq!(op.replica_groups(), ReplicaGroups::MeshAxes(replica_groups));
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "test_all_gather_with_mesh_axis_replica_groups",
+                func::FuncAttributes {
+                    arguments: vec![input_tensor_type.into()],
+                    results: vec![output_tensor_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @test_all_gather_with_mesh_axis_replica_groups(%arg0: tensor<2x2xi64>) -> tensor<2x4xi64> {
+                    %0 = \"stablehlo.all_gather\"(%arg0) <{\
+                      all_gather_dim = 1 : i64, \
+                      replica_groups = #stablehlo.replica_group_mesh_axes<\
+                        mesh = #stablehlo.mesh<axes=[<name = \"x\", size = 2>, <name = \"y\", size = 2>]>, \
+                        axes = [#stablehlo.axis_ref<name = \"x\">]\
+                      >\
+                    }> : (tensor<2x2xi64>) -> tensor<2x4xi64>
+                    return %0 : tensor<2x4xi64>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -1726,14 +1826,14 @@ mod tests {
             let computation = computation_region.into();
             let op = all_reduce(
                 &[block.argument(0).unwrap()],
-                &[&[0, 2], &[1]],
+                ReplicaGroups::dense(&[&[0, 2], &[1]]),
                 Some(1),
                 Some(ChannelHandleType::DeviceToDevice),
                 true,
                 computation,
                 location,
             );
-            assert_eq!(op.replica_groups(), vec![vec![0, 2], vec![1]]);
+            assert_eq!(op.replica_groups(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1]]));
             assert_eq!(op.channel_id(), Some(1));
             assert_eq!(op.channel_type(), Some(ChannelHandleType::DeviceToDevice));
             assert!(op.use_global_device_ids());
@@ -1789,7 +1889,7 @@ mod tests {
                 1,
                 2,
                 0,
-                &[&[0, 2], &[1, 3]],
+                ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
                 Some(1),
                 Some(ChannelHandleType::DeviceToDevice),
                 true,
@@ -1798,7 +1898,7 @@ mod tests {
             assert_eq!(op.split_dimension(), 1);
             assert_eq!(op.split_count(), 2);
             assert_eq!(op.concatenation_dimension(), 0);
-            assert_eq!(op.replica_groups(), vec![vec![0, 2], vec![1, 3]]);
+            assert_eq!(op.replica_groups(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]]));
             assert_eq!(op.channel_id(), Some(1));
             assert_eq!(op.channel_type(), Some(ChannelHandleType::DeviceToDevice));
             let op = block.append_operation(op);
@@ -1845,12 +1945,12 @@ mod tests {
             let mut block = context.block(&[(tensor_type, location)]);
             let op = collective_broadcast(
                 block.argument(0).unwrap(),
-                &[&[0, 2], &[1, 3]],
+                ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
                 Some(1),
                 Some(ChannelHandleType::DeviceToDevice),
                 location,
             );
-            assert_eq!(op.replica_groups(), vec![vec![0, 2], vec![1, 3]]);
+            assert_eq!(op.replica_groups(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]]));
             assert_eq!(op.channel_id(), Some(1));
             assert_eq!(op.channel_type(), Some(ChannelHandleType::DeviceToDevice));
             let op = block.append_operation(op);
@@ -1956,7 +2056,7 @@ mod tests {
             let reduce_scatter_op = reduce_scatter(
                 input,
                 1,
-                &[&[0, 2], &[1, 3]],
+                ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
                 Some(1),
                 Some(ChannelHandleType::DeviceToDevice),
                 false,
@@ -1965,7 +2065,7 @@ mod tests {
                 location,
             );
             assert_eq!(reduce_scatter_op.dimension(), 1);
-            assert_eq!(reduce_scatter_op.replica_groups(), vec![vec![0, 2], vec![1, 3]]);
+            assert_eq!(reduce_scatter_op.replica_groups(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]]));
             assert_eq!(reduce_scatter_op.channel_id(), Some(1));
             assert_eq!(reduce_scatter_op.channel_type(), Some(ChannelHandleType::DeviceToDevice));
             assert_eq!(reduce_scatter_op.use_global_device_ids(), false);
