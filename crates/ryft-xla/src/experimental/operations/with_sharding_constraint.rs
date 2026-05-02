@@ -119,7 +119,6 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
     fn transpose(
         &self,
         context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
-            '_,
             ArrayType,
             ShardMapTensor,
             LinearArrayOperation<ShardMapTensor>,
@@ -177,7 +176,6 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
     fn transpose(
         &self,
         context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
-            '_,
             ArrayType,
             ShardMapTracer,
             LinearArrayOperation<ShardMapTracer>,
@@ -246,7 +244,7 @@ mod tests {
 
     fn test_transposition_context<V: Traceable<ArrayType>>(
         builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearArrayOperation<V>>>>,
-    ) -> TranspositionContext<'static, ArrayType, V, LinearArrayOperation<V>> {
+    ) -> TranspositionContext<ArrayType, V, LinearArrayOperation<V>> {
         TranspositionContext::new(builder)
     }
 

@@ -433,7 +433,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         let transpose = self.transpose_op();
@@ -468,7 +468,7 @@ where
 /// is structurally zero. Linear higher-order rules use this when they must consume all output
 /// cotangents jointly (e.g. a nested transpose program that has a fixed input arity).
 fn materialize_optional_cotangent<T, V>(
-    context: &crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
+    context: &crate::tracing_v2::operations::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
     cotangent: Option<crate::tracing::AtomId>,
     input_type: &T,
 ) -> crate::tracing::AtomId
@@ -481,7 +481,7 @@ where
         return atom;
     }
     use crate::tracing_v2::operations::SupportsZero;
-    let builder = context.builder();
+    let builder = &context.builder;
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(input_type.clone());
     builder_borrow.instructions.push(Instruction {
@@ -669,7 +669,7 @@ mod tests {
         ArrayType::scalar(crate::types::DataType::F64)
     }
 
-    fn test_transposition_context() -> TranspositionContext<'static, ArrayType, f64, LinearArrayOperation<f64>> {
+    fn test_transposition_context() -> TranspositionContext<ArrayType, f64, LinearArrayOperation<f64>> {
         TranspositionContext::new(Rc::new(RefCell::new(ProgramBuilder::new())))
     }
 

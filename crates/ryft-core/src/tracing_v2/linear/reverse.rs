@@ -643,12 +643,7 @@ mod tests {
     impl LinearOperation<TestType, TestValue, TestLinearOperation> for TestLinearOperation {
         fn transpose(
             &self,
-            context: &mut crate::tracing_v2::operations::TranspositionContext<
-                '_,
-                TestType,
-                TestValue,
-                TestLinearOperation,
-            >,
+            context: &mut crate::tracing_v2::operations::TranspositionContext<TestType, TestValue, TestLinearOperation>,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
             if output_cotangents.len() != 1 {

@@ -326,7 +326,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         self.transpose_rule
@@ -436,7 +436,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         self.primitive
@@ -545,7 +545,6 @@ mod tests {
         fn transpose(
             &self,
             _context: &mut crate::tracing_v2::operations::TranspositionContext<
-                '_,
                 ArrayType,
                 f64,
                 LinearArrayOperation<f64>,
@@ -623,7 +622,7 @@ mod tests {
 
     fn test_transposition_context(
         builder: Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearArrayOperation<f64>>>>,
-    ) -> TranspositionContext<'static, ArrayType, f64, LinearArrayOperation<f64>> {
+    ) -> TranspositionContext<ArrayType, f64, LinearArrayOperation<f64>> {
         TranspositionContext::new(builder)
     }
 

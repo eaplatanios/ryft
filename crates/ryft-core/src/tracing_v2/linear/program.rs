@@ -118,7 +118,7 @@ where
 }
 
 fn transpose_linear_program_with_context<T, V, Input, Output, O>(
-    context: &mut TranspositionContext<'_, T, V, O>,
+    context: &mut TranspositionContext<T, V, O>,
     program: &Program<T, V, O, Input, Output>,
 ) -> Result<Program<T, V, O, Output, Input>, TracingError>
 where
@@ -172,7 +172,7 @@ where
         output
     }
 
-    let builder = context.builder().clone();
+    let builder = context.builder.clone();
     let mut output_cotangent_inputs = Vec::with_capacity(program.output_ids.len());
     for output in program.output_ids.iter() {
         let output_atom = program.atoms.get(output.index).ok_or(TracingError::UnboundAtomId { id: *output })?;
@@ -215,7 +215,7 @@ where
         .simplified()
 }
 
-impl<T, V, O> TranspositionContext<'_, T, V, O>
+impl<T, V, O> TranspositionContext<T, V, O>
 where
     T: Type,
     V: Traceable<T>,

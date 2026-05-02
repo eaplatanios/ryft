@@ -121,27 +121,16 @@ pub use sin::{Sin, SinOperation, SupportsSin};
 /// stage new linear instructions through it, and higher-order rules use it to recursively transpose
 /// nested linear programs into the same builder. The pass propagates structural zeros via
 /// `Option<AtomId>`, so no cotangent-synthesis policy lives on the context anymore.
-#[doc(hidden)]
-pub struct TranspositionContext<'a, T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> {
+pub struct TranspositionContext<T: Type, V: Traceable<T>, O: Clone + Operation<T>> {
     /// Builder for the currently active transpose program.
-    builder: Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>,
-
-    /// Phantom marker reserving a context lifetime for future per-pass borrows without forcing an
-    /// API change when one is added.
-    marker: std::marker::PhantomData<&'a ()>,
+    pub builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
 }
 
-impl<'a, T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> TranspositionContext<'a, T, V, LinearCarrier> {
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> TranspositionContext<T, V, O> {
     /// Creates a transposition context that stages into `builder`.
     #[doc(hidden)]
-    pub fn new(builder: Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>) -> Self {
-        Self { builder, marker: std::marker::PhantomData }
-    }
-
-    /// Returns the builder for the currently active transpose program.
-    #[inline]
-    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>> {
-        &self.builder
+    pub fn new(builder: Rc<RefCell<ProgramBuilder<T, V, O>>>) -> Self {
+        Self { builder }
     }
 
     /// Stages one operation in the currently active transpose program.
@@ -152,7 +141,7 @@ impl<'a, T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> Transpos
     pub fn apply_operation(
         &self,
         inputs: &[AtomId],
-        operation: LinearCarrier,
+        operation: O,
         output_count: usize,
     ) -> Result<Vec<AtomId>, TracingError> {
         let mut builder_borrow = self.builder.borrow_mut();
@@ -173,13 +162,13 @@ impl<'a, T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> Transpos
     #[inline]
     pub(crate) fn replace_builder(
         &mut self,
-        builder: Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>,
-    ) -> Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>> {
+        builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
+    ) -> Rc<RefCell<ProgramBuilder<T, V, O>>> {
         std::mem::replace(&mut self.builder, builder)
     }
 
     /// Takes ownership of the active builder, leaving an empty builder behind.
-    pub(crate) fn take_builder(&mut self) -> Result<ProgramBuilder<T, V, LinearCarrier>, TracingError> {
+    pub(crate) fn take_builder(&mut self) -> Result<ProgramBuilder<T, V, O>, TracingError> {
         let builder = self.replace_builder(Rc::new(RefCell::new(ProgramBuilder::new())));
         match Rc::try_unwrap(builder) {
             Ok(builder) => Ok(builder.into_inner()),
@@ -202,7 +191,7 @@ pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone + Opera
     /// the transpose builder via [`TranspositionContext::apply_operation`].
     fn transpose(
         &self,
-        context: &mut TranspositionContext<'_, T, V, LinearCarrier>,
+        context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError>;
 }

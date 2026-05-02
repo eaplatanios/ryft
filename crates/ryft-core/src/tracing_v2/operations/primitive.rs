@@ -1702,7 +1702,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, DataType, V, LinearScalarOperation<V>>,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<DataType, V, LinearScalarOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         match self {
@@ -1761,7 +1761,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         match self {
@@ -1798,7 +1798,6 @@ where
     fn transpose(
         &self,
         context: &mut crate::tracing_v2::operations::TranspositionContext<
-            '_,
             DataType,
             V,
             LinearArrayOperation<V, DataType>,

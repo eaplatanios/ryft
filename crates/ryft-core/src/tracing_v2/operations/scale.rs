@@ -107,7 +107,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing_v2::operations::TranspositionContext<'_, T, V, LinearArrayOperation<V, T>>,
+        context: &mut crate::tracing_v2::operations::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1, TracingError);
@@ -232,7 +232,7 @@ mod tests {
 
     fn test_transposition_context(
         builder: Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearArrayOperation<f64>>>>,
-    ) -> TranspositionContext<'static, ArrayType, f64, LinearArrayOperation<f64>> {
+    ) -> TranspositionContext<ArrayType, f64, LinearArrayOperation<f64>> {
         TranspositionContext::new(builder)
     }
 

@@ -115,7 +115,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 {
     fn transpose(
         &self,
-        _context: &mut TranspositionContext<'_, T, V, LinearCarrier>,
+        _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
         if output_cotangents.len() != 1 {
@@ -248,7 +248,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 {
     fn transpose(
         &self,
-        _context: &mut TranspositionContext<'_, T, V, LinearCarrier>,
+        _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
         if output_cotangents.len() != 1 {
@@ -372,7 +372,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 {
     fn transpose(
         &self,
-        _context: &mut TranspositionContext<'_, T, V, LinearCarrier>,
+        _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
         if output_cotangents.len() != 1 {
@@ -487,7 +487,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 {
     fn transpose(
         &self,
-        _context: &mut TranspositionContext<'_, T, V, LinearCarrier>,
+        _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
         if output_cotangents.len() != 1 {

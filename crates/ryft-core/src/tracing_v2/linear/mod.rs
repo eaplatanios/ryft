@@ -277,7 +277,7 @@ mod tests {
     impl LinearOperation<ArrayType, f64, LinearArrayOperation<f64>> for PanicReplayOp {
         fn transpose(
             &self,
-            _context: &mut TranspositionContext<'_, ArrayType, f64, LinearArrayOperation<f64>>,
+            _context: &mut TranspositionContext<ArrayType, f64, LinearArrayOperation<f64>>,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
             if output_cotangents.len() != 1 {

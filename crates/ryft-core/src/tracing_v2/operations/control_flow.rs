@@ -429,7 +429,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut TranspositionContext<'_, ArrayType, V, O>,
+        context: &mut TranspositionContext<ArrayType, V, O>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         let ConditionPredicate::Captured(predicate) = self.predicate else {
@@ -468,7 +468,7 @@ where
 /// is structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
 fn stage_optional_cotangent<V, O>(
-    context: &TranspositionContext<'_, ArrayType, V, O>,
+    context: &TranspositionContext<ArrayType, V, O>,
     cotangent: Option<crate::tracing::AtomId>,
     output_type: &ArrayType,
 ) -> crate::tracing::AtomId
@@ -479,7 +479,7 @@ where
     if let Some(atom) = cotangent {
         return atom;
     }
-    let builder = context.builder();
+    let builder = &context.builder;
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(output_type.clone());
     builder_borrow.instructions.push(Instruction {
@@ -681,7 +681,7 @@ where
 {
     fn transpose(
         &self,
-        _context: &mut TranspositionContext<'_, ArrayType, V, O>,
+        _context: &mut TranspositionContext<ArrayType, V, O>,
         _output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         Err(ControlFlowError::MissingTransformRule { transform: "while transpose" }.into())
@@ -1012,7 +1012,7 @@ mod tests {
     impl LinearOperation<ArrayType, TestValue, TestLinearOperation> for TestLinearOperation {
         fn transpose(
             &self,
-            context: &mut TranspositionContext<'_, ArrayType, TestValue, TestLinearOperation>,
+            context: &mut TranspositionContext<ArrayType, TestValue, TestLinearOperation>,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
             match self {
@@ -1172,7 +1172,7 @@ mod tests {
 
     fn test_transposition_context(
         builder: Rc<RefCell<ProgramBuilder<ArrayType, TestValue, TestLinearOperation>>>,
-    ) -> TranspositionContext<'static, ArrayType, TestValue, TestLinearOperation> {
+    ) -> TranspositionContext<ArrayType, TestValue, TestLinearOperation> {
         TranspositionContext::new(builder)
     }
 

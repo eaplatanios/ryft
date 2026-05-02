@@ -135,7 +135,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<Array
 {
     fn transpose(
         &self,
-        _context: &mut crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
+        _context: &mut crate::tracing_v2::operations::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1, TracingError);
@@ -149,7 +149,6 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Add<Output = V> + Z
     fn transpose(
         &self,
         _context: &mut crate::tracing_v2::operations::TranspositionContext<
-            '_,
             DataType,
             V,
             LinearArrayOperation<V, DataType>,

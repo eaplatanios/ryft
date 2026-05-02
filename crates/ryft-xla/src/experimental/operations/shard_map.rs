@@ -565,7 +565,6 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
     fn transpose(
         &self,
         context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
-            '_,
             ArrayType,
             ShardMapTensor,
             LinearArrayOperation<ShardMapTensor>,
@@ -602,7 +601,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
 /// structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
 fn materialize_optional_cotangent<V>(
-    context: &ryft_core::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearArrayOperation<V>>,
+    context: &ryft_core::tracing_v2::operations::TranspositionContext<ArrayType, V, LinearArrayOperation<V>>,
     cotangent: &Option<AtomId>,
     output_type: &ArrayType,
 ) -> AtomId
@@ -612,7 +611,7 @@ where
     if let Some(atom) = cotangent {
         return *atom;
     }
-    let builder = context.builder();
+    let builder = &context.builder;
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(output_type.clone());
     builder_borrow.instructions.push(ryft_core::tracing::Instruction {
@@ -753,7 +752,6 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
     fn transpose(
         &self,
         context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
-            '_,
             ArrayType,
             ShardMapTracer,
             LinearArrayOperation<ShardMapTracer>,
@@ -1675,7 +1673,7 @@ mod tests {
 
     fn test_transposition_context<V: Traceable<ArrayType>>(
         builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearArrayOperation<V>>>>,
-    ) -> TranspositionContext<'static, ArrayType, V, LinearArrayOperation<V>> {
+    ) -> TranspositionContext<ArrayType, V, LinearArrayOperation<V>> {
         TranspositionContext::new(builder)
     }
 
