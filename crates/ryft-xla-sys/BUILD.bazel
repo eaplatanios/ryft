@@ -95,6 +95,7 @@ XLA_DEPENDENCIES = [
     "@stablehlo//:stablehlo_dialect_capi",
     "@stablehlo//:vhlo_capi",
     "@xla//xla/ffi/api:c_api",
+    "@xla//xla/pjrt/c:pjrt_c_api_status_utils",
     "@xla//xla/mlir_hlo:CAPI",
     "@xla//xla/pjrt/distributed",
     "@xla//xla/service/spmd/shardy/integrations/c:xla_sdy_capi",
