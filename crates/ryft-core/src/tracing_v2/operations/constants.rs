@@ -3,14 +3,13 @@ use half::{bf16, f16};
 use crate::macros::check_input_count;
 use crate::operations::Operation;
 use crate::operations::constants::{
-    One, OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, Zero, ZeroLike, ZeroLikeOperation,
-    ZeroOperation,
+    OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
-use crate::tracing::{AtomId, Traceable, TracingError, Value};
+use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
-use crate::types::{ArrayType, DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType, Type};
 
 impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
     for ZeroOperation<T>
@@ -168,80 +167,8 @@ where
     }
 }
 
-fn ensure_scalar_array_seed_type(r#type: &ArrayType) -> Result<(), TracingError> {
-    if r#type.rank() != 0 {
-        return Err(
-            crate::tracing_v2::DifferentiationError::NonScalarGradientOutput { output_type: r#type.clone() }.into()
-        );
-    }
-    Ok(())
-}
-
-fn ensure_scalar_data_type(r#type: DataType, expected: DataType) -> Result<(), TracingError> {
-    if r#type != expected {
-        return Err(TypeError {
-            message: format!("scalar value expected data type {expected} but got {type_}", type_ = r#type),
-        }
-        .into());
-    }
-    Ok(())
-}
-
-macro_rules! impl_scalar_value_traits {
-    ($ty:ty, $data_type:path, $zero:expr, $one:expr) => {
-        impl Value<DataType> for $ty {}
-
-        impl Value<ArrayType> for $ty {}
-
-        impl Traceable<DataType> for $ty {}
-
-        impl Traceable<ArrayType> for $ty {}
-
-        impl ZeroLike for $ty {
-            #[inline]
-            fn zero_like(&self) -> Self {
-                $zero
-            }
-        }
-
-        impl OneLike for $ty {
-            #[inline]
-            fn one_like(&self) -> Self {
-                $one
-            }
-        }
-
-        impl Zero<DataType> for $ty {
-            #[inline]
-            fn zero(r#type: &DataType) -> Result<Self, TracingError> {
-                ensure_scalar_data_type(*r#type, $data_type)?;
-                Ok($zero)
-            }
-        }
-
-        impl Zero<ArrayType> for $ty {
-            #[inline]
-            fn zero(_type: &ArrayType) -> Result<Self, TracingError> {
-                Ok($zero)
-            }
-        }
-
-        impl One<DataType> for $ty {
-            #[inline]
-            fn one(r#type: &DataType) -> Result<Self, TracingError> {
-                ensure_scalar_data_type(*r#type, $data_type)?;
-                Ok($one)
-            }
-        }
-
-        impl One<ArrayType> for $ty {
-            #[inline]
-            fn one(r#type: &ArrayType) -> Result<Self, TracingError> {
-                ensure_scalar_array_seed_type(r#type)?;
-                Ok($one)
-            }
-        }
-
+macro_rules! impl_scalar_differentiable {
+    ($ty:ty) => {
         impl crate::tracing_v2::differentiation::Differentiable<DataType> for $ty {
             type Tangent = Self;
         }
@@ -252,19 +179,19 @@ macro_rules! impl_scalar_value_traits {
     };
 }
 
-impl_scalar_value_traits!(bool, DataType::Boolean, false, true);
-impl_scalar_value_traits!(i8, DataType::I8, 0i8, 1i8);
-impl_scalar_value_traits!(i16, DataType::I16, 0i16, 1i16);
-impl_scalar_value_traits!(i32, DataType::I32, 0i32, 1i32);
-impl_scalar_value_traits!(i64, DataType::I64, 0i64, 1i64);
-impl_scalar_value_traits!(u8, DataType::U8, 0u8, 1u8);
-impl_scalar_value_traits!(u16, DataType::U16, 0u16, 1u16);
-impl_scalar_value_traits!(u32, DataType::U32, 0u32, 1u32);
-impl_scalar_value_traits!(u64, DataType::U64, 0u64, 1u64);
-impl_scalar_value_traits!(bf16, DataType::BF16, bf16::ZERO, bf16::ONE);
-impl_scalar_value_traits!(f16, DataType::F16, f16::ZERO, f16::ONE);
-impl_scalar_value_traits!(f32, DataType::F32, 0.0f32, 1.0f32);
-impl_scalar_value_traits!(f64, DataType::F64, 0.0f64, 1.0f64);
+impl_scalar_differentiable!(bool);
+impl_scalar_differentiable!(i8);
+impl_scalar_differentiable!(i16);
+impl_scalar_differentiable!(i32);
+impl_scalar_differentiable!(i64);
+impl_scalar_differentiable!(u8);
+impl_scalar_differentiable!(u16);
+impl_scalar_differentiable!(u32);
+impl_scalar_differentiable!(u64);
+impl_scalar_differentiable!(bf16);
+impl_scalar_differentiable!(f16);
+impl_scalar_differentiable!(f32);
+impl_scalar_differentiable!(f64);
 
 #[cfg(test)]
 mod tests {

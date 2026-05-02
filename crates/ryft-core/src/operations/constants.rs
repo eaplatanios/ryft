@@ -1,9 +1,11 @@
 use std::fmt::Display;
 
+use half::{bf16, f16};
+
 use crate::macros::check_input_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
-use crate::types::{DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Synthesizes a _zero_ value for a given [`Type`]. [`Zero`] is the [`Type`]-driven counterpart to [`ZeroLike`]; it is
 /// what [`ZeroOperation`] needs for its [`InterpretableOperation`] implementation.
@@ -77,8 +79,6 @@ pub trait SupportsZero<T: Type, V: Traceable<T>> {
         None
     }
 }
-
-// TODO(eaplatanios): `impl Zero for Tracer`.
 
 /// Synthesizes a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart to [`Zero`]; it is what
 /// [`ZeroLikeOperation`] needs for its [`InterpretableOperation`] implementation.
@@ -201,8 +201,6 @@ pub trait SupportsOne<T: Type, V: Traceable<T>> {
     fn one_operation(r#type: T) -> Self;
 }
 
-// TODO(eaplatanios): `impl One for Tracer`.
-
 /// Synthesizes a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart to [`One`]; it is what
 /// [`OneLikeOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait OneLike {
@@ -258,3 +256,89 @@ impl<'engine, E: TracingEngine<OperationCarrier: SupportsOneLike<E::Type, E::Val
         self.clone().unary(E::OperationCarrier::one_like_operation())
     }
 }
+
+// TODO(eaplatanios): Remove this.
+fn ensure_scalar_array_seed_type(r#type: &ArrayType) -> Result<(), TracingError> {
+    if r#type.rank() != 0 {
+        return Err(
+            crate::tracing_v2::DifferentiationError::NonScalarGradientOutput { output_type: r#type.clone() }.into()
+        );
+    }
+    Ok(())
+}
+
+// TODO(eaplatanios): Inline this.
+fn ensure_scalar_data_type(r#type: DataType, expected: DataType) -> Result<(), TracingError> {
+    if r#type != expected {
+        return Err(TypeError {
+            message: format!("scalar value expected data type {expected} but got {type_}", type_ = r#type),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+macro_rules! impl_constants_for_scalar {
+    ($ty:ty, $data_type:path, $zero:expr, $one:expr) => {
+        impl ZeroLike for $ty {
+            #[inline]
+            fn zero_like(&self) -> Self {
+                $zero
+            }
+        }
+
+        impl OneLike for $ty {
+            #[inline]
+            fn one_like(&self) -> Self {
+                $one
+            }
+        }
+
+        impl Zero<DataType> for $ty {
+            #[inline]
+            fn zero(r#type: &DataType) -> Result<Self, TracingError> {
+                ensure_scalar_data_type(*r#type, $data_type)?;
+                Ok($zero)
+            }
+        }
+
+        // TODO(eaplatanios): Remove this.
+        impl Zero<ArrayType> for $ty {
+            #[inline]
+            fn zero(_type: &ArrayType) -> Result<Self, TracingError> {
+                Ok($zero)
+            }
+        }
+
+        impl One<DataType> for $ty {
+            #[inline]
+            fn one(r#type: &DataType) -> Result<Self, TracingError> {
+                ensure_scalar_data_type(*r#type, $data_type)?;
+                Ok($one)
+            }
+        }
+
+        // TODO(eaplatanios): Remove this.
+        impl One<ArrayType> for $ty {
+            #[inline]
+            fn one(r#type: &ArrayType) -> Result<Self, TracingError> {
+                ensure_scalar_array_seed_type(r#type)?;
+                Ok($one)
+            }
+        }
+    };
+}
+
+impl_constants_for_scalar!(bool, DataType::Boolean, false, true);
+impl_constants_for_scalar!(i8, DataType::I8, 0i8, 1i8);
+impl_constants_for_scalar!(i16, DataType::I16, 0i16, 1i16);
+impl_constants_for_scalar!(i32, DataType::I32, 0i32, 1i32);
+impl_constants_for_scalar!(i64, DataType::I64, 0i64, 1i64);
+impl_constants_for_scalar!(u8, DataType::U8, 0u8, 1u8);
+impl_constants_for_scalar!(u16, DataType::U16, 0u16, 1u16);
+impl_constants_for_scalar!(u32, DataType::U32, 0u32, 1u32);
+impl_constants_for_scalar!(u64, DataType::U64, 0u64, 1u64);
+impl_constants_for_scalar!(bf16, DataType::BF16, bf16::ZERO, bf16::ONE);
+impl_constants_for_scalar!(f16, DataType::F16, f16::ZERO, f16::ONE);
+impl_constants_for_scalar!(f32, DataType::F32, 0.0f32, 1.0f32);
+impl_constants_for_scalar!(f64, DataType::F64, 0.0f64, 1.0f64);
