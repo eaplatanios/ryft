@@ -16,7 +16,7 @@ use super::{SupportsNeg, SupportsScale};
 
 /// Hidden carrier capability for staging the cosine primitive.
 #[doc(hidden)]
-pub trait SupportsCos<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsCos<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the cosine primitive.
     fn cos_operation() -> Self;
 }

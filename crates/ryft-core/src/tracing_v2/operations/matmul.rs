@@ -14,7 +14,7 @@ use super::right_matmul::SupportsRightMatMul;
 
 /// Hidden carrier capability for staging the matrix multiplication primitive.
 #[doc(hidden)]
-pub trait SupportsMatMul<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsMatMul<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the matrix multiplication primitive.
     fn matmul_operation() -> Self;
 }

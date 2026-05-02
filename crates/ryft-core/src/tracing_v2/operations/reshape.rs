@@ -14,7 +14,7 @@ use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Hidden carrier capability for staging the reshape primitive.
 #[doc(hidden)]
-pub trait SupportsReshape<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsReshape<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the reshape primitive.
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self;
 }

@@ -13,21 +13,16 @@ use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearizableEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-/// Hidden carrier capability for staging the addition primitive.
-///
-/// Backend-owned closed op carriers (such as [`ArrayOperation`](super::ArrayOperation) and the XLA backend's
-/// `XlaOperation`) implement this trait so that generic transform code can stage `AddOperation` without
-/// knowing which carrier is in use.
+/// Trait that represents [`Operation`] carrier types that support/include [`AddOperation`]. Backend-owned closed
+/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`AddOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
-pub trait SupportsAdd<T: Type, V: Traceable<T>>: Clone {
-    /// Constructs the carrier-specific representation of the addition primitive.
+pub trait SupportsAdd<T: Type, V: Traceable<T>> {
+    /// Constructs the carrier-specific representation of the addition [`Operation`].
     fn add_operation() -> Self;
 }
 
-impl<'engine, E: TracingEngine + ?Sized> Add for Tracer<'engine, E>
-where
-    E::OperationCarrier: SupportsAdd<E::Type, E::Value>,
-{
+impl<'engine, E: TracingEngine<OperationCarrier: SupportsAdd<E::Type, E::Value>> + ?Sized> Add for Tracer<'engine, E> {
     type Output = Self;
 
     #[inline]
@@ -36,10 +31,8 @@ where
     }
 }
 
-/// Elementwise addition primitive.
-///
-/// In the larger architecture, [`AddOperation`] is the canonical "fully supported" primitive: nearly
-/// every transform depends on addition being available in its staged carrier.
+/// Elementwise addition operation. Note that nearly every `ryft-core` transform depends on its [`Operation`] carrier
+/// type implementing [`SupportsAdd`] and thus supporting this operation type.
 #[derive(Clone, Default)]
 pub struct AddOperation;
 
@@ -116,14 +109,14 @@ impl Operation<DataType> for AddOperation {
     }
 }
 
-impl<V: Typed<ArrayType> + Clone + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
+impl<V: Typed<DataType> + Clone + Add<Output = V>> InterpretableOperation<DataType, V> for AddOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }
 }
 
-impl<V: Typed<DataType> + Clone + Add<Output = V>> InterpretableOperation<DataType, V> for AddOperation {
+impl<V: Typed<ArrayType> + Clone + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() + inputs[1].clone()])

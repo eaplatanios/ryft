@@ -15,7 +15,7 @@ use super::{SupportsAdd, SupportsScale};
 
 /// Hidden carrier capability for staging the multiplication primitive.
 #[doc(hidden)]
-pub trait SupportsMul<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsMul<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the multiplication primitive.
     fn mul_operation() -> Self;
 }

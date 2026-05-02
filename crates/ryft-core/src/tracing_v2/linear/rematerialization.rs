@@ -8,7 +8,8 @@ fn build_traced_gradient_program<'engine, E, Input, ProgramInput, ProgramOutput,
 where
     E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
     V: Value<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
-    E::OperationCarrier: InterpretableOperation<E::Type, V>
+    E::OperationCarrier: Clone
+        + InterpretableOperation<E::Type, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<E::Type, V>
         + SupportsZeroLike<E::Type, V>
@@ -68,7 +69,8 @@ pub fn compile_grad<'engine, E, F, Input, V>(
 where
     E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
     V: Value<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
-    E::OperationCarrier: InterpretableOperation<E::Type, V>
+    E::OperationCarrier: Clone
+        + InterpretableOperation<E::Type, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<E::Type, V>
         + SupportsZeroLike<E::Type, V>,
@@ -148,7 +150,8 @@ where
         + DifferentiableTracingEngine<Type = ArrayType, Value = V>
         + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
-    E::OperationCarrier: InterpretableOperation<ArrayType, V>
+    E::OperationCarrier: Clone
+        + InterpretableOperation<ArrayType, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>
@@ -202,7 +205,8 @@ where
         + DifferentiableTracingEngine<Type = ArrayType, Value = V>
         + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
-    E::OperationCarrier: InterpretableOperation<ArrayType, V>
+    E::OperationCarrier: Clone
+        + InterpretableOperation<ArrayType, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>

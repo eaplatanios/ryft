@@ -16,7 +16,7 @@ use super::primitive::LinearArrayOperation;
 
 /// Hidden carrier capability for staging the left matrix-multiplication primitive.
 #[doc(hidden)]
-pub trait SupportsLeftMatMul<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsLeftMatMul<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the left matrix-multiplication primitive
     /// with a captured factor.
     fn left_matmul_operation(factor: V) -> Self;

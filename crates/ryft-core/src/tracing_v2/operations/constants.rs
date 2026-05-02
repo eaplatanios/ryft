@@ -30,7 +30,7 @@ pub trait Zero<T: Type>: Sized {
 /// carriers without knowing the carrier type. The transpose pass uses it at the boundary to emit
 /// structural zeros for primal inputs that have no contribution accumulated onto them.
 #[doc(hidden)]
-pub trait SupportsZero<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsZero<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the typed-zero primitive.
     fn zero_operation(r#type: T) -> Self;
 
@@ -172,7 +172,7 @@ pub trait One<T: Type>: Sized {
 /// transforms and value-level APIs to construct a carrier-specific [`OneOperation`] without knowing
 /// the concrete operation enum.
 #[doc(hidden)]
-pub trait SupportsOne<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsOne<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the typed-one primitive.
     fn one_operation(r#type: T) -> Self;
 
@@ -311,7 +311,7 @@ pub trait ZeroLike {
 /// [`ZeroLikeOperation`] in the backend-owned carrier without coupling that helper to a concrete
 /// operation enum.
 #[doc(hidden)]
-pub trait SupportsZeroLike<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsZeroLike<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the zero-like primitive.
     fn zero_like_operation() -> Self;
 }
@@ -428,7 +428,7 @@ pub trait OneLike {
 ///
 /// `SupportsOneLike` is the multiplicative-identity counterpart to [`SupportsZeroLike`].
 #[doc(hidden)]
-pub trait SupportsOneLike<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsOneLike<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the one-like primitive.
     fn one_like_operation() -> Self;
 }

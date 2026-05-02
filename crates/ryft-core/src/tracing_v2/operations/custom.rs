@@ -26,14 +26,14 @@ pub enum CustomOperationError {
 
 /// Hidden carrier capability for staging the custom-primitive escape hatch.
 #[doc(hidden)]
-pub trait SupportsCustom<T: Type + PartialEq, V: Traceable<T> + Parameter>: Clone {
+pub trait SupportsCustom<T: Type + PartialEq, V: Traceable<T> + Parameter> {
     /// Constructs the carrier-specific representation of one custom primitive.
     fn custom_operation(primitive: Arc<CustomPrimitive<T, V>>) -> Self;
 }
 
 /// Hidden carrier capability for staging the custom-primitive escape hatch in linear programs.
 #[doc(hidden)]
-pub trait SupportsLinearCustom<T: Type + PartialEq, V: Traceable<T> + Parameter>: Clone {
+pub trait SupportsLinearCustom<T: Type + PartialEq, V: Traceable<T> + Parameter>: Sized {
     /// Constructs the carrier-specific representation of one custom primitive in the linear universe.
     fn custom_operation(primitive: CustomPrimitive<T, V>) -> Result<Self, TracingError>;
 

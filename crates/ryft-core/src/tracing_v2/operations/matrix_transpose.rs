@@ -13,7 +13,7 @@ use super::matrix::{MatrixOps, MatrixValue, transpose_abstract};
 
 /// Hidden carrier capability for staging the matrix transposition primitive.
 #[doc(hidden)]
-pub trait SupportsMatrixTranspose<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsMatrixTranspose<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the matrix transposition primitive.
     fn matrix_transpose_operation() -> Self;
 }

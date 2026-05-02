@@ -27,7 +27,7 @@ use super::SupportsAdd;
 /// binary operation over two input atoms, while scaling is a unary operation that carries one
 /// captured factor in the operation itself.
 #[doc(hidden)]
-pub trait SupportsScale<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsScale<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the scaling primitive with a captured factor.
     fn scale_operation(factor: V) -> Self;
 }

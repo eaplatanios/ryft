@@ -17,7 +17,7 @@ use super::SupportsAdd;
 
 /// Hidden carrier capability for staging the `rematerialize` higher-order primitive.
 #[doc(hidden)]
-pub trait SupportsRematerialize<T: Type + PartialEq, V: Traceable<T>, L: Clone>: Clone + Operation<T> {
+pub trait SupportsRematerialize<T: Type + PartialEq, V: Traceable<T>, L>: Sized + Operation<T> {
     /// Constructs the carrier-specific representation of the `rematerialize` higher-order primitive
     /// with a captured traced body.
     fn rematerialize_operation(op: RematerializeOperation<T, V, Self, L>) -> Self;
@@ -25,7 +25,7 @@ pub trait SupportsRematerialize<T: Type + PartialEq, V: Traceable<T>, L: Clone>:
 
 /// Hidden carrier capability for staging the `rematerialize` higher-order primitive in linear programs.
 #[doc(hidden)]
-pub trait SupportsLinearRematerialize<T: Type + PartialEq, V: Traceable<T>>: Clone + Operation<T> {
+pub trait SupportsLinearRematerialize<T: Type + PartialEq, V: Traceable<T>>: Sized + Operation<T> {
     /// Constructs the carrier-specific representation of the linear `rematerialize` higher-order
     /// primitive with a captured linear traced body.
     fn rematerialize_operation(op: LinearRematerializeOperation<T, V, Self>) -> Self;
@@ -36,7 +36,7 @@ pub trait SupportsLinearRematerialize<T: Type + PartialEq, V: Traceable<T>>: Clo
 /// This stores a flattened traced body that higher-order op nodes can carry around independently of
 /// the caller's original parameter shapes.
 #[derive(Clone)]
-pub struct FlatTracedRematerialize<T: Type + PartialEq, V: Traceable<T>, O: Clone = ArrayOperation<V, T>> {
+pub struct FlatTracedRematerialize<T: Type + PartialEq, V: Traceable<T>, O = ArrayOperation<V, T>> {
     /// Canonical input types of the body.
     input_types: Vec<T>,
 
@@ -47,7 +47,7 @@ pub struct FlatTracedRematerialize<T: Type + PartialEq, V: Traceable<T>, O: Clon
     program: Program<T, V, O, Vec<V>, Vec<V>>,
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
+impl<T: Type + PartialEq, V: Traceable<T>, O> FlatTracedRematerialize<T, V, O> {
     /// Builds one erased traced rematerialize body from explicit staged parts.
     #[inline]
     pub fn from_parts(input_types: Vec<T>, output_types: Vec<T>, program: Program<T, V, O, Vec<V>, Vec<V>>) -> Self {
@@ -83,8 +83,8 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, 
 pub struct RematerializeOperation<
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
-    O: Clone = ArrayOperation<V, T>,
-    L: Clone = LinearArrayOperation<V, T>,
+    O = ArrayOperation<V, T>,
+    L = LinearArrayOperation<V, T>,
 > {
     /// The forward body sub-program.
     body: FlatTracedRematerialize<T, V, O>,
@@ -93,7 +93,7 @@ pub struct RematerializeOperation<
     marker: PhantomData<fn() -> L>,
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone, L: Clone> RematerializeOperation<T, V, O, L> {
+impl<T: Type + PartialEq, V: Traceable<T>, O, L> RematerializeOperation<T, V, O, L> {
     /// Builds one ordinary (non-linear) rematerialize op wrapping the given body.
     #[inline]
     pub fn new(body: FlatTracedRematerialize<T, V, O>) -> Self {
@@ -107,13 +107,13 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone, L: Clone> RematerializeOper
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone, L: Clone> Debug for RematerializeOperation<T, V, O, L> {
+impl<T: Type + PartialEq, V: Traceable<T>, O, L> Debug for RematerializeOperation<T, V, O, L> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Rematerialize")
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone, L: Clone> Display for RematerializeOperation<T, V, O, L> {
+impl<T: Type + PartialEq, V: Traceable<T>, O, L> Display for RematerializeOperation<T, V, O, L> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "rematerialize")
     }
@@ -183,7 +183,8 @@ where
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    EInner::OperationCarrier: InterpretableOperation<ArrayType, V>
+    EInner::OperationCarrier: Clone
+        + InterpretableOperation<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, LinearArrayOperation<V>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -317,7 +318,7 @@ impl<
 where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     E::OperationCarrier:
-        InterpretableOperation<ArrayType, V> + SupportsRematerialize<ArrayType, V, E::LinearOperationCarrier>,
+        Clone + InterpretableOperation<ArrayType, V> + SupportsRematerialize<ArrayType, V, E::LinearOperationCarrier>,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         if inputs.is_empty() {
@@ -340,7 +341,7 @@ where
 pub struct LinearRematerializeOperation<
     T: Type + PartialEq,
     V: Traceable<T> + Parameter,
-    O: Clone = LinearArrayOperation<V, T>,
+    O = LinearArrayOperation<V, T>,
 > {
     /// The forward linear body sub-program.
     body: FlatTracedRematerialize<T, V, O>,
@@ -349,7 +350,7 @@ pub struct LinearRematerializeOperation<
     transpose_body: FlatTracedRematerialize<T, V, O>,
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> LinearRematerializeOperation<T, V, O> {
+impl<T: Type + PartialEq, V: Traceable<T>, O> LinearRematerializeOperation<T, V, O> {
     /// Builds one linear rematerialize op with an explicit transpose body.
     #[inline]
     pub fn new(body: FlatTracedRematerialize<T, V, O>, transpose_body: FlatTracedRematerialize<T, V, O>) -> Self {
@@ -361,19 +362,21 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> LinearRematerializeOperatio
     pub fn body(&self) -> &FlatTracedRematerialize<T, V, O> {
         &self.body
     }
+}
 
+impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> LinearRematerializeOperation<T, V, O> {
     fn transpose_op(&self) -> Self {
         Self::new(self.transpose_body.clone(), self.body.clone())
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> Debug for LinearRematerializeOperation<T, V, O> {
+impl<T: Type + PartialEq, V: Traceable<T>, O> Debug for LinearRematerializeOperation<T, V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "LinearRematerialize")
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> Display for LinearRematerializeOperation<T, V, O> {
+impl<T: Type + PartialEq, V: Traceable<T>, O> Display for LinearRematerializeOperation<T, V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "rematerialize")
     }
@@ -561,7 +564,7 @@ where
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input, To<V> = Input::To<V>>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output, To<V> = Output::To<V>>,
     E::OperationCarrier:
-        InterpretableOperation<ArrayType, V> + SupportsRematerialize<ArrayType, V, E::LinearOperationCarrier>,
+        Clone + InterpretableOperation<ArrayType, V> + SupportsRematerialize<ArrayType, V, E::LinearOperationCarrier>,
 {
     fn invoke<F>(function: F, input: Input) -> Result<Output, TracingError>
     where

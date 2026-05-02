@@ -13,7 +13,7 @@ use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Hidden carrier capability for staging the negation primitive.
 #[doc(hidden)]
-pub trait SupportsNeg<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsNeg<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the negation primitive.
     fn neg_operation() -> Self;
 }

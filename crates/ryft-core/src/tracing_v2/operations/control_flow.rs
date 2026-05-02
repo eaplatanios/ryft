@@ -538,7 +538,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
+    EInner::OperationCarrier: Clone + SupportsAdd<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(
@@ -695,7 +695,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
+    EInner::OperationCarrier: Clone + SupportsAdd<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp(

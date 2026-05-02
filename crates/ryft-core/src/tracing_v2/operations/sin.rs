@@ -15,7 +15,7 @@ use super::cos::Cos;
 
 /// Hidden carrier capability for staging the sine primitive.
 #[doc(hidden)]
-pub trait SupportsSin<T: Type, V: Traceable<T>>: Clone {
+pub trait SupportsSin<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the sine primitive.
     fn sin_operation() -> Self;
 }
