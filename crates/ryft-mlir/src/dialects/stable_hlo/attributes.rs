@@ -700,8 +700,7 @@ mod tests {
         let attribute = context.stable_hlo_mesh(axes, None);
         test_attribute_display_and_debug(
             attribute,
-            "#stablehlo.mesh<axes = \
-             [#stablehlo.mesh_axis<name = \"x\", size = 2>, #stablehlo.mesh_axis<name = \"y\", size = 4>]>",
+            "#stablehlo.mesh<axes=[<name = \"x\", size = 2>, <name = \"y\", size = 4>]>",
         );
     }
 

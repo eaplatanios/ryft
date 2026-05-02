@@ -514,6 +514,7 @@ mod tests {
         let _service = plugin.distributed_runtime_service(&address, service_options).unwrap();
         let client_options = DistributedRuntimeClientOptions::default();
         let client = plugin.distributed_runtime_client(&address, client_options).unwrap();
+        client.connect().unwrap();
         let store = DistributedKeyValueStore::new(client);
 
         // Test using valid keys and values.

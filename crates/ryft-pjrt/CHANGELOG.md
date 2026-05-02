@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - Updated our PJRT C API bindings for version `0.107`.
+- Changed `BufferSpecification` to carry a concrete `Layout`, materializing dense defaults during construction and
+  parsing before values cross layout-sensitive PJRT C API calls.
 - Expanded executable compiled-memory statistics support to include total allocator bytes, indefinite allocations,
   and peak unpadded heap bytes.
 - Changed `TiledLayout::minor_to_major` to `Vec<u64>` from `Vec<i64>`.
