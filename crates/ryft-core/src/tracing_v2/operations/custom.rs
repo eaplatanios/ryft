@@ -455,11 +455,11 @@ mod tests {
 
     use super::*;
     use crate::macros::check_input_count;
+    use crate::operations::constants::OneLike;
     use crate::tracing::engines::Tracer;
     use crate::tracing::engines::{Engine, TracingEngine};
     use crate::tracing::transposition::TranspositionContext;
     use crate::tracing::{Program, ProgramBuilder};
-    use crate::tracing_v2::operations::constants::OneLike;
     use crate::tracing_v2::{
         ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, grad, jvp,
     };

@@ -14,12 +14,12 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use ryft_core::operations::constants::{One, Zero};
+use ryft_core::operations::constants::{OneLike, ZeroLike};
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::engines::{Tracer, TracingEngine};
 use ryft_core::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, TracingError, Value};
-use ryft_core::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use ryft_core::tracing_v2::operations::{
     AddOperation, ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
 };
@@ -1898,8 +1898,8 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
+    use ryft_core::operations::constants::OneLike;
     use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::operations::constants::OneLike;
     use ryft_core::tracing_v2::{Sin, grad};
     use ryft_core::types::data_types::DataType;
 

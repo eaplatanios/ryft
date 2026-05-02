@@ -6,11 +6,11 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::operations::constants::{One, Zero};
+use crate::operations::constants::{OneLike, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::tracing::engines::Tracer;
 use crate::tracing::{Program, Traceable, TracingError, Value};
-use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
 use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::{
     ArrayOperation, ControlFlowError, ControlFlowValue, Cos, LinearArrayOperation, MatrixOps, Sin,
@@ -324,10 +324,10 @@ where
             Self::Sin => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::SinOperation, inputs),
             Self::Cos => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::CosOperation, inputs),
             Self::ZeroLike => {
-                batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::ZeroLikeOperation, inputs)
+                batch_by_interpreting_physical_operation(&crate::operations::constants::ZeroLikeOperation, inputs)
             }
             Self::OneLike => {
-                batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::OneLikeOperation, inputs)
+                batch_by_interpreting_physical_operation(&crate::operations::constants::OneLikeOperation, inputs)
             }
             Self::MatrixMultiply => {
                 batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::MatMulOperation, inputs)

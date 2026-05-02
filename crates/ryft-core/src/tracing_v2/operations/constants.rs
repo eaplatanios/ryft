@@ -1,16 +1,16 @@
-use std::fmt::{Debug, Display};
-
 use half::{bf16, f16};
 
 use crate::macros::check_input_count;
-use crate::operations::constants::{One, OneOperation, SupportsZero, Zero, ZeroOperation};
-use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::engines::{Tracer, TracingEngine};
+use crate::operations::Operation;
+use crate::operations::constants::{
+    One, OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, Zero, ZeroLike, ZeroLikeOperation,
+    ZeroOperation,
+};
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError};
 
 impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
     for ZeroOperation<T>
@@ -90,74 +90,6 @@ where
     }
 }
 
-/// Returns a zero value with the same structure as an existing value.
-///
-/// [`ZeroLike`] is the local, value-level counterpart to
-/// [`Engine::zero`](crate::tracing::engines::Engine::zero). When a transform already has an
-/// exemplar in hand, it uses this trait instead of going back through abstract metadata. That is
-/// especially important for wrappers like [`Tracer`](crate::tracing::engines::Tracer) and
-/// [`JvpTracer`](crate::tracing_v2::JvpTracer), which can stage or derive a zero from their existing
-/// state even when abstract synthesis alone would be insufficient. This module also ships the
-/// built-in scalar implementations of [`Traceable`](crate::tracing::Traceable),
-/// [`Value`](crate::tracing::Value), [`ZeroLike`], and [`OneLike`].
-pub trait ZeroLike {
-    /// Returns a zero value with the same shape as `self`.
-    fn zero_like(&self) -> Self;
-}
-
-/// Trait that represents [`Operation`] carrier types that support/include [`ZeroLikeOperation`]. Backend-owned closed
-/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
-/// so that generic transform code can stage [`ZeroLikeOperation`] without knowing which carrier is in use.
-#[doc(hidden)]
-pub trait SupportsZeroLike<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the zero-like [`Operation`].
-    fn zero_like_operation() -> Self;
-}
-
-impl<'engine, E> ZeroLike for Tracer<'engine, E>
-where
-    E: TracingEngine + ?Sized,
-    E::OperationCarrier: SupportsZeroLike<E::Type, E::Value>,
-{
-    #[inline]
-    fn zero_like(&self) -> Self {
-        self.clone().unary(E::OperationCarrier::zero_like_operation())
-    }
-}
-
-/// Exemplar-derived zero primitive.
-///
-/// [`ZeroLikeOperation`] is the staged form of [`ZeroLike::zero_like`]. It takes one exemplar input
-/// and produces one output with the same abstract type, leaving concrete interpretation to the
-/// value type's [`ZeroLike`] implementation.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct ZeroLikeOperation;
-
-impl Display for ZeroLikeOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(<Self as Operation<ArrayType>>::name(self))
-    }
-}
-
-impl<T: Type> Operation<T> for ZeroLikeOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        "zero_like"
-    }
-
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(input_types, 1, TypeError);
-        Ok(vec![input_types[0].clone()])
-    }
-}
-
-impl<T: Type, V: Typed<T> + ZeroLike> InterpretableOperation<T, V> for ZeroLikeOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
-        Ok(vec![inputs[0].zero_like()])
-    }
-}
-
 impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
     for ZeroLikeOperation
 {
@@ -194,69 +126,6 @@ where
             .next()
             .expect("zero_like jvp should produce one tangent");
         Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent }])
-    }
-}
-
-/// Returns a one value with the same structure as an existing value.
-///
-/// This mirrors [`ZeroLike`] for the multiplicative identity. It is used in the same places where
-/// transforms need a unit seed from an exemplar, such as reverse-mode pullbacks for scalar-output
-/// functions.
-pub trait OneLike {
-    /// Returns a one value with the same shape as `self`.
-    fn one_like(&self) -> Self;
-}
-
-/// Trait that represents [`Operation`] carrier types that support/include [`OneLikeOperation`]. Backend-owned closed
-/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
-/// so that generic transform code can stage [`OneLikeOperation`] without knowing which carrier is in use.
-#[doc(hidden)]
-pub trait SupportsOneLike<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the one-like [`Operation`].
-    fn one_like_operation() -> Self;
-}
-
-impl<'engine, E> OneLike for Tracer<'engine, E>
-where
-    E: TracingEngine + ?Sized,
-    E::OperationCarrier: SupportsOneLike<E::Type, E::Value>,
-{
-    #[inline]
-    fn one_like(&self) -> Self {
-        self.clone().unary(E::OperationCarrier::one_like_operation())
-    }
-}
-
-/// Exemplar-derived one primitive.
-///
-/// [`OneLikeOperation`] is the staged form of [`OneLike::one_like`]. It takes one exemplar input
-/// and produces one output with the same abstract type, leaving concrete interpretation to the
-/// value type's [`OneLike`] implementation.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct OneLikeOperation;
-
-impl Display for OneLikeOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(<Self as Operation<ArrayType>>::name(self))
-    }
-}
-
-impl<T: Type> Operation<T> for OneLikeOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        "one_like"
-    }
-
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(input_types, 1, TypeError);
-        Ok(vec![input_types[0].clone()])
-    }
-}
-
-impl<T: Type, V: Typed<T> + OneLike> InterpretableOperation<T, V> for OneLikeOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
-        Ok(vec![inputs[0].one_like()])
     }
 }
 
@@ -402,13 +271,14 @@ mod tests {
     use half::{bf16, f16};
     use indoc::indoc;
 
+    use crate::operations::constants::{
+        OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    };
     use crate::operations::{InterpretableOperation, Operation};
     use crate::tracing::engines::{ScalarEngine, TracingEngine};
     use crate::tracing::{Program, TracingError, Value};
     use crate::tracing_v2::{Cos, ScalarOperation, Sin};
     use crate::types::{ArrayType, DataType, TypeError, Typed};
-
-    use super::{OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation, ZeroOperation};
 
     fn assert_scalar_value_type<V: Value<ArrayType>>(value: V, expected_type: DataType) {
         assert_eq!(value.r#type().into_owned(), ArrayType::scalar(expected_type));

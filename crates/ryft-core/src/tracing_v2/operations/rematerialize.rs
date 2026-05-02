@@ -3,12 +3,12 @@ use std::marker::PhantomData;
 
 use crate::macros::check_input_count;
 use crate::operations::constants::{SupportsZero, Zero};
+use crate::operations::constants::{SupportsZeroLike, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
-use crate::tracing_v2::operations::constants::{SupportsZeroLike, ZeroLike};
 use crate::tracing_v2::{
     ArrayOperation, Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine,
     DifferentiationError, LinearArrayOperation, LinearizableEngine,

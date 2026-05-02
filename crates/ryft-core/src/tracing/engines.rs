@@ -460,8 +460,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::operations::constants::{OneLike, ZeroLike};
     use crate::parameters::Placeholder;
-    use crate::tracing_v2::operations::constants::{OneLike, ZeroLike};
     use crate::tracing_v2::operations::sin::Sin;
     use crate::types::{DataType, TypeError, Typed};
 

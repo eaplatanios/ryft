@@ -1,11 +1,11 @@
 use std::ops::{Add, Mul, Neg};
 
+use crate::operations::constants::OneLike;
 use crate::tracing::engines::{Engine, Tracer, TracingEngine};
 use crate::tracing::{Program, Traceable, TracingError};
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::tracing_v2::operations::constants::OneLike;
 use crate::tracing_v2::{
     ArrayOperation, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation, LinearizableEngine, Sin,
     grad, jvp, linearize, value_and_grad, vjp,
@@ -99,8 +99,8 @@ fn tracing_record<
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
-        + crate::tracing_v2::operations::constants::ZeroLike
-        + crate::tracing_v2::operations::constants::OneLike
+        + crate::operations::constants::ZeroLike
+        + crate::operations::constants::OneLike
         + crate::tracing_v2::MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: crate::parameters::Parameterized<V>,

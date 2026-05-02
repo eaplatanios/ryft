@@ -2496,12 +2496,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::macros::check_input_count;
+    use ryft_core::operations::constants::{OneLike, ZeroLike};
     use ryft_core::operations::{InterpretableOperation, Operation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
     use ryft_core::tracing::{ProgramBuilder, TracingError};
-    use ryft_core::tracing_v2::operations::constants::{OneLike, ZeroLike};
     use ryft_core::tracing_v2::{
         ArrayOperation, Cos, CustomPrimitive, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation,
         LinearizableEngine, MatrixOps, Sin,

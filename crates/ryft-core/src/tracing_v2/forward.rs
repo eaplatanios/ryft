@@ -1,13 +1,13 @@
 use std::fmt::Debug;
 
 use crate::operations::InterpretableOperation;
+use crate::operations::constants::SupportsZeroLike;
 use crate::operations::constants::Zero;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
 use crate::tracing_v2::linear::linearize;
-use crate::tracing_v2::operations::constants::SupportsZeroLike;
 use crate::tracing_v2::operations::{SupportsAdd, SupportsNeg, SupportsScale};
 use crate::tracing_v2::{
     DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,

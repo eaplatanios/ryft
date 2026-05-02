@@ -2,12 +2,12 @@ use std::fmt::Display;
 use std::ops::Neg;
 
 use crate::macros::check_input_count;
+use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearizableEngine};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 

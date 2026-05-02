@@ -5,12 +5,12 @@ use std::ops::Mul;
 use indoc::indoc;
 
 use crate::macros::check_input_count;
+use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::engines::Tracer;
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::operations::constants::ZeroLike;
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiableTracingEngine, LinearArrayOperation, LinearizableEngine,
 };
