@@ -98,10 +98,7 @@ fn main() {
     - [x] `builtin`
     - [x] `cf`
     - [ ] `chlo`
-    - [ ] `emit_c`
-        - [ ] Add support for types: `EmitCArrayType`, `EmitCLValueType`, `EmitCOpaqueType`, `EmitCPointerType`,
-          `EmitCPtrDiffTType`, `EmitCSignedSizeTType`, `EmitCSizeTType`.
-        - [ ] Add support for operations.
+    - [x] `emit_c`
     - [x] `func`
     - [x] `gpu`
     - [x] `index`

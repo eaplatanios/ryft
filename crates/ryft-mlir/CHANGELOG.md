@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added missing `affine` dialect operations.
 - Added missing `arith` dialect operations.
 - Added support for the `async` dialect.
+- Added support for the `emit_c` dialect.
 - Added support for the `gpu` dialect.
 - Added support for the `linalg` dialect.
 - Added support for the `memref` dialect.
