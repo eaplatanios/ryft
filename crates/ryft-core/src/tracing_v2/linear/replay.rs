@@ -4,28 +4,6 @@ use crate::types::Type;
 
 use super::*;
 
-/// Operation-level capability required by traced program linearization.
-///
-/// [`TracingContext::linearize`] runs while an outer trace is already active. Its primal values are
-/// therefore [`Tracer`] leaves, while tangent values are atom ids in a fresh linear builder. This
-/// trait is the exact semantic contract needed for one staged operation carrier to participate in
-/// that pass.
-#[doc(hidden)]
-pub trait TracedLinearizableOperation<'engine, E: DifferentiableTracingEngine + ?Sized + 'engine>:
-    Clone + Operation<E::Type>
-{
-    /// Applies this operation's JVP rule to traced primals inside the active linearization pass.
-    fn jvp_traced_linearization(
-        &self,
-        context: &mut JvpContext<'_, TracingContext<'engine, E>>,
-        inputs: &[JvpTracer<Tracer<'engine, E>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, E>, AtomId>>, TracingError>
-    where
-        E::Value: Differentiable<E::Type, Tangent = E::Value>,
-        E::Operation: SupportsAdd<E::Type, E::Value>,
-        AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>;
-}
-
 impl<'engine, E: DifferentiableTracingEngine + ?Sized> TracingContext<'engine, E> {
     /// Builds a staged linear program by replaying a traced primal program on symbolic dual inputs.
     ///
@@ -44,7 +22,7 @@ impl<'engine, E: DifferentiableTracingEngine + ?Sized> TracingContext<'engine, E
         Input: Parameterized<V>,
         Output: Parameterized<V>,
         V: Traceable<T> + Differentiable<T, Tangent = V>,
-        O: TracedLinearizableOperation<'engine, E> + Operation<T>,
+        O: DifferentiableOperation<TracingContext<'engine, E>> + Operation<T>,
     >(
         &self,
         program: &Program<T, V, O, Input, Output>,
@@ -135,7 +113,7 @@ impl<'engine, E: DifferentiableTracingEngine + ?Sized> TracingContext<'engine, E
                     })
                 })
                 .collect::<Result<Vec<_>, TracingError>>()?;
-            let output_duals = instruction.operation.jvp_traced_linearization(&mut context, input_duals.as_slice())?;
+            let output_duals = instruction.operation.jvp(&mut context, input_duals.as_slice())?;
             if output_duals.len() != instruction.outputs.len() {
                 return Err(TracingError::InvalidOutputCount {
                     expected: instruction.outputs.len(),

@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 use crate::operations::InterpretableOperation;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::tracing::engines::{Engine, Tracer, TracingEngine};
+use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
 use crate::tracing_v2::linear::{jvp_program, jvp_traced};
@@ -125,9 +125,8 @@ where
     Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
     Output::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Output>,
-    E::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, E>
-        + SupportsAdd<E::Type, V>
-        + SupportsZeroLike<E::Type, V>,
+    E::Operation:
+        DifferentiableOperation<TracingContext<'engine, E>> + SupportsAdd<E::Type, V> + SupportsZeroLike<E::Type, V>,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
     crate::tracing_v2::operations::AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {

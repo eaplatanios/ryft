@@ -189,8 +189,8 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V>:
         Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearArrayOperation<V>>,
-    EInner::Operation:
-        crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner> + SupportsZeroLike<ArrayType, V>,
+    EInner::Operation: DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
+        + SupportsZeroLike<ArrayType, V>,
     EInner::LinearOperation<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, EInner>>
         + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperation<'engine>>

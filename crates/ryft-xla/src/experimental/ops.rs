@@ -4,8 +4,7 @@ use std::sync::Arc;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{AtomId, TracingError};
-use ryft_core::tracing_v2::differentiation::{Differentiable, JvpTracer};
-use ryft_core::tracing_v2::linear::TracedLinearizableOperation;
+use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
     AddOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation, FlatTracedRematerialize,
     LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
@@ -37,6 +36,7 @@ fn make_linear_xla_rematerialize<E>(
 ) -> Result<LinearRematerializeOperation<ArrayType, ShardMapTensor>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
+    XlaOperation: DifferentiableOperation<E>,
 {
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
@@ -100,6 +100,7 @@ fn interpret_xla_condition_jvp<E>(
 ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
+    XlaOperation: DifferentiableOperation<E>,
 {
     let ConditionPredicate::Captured(predicate) = condition.predicate() else {
         return Err(ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition jvp" }.into());
@@ -385,14 +386,10 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
     }
 }
 
-impl<E> DifferentiableOperation<E> for XlaOperation
-where
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearXlaOperation>,
-    ShardMapTensor: Differentiable<ArrayType, Tangent = ShardMapTensor>,
-{
+impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
     fn jvp(
         &self,
-        context: &mut JvpContext<'_, E>,
+        context: &mut JvpContext<'_, XlaEngine<'c>>,
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         match self {
@@ -433,7 +430,7 @@ where
                     .map(|(primal, tangent)| JvpTracer { primal, tangent })
                     .collect::<Vec<_>>())
             }
-            Self::Condition(condition) => interpret_xla_condition_jvp::<E>(condition, context, inputs),
+            Self::Condition(condition) => interpret_xla_condition_jvp(condition, context, inputs),
             Self::While(_) => Err(ControlFlowError::MissingTransformRule { transform: "while jvp" }.into()),
             Self::ShardMap(op) => op.jvp(context, inputs),
             Self::LinearShardMap(op) => op.jvp(context, inputs),
@@ -445,8 +442,8 @@ where
     }
 }
 
-impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaOperation {
-    fn jvp_traced_linearization(
+impl DifferentiableOperation<TracingContext<'static, XlaEngine<'static>>> for XlaOperation {
+    fn jvp(
         &self,
         context: &mut JvpContext<'_, TracingContext<'static, XlaEngine<'static>>>,
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],

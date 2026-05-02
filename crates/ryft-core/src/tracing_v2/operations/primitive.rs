@@ -2279,60 +2279,6 @@ where
     }
 }
 
-impl<'engine, V, EInner> crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner> for ArrayOperation<V>
-where
-    V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V> + Parameter + 'static,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, Operation = ArrayOperation<V>> + ?Sized + 'engine,
-    ArrayOperation<V>: DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>,
-{
-    fn jvp_traced_linearization(
-        &self,
-        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
-        <Self as DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>>::jvp(
-            self, context, inputs,
-        )
-    }
-}
-
-impl<'engine, V, EInner> crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Differentiable<DataType, Tangent = V> + Parameter + 'static,
-    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, Operation = ScalarOperation<V>> + ?Sized + 'engine,
-    ScalarOperation<V>: DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>,
-{
-    fn jvp_traced_linearization(
-        &self,
-        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
-        <Self as DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>>::jvp(
-            self, context, inputs,
-        )
-    }
-}
-
-impl<'engine, V, EInner> crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner>
-    for ArrayOperation<V, DataType>
-where
-    V: Traceable<DataType> + Differentiable<DataType, Tangent = V> + Parameter + 'static,
-    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, Operation = ArrayOperation<V, DataType>>
-        + ?Sized
-        + 'engine,
-    ArrayOperation<V, DataType>: DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>,
-{
-    fn jvp_traced_linearization(
-        &self,
-        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
-        <Self as DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>>::jvp(
-            self, context, inputs,
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // Primitive-operation behavior is exercised through the per-operation modules and transform tests.

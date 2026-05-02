@@ -28,8 +28,6 @@ mod reverse;
 
 pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
-#[doc(hidden)]
-pub use replay::TracedLinearizableOperation;
 pub(crate) use reverse::jvp_traced;
 pub use reverse::{grad, grad_with_aux, jvp_program, value_and_grad, value_and_grad_with_aux, vjp};
 
@@ -49,8 +47,10 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     E: DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
-    E::Operation:
-        TracedLinearizableOperation<'engine, E> + SupportsAdd<E::Type, V> + SupportsZeroLike<E::Type, V> + 'static,
+    E::Operation: DifferentiableOperation<TracingContext<'engine, E>>
+        + SupportsAdd<E::Type, V>
+        + SupportsZeroLike<E::Type, V>
+        + 'static,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
         + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>

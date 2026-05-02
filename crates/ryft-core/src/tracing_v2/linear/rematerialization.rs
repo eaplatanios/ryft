@@ -9,7 +9,7 @@ where
     E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
     V: Value<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
     E::Operation: InterpretableOperation<E::Type, V>
-        + TracedLinearizableOperation<'engine, E>
+        + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<E::Type, V>
         + SupportsZeroLike<E::Type, V>
         + 'static,
@@ -65,7 +65,7 @@ where
     E: DifferentiableEngine<Value = V> + DifferentiableTracingEngine<Value = V> + 'static,
     V: Value<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
     E::Operation: InterpretableOperation<E::Type, V>
-        + TracedLinearizableOperation<'engine, E>
+        + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<E::Type, V>
         + SupportsZeroLike<E::Type, V>,
     <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
@@ -141,7 +141,7 @@ where
         + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
     E::Operation: InterpretableOperation<ArrayType, V>
-        + TracedLinearizableOperation<'engine, E>
+        + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, <E as DifferentiableEngine>::LinearOperation>,
@@ -191,7 +191,7 @@ where
         + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
     E::Operation: InterpretableOperation<ArrayType, V>
-        + TracedLinearizableOperation<'engine, E>
+        + DifferentiableOperation<TracingContext<'engine, E>>
         + SupportsAdd<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, <E as DifferentiableEngine>::LinearOperation>,
