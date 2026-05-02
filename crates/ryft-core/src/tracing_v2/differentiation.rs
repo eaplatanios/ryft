@@ -88,6 +88,60 @@ where
     type Tangent = Self;
 }
 
+/// Extension of [`Engine`] for backends that support automatic differentiation.
+///
+/// Engines that only need ordinary tracing implement [`TracingEngine`] without this extension. AD
+/// transforms such as [`grad`](crate::tracing_v2::grad), [`jvp`](crate::tracing_v2::jvp), and
+/// [`vjp`](crate::tracing_v2::vjp) require this trait so non-differentiable backends do not need to
+/// define fake tangent carriers.
+///
+/// Differentiated closures are traced through [`DifferentiableOperationTracingEngine`], whose
+/// [`TracingEngine::Operation`] is [`DifferentiableEngine::DifferentiableOperation`]. That keeps
+/// ordinary tracing free to use a wider operation carrier while making differentiation reject
+/// unsupported operations at type-check time when the differentiation carrier omits them.
+pub trait DifferentiableEngine: Engine {
+    /// Staged operation type selected by this engine for tracing differentiable primal programs.
+    type DifferentiableOperation: Clone + InterpretableOperation<Self::Type, Self::Value>;
+
+    /// Linear staged operation type selected by this engine for tangent and cotangent programs.
+    ///
+    /// Linear programs produced by [`linearize`](crate::tracing_v2::linearize),
+    /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
+    type LinearOperation: Clone
+        + LinearOperationTrait<Self::Type, Self::Value, Self::LinearOperation>
+        + SupportsAdd<Self::Type, Self::Value>
+        + SupportsNeg<Self::Type, Self::Value>
+        + SupportsScale<Self::Type, Self::Value>;
+}
+
+/// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
+///
+/// A [`DifferentiableOperation`] is keyed by the [`DifferentiableEngine`] that supplies the value,
+/// type, and linear-operation families used while differentiating. Implementors consume
+/// [`JvpTracer`] inputs, each carrying a primal value and a tangent atom in the active linear
+/// builder, and return traced primal/tangent outputs.
+///
+/// Primitive rules usually stage tangent operations through [`JvpContext::apply_operation`].
+/// Higher-order rules use [`JvpContext::engine`] to recurse into nested programs with the same
+/// engine.
+pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E::Type> {
+    /// Applies this operation's forward-mode Jacobian-Vector Product (JVP) rule.
+    ///
+    /// The returned vector must be aligned with this operation's outputs and must carry both the
+    /// primal output values and the staged tangent atoms for those outputs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active JVP context used to stage tangent operations and access the
+    ///     differentiable engine.
+    ///   - `inputs`: Traced inputs aligned with this operation's inputs.
+    fn jvp(
+        &self,
+        context: &mut JvpContext<'_, E>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError>;
+}
+
 /// Concrete state threaded through forward-mode JVP rules.
 ///
 /// [`JvpContext`] owns the active linear-program builder where tangent ops are staged. It is the
@@ -295,34 +349,6 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     }
 }
 
-/// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
-///
-/// A [`DifferentiableOperation`] is keyed by the [`DifferentiableEngine`] that supplies the value,
-/// type, and linear-operation families used while differentiating. Implementors consume
-/// [`JvpTracer`] inputs, each carrying a primal value and a tangent atom in the active linear
-/// builder, and return traced primal/tangent outputs.
-///
-/// Primitive rules usually stage tangent operations through [`JvpContext::apply_operation`].
-/// Higher-order rules use [`JvpContext::engine`] to recurse into nested programs with the same
-/// engine.
-pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E::Type> {
-    /// Applies this operation's forward-mode Jacobian-Vector Product (JVP) rule.
-    ///
-    /// The returned vector must be aligned with this operation's outputs and must carry both the
-    /// primal output values and the staged tangent atoms for those outputs.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Active JVP context used to stage tangent operations and access the
-    ///     differentiable engine.
-    ///   - `inputs`: Traced inputs aligned with this operation's inputs.
-    fn jvp(
-        &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError>;
-}
-
 /// Optional extension for tracing engines that support differentiation inside an active trace.
 ///
 /// Plain tracing engines do not need to choose any linear carrier. This trait is the additional
@@ -340,32 +366,6 @@ pub trait DifferentiableTracingEngine: TracingEngine {
         + SupportsZero<Self::Type, Tracer<'engine, Self>>
     where
         Self: 'engine;
-}
-
-/// Extension of [`Engine`] for backends that support automatic differentiation.
-///
-/// Engines that only need ordinary tracing implement [`TracingEngine`] without this extension. AD
-/// transforms such as [`grad`](crate::tracing_v2::grad), [`jvp`](crate::tracing_v2::jvp), and
-/// [`vjp`](crate::tracing_v2::vjp) require this trait so non-differentiable backends do not need to
-/// define fake tangent carriers.
-///
-/// Differentiated closures are traced through [`DifferentiableOperationTracingEngine`], whose
-/// [`TracingEngine::Operation`] is [`DifferentiableEngine::DifferentiableOperation`]. That keeps
-/// ordinary tracing free to use a wider operation carrier while making differentiation reject
-/// unsupported operations at type-check time when the differentiation carrier omits them.
-pub trait DifferentiableEngine: Engine {
-    /// Staged operation type selected by this engine for tracing differentiable primal programs.
-    type DifferentiableOperation: Clone + InterpretableOperation<Self::Type, Self::Value>;
-
-    /// Linear staged operation type selected by this engine for tangent and cotangent programs.
-    ///
-    /// Linear programs produced by [`linearize`](crate::tracing_v2::linearize),
-    /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
-    type LinearOperation: Clone
-        + LinearOperationTrait<Self::Type, Self::Value, Self::LinearOperation>
-        + SupportsAdd<Self::Type, Self::Value>
-        + SupportsNeg<Self::Type, Self::Value>
-        + SupportsScale<Self::Type, Self::Value>;
 }
 
 /// Transparent tracing view used while tracing differentiable primal programs.
