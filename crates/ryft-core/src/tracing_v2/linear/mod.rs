@@ -13,7 +13,7 @@ use crate::tracing_v2::operations::rematerialize::{FlatTracedRematerialize, Rema
 use crate::tracing_v2::operations::{AddOperation, SupportsAdd, SupportsRematerialize};
 use crate::tracing_v2::{
     Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
-    DifferentiableTracingEngine, DifferentiationError,
+    DifferentiableTracingEngine,
 };
 use crate::types::{ArrayType, Typed};
 
@@ -30,46 +30,6 @@ pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
 pub(crate) use reverse::jvp_traced;
 pub use reverse::{grad, grad_with_aux, jvp_program, value_and_grad, value_and_grad_with_aux, vjp};
-
-/// Linearizes one flat scalar traced program and stages its pullback with a unit cotangent seed.
-///
-/// This is the internal core of traced reverse-mode for scalar-output functions. Given a staged
-/// primal body and symbolic primals from an enclosing trace, it builds the pushforward, transposes
-/// it into a pullback, seeds that pullback with a symbolic one, and returns both the traced scalar
-/// output and the traced gradient leaves.
-fn reverse_mode_scalar_traced_program<'engine, V, E, Input, Output>(
-    tracing_context: TracingContext<'engine, E>,
-    traced_program: &Program<E::Type, V, E::Operation, Input, Output>,
-    traced_primals: Vec<Tracer<'engine, E>>,
-) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
-where
-    V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-    E: DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
-    E::Operation: DifferentiableOperation<TracingContext<'engine, E>>
-        + SupportsAdd<E::Type, V>
-        + SupportsZeroLike<E::Type, V>
-        + 'static,
-    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
-        + InterpretableOperation<E::Type, Tracer<'engine, E>>
-        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>
-        + SupportsZero<E::Type, Tracer<'engine, E>>,
-    AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
-{
-    let (outputs, pushforward) = tracing_context.linearize(traced_program, traced_primals)?;
-    if outputs.len() != 1 {
-        return Err(DifferentiationError::InvalidGradientOutputLeafCount { expected: 1, got: outputs.len() }.into());
-    }
-    let traced_output = outputs[0].clone();
-    let pullback = tracing_context.transpose(&pushforward)?;
-    let seed_type = traced_output.r#type().into_owned();
-    let _ = <V as One<E::Type>>::one(&seed_type)?;
-    let seed_value = tracing_context.engine.one(&seed_type)?;
-    let seed = tracing_context.constant(seed_value);
-    let traced_gradient = pullback.interpret(vec![seed])?;
-    Ok((traced_output, traced_gradient))
-}
 
 #[cfg(test)]
 mod tests {

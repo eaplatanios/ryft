@@ -71,14 +71,13 @@ where
         .into());
     }
 
-    let input_structure = primal_structure;
     let traced_primals = primals.into_parameters().collect::<Vec<_>>();
     let traced_tangents = tangents.into_parameters().collect::<Vec<_>>();
     let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
         return Err(DifferentiationError::MissingTracedJvpInputLeaves.into());
     };
     let staged_input_types = Input::To::<E::Type>::from_parameters(
-        input_structure.clone(),
+        primal_structure,
         traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
     let (primal_output_types, traced_program) =
@@ -125,6 +124,46 @@ where
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
     let pullback = pushforward.transpose(output_examples.as_slice())?;
     Ok((output, pullback))
+}
+
+/// Linearizes one traced scalar-output program and stages its pullback with a unit cotangent seed.
+///
+/// This is the internal core of traced reverse-mode for scalar-output functions. Given a staged
+/// primal body and symbolic primals from an enclosing trace, it builds the pushforward, transposes
+/// it into a pullback, seeds that pullback with a symbolic one, and returns both the traced scalar
+/// output and the traced gradient leaves.
+pub(super) fn reverse_mode_scalar_traced_program<'engine, V, E, Input, Output>(
+    tracing_context: TracingContext<'engine, E>,
+    traced_program: &Program<E::Type, V, E::Operation, Input, Output>,
+    traced_primals: Vec<Tracer<'engine, E>>,
+) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
+where
+    V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+    E: DifferentiableTracingEngine<Value = V> + ?Sized + 'static,
+    E::Operation: DifferentiableOperation<TracingContext<'engine, E>>
+        + SupportsAdd<E::Type, V>
+        + SupportsZeroLike<E::Type, V>
+        + 'static,
+    <E as DifferentiableTracingEngine>::LinearOperation<'engine>: Clone
+        + InterpretableOperation<E::Type, Tracer<'engine, E>>
+        + LinearOperation<E::Type, Tracer<'engine, E>, <E as DifferentiableTracingEngine>::LinearOperation<'engine>>
+        + SupportsZero<E::Type, Tracer<'engine, E>>,
+    AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+{
+    let (outputs, pushforward) = tracing_context.linearize(traced_program, traced_primals)?;
+    if outputs.len() != 1 {
+        return Err(DifferentiationError::InvalidGradientOutputLeafCount { expected: 1, got: outputs.len() }.into());
+    }
+    let traced_output = outputs[0].clone();
+    let pullback = tracing_context.transpose(&pushforward)?;
+    let seed_type = traced_output.r#type().into_owned();
+    let _ = <V as One<E::Type>>::one(&seed_type)?;
+    let seed_value = tracing_context.engine.one(&seed_type)?;
+    let seed = tracing_context.constant(seed_value);
+    let traced_gradient = pullback.interpret(vec![seed])?;
+    Ok((traced_output, traced_gradient))
 }
 
 /// Marker selecting concrete-value [`value_and_grad`] dispatch.
@@ -263,14 +302,13 @@ where
     {
         let input_structure = primals.parameter_structure();
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
-        if traced_primals.is_empty() {
+        let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
             return Err(DifferentiationError::MissingTracedReverseModeInputLeaves.into());
-        }
+        };
         let staged_input_types = Input::To::<E::Type>::from_parameters(
             input_structure.clone(),
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
-        let tracing_context = traced_primals[0].context.clone();
         let (_, traced_program) =
             tracing_context.engine.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?;
         let (traced_output, traced_gradient) =
