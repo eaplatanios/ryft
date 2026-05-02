@@ -173,11 +173,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::tracing::Program;
     use crate::tracing::engines::ScalarEngine;
-    use crate::tracing_v2::{jvp, test_support};
+    use crate::tracing_v2::{LinearScalarOperation, Sin, jvp, jvp_program};
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -195,7 +197,23 @@ mod tests {
 
         approx_eq(primal, 10.0);
         approx_eq(tangent, 13.0);
-        test_support::assert_bilinear_pushforward_rendering();
+
+        let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) =
+            jvp_program(&engine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
+
+        assert_eq!(
+            pushforward.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = scale [factor=3] %0
+                    %3:f64 = scale [factor=2] %1
+                    %4:f64 = add %2 %3
+                    %5:f64 = scale [factor=-0.4161468365471424] %0
+                    %6:f64 = add %4 %5
+                in (%6)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

@@ -626,10 +626,12 @@ impl_scalar_value_traits!(f64, DataType::F64, 0.0f64, 1.0f64);
 #[cfg(test)]
 mod tests {
     use half::{bf16, f16};
+    use indoc::indoc;
 
     use crate::operations::{InterpretableOperation, Operation};
-    use crate::tracing::{TracingError, Value};
-    use crate::tracing_v2::{Cos, Sin, test_support};
+    use crate::tracing::engines::{ScalarEngine, TracingEngine};
+    use crate::tracing::{Program, TracingError, Value};
+    use crate::tracing_v2::{Cos, ScalarOperation, Sin};
     use crate::types::{ArrayType, DataType, TypeError, Typed};
 
     use super::{OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation, ZeroOperation};
@@ -772,7 +774,20 @@ mod tests {
         assert_scalar_identities(f16::from_f32(5.0), f16::from_f32(0.0), f16::from_f32(1.0));
         assert_scalar_identities(3.0f32, 0.0f32, 1.0f32);
         assert_scalar_identities(7.0f64, 0.0f64, 1.0f64);
-        test_support::assert_reference_scalar_sine_jit_rendering();
+
+        let engine = ScalarEngine::<f64>::new();
+        let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) =
+            engine.interpret_and_trace(|x| Ok(x.sin()), 2.0f64).unwrap();
+
+        assert_eq!(
+            compiled.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = sin %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -780,6 +795,19 @@ mod tests {
         let angle = 0.75f64;
         assert_eq!(Sin::sin(angle), angle.sin());
         assert_eq!(Cos::cos(angle), angle.cos());
-        test_support::assert_reference_scalar_sine_jit_rendering();
+
+        let engine = ScalarEngine::<f64>::new();
+        let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) =
+            engine.interpret_and_trace(|x| Ok(x.sin()), 2.0f64).unwrap();
+
+        assert_eq!(
+            compiled.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = sin %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 }

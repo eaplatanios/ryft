@@ -122,18 +122,6 @@ fn tracing_category(case_id: &str) -> &'static str {
     if case_id.starts_with("matrix_") { "matrix" } else { "scalar" }
 }
 
-/// Benchmark helper used by the scalar bilinear benchmark family.
-///
-/// # Parameters
-///
-///   - `inputs`: Structured scalar inputs.
-fn bilinear_sin<T>(inputs: (T, T)) -> T
-where
-    T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
-{
-    inputs.0.clone() * inputs.1 + inputs.0.sin()
-}
-
 /// Benchmark helper used by the scalar higher-order benchmark family.
 ///
 /// # Parameters
@@ -159,7 +147,8 @@ fn hessian_style_second_derivative_traced(x: Tracer<ArrayScalarEngine>) -> Trace
 /// Emits the plain JIT scalar bilinear benchmark.
 fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ArrayOperation<f64>, (f64, f64), f64>) =
-        ArrayScalarEngine.interpret_and_trace(|inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64))?;
+        ArrayScalarEngine
+            .interpret_and_trace(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jit", "jit", &compiled)?])
 }
 
@@ -168,14 +157,14 @@ fn emit_scalar_bilinear_sin_jvp() -> Result<Vec<IrBenchmarkRecord>, BenchmarkErr
     let (_, pushforward): (
         f64,
         Program<ArrayType, f64, crate::tracing_v2::LinearArrayOperation<f64>, (f64, f64), f64>,
-    ) = jvp_program(&ArrayScalarEngine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64))?;
+    ) = jvp_program(&ArrayScalarEngine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jvp", "jvp_pushforward", &pushforward)?])
 }
 
 /// Emits the staged scalar bilinear pullback benchmark.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pullback): (f64, Program<ArrayType, f64, crate::tracing_v2::LinearArrayOperation<f64>, f64, (f64, f64)>) =
-        vjp(&ArrayScalarEngine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64))?;
+        vjp(&ArrayScalarEngine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 

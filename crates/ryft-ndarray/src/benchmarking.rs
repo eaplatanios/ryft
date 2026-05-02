@@ -1,7 +1,7 @@
 use std::ops::{Add, Mul, Neg};
 
-use ryft_core::parameters::Parameterized;
 use ryft_core::operations::Operation;
+use ryft_core::parameters::Parameterized;
 use ryft_core::tracing::engines::{Tracer, TracingEngine};
 use ryft_core::tracing::{Program, Traceable};
 use ryft_core::tracing_v2::benchmarking::{

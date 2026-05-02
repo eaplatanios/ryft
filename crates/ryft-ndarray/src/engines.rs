@@ -65,8 +65,8 @@ mod tests {
     use ndarray::{arr1, arr2};
     use pretty_assertions::assert_eq;
     use ryft_core::operations::Operation;
-    use ryft_core::tracing::engines::{Engine, TracingEngine};
     use ryft_core::tracing::TracingError;
+    use ryft_core::tracing::engines::{Engine, TracingEngine};
     use ryft_core::tracing_v2::{DifferentiationError, MatrixOps, Sin, compile_grad, grad, jvp};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 

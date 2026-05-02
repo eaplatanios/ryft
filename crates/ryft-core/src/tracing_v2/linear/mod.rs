@@ -171,7 +171,6 @@ where
 #[cfg(test)]
 mod tests {
     use std::fmt::{Debug, Display};
-    use std::ops::{Add, Mul, Neg};
     use std::sync::Arc;
 
     use crate::operations::{InterpretableOperation, Operation};
@@ -181,7 +180,7 @@ mod tests {
     use crate::tracing::{ProgramBuilder, TracingError};
     use crate::tracing_v2::{
         ArrayOperation, CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearArrayOperation,
-        LinearScalarOperation, Sin, test_support,
+        LinearScalarOperation, Sin,
     };
     use crate::types::{ArrayType, DataType, TypeError, Typed};
     use indoc::indoc;
@@ -191,13 +190,6 @@ mod tests {
     fn approx_eq(left: f64, right: f64) {
         let delta = (left - right).abs();
         assert!(delta <= 1e-9, "expected {left} ~= {right}; absolute error {delta} exceeded tolerance");
-    }
-
-    fn quadratic_plus_sin<T>(x: T) -> T
-    where
-        T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
-    {
-        x.clone() * x.clone() + x.sin()
     }
 
     struct ArrayScalarEngine;
@@ -229,13 +221,6 @@ mod tests {
             = LinearArrayOperation<Tracer<'engine, Self>>
         where
             Self: 'engine;
-    }
-
-    fn bilinear_sin<T>(inputs: (T, T)) -> T
-    where
-        T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
-    {
-        inputs.0.clone() * inputs.1 + inputs.0.sin()
     }
 
     #[derive(Clone, Default)]
@@ -428,7 +413,7 @@ mod tests {
     #[test]
     fn test_jvp_program_returns_the_primal_output_and_pushforward() {
         let engine = ArrayScalarEngine;
-        let (primal, pushforward) = jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
+        let (primal, pushforward) = jvp_program(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
         approx_eq(pushforward.interpret(1.5f64).unwrap(), (4.0 + 2.0f64.cos()) * 1.5);
@@ -450,7 +435,8 @@ mod tests {
     #[test]
     fn test_transposed_linear_program_matches_the_reverse_mode_pullback() {
         let engine = ArrayScalarEngine;
-        let (primal, pushforward) = jvp_program(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
+        let (primal, pushforward) =
+            jvp_program(&engine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
         let pullback = transpose_linear_program_with_output_examples(&pushforward, &[primal]).unwrap();
         let cotangent = pullback.interpret(1.0f64).unwrap();
 
@@ -517,7 +503,7 @@ mod tests {
     fn linear_program_display_delegates_to_the_underlying_program() {
         let engine = ScalarEngine::<f64>::new();
         let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
-            jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
+            jvp_program(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         assert_eq!(
             pushforward.to_string(),
@@ -532,13 +518,12 @@ mod tests {
             "}
             .trim_end(),
         );
-        test_support::assert_quadratic_pushforward_rendering();
     }
 
     #[test]
     fn compile_grad_produces_reusable_gradient_program() {
         let engine = ScalarEngine::<f64>::new();
-        let compiled = compile_grad(&engine, quadratic_plus_sin, 2.0f64).unwrap();
+        let compiled = compile_grad(&engine, |x| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
 
         // d/dx(x^2 + sin(x)) = 2x + cos(x)
 
@@ -561,7 +546,8 @@ mod tests {
     #[test]
     fn compile_grad_bilinear_returns_both_partial_derivatives() {
         let engine = ScalarEngine::<f64>::new();
-        let compiled = compile_grad(&engine, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        let compiled =
+            compile_grad(&engine, |inputs| inputs.0.clone() * inputs.1 + inputs.0.sin(), (2.0f64, 3.0f64)).unwrap();
 
         // df/dx = y + cos(x), df/dy = x
         let (grad_x, grad_y) = compiled.interpret((2.0f64, 3.0f64)).unwrap();
@@ -595,9 +581,14 @@ mod tests {
     fn test_compile_grad_save_all_matches_compile_grad() {
         // SaveAll should produce the same gradient as the plain compile_grad.
         let engine = ArrayScalarEngine;
-        let compiled_plain = compile_grad(&engine, quadratic_plus_sin, 2.0f64).unwrap();
-        let compiled_save_all =
-            compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::SaveAll).unwrap();
+        let compiled_plain = compile_grad(&engine, |x| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
+        let compiled_save_all = compile_grad_with_policy(
+            &engine,
+            |x| x.clone() * x.clone() + x.sin(),
+            2.0f64,
+            RematerializationPolicy::SaveAll,
+        )
+        .unwrap();
 
         let grad_plain = compiled_plain.interpret(2.0f64).unwrap();
         let grad_save_all = compiled_save_all.interpret(2.0f64).unwrap();
@@ -613,9 +604,13 @@ mod tests {
     fn test_compile_grad_recompute_all_gives_correct_gradient() {
         // RecomputeAll should give d/dx(x^2 + sin(x)) = 2x + cos(x).
         let engine = ArrayScalarEngine;
-        let compiled =
-            compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::RecomputeAll)
-                .unwrap();
+        let compiled = compile_grad_with_policy(
+            &engine,
+            |x| x.clone() * x.clone() + x.sin(),
+            2.0f64,
+            RematerializationPolicy::RecomputeAll,
+        )
+        .unwrap();
 
         approx_eq(compiled.interpret(2.0f64).unwrap(), 2.0 * 2.0 + 2.0f64.cos());
         approx_eq(compiled.interpret(0.5f64).unwrap(), 2.0 * 0.5 + 0.5f64.cos());
@@ -629,10 +624,14 @@ mod tests {
     fn test_compile_grad_recompute_all_matches_compile_grad() {
         // RecomputeAll should give the same numerical gradient as compile_grad.
         let engine = ArrayScalarEngine;
-        let compiled_plain = compile_grad(&engine, quadratic_plus_sin, 2.0f64).unwrap();
-        let compiled_recompute =
-            compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::RecomputeAll)
-                .unwrap();
+        let compiled_plain = compile_grad(&engine, |x| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
+        let compiled_recompute = compile_grad_with_policy(
+            &engine,
+            |x| x.clone() * x.clone() + x.sin(),
+            2.0f64,
+            RematerializationPolicy::RecomputeAll,
+        )
+        .unwrap();
 
         for x in [0.0, 0.5, 1.0, 2.0, 3.0, std::f64::consts::PI] {
             let grad_plain = compiled_plain.interpret(x).unwrap();
@@ -648,7 +647,7 @@ mod tests {
         let engine = ArrayScalarEngine;
         let compiled = compile_grad_with_policy(
             &engine,
-            quadratic_plus_sin,
+            |x| x.clone() * x.clone() + x.sin(),
             2.0f64,
             RematerializationPolicy::Checkpoint { segment_size: 2 },
         )
@@ -664,7 +663,7 @@ mod tests {
         let engine = ArrayScalarEngine;
         let compiled = compile_grad_with_policy(
             &engine,
-            quadratic_plus_sin,
+            |x| x.clone() * x.clone() + x.sin(),
             1.0f64,
             RematerializationPolicy::Checkpoint { segment_size: 2 },
         )
@@ -680,10 +679,10 @@ mod tests {
     fn test_compile_grad_checkpoint_matches_compile_grad() {
         // Checkpoint should give the same numerical gradient as compile_grad.
         let engine = ArrayScalarEngine;
-        let compiled_plain = compile_grad(&engine, quadratic_plus_sin, 2.0f64).unwrap();
+        let compiled_plain = compile_grad(&engine, |x| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
         let compiled_checkpoint = compile_grad_with_policy(
             &engine,
-            quadratic_plus_sin,
+            |x| x.clone() * x.clone() + x.sin(),
             2.0f64,
             RematerializationPolicy::Checkpoint { segment_size: 2 },
         )
@@ -700,11 +699,16 @@ mod tests {
     fn test_compile_grad_checkpoint_segment_size_one_matches_save_all() {
         // Checkpoint with segment_size=1 should degenerate to SaveAll.
         let engine = ArrayScalarEngine;
-        let compiled_save_all =
-            compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::SaveAll).unwrap();
+        let compiled_save_all = compile_grad_with_policy(
+            &engine,
+            |x| x.clone() * x.clone() + x.sin(),
+            2.0f64,
+            RematerializationPolicy::SaveAll,
+        )
+        .unwrap();
         let compiled_checkpoint = compile_grad_with_policy(
             &engine,
-            quadratic_plus_sin,
+            |x| x.clone() * x.clone() + x.sin(),
             2.0f64,
             RematerializationPolicy::Checkpoint { segment_size: 1 },
         )
@@ -722,7 +726,7 @@ mod tests {
         let engine = ArrayScalarEngine;
         let compiled = compile_grad_with_policy(
             &engine,
-            quadratic_plus_sin,
+            |x| x.clone() * x.clone() + x.sin(),
             2.0f64,
             RematerializationPolicy::Checkpoint { segment_size: 100 },
         )

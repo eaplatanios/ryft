@@ -188,10 +188,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::parameters::Placeholder;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::test_support;
+    use crate::tracing::ProgramBuilder;
+    use crate::tracing_v2::ScalarOperation;
     use crate::types::{DataType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -227,7 +230,23 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, TypeError { message: "add input types are not broadcast-compatible".to_string() });
-        test_support::assert_reference_program_rendering();
+
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let x = builder.add_input(<f64 as Typed<DataType>>::r#type(&1.0f64).into_owned());
+        let three = builder.add_constant(3.0f64);
+        let sum = builder.add_instruction(ScalarOperation::Add, vec![x, three]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder).unwrap();
+
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = const
+                    %2:f64 = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

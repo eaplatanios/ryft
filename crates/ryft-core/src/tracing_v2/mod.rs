@@ -17,10 +17,6 @@ pub mod linear;
 /// Per-op staging stays on small operation-local capability traits rather than on catch-all
 /// `Supports*` bundles.
 pub mod operations;
-#[cfg(test)]
-/// Test-only helpers shared by `tracing_v2` unit tests.
-pub(crate) mod test_support;
-
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
     DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,

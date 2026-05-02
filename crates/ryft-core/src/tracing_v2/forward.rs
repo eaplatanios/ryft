@@ -294,12 +294,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
+
     use crate::parameters::{ParameterError, Parameterized};
-    use crate::tracing::ProgramBuilder;
     use crate::tracing::engines::{ScalarEngine, TracingContext};
+    use crate::tracing::{Program, ProgramBuilder};
     use crate::tracing_v2::DifferentiableOperation;
     use crate::tracing_v2::operations::AddOperation;
-    use crate::tracing_v2::{LinearScalarOperation, ScalarOperation, test_support};
+    use crate::tracing_v2::{LinearScalarOperation, ScalarOperation, Sin};
     use crate::types::DataType;
 
     use super::*;
@@ -354,6 +356,22 @@ mod tests {
             })) if left_structure == format!("{:?}", vec![2.0f64].parameter_structure())
                 && right_structure == format!("{:?}", vec![1.0f64, 2.0f64].parameter_structure())
         ));
-        test_support::assert_quadratic_pushforward_rendering();
+
+        let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
+            jvp_program(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+
+        assert_eq!(
+            pushforward.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = scale [factor=2] %0
+                    %2:f64 = scale [factor=2] %0
+                    %3:f64 = add %1 %2
+                    %4:f64 = scale [factor=-0.4161468365471424] %0
+                    %5:f64 = add %3 %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
     }
 }
