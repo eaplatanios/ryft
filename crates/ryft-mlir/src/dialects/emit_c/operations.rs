@@ -2133,18 +2133,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::operations::traits::OneResult;
     use crate::{Block, Context, Operation, Region, Type, TypeRef, Value, ValueRef};
 
     use super::*;
-
-    fn empty_function_type<'c, 't>(context: &'c Context<'t>) -> FunctionTypeRef<'c, 't> {
-        context.function_type::<TypeRef, TypeRef>(&[], &[])
-    }
-
-    fn empty_region<'c, 't>(context: &'c Context<'t>) -> DetachedRegion<'c, 't> {
-        context.block_with_no_arguments().into()
-    }
 
     #[test]
     fn test_func_return_and_constant_module() {
@@ -2216,73 +2207,130 @@ mod tests {
 
         let op = address_of(lvalue, pointer_i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lvalue);
-        assert_eq!(op.output_type(), pointer_i32_type.as_ref());
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_i32_type.as_ref());
 
         let op = apply("&", lvalue, pointer_i32_type, location);
         assert_eq!(op.applicable_operator().as_str().unwrap(), "&");
         assert_eq!(UnaryExpressionOperation::operand(&op), lvalue);
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_i32_type.as_ref());
 
         let op = bitwise_and(lhs, rhs, i32_type, location);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
-        assert_eq!(op.output_type(), i32_type.as_ref());
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
 
-        assert_eq!(bitwise_left_shift(lhs, rhs, i32_type, location).lhs(), lhs);
+        let op = bitwise_left_shift(lhs, rhs, i32_type, location);
+        assert_eq!(op.lhs(), lhs);
+        assert_eq!(op.rhs(), rhs);
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+
         let op = bitwise_not(lhs, i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
-        assert_eq!(bitwise_or(lhs, rhs, i32_type, location).rhs(), rhs);
-        assert_eq!(bitwise_right_shift(lhs, rhs, i32_type, location).lhs(), lhs);
-        assert_eq!(bitwise_xor(lhs, rhs, i32_type, location).rhs(), rhs);
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+
+        let op = bitwise_or(lhs, rhs, i32_type, location);
+        assert_eq!(op.lhs(), lhs);
+        assert_eq!(op.rhs(), rhs);
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+
+        let op = bitwise_right_shift(lhs, rhs, i32_type, location);
+        assert_eq!(op.lhs(), lhs);
+        assert_eq!(op.rhs(), rhs);
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+
+        let op = bitwise_xor(lhs, rhs, i32_type, location);
+        assert_eq!(op.lhs(), lhs);
+        assert_eq!(op.rhs(), rhs);
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+
         let op = cast(lhs, context.emit_c_opaque_type("int"), location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), context.emit_c_opaque_type("int").as_ref());
 
         let op = cmp(CmpPredicate::LessThan, lhs, rhs, i1_type, location);
         assert_eq!(op.predicate(), CmpPredicate::LessThan);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
 
         let op = constant(context.integer_attribute(i32_type, 3), i32_type, location);
         assert_eq!(op.value().to_string(), "3 : i32");
-        assert_eq!(op.output_type(), i32_type.as_ref());
+        assert_eq!(ConstantOperation::output(&op).r#type(), i32_type.as_ref());
 
         let op = dereference(pointer, lvalue_i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), pointer);
-        assert_eq!(div(lhs, rhs, i32_type, location).lhs(), lhs);
-        assert_eq!(logical_and(condition, condition, location).output_type(), i1_type.as_ref());
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+
+        let op = div(lhs, rhs, i32_type, location);
+        assert_eq!(op.lhs(), lhs);
+        assert_eq!(op.rhs(), rhs);
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+
+        let op = logical_and(condition, condition, location);
+        assert_eq!(op.lhs(), condition);
+        assert_eq!(op.rhs(), condition);
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
+
         let op = logical_not(condition, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), condition);
-        assert_eq!(logical_or(condition, condition, location).rhs(), condition);
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
+
+        let op = logical_or(condition, condition, location);
+        assert_eq!(op.lhs(), condition);
+        assert_eq!(op.rhs(), condition);
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
+
         let op = load(lvalue, i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lvalue);
-        assert_eq!(mul(lhs, rhs, i32_type, location).rhs(), rhs);
-        assert_eq!(rem(lhs, rhs, i32_type, location).lhs(), lhs);
-        assert_eq!(sub(lhs, rhs, i32_type, location).rhs(), rhs);
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+
+        let op = mul(lhs, rhs, i32_type, location);
+        assert_eq!(op.lhs(), lhs);
+        assert_eq!(op.rhs(), rhs);
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+
+        let op = rem(lhs, rhs, i32_type, location);
+        assert_eq!(op.lhs(), lhs);
+        assert_eq!(op.rhs(), rhs);
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+
+        let op = sub(lhs, rhs, i32_type, location);
+        assert_eq!(op.lhs(), lhs);
+        assert_eq!(op.rhs(), rhs);
+        assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
 
         let op = member("field", lvalue, lvalue_i32_type, location);
         assert_eq!(op.member().as_str().unwrap(), "field");
         assert_eq!(UnaryExpressionOperation::operand(&op), lvalue);
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
 
         let op = member_of_ptr("field", pointer, lvalue_i32_type, location);
         assert_eq!(op.member().as_str().unwrap(), "field");
         assert_eq!(UnaryExpressionOperation::operand(&op), pointer);
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
 
         let op = conditional(condition, lhs, rhs, i32_type, location);
         assert_eq!(op.condition(), condition);
         assert_eq!(op.true_value(), lhs);
         assert_eq!(op.false_value(), rhs);
+        assert_eq!(ConditionalOperation::output(&op).r#type(), i32_type.as_ref());
 
         let op = unary_minus(lhs, i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+
         let op = unary_plus(lhs, i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
 
         let op = variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location);
         assert_eq!(op.value().to_string(), "0 : i32");
-        assert_eq!(op.output_type(), lvalue_i32_type.as_ref());
+        assert_eq!(VariableOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
 
         let op = subscript(array, &[lhs.as_ref()], lvalue_i32_type, location);
         assert_eq!(op.value(), array);
         assert_eq!(op.indices(), vec![lhs.as_ref()]);
+        assert_eq!(SubscriptOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
 
         let op = assign(lvalue, lhs, location);
         assert_eq!(op.variable(), lvalue);
@@ -2304,17 +2352,27 @@ mod tests {
         let block = context.block(&[(i32_type.as_ref(), location)]);
         let argument = block.argument(0).unwrap();
 
-        let op = call_opaque("opaque", &[argument.as_ref()], &[i32_type.as_ref()], None, None, location);
+        let empty_array_attribute = context.array_attribute::<AttributeRef>(&[]);
+        let op = call_opaque(
+            "opaque",
+            &[argument.as_ref()],
+            &[i32_type.as_ref()],
+            Some(empty_array_attribute),
+            Some(empty_array_attribute),
+            location,
+        );
         assert_eq!(op.callee().as_str().unwrap(), "opaque");
-        assert!(op.args().is_none());
-        assert!(op.template_args().is_none());
+        assert!(op.args().unwrap().is_empty());
+        assert!(op.template_args().unwrap().is_empty());
         assert_eq!(op.arguments(), vec![argument.as_ref()]);
         assert_eq!(op.outputs().len(), 1);
+        assert_eq!(op.outputs()[0].r#type(), i32_type.as_ref());
 
         let op = call("callee", &[argument.as_ref()], &[i32_type.as_ref()], None, None, location);
         assert_eq!(op.callee().reference().as_str().unwrap(), "callee");
         assert_eq!(op.arguments(), vec![argument.as_ref()]);
         assert_eq!(op.outputs().len(), 1);
+        assert_eq!(op.outputs()[0].r#type(), i32_type.as_ref());
 
         let op = declare_func("external", location);
         assert_eq!(op.symbol_name().reference().as_str().unwrap(), "external");
@@ -2323,22 +2381,44 @@ mod tests {
         assert_eq!(op.include().as_str().unwrap(), "stdint.h");
         assert!(op.is_standard_include());
 
+        let op = include("local.h", false, location);
+        assert_eq!(op.include().as_str().unwrap(), "local.h");
+        assert!(!op.is_standard_include());
+
         let op = literal("nullptr", context.emit_c_opaque_type("int *"), location);
         assert_eq!(op.value().as_str().unwrap(), "nullptr");
+        assert_eq!(LiteralOperation::output(&op).r#type(), context.emit_c_opaque_type("int *").as_ref());
 
-        let op = expression(&[argument.as_ref()], i32_type.as_ref(), empty_region(&context), true, location);
+        let op = expression(
+            &[argument.as_ref()],
+            i32_type.as_ref(),
+            context.block_with_no_arguments().into(),
+            true,
+            location,
+        );
         assert_eq!(op.definitions(), vec![argument.as_ref()]);
         assert!(op.do_not_inline());
-        assert_eq!(op.output_type(), i32_type.as_ref());
+        assert_eq!(ExpressionOperation::output(&op).r#type(), i32_type.as_ref());
         assert_eq!(op.body().blocks().count(), 1);
 
-        let op = r#for(argument, argument, argument, empty_region(&context), location);
+        let op = expression(
+            &[argument.as_ref()],
+            i32_type.as_ref(),
+            context.block_with_no_arguments().into(),
+            false,
+            location,
+        );
+        assert_eq!(op.definitions(), vec![argument.as_ref()]);
+        assert!(!op.do_not_inline());
+        assert_eq!(ExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+
+        let op = r#for(argument, argument, argument, context.block_with_no_arguments().into(), location);
         assert_eq!(op.lower_bound(), argument);
         assert_eq!(op.upper_bound(), argument);
         assert_eq!(op.step(), argument);
         assert_eq!(op.body().blocks().count(), 1);
 
-        let op = file("generated.cc", empty_region(&context), location);
+        let op = file("generated.cc", context.block_with_no_arguments().into(), location);
         assert_eq!(op.id().as_str().unwrap(), "generated.cc");
         assert_eq!(op.body().blocks().count(), 1);
 
@@ -2351,12 +2431,25 @@ mod tests {
         assert!(op.static_specifier());
         assert!(op.const_specifier());
 
+        let op = global("external_counter", i32_type, None, true, false, false, location);
+        assert_eq!(op.symbol_name().as_str().unwrap(), "external_counter");
+        assert_eq!(op.r#type(), i32_type.as_ref());
+        assert!(op.initial_value().is_none());
+        assert!(op.extern_specifier());
+        assert!(!op.static_specifier());
+        assert!(!op.const_specifier());
+
         let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
         let op = get_global("counter", lvalue_i32_type, location);
         assert_eq!(GetGlobalOperation::name(&op).reference().as_str().unwrap(), "counter");
-        assert_eq!(op.output_type(), lvalue_i32_type.as_ref());
+        assert_eq!(GetGlobalOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
 
-        let op = r#if(argument, empty_region(&context), empty_region(&context), location);
+        let op = r#if(
+            argument,
+            context.block_with_no_arguments().into(),
+            context.block_with_no_arguments().into(),
+            location,
+        );
         assert_eq!(op.condition(), argument);
         assert_eq!(op.then_region().blocks().count(), 1);
         assert_eq!(op.else_region().blocks().count(), 1);
@@ -2364,8 +2457,8 @@ mod tests {
         let op = switch(
             argument,
             &[1, 2],
-            empty_region(&context),
-            vec![empty_region(&context), empty_region(&context)],
+            context.block_with_no_arguments().into(),
+            vec![context.block_with_no_arguments().into(), context.block_with_no_arguments().into()],
             location,
         );
         assert_eq!(op.argument(), argument);
@@ -2378,24 +2471,53 @@ mod tests {
         assert_eq!(op.r#type(), i32_type.as_ref());
         assert_eq!(op.initial_value(), Some(initial_value));
 
-        let op = class("Box", true, empty_region(&context), location);
+        let op = field("empty", i32_type, None, location);
+        assert_eq!(op.symbol_name().as_str().unwrap(), "empty");
+        assert_eq!(op.r#type(), i32_type.as_ref());
+        assert!(op.initial_value().is_none());
+
+        let op = class("Box", true, context.block_with_no_arguments().into(), location);
         assert_eq!(op.symbol_name().as_str().unwrap(), "Box");
         assert!(op.final_specifier());
         assert_eq!(op.body().blocks().count(), 1);
 
+        let op = class("OpenBox", false, context.block_with_no_arguments().into(), location);
+        assert_eq!(op.symbol_name().as_str().unwrap(), "OpenBox");
+        assert!(!op.final_specifier());
+        assert_eq!(op.body().blocks().count(), 1);
+
         let op = get_field("value", i32_type, location);
         assert_eq!(op.field_name().reference().as_str().unwrap(), "value");
-        assert_eq!(op.output_type(), i32_type.as_ref());
+        assert_eq!(GetFieldOperation::output(&op).r#type(), i32_type.as_ref());
 
-        let op = r#do(empty_region(&context), empty_region(&context), location);
+        let op = r#do(context.block_with_no_arguments().into(), context.block_with_no_arguments().into(), location);
         assert_eq!(op.body().blocks().count(), 1);
         assert_eq!(op.condition().blocks().count(), 1);
 
-        let op = func("empty", empty_function_type(&context), empty_region(&context), None, None, None, location);
+        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[]);
+        let op = func("empty", function_type, context.block_with_no_arguments().into(), None, None, None, location);
         assert_eq!(op.symbol_name().as_str().unwrap(), "empty");
-        assert_eq!(op.function_type(), empty_function_type(&context));
+        assert_eq!(op.function_type(), function_type);
+        assert!(op.specifiers().is_none());
+
+        let specifiers = context.array_attribute(&[context.string_attribute("static")]);
+        let op = func(
+            "static_empty",
+            function_type,
+            context.block_with_no_arguments().into(),
+            Some(specifiers),
+            None,
+            None,
+            location,
+        );
+        assert_eq!(op.symbol_name().as_str().unwrap(), "static_empty");
+        assert_eq!(op.function_type(), function_type);
+        assert_eq!(op.specifiers().unwrap().len(), 1);
 
         let op = r#return(Option::<ValueRef<'_, '_, '_>>::None, location);
+        assert!(op.value().is_none());
+
+        let op = r#yield(Option::<ValueRef<'_, '_, '_>>::None, location);
         assert!(op.value().is_none());
     }
 }
