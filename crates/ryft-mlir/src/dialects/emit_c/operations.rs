@@ -2190,158 +2190,271 @@ mod tests {
         let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
         let pointer_i32_type = context.emit_c_pointer_type(i32_type);
         let array_i32_type = context.emit_c_array_type(i32_type, &[4]);
-        let block = context.block(&[
+        let opaque_box_type = context.emit_c_opaque_type("Box");
+        let lvalue_box_type = context.emit_c_lvalue_type(opaque_box_type);
+        let pointer_box_type = context.emit_c_pointer_type(opaque_box_type);
+        let lvalue_pointer_box_type = context.emit_c_lvalue_type(pointer_box_type);
+        let function_type =
+            context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref(), i1_type.as_ref()], &[]);
+        let module = context.module(location);
+        let mut block = context.block(&[
             (i32_type.as_ref(), location),
             (i32_type.as_ref(), location),
             (i1_type.as_ref(), location),
-            (lvalue_i32_type.as_ref(), location),
-            (pointer_i32_type.as_ref(), location),
-            (array_i32_type.as_ref(), location),
         ]);
         let lhs = block.argument(0).unwrap();
         let rhs = block.argument(1).unwrap();
         let condition = block.argument(2).unwrap();
-        let lvalue = block.argument(3).unwrap();
-        let pointer = block.argument(4).unwrap();
-        let array = block.argument(5).unwrap();
+
+        let op = variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location);
+        assert_eq!(op.value().to_string(), "0 : i32");
+        assert_eq!(VariableOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+        let op = block.append_operation(op);
+        let lvalue = op.result(0).unwrap().as_ref();
+
+        let op = literal("values", array_i32_type, location);
+        assert_eq!(op.value().as_str().unwrap(), "values");
+        assert_eq!(LiteralOperation::output(&op).r#type(), array_i32_type.as_ref());
+        let op = block.append_operation(op);
+        let array = op.result(0).unwrap().as_ref();
+
+        let op = variable(context.emit_c_opaque_attribute("box"), lvalue_box_type, location);
+        assert_eq!(VariableOperation::output(&op).r#type(), lvalue_box_type.as_ref());
+        let op = block.append_operation(op);
+        let box_lvalue = op.result(0).unwrap().as_ref();
+
+        let op = address_of(box_lvalue, pointer_box_type, location);
+        assert_eq!(UnaryExpressionOperation::operand(&op), box_lvalue);
+        assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_box_type.as_ref());
+        block.append_operation(op);
+
+        let op = variable(context.emit_c_opaque_attribute("box_ptr"), lvalue_pointer_box_type, location);
+        assert_eq!(VariableOperation::output(&op).r#type(), lvalue_pointer_box_type.as_ref());
+        let op = block.append_operation(op);
+        let box_pointer_lvalue = op.result(0).unwrap().as_ref();
 
         let op = address_of(lvalue, pointer_i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lvalue);
         assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_i32_type.as_ref());
+        let op = block.append_operation(op);
+        let pointer = op.result(0).unwrap().as_ref();
 
         let op = apply("&", lvalue, pointer_i32_type, location);
         assert_eq!(op.applicable_operator().as_str().unwrap(), "&");
         assert_eq!(UnaryExpressionOperation::operand(&op), lvalue);
         assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_i32_type.as_ref());
+        block.append_operation(op);
 
         let op = bitwise_and(lhs, rhs, i32_type, location);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = bitwise_left_shift(lhs, rhs, i32_type, location);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = bitwise_not(lhs, i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
         assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = bitwise_or(lhs, rhs, i32_type, location);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = bitwise_right_shift(lhs, rhs, i32_type, location);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = bitwise_xor(lhs, rhs, i32_type, location);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = cast(lhs, context.emit_c_opaque_type("int"), location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
         assert_eq!(UnaryExpressionOperation::output(&op).r#type(), context.emit_c_opaque_type("int").as_ref());
+        block.append_operation(op);
 
         let op = cmp(CmpPredicate::LessThan, lhs, rhs, i1_type, location);
         assert_eq!(op.predicate(), CmpPredicate::LessThan);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
+        block.append_operation(op);
 
         let op = constant(context.integer_attribute(i32_type, 3), i32_type, location);
         assert_eq!(op.value().to_string(), "3 : i32");
         assert_eq!(ConstantOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = dereference(pointer, lvalue_i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), pointer);
         assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+        block.append_operation(op);
 
         let op = div(lhs, rhs, i32_type, location);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = logical_and(condition, condition, location);
         assert_eq!(op.lhs(), condition);
         assert_eq!(op.rhs(), condition);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
+        block.append_operation(op);
 
         let op = logical_not(condition, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), condition);
         assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
+        block.append_operation(op);
 
         let op = logical_or(condition, condition, location);
         assert_eq!(op.lhs(), condition);
         assert_eq!(op.rhs(), condition);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
+        block.append_operation(op);
 
         let op = load(lvalue, i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lvalue);
         assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = mul(lhs, rhs, i32_type, location);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = rem(lhs, rhs, i32_type, location);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = sub(lhs, rhs, i32_type, location);
         assert_eq!(op.lhs(), lhs);
         assert_eq!(op.rhs(), rhs);
         assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
-        let op = member("field", lvalue, lvalue_i32_type, location);
+        let op = member("field", box_lvalue, lvalue_i32_type, location);
         assert_eq!(op.member().as_str().unwrap(), "field");
-        assert_eq!(UnaryExpressionOperation::operand(&op), lvalue);
+        assert_eq!(UnaryExpressionOperation::operand(&op), box_lvalue);
         assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+        block.append_operation(op);
 
-        let op = member_of_ptr("field", pointer, lvalue_i32_type, location);
+        let op = member_of_ptr("field", box_pointer_lvalue, lvalue_i32_type, location);
         assert_eq!(op.member().as_str().unwrap(), "field");
-        assert_eq!(UnaryExpressionOperation::operand(&op), pointer);
+        assert_eq!(UnaryExpressionOperation::operand(&op), box_pointer_lvalue);
         assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+        block.append_operation(op);
 
         let op = conditional(condition, lhs, rhs, i32_type, location);
         assert_eq!(op.condition(), condition);
         assert_eq!(op.true_value(), lhs);
         assert_eq!(op.false_value(), rhs);
         assert_eq!(ConditionalOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = unary_minus(lhs, i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
         assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        block.append_operation(op);
 
         let op = unary_plus(lhs, i32_type, location);
         assert_eq!(UnaryExpressionOperation::operand(&op), lhs);
         assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-
-        let op = variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location);
-        assert_eq!(op.value().to_string(), "0 : i32");
-        assert_eq!(VariableOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+        block.append_operation(op);
 
         let op = subscript(array, &[lhs.as_ref()], lvalue_i32_type, location);
         assert_eq!(op.value(), array);
         assert_eq!(op.indices(), vec![lhs.as_ref()]);
         assert_eq!(SubscriptOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
+        block.append_operation(op);
 
         let op = assign(lvalue, lhs, location);
         assert_eq!(op.variable(), lvalue);
         assert_eq!(op.value(), lhs);
+        block.append_operation(op);
 
         let op = verbatim("value = {}", &[lhs.as_ref()], location);
         assert_eq!(op.value().as_str().unwrap(), "value = {}");
         assert_eq!(op.format_arguments(), vec![lhs.as_ref()]);
+        block.append_operation(op);
 
-        let op = r#yield(Some(lhs.as_ref()), location);
-        assert_eq!(op.value(), Some(lhs.as_ref()));
+        let mut expression_region = context.region();
+        let mut expression_block = context.block_with_no_arguments();
+        let expression_value =
+            expression_block.append_operation(constant(context.integer_attribute(i32_type, 4), i32_type, location));
+        let op = r#yield(Some(expression_value.result(0).unwrap().as_ref()), location);
+        assert_eq!(op.value(), Some(expression_value.result(0).unwrap().as_ref()));
+        expression_block.append_operation(op);
+        expression_region.append_block(expression_block);
+        let op = expression(&[lhs.as_ref()], i32_type.as_ref(), expression_region.into(), true, location);
+        assert_eq!(op.definitions(), vec![lhs.as_ref()]);
+        assert!(op.do_not_inline());
+        assert_eq!(ExpressionOperation::output(&op).r#type(), i32_type.as_ref());
+        assert_eq!(op.body().blocks().count(), 1);
+
+        block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
+        module
+            .body()
+            .append_operation(func("expression_ops", function_type, block.into(), None, None, None, location));
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.func @expression_ops(%arg0: i32, %arg1: i32, %arg2: i1) {
+                    %0 = "emitc.variable"() <{value = 0 : i32}> : () -> !emitc.lvalue<i32>
+                    %1 = literal "values" : !emitc.array<4xi32>
+                    %2 = "emitc.variable"() <{value = #emitc.opaque<"box">}> : () -> !emitc.lvalue<!emitc.opaque<"Box">>
+                    %3 = address_of %2 : !emitc.lvalue<!emitc.opaque<"Box">>
+                    %4 = "emitc.variable"() <{value = #emitc.opaque<"box_ptr">}> : () -> !emitc.lvalue<!emitc.ptr<!emitc.opaque<"Box">>>
+                    %5 = address_of %0 : !emitc.lvalue<i32>
+                    %6 = apply "&"(%0) : (!emitc.lvalue<i32>) -> !emitc.ptr<i32>
+                    %7 = bitwise_and %arg0, %arg1 : (i32, i32) -> i32
+                    %8 = bitwise_left_shift %arg0, %arg1 : (i32, i32) -> i32
+                    %9 = bitwise_not %arg0 : (i32) -> i32
+                    %10 = bitwise_or %arg0, %arg1 : (i32, i32) -> i32
+                    %11 = bitwise_right_shift %arg0, %arg1 : (i32, i32) -> i32
+                    %12 = bitwise_xor %arg0, %arg1 : (i32, i32) -> i32
+                    %13 = cast %arg0 : i32 to !emitc.opaque<"int">
+                    %14 = cmp lt, %arg0, %arg1 : (i32, i32) -> i1
+                    %15 = "emitc.constant"() <{value = 3 : i32}> : () -> i32
+                    %16 = dereference %5 : !emitc.ptr<i32>
+                    %17 = div %arg0, %arg1 : (i32, i32) -> i32
+                    %18 = logical_and %arg2, %arg2 : i1, i1
+                    %19 = logical_not %arg2 : i1
+                    %20 = logical_or %arg2, %arg2 : i1, i1
+                    %21 = load %0 : <i32>
+                    %22 = mul %arg0, %arg1 : (i32, i32) -> i32
+                    %23 = rem %arg0, %arg1 : (i32, i32) -> i32
+                    %24 = sub %arg0, %arg1 : (i32, i32) -> i32
+                    %25 = "emitc.member"(%2) <{member = "field"}> : (!emitc.lvalue<!emitc.opaque<"Box">>) -> !emitc.lvalue<i32>
+                    %26 = "emitc.member_of_ptr"(%4) <{member = "field"}> : (!emitc.lvalue<!emitc.ptr<!emitc.opaque<"Box">>>) -> !emitc.lvalue<i32>
+                    %27 = conditional %arg2, %arg0, %arg1 : i32
+                    %28 = unary_minus %arg0 : (i32) -> i32
+                    %29 = unary_plus %arg0 : (i32) -> i32
+                    %30 = subscript %1[%arg0] : (!emitc.array<4xi32>, i32) -> !emitc.lvalue<i32>
+                    assign %arg0 : i32 to %0 : <i32>
+                    verbatim "value = {}" args %arg0 : i32
+                    return
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
@@ -2519,5 +2632,33 @@ mod tests {
 
         let op = r#yield(Option::<ValueRef<'_, '_, '_>>::None, location);
         assert!(op.value().is_none());
+
+        let module = context.module(location);
+        module.body().append_operation(include("stdint.h", true, location));
+        module.body().append_operation(include("local.h", false, location));
+        module.body().append_operation(declare_func("empty", location));
+        module
+            .body()
+            .append_operation(global("counter", i32_type, Some(initial_value), false, true, true, location));
+        let mut body = context.block_with_no_arguments();
+        body.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
+        module
+            .body()
+            .append_operation(func("empty", function_type, body.into(), None, None, None, location));
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  emitc.include <"stdint.h">
+                  emitc.include "local.h"
+                  emitc.declare_func @empty
+                  emitc.global static const @counter : i32 = 7
+                  emitc.func @empty() {
+                    return
+                  }
+                }
+            "#},
+        );
     }
 }
