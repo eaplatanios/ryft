@@ -83,15 +83,64 @@ bool mlirTypeIsATritonTtTensorDescType(MlirType type) {
   return type.ptr != nullptr && llvm::isa<mlir::triton::TensorDescType>(unwrap(type));
 }
 
-MlirType mlirTritonTtTensorDescTypeGet(MlirType blockType) {
-  if (blockType.ptr == nullptr) {
+MlirType mlirTritonTtTensorDescTypeGet(
+    const int64_t *shape,
+    intptr_t shapeSize,
+    MlirType elementType,
+    MlirAttribute sharedLayout) {
+  if (shape == nullptr || shapeSize < 0 || elementType.ptr == nullptr) {
     return {nullptr};
   }
-  auto rankedTensorType = llvm::dyn_cast<mlir::RankedTensorType>(unwrap(blockType));
-  if (!rankedTensorType) {
+  llvm::ArrayRef<int64_t> shapeRef(shape, static_cast<size_t>(shapeSize));
+  mlir::Attribute sharedLayoutAttribute;
+  if (sharedLayout.ptr != nullptr) {
+    sharedLayoutAttribute = unwrap(sharedLayout);
+  }
+  return wrap(mlir::triton::TensorDescType::get(shapeRef, unwrap(elementType), sharedLayoutAttribute));
+}
+
+intptr_t mlirTritonTtTensorDescTypeGetNumDims(MlirType type) {
+  if (type.ptr == nullptr) {
+    return 0;
+  }
+  auto tensorDescType = llvm::dyn_cast<mlir::triton::TensorDescType>(unwrap(type));
+  if (!tensorDescType) {
+    return 0;
+  }
+  return static_cast<intptr_t>(tensorDescType.getShape().size());
+}
+
+int64_t mlirTritonTtTensorDescTypeGetDimSize(MlirType type, intptr_t dimension) {
+  if (type.ptr == nullptr) {
+    return 0;
+  }
+  auto tensorDescType = llvm::dyn_cast<mlir::triton::TensorDescType>(unwrap(type));
+  if (!tensorDescType || dimension < 0 || dimension >= static_cast<intptr_t>(tensorDescType.getShape().size())) {
+    return 0;
+  }
+  return tensorDescType.getShape()[static_cast<size_t>(dimension)];
+}
+
+MlirType mlirTritonTtTensorDescTypeGetElementType(MlirType type) {
+  if (type.ptr == nullptr) {
     return {nullptr};
   }
-  return wrap(mlir::triton::TensorDescType::get(rankedTensorType.getContext(), rankedTensorType));
+  auto tensorDescType = llvm::dyn_cast<mlir::triton::TensorDescType>(unwrap(type));
+  if (!tensorDescType) {
+    return {nullptr};
+  }
+  return wrap(tensorDescType.getElementType());
+}
+
+MlirAttribute mlirTritonTtTensorDescTypeGetSharedLayout(MlirType type) {
+  if (type.ptr == nullptr) {
+    return {nullptr};
+  }
+  auto tensorDescType = llvm::dyn_cast<mlir::triton::TensorDescType>(unwrap(type));
+  if (!tensorDescType) {
+    return {nullptr};
+  }
+  return wrap(tensorDescType.getSharedLayout());
 }
 
 MlirType mlirTritonTtTensorDescTypeGetBlockType(MlirType type) {

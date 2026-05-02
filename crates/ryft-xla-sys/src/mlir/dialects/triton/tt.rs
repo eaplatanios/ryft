@@ -28,7 +28,16 @@ unsafe extern "C" {
     pub fn mlirTritonTtPointerTypeGetAddressSpace(r#type: MlirType) -> i32;
 
     pub fn mlirTypeIsATritonTtTensorDescType(r#type: MlirType) -> bool;
-    pub fn mlirTritonTtTensorDescTypeGet(block_type: MlirType) -> MlirType;
+    pub fn mlirTritonTtTensorDescTypeGet(
+        shape: *const i64,
+        shape_size: isize,
+        element_type: MlirType,
+        shared_layout: MlirAttribute,
+    ) -> MlirType;
+    pub fn mlirTritonTtTensorDescTypeGetNumDims(r#type: MlirType) -> isize;
+    pub fn mlirTritonTtTensorDescTypeGetDimSize(r#type: MlirType, dimension: isize) -> i64;
+    pub fn mlirTritonTtTensorDescTypeGetElementType(r#type: MlirType) -> MlirType;
+    pub fn mlirTritonTtTensorDescTypeGetSharedLayout(r#type: MlirType) -> MlirAttribute;
     pub fn mlirTritonTtTensorDescTypeGetBlockType(r#type: MlirType) -> MlirType;
 
     pub fn mlirAttributeIsATritonTtEnumAttr(attribute: MlirAttribute, kind: MlirTritonTtEnumAttribute) -> bool;

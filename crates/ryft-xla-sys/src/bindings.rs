@@ -3216,11 +3216,7 @@ unsafe extern "C" {
     pub fn stablehloSubAxisInfoAttrGetSize(attr: MlirAttribute) -> i64;
 }
 unsafe extern "C" {
-    pub fn stablehloAxisRefAttrGet(
-        ctx: MlirContext,
-        name: MlirStringRef,
-        subAxisInfo: MlirAttribute,
-    ) -> MlirAttribute;
+    pub fn stablehloAxisRefAttrGet(ctx: MlirContext, name: MlirStringRef, subAxisInfo: MlirAttribute) -> MlirAttribute;
 }
 unsafe extern "C" {
     pub fn stablehloAttributeIsAnAxisRefAttr(attr: MlirAttribute) -> bool;
