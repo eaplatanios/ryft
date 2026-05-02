@@ -1,8 +1,6 @@
 #![allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
-use crate::bindings::{
-    MlirAffineMap, MlirAttribute, MlirContext, MlirSparseTensorLevelType, MlirType,
-};
+use crate::bindings::{MlirAffineMap, MlirAttribute, MlirContext, MlirSparseTensorLevelType, MlirType};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -14,12 +12,7 @@ pub enum MlirSparseTensorEnumAttribute {
 
 unsafe extern "C" {
     pub fn mlirAttributeIsASparseTensorDimSliceAttr(attribute: MlirAttribute) -> bool;
-    pub fn mlirSparseTensorDimSliceAttrGet(
-        context: MlirContext,
-        offset: i64,
-        size: i64,
-        stride: i64,
-    ) -> MlirAttribute;
+    pub fn mlirSparseTensorDimSliceAttrGet(context: MlirContext, offset: i64, size: i64, stride: i64) -> MlirAttribute;
     pub fn mlirSparseTensorDimSliceAttrGetOffset(attribute: MlirAttribute) -> i64;
     pub fn mlirSparseTensorDimSliceAttrGetSize(attribute: MlirAttribute) -> i64;
     pub fn mlirSparseTensorDimSliceAttrGetStride(attribute: MlirAttribute) -> i64;
@@ -40,19 +33,13 @@ unsafe extern "C" {
     pub fn mlirSparseTensorEncodingAttrGetDimSliceCount(attribute: MlirAttribute) -> isize;
     pub fn mlirSparseTensorEncodingAttrGetDimSlice(attribute: MlirAttribute, dimension: isize) -> MlirAttribute;
 
-    pub fn mlirAttributeIsASparseTensorEnumAttr(
-        attribute: MlirAttribute,
-        kind: MlirSparseTensorEnumAttribute,
-    ) -> bool;
+    pub fn mlirAttributeIsASparseTensorEnumAttr(attribute: MlirAttribute, kind: MlirSparseTensorEnumAttribute) -> bool;
     pub fn mlirSparseTensorEnumAttrGet(
         context: MlirContext,
         kind: MlirSparseTensorEnumAttribute,
         value: u32,
     ) -> MlirAttribute;
-    pub fn mlirSparseTensorEnumAttrGetValue(
-        attribute: MlirAttribute,
-        kind: MlirSparseTensorEnumAttribute,
-    ) -> u32;
+    pub fn mlirSparseTensorEnumAttrGetValue(attribute: MlirAttribute, kind: MlirSparseTensorEnumAttribute) -> u32;
 
     pub fn mlirTypeIsASparseTensorStorageSpecifierType(r#type: MlirType) -> bool;
     pub fn mlirSparseTensorStorageSpecifierTypeGet(context: MlirContext, encoding: MlirAttribute) -> MlirType;

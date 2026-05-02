@@ -12,9 +12,15 @@ use ryft_xla_sys::bindings::mlirGetDialectHandle__sparse_tensor__;
 
 use crate::DialectHandle;
 
+pub mod attributes;
+pub mod operations;
 pub mod passes;
+pub mod types;
 
+pub use attributes::*;
+pub use operations::*;
 pub use passes::*;
+pub use types::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `sparse_tensor` [`Dialect`](crate::Dialect).
