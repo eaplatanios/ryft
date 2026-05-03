@@ -11,8 +11,8 @@ where
     E::OperationCarrier: Clone
         + InterpretableOperation<E::Type, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
-        + SupportsAdd<E::Type, V>
         + SupportsZeroLike<E::Type, V>
+        + SupportsAdd<E::Type, V>
         + 'static,
     <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
@@ -72,8 +72,8 @@ where
     E::OperationCarrier: Clone
         + InterpretableOperation<E::Type, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
-        + SupportsAdd<E::Type, V>
-        + SupportsZeroLike<E::Type, V>,
+        + SupportsZeroLike<E::Type, V>
+        + SupportsAdd<E::Type, V>,
     <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<E::Type, Tracer<'engine, E>>
         + LinearOperation<
@@ -153,8 +153,8 @@ where
     E::OperationCarrier: Clone
         + InterpretableOperation<ArrayType, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
-        + SupportsAdd<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>
+        + SupportsAdd<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, <E as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier>,
     <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E>>
@@ -208,8 +208,8 @@ where
     E::OperationCarrier: Clone
         + InterpretableOperation<ArrayType, V>
         + DifferentiableOperation<TracingContext<'engine, E>>
-        + SupportsAdd<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>
+        + SupportsAdd<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, <E as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier>,
     <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E>>

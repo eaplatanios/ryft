@@ -1314,9 +1314,9 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearArrayOper
     }
 }
 
-impl<
-    V: Traceable<DataType>
-        + Parameter
+impl<V: Traceable<DataType>> InterpretableOperation<DataType, V> for ScalarOperation<V>
+where
+    V: Parameter
         + Add<Output = V>
         + Sub<Output = V>
         + Mul<Output = V>
@@ -1328,8 +1328,6 @@ impl<
         + One<DataType>
         + ZeroLike
         + OneLike,
-> InterpretableOperation<DataType, V> for ScalarOperation<V>
-where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -1351,9 +1349,9 @@ where
     }
 }
 
-impl<
-    V: Traceable<DataType>
-        + Parameter
+impl<V: Traceable<DataType>> InterpretableOperation<DataType, V> for LinearScalarOperation<V>
+where
+    V: Parameter
         + Add<Output = V>
         + Sub<Output = V>
         + Neg<Output = V>
@@ -1362,8 +1360,6 @@ impl<
         + One<DataType>
         + ZeroLike
         + OneLike,
-> InterpretableOperation<DataType, V> for LinearScalarOperation<V>
-where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -1431,9 +1427,9 @@ where
 /// That broad union is local to [`ArrayOperation`] itself. The higher-level tracing APIs avoid
 /// exposing it as one public value-bundle trait and instead express their requirements through the
 /// specific staged op carrier bounds they actually exercise.
-impl<
-    V: Traceable<ArrayType>
-        + Parameter
+impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for ArrayOperation<V, ArrayType>
+where
+    V: Parameter
         + Add<Output = V>
         + Sub<Output = V>
         + Mul<Output = V>
@@ -1448,8 +1444,6 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-> InterpretableOperation<ArrayType, V> for ArrayOperation<V, ArrayType>
-where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -1479,9 +1473,9 @@ where
     }
 }
 
-impl<
-    V: Traceable<DataType>
-        + Parameter
+impl<V: Traceable<DataType>> InterpretableOperation<DataType, V> for ArrayOperation<V, DataType>
+where
+    V: Parameter
         + Add<Output = V>
         + Sub<Output = V>
         + Mul<Output = V>
@@ -1493,8 +1487,6 @@ impl<
         + One<DataType>
         + ZeroLike
         + OneLike,
-> InterpretableOperation<DataType, V> for ArrayOperation<V, DataType>
-where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -1522,9 +1514,9 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + Parameter
+impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for LinearArrayOperation<V, ArrayType>
+where
+    V: Parameter
         + Add<Output = V>
         + Sub<Output = V>
         + Neg<Output = V>
@@ -1536,8 +1528,6 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-> InterpretableOperation<ArrayType, V> for LinearArrayOperation<V, ArrayType>
-where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -1564,9 +1554,9 @@ where
     }
 }
 
-impl<
-    V: Traceable<DataType>
-        + Parameter
+impl<V: Traceable<DataType>> InterpretableOperation<DataType, V> for LinearArrayOperation<V, DataType>
+where
+    V: Parameter
         + Add<Output = V>
         + Sub<Output = V>
         + Neg<Output = V>
@@ -1575,8 +1565,6 @@ impl<
         + One<DataType>
         + ZeroLike
         + OneLike,
-> InterpretableOperation<DataType, V> for LinearArrayOperation<V, DataType>
-where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -1713,9 +1701,9 @@ where
     }
 }
 
-impl<V: Traceable<DataType> + Parameter + Add<Output = V> + Neg<Output = V> + ZeroLike + OneLike>
-    LinearOperation<DataType, V, LinearScalarOperation<V>> for LinearScalarOperation<V>
+impl<V: Traceable<DataType>> LinearOperation<DataType, V, LinearScalarOperation<V>> for LinearScalarOperation<V>
 where
+    V: Parameter + Add<Output = V> + Neg<Output = V> + ZeroLike + OneLike,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose(
@@ -1763,9 +1751,10 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + Parameter
+impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>
+    for LinearArrayOperation<V, ArrayType>
+where
+    V: Parameter
         + Add<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
@@ -1774,8 +1763,6 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for LinearArrayOperation<V, ArrayType>
-where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose(
@@ -1814,9 +1801,10 @@ where
     }
 }
 
-impl<V: Traceable<DataType> + Parameter + Add<Output = V> + Neg<Output = V> + Mul<Output = V> + ZeroLike + OneLike>
-    LinearOperation<DataType, V, LinearArrayOperation<V, DataType>> for LinearArrayOperation<V, DataType>
+impl<V: Traceable<DataType>> LinearOperation<DataType, V, LinearArrayOperation<V, DataType>>
+    for LinearArrayOperation<V, DataType>
 where
+    V: Parameter + Add<Output = V> + Neg<Output = V> + Mul<Output = V> + ZeroLike + OneLike,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose(
@@ -1849,9 +1837,9 @@ where
     }
 }
 
-impl<
-    V: Value<DataType>
-        + Add<Output = V>
+impl<V: Value<DataType>, E> DifferentiableOperation<E> for ScalarOperation<V>
+where
+    V: Add<Output = V>
         + Sub<Output = V>
         + Mul<Output = V>
         + Div<Output = V>
@@ -1866,16 +1854,14 @@ impl<
         + Differentiable<DataType, Tangent = V>
         + 'static,
     E: LinearizableEngine<Type = DataType, Value = V, LinearOperationCarrier = LinearScalarOperation<V>> + 'static,
-> DifferentiableOperation<E> for ScalarOperation<V>
-where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearScalarOperation<V>: SupportsAdd<DataType, V>
-        + SupportsSub<DataType, V>
+    LinearScalarOperation<V>: SupportsZero<DataType, V>
+        + SupportsZeroLike<DataType, V>
         + super::SupportsNeg<DataType, V>
-        + super::SupportsScale<DataType, V>
-        + SupportsZero<DataType, V>
-        + SupportsZeroLike<DataType, V>,
+        + SupportsAdd<DataType, V>
+        + SupportsSub<DataType, V>
+        + super::SupportsScale<DataType, V>,
 {
     fn jvp(
         &self,
@@ -1925,12 +1911,12 @@ where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearScalarOperation<V>: Clone
-        + SupportsAdd<DataType, V>
-        + SupportsSub<DataType, V>
-        + super::SupportsNeg<DataType, V>
-        + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>
         + SupportsZeroLike<DataType, V>
+        + super::SupportsNeg<DataType, V>
+        + SupportsAdd<DataType, V>
+        + SupportsSub<DataType, V>
+        + super::SupportsScale<DataType, V>
         + InterpretableOperation<DataType, V>
         + LinearOperation<DataType, V, LinearScalarOperation<V>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
@@ -1945,11 +1931,11 @@ where
     EInner::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<DataType, Tracer<'engine, EInner>>
         + LinearOperation<DataType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
+        + SupportsZero<DataType, Tracer<'engine, EInner>>
+        + SupportsZeroLike<DataType, Tracer<'engine, EInner>>
         + SupportsAdd<DataType, Tracer<'engine, EInner>>
         + SupportsSub<DataType, Tracer<'engine, EInner>>
-        + SupportsScale<DataType, Tracer<'engine, EInner>>
-        + SupportsZeroLike<DataType, Tracer<'engine, EInner>>
-        + SupportsZero<DataType, Tracer<'engine, EInner>>,
+        + SupportsScale<DataType, Tracer<'engine, EInner>>,
 {
     fn jvp(
         &self,
@@ -1990,9 +1976,9 @@ where
     }
 }
 
-impl<
-    V: Value<ArrayType>
-        + Add<Output = V>
+impl<V: Value<ArrayType>, E> DifferentiableOperation<E> for ArrayOperation<V, ArrayType>
+where
+    V: Add<Output = V>
         + Sub<Output = V>
         + Mul<Output = V>
         + Div<Output = V>
@@ -2011,21 +1997,18 @@ impl<
         + 'static,
     E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V, ArrayType>>
         + 'static,
-> DifferentiableOperation<E> for ArrayOperation<V, ArrayType>
-where
-    V: Differentiable<ArrayType, Tangent = V>,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V, ArrayType>: SupportsAdd<ArrayType, V>
-        + SupportsSub<ArrayType, V>
+    LinearArrayOperation<V, ArrayType>: SupportsZero<ArrayType, V>
+        + SupportsZeroLike<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
+        + SupportsAdd<ArrayType, V>
+        + SupportsSub<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
         + super::SupportsRightMatMul<ArrayType, V>
         + super::SupportsMatrixTranspose<ArrayType, V>
-        + super::SupportsReshape<ArrayType, V>
-        + SupportsZero<ArrayType, V>
-        + SupportsZeroLike<ArrayType, V>,
+        + super::SupportsReshape<ArrayType, V>,
 {
     fn jvp(
         &self,
@@ -2058,9 +2041,9 @@ where
     }
 }
 
-impl<
-    V: Value<DataType>
-        + Add<Output = V>
+impl<V: Value<DataType>, E> DifferentiableOperation<E> for ArrayOperation<V, DataType>
+where
+    V: Add<Output = V>
         + Sub<Output = V>
         + Mul<Output = V>
         + Div<Output = V>
@@ -2076,16 +2059,14 @@ impl<
         + 'static,
     E: LinearizableEngine<Type = DataType, Value = V, LinearOperationCarrier = LinearArrayOperation<V, DataType>>
         + 'static,
-> DifferentiableOperation<E> for ArrayOperation<V, DataType>
-where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V, DataType>: SupportsAdd<DataType, V>
-        + SupportsSub<DataType, V>
+    LinearArrayOperation<V, DataType>: SupportsZero<DataType, V>
+        + SupportsZeroLike<DataType, V>
         + super::SupportsNeg<DataType, V>
-        + super::SupportsScale<DataType, V>
-        + SupportsZero<DataType, V>
-        + SupportsZeroLike<DataType, V>,
+        + SupportsAdd<DataType, V>
+        + SupportsSub<DataType, V>
+        + super::SupportsScale<DataType, V>,
 {
     fn jvp(
         &self,
@@ -2154,16 +2135,16 @@ where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V, ArrayType>: Clone
+        + SupportsZero<ArrayType, V>
+        + SupportsZeroLike<ArrayType, V>
+        + super::SupportsNeg<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + SupportsSub<ArrayType, V>
-        + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
         + super::SupportsRightMatMul<ArrayType, V>
         + super::SupportsMatrixTranspose<ArrayType, V>
         + super::SupportsReshape<ArrayType, V>
-        + SupportsZero<ArrayType, V>
-        + SupportsZeroLike<ArrayType, V>
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
@@ -2179,6 +2160,8 @@ where
     EInner::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, EInner>>
         + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
+        + SupportsZero<ArrayType, Tracer<'engine, EInner>>
+        + SupportsZeroLike<ArrayType, Tracer<'engine, EInner>>
         + SupportsAdd<ArrayType, Tracer<'engine, EInner>>
         + SupportsSub<ArrayType, Tracer<'engine, EInner>>
         + SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>
@@ -2186,8 +2169,6 @@ where
         + SupportsMatrixTranspose<ArrayType, Tracer<'engine, EInner>>
         + SupportsScale<ArrayType, Tracer<'engine, EInner>>
         + SupportsReshape<ArrayType, Tracer<'engine, EInner>>
-        + SupportsZeroLike<ArrayType, Tracer<'engine, EInner>>
-        + SupportsZero<ArrayType, Tracer<'engine, EInner>>
         + SupportsLinearRematerialize<ArrayType, Tracer<'engine, EInner>>,
 {
     fn jvp(
@@ -2244,12 +2225,12 @@ where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V, DataType>: Clone
-        + SupportsAdd<DataType, V>
-        + SupportsSub<DataType, V>
-        + super::SupportsNeg<DataType, V>
-        + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>
         + SupportsZeroLike<DataType, V>
+        + super::SupportsNeg<DataType, V>
+        + SupportsAdd<DataType, V>
+        + SupportsSub<DataType, V>
+        + super::SupportsScale<DataType, V>
         + InterpretableOperation<DataType, V>
         + LinearOperation<DataType, V, LinearArrayOperation<V, DataType>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
@@ -2264,11 +2245,11 @@ where
     EInner::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<DataType, Tracer<'engine, EInner>>
         + LinearOperation<DataType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
+        + SupportsZero<DataType, Tracer<'engine, EInner>>
+        + SupportsZeroLike<DataType, Tracer<'engine, EInner>>
         + SupportsAdd<DataType, Tracer<'engine, EInner>>
         + SupportsSub<DataType, Tracer<'engine, EInner>>
-        + SupportsScale<DataType, Tracer<'engine, EInner>>
-        + SupportsZeroLike<DataType, Tracer<'engine, EInner>>
-        + SupportsZero<DataType, Tracer<'engine, EInner>>,
+        + SupportsScale<DataType, Tracer<'engine, EInner>>,
 {
     fn jvp(
         &self,

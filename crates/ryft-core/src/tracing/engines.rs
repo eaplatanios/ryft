@@ -424,7 +424,10 @@ impl<'engine, E: TracingEngine> Clone for Tracer<'engine, E> {
     }
 }
 
-impl<'engine, E: TracingEngine<Type: Debug>> Debug for Tracer<'engine, E> {
+impl<'engine, E: TracingEngine> Debug for Tracer<'engine, E>
+where
+    E::Type: Debug,
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Tracer")

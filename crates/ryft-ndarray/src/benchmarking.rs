@@ -81,7 +81,10 @@ fn matrix_inputs() -> MatrixPair {
 /// # Parameters
 ///
 ///   - `inputs`: Structured matrix inputs.
-fn bilinear_matmul<M: Clone + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>>(inputs: (M, M)) -> M {
+fn bilinear_matmul<M>(inputs: (M, M)) -> M
+where
+    M: Clone + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
+{
     inputs.0.matmul(inputs.1)
 }
 
@@ -90,9 +93,10 @@ fn bilinear_matmul<M: Clone + MatrixOps + Add<Output = M> + Mul<Output = M> + Ne
 /// # Parameters
 ///
 ///   - `inputs`: Structured matrix inputs.
-fn three_matmul_sine<M: Clone + Sin + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>>(
-    inputs: (M, M, M, M),
-) -> M {
+fn three_matmul_sine<M>(inputs: (M, M, M, M)) -> M
+where
+    M: Clone + Sin + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
+{
     let (x, a, b, c) = inputs;
     x.matmul(a).sin().matmul(b).matmul(c)
 }

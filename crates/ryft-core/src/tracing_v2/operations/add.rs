@@ -25,13 +25,10 @@ where
     }
 }
 
-impl<
-    E: LinearizableEngine<
-            Value: Add<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
-            LinearOperationCarrier: SupportsAdd<E::Type, E::Value>,
-        >,
-> DifferentiableOperation<E> for AddOperation
+impl<E: LinearizableEngine> DifferentiableOperation<E> for AddOperation
 where
+    E::Value: Add<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
+    E::LinearOperationCarrier: SupportsAdd<E::Type, E::Value>,
     AddOperation: Operation<E::Type>,
 {
     #[inline]

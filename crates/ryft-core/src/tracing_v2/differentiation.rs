@@ -105,8 +105,8 @@ pub trait LinearizableEngine: Engine {
     /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
     type LinearOperationCarrier: Clone
         + LinearOperation<Self::Type, Self::Value, Self::LinearOperationCarrier>
-        + SupportsAdd<Self::Type, Self::Value>
         + SupportsNeg<Self::Type, Self::Value>
+        + SupportsAdd<Self::Type, Self::Value>
         + SupportsScale<Self::Type, Self::Value>;
 }
 
@@ -368,10 +368,10 @@ pub trait DifferentiableTracingEngine: TracingEngine {
     /// active outer trace.
     type LinearOperationCarrier<'engine>: Clone
         + LinearOperation<Self::Type, Tracer<'engine, Self>, Self::LinearOperationCarrier<'engine>>
-        + SupportsAdd<Self::Type, Tracer<'engine, Self>>
-        + SupportsNeg<Self::Type, Tracer<'engine, Self>>
-        + SupportsScale<Self::Type, Tracer<'engine, Self>>
         + SupportsZero<Self::Type, Tracer<'engine, Self>>
+        + SupportsNeg<Self::Type, Tracer<'engine, Self>>
+        + SupportsAdd<Self::Type, Tracer<'engine, Self>>
+        + SupportsScale<Self::Type, Tracer<'engine, Self>>
     where
         Self: 'engine;
 }

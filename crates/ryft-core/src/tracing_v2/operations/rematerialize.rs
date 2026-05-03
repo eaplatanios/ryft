@@ -156,14 +156,14 @@ where
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + 'static,
     EInner::OperationCarrier: Clone
         + InterpretableOperation<ArrayType, V>
+        + DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
+        + SupportsZeroLike<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V, ArrayType>: Clone
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-    EInner::OperationCarrier: DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-        + SupportsZeroLike<ArrayType, V>,
     EInner::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, EInner>>
         + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
@@ -507,15 +507,12 @@ impl<V: Value<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>> Rem
 /// Already-traced dispatch for [`rematerialize`]: traces the body function into a sub-program and
 /// stages a [`RematerializeOperation`] in the enclosing [`Tracer`] engine. The sub-program is traced
 /// once over exemplar values and captured as a [`Program`] that lowering can later handle.
-impl<
-    'engine,
-    E,
+impl<'engine, E, V, Input, Output> RematerializeInvocationLeaf<Input, Output> for Tracer<'engine, E>
+where
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + TracingEngine + 'static,
     V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     Input: Parameterized<Tracer<'engine, E>, To<Tracer<'engine, E>> = Input>,
     Output: Parameterized<Tracer<'engine, E>, To<Tracer<'engine, E>> = Output>,
-> RematerializeInvocationLeaf<Input, Output> for Tracer<'engine, E>
-where
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + TracingEngine + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input, To<V> = Input::To<V>>,

@@ -71,7 +71,10 @@ pub trait SupportsDiv<T: Type, V: Traceable<T>> {
     fn div_operation() -> Self;
 }
 
-impl<'engine, E: TracingEngine<OperationCarrier: SupportsDiv<E::Type, E::Value>>> Div for Tracer<'engine, E> {
+impl<'engine, E> Div for Tracer<'engine, E>
+where
+    E: TracingEngine<OperationCarrier: SupportsDiv<E::Type, E::Value>>,
+{
     type Output = Self;
 
     #[inline]

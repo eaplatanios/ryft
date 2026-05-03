@@ -71,7 +71,10 @@ pub trait SupportsMul<T: Type, V: Traceable<T>> {
     fn mul_operation() -> Self;
 }
 
-impl<'engine, E: TracingEngine<OperationCarrier: SupportsMul<E::Type, E::Value>>> Mul for Tracer<'engine, E> {
+impl<'engine, E> Mul for Tracer<'engine, E>
+where
+    E: TracingEngine<OperationCarrier: SupportsMul<E::Type, E::Value>>,
+{
     type Output = Self;
 
     #[inline]

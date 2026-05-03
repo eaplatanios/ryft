@@ -82,12 +82,14 @@ impl<T: Type, V: Traceable<T>> CustomPrimitiveExtensions<T, V> {
 ///
 /// Custom primitives now key JVP rules by the concrete engine type instead of the `(O, L)` carrier
 /// family pair so the public differentiation surface stays fully engine-driven.
-struct JvpRule<E: LinearizableEngine<Type = ArrayType> + 'static>(Arc<dyn DifferentiableOperation<E>>)
+struct JvpRule<E>(Arc<dyn DifferentiableOperation<E>>)
 where
+    E: LinearizableEngine<Type = ArrayType> + 'static,
     E::Value: Differentiable<ArrayType, Tangent = E::Value>;
 
-impl<E: LinearizableEngine<Type = ArrayType> + 'static> JvpRule<E>
+impl<E> JvpRule<E>
 where
+    E: LinearizableEngine<Type = ArrayType> + 'static,
     E::Value: Differentiable<ArrayType, Tangent = E::Value>,
 {
     fn rule(&self) -> &dyn DifferentiableOperation<E> {
@@ -97,10 +99,11 @@ where
 
 /// Rule for differentiating a custom primitive while its primals are already staged tracers.
 #[doc(hidden)]
-pub trait CustomTracedLinearizationRule<
-    V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>> + 'static,
->
+pub trait CustomTracedLinearizationRule<V: Value<ArrayType>, E>
+where
+    V: Differentiable<ArrayType, Tangent = V>,
+    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
+        + 'static,
 {
     /// Applies the custom primitive's traced-linearization JVP rule.
     fn jvp_traced_linearization<'engine>(
@@ -111,15 +114,17 @@ pub trait CustomTracedLinearizationRule<
 }
 
 /// Engine-keyed wrapper for one traced-linearization rule stored inside [`CustomPrimitiveExtensions`].
-struct TracedLinearizationRule<
-    V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>> + 'static,
->(Arc<dyn CustomTracedLinearizationRule<V, E>>);
+struct TracedLinearizationRule<V: Value<ArrayType>, E>(Arc<dyn CustomTracedLinearizationRule<V, E>>)
+where
+    V: Differentiable<ArrayType, Tangent = V>,
+    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
+        + 'static;
 
-impl<
-    V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>> + 'static,
-> TracedLinearizationRule<V, E>
+impl<V: Value<ArrayType>, E> TracedLinearizationRule<V, E>
+where
+    V: Differentiable<ArrayType, Tangent = V>,
+    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
+        + 'static,
 {
     fn rule(&self) -> &dyn CustomTracedLinearizationRule<V, E> {
         self.0.as_ref()

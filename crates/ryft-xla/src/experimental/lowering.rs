@@ -130,29 +130,39 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current block
     /// and placing an optimization barrier on the boundary outputs.
-    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>, L: Clone>(
+    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O, L>(
         &mut self,
         remat_op: &RematerializeOperation<ArrayType, V, O, L>,
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        O: Clone + LowerableXlaOperation<V>,
+        L: Clone,
+    {
         lower_rematerialize_inline(&remat_op.body.program, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested condition operation inside this lowering context.
-    pub(crate) fn lower_condition<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>>(
+    pub(crate) fn lower_condition<V: MlirLowerableValue, O>(
         &mut self,
         condition_op: &ConditionOperation<V, O, ArrayType>,
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        O: Clone + LowerableXlaOperation<V>,
+    {
         lower_condition_to_if(condition_op, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested while operation inside this lowering context.
-    pub(crate) fn lower_while<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>>(
+    pub(crate) fn lower_while<V: MlirLowerableValue, O>(
         &mut self,
         while_op: &WhileOperation<V, O, ArrayType>,
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        O: Clone + LowerableXlaOperation<V>,
+    {
         lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
     }
 }
@@ -672,8 +682,9 @@ impl LowerableXlaOperation<ShardMapTensor> for XlaOperation {
     }
 }
 
-impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOperation<V>
-    for LinearRematerializeOperation<ArrayType, V, O>
+impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for LinearRematerializeOperation<ArrayType, V, O>
+where
+    O: Clone + LowerableXlaOperation<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -692,8 +703,9 @@ impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOpe
     }
 }
 
-impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOperation<V>
-    for ConditionOperation<V, O, ArrayType>
+impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for ConditionOperation<V, O, ArrayType>
+where
+    O: Clone + LowerableXlaOperation<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -706,8 +718,9 @@ impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOpe
     }
 }
 
-impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOperation<V>
-    for WhileOperation<V, O, ArrayType>
+impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for WhileOperation<V, O, ArrayType>
+where
+    O: Clone + LowerableXlaOperation<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -720,7 +733,10 @@ impl<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>> LowerableXlaOpe
     }
 }
 
-impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for ArrayOperation<V, ArrayType> {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V, ArrayType>
+where
+    V: MatrixOps,
+{
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1025,29 +1041,39 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current block
     /// and placing an optimization barrier on the boundary outputs.
-    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>, L: Clone>(
+    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O, L>(
         &mut self,
         remat_op: &RematerializeOperation<ArrayType, V, O, L>,
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        O: Clone + LowerableXlaOperation<V>,
+        L: Clone,
+    {
         lower_rematerialize_inline(&remat_op.body.program, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested condition operation inside this lowering context.
-    pub(crate) fn lower_condition<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>>(
+    pub(crate) fn lower_condition<V: MlirLowerableValue, O>(
         &mut self,
         condition_op: &ConditionOperation<V, O, ArrayType>,
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        O: Clone + LowerableXlaOperation<V>,
+    {
         lower_condition_to_if(condition_op, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested while operation inside this lowering context.
-    pub(crate) fn lower_while<V: MlirLowerableValue, O: Clone + LowerableXlaOperation<V>>(
+    pub(crate) fn lower_while<V: MlirLowerableValue, O>(
         &mut self,
         while_op: &WhileOperation<V, O, ArrayType>,
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        O: Clone + LowerableXlaOperation<V>,
+    {
         lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
     }
 

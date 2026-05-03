@@ -87,8 +87,9 @@ pub trait LinearOperation<T: Type, V: Traceable<T>, O: Clone + Operation<T>>: Op
     ) -> Result<Vec<Option<AtomId>>, TracingError>;
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>>
-    TranspositionContext<T, V, O>
+impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O>> TranspositionContext<T, V, O>
+where
+    O: SupportsZero<T, V> + SupportsAdd<T, V>,
 {
     /// Transposes a complete linear [`Program`] using this context's current builder.
     ///
@@ -111,12 +112,15 @@ impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O> + SupportsAdd
         &mut self,
         program: &Program<T, V, O, Input, Output>,
     ) -> Result<Program<T, V, O, Output, Input>, TracingError> {
-        fn accumulate<T: Type, V: Traceable<T>, O: Clone + SupportsAdd<T, V> + Operation<T>>(
+        fn accumulate<T: Type, V: Traceable<T>, O: Clone + Operation<T>>(
             builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
             adjoints: &mut [Option<AtomId>],
             atom: AtomId,
             contribution: AtomId,
-        ) -> Result<(), TracingError> {
+        ) -> Result<(), TracingError>
+        where
+            O: SupportsAdd<T, V>,
+        {
             adjoints[atom.index] = Some(match adjoints[atom.index] {
                 Some(existing) => {
                     let mut builder_borrow = builder.borrow_mut();
@@ -134,10 +138,13 @@ impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O> + SupportsAdd
             Ok(())
         }
 
-        fn stage_zero<T: Type, V: Traceable<T>, O: Clone + SupportsZero<T, V> + Operation<T>>(
+        fn stage_zero<T: Type, V: Traceable<T>, O: Clone + Operation<T>>(
             builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
             r#type: T,
-        ) -> AtomId {
+        ) -> AtomId
+        where
+            O: SupportsZero<T, V>,
+        {
             let mut builder_borrow = builder.borrow_mut();
             let output = builder_borrow.add_variable(r#type.clone());
             builder_borrow.instructions.push(Instruction {
@@ -236,7 +243,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     ///   - `output_examples`: Representative output values aligned with this program's output atoms.
     pub fn transpose(&self, output_examples: &[V]) -> Result<Program<T, V, O, Output, Input>, TracingError>
     where
-        O: LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
+        O: LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>,
     {
         let expected_output_count = self.output_ids.len();
         check_count!("output", output_examples, expected_output_count, TracingError);
@@ -252,19 +259,16 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
     /// The transpose program itself is staged in a fresh linear-program builder. Any zero operation
     /// produced for a disconnected primal input is then replaced with a traced constant whose
     /// underlying outer-trace value is synthesized through [`Engine::zero`](crate::tracing::engines::Engine::zero).
-    pub fn transpose<
-        Input: Parameterized<Tracer<'engine, E>>,
-        Output: Parameterized<Tracer<'engine, E>>,
-        O: Clone
-            + LinearOperation<E::Type, Tracer<'engine, E>, O>
-            + SupportsAdd<E::Type, Tracer<'engine, E>>
-            + SupportsZero<E::Type, Tracer<'engine, E>>,
-    >(
+    pub fn transpose<Input: Parameterized<Tracer<'engine, E>>, Output: Parameterized<Tracer<'engine, E>>, O>(
         &self,
         program: &Program<E::Type, Tracer<'engine, E>, O, Input, Output>,
     ) -> Result<Program<E::Type, Tracer<'engine, E>, O, Output, Input>, TracingError>
     where
         E: 'static,
+        O: Clone
+            + LinearOperation<E::Type, Tracer<'engine, E>, O>
+            + SupportsZero<E::Type, Tracer<'engine, E>>
+            + SupportsAdd<E::Type, Tracer<'engine, E>>,
     {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new()));
         let mut context = TranspositionContext::new(builder);

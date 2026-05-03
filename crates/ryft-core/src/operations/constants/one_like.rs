@@ -56,7 +56,10 @@ pub trait SupportsOneLike<T: Type, V: Traceable<T>> {
     fn one_like_operation() -> Self;
 }
 
-impl<'engine, E: TracingEngine<OperationCarrier: SupportsOneLike<E::Type, E::Value>>> OneLike for Tracer<'engine, E> {
+impl<'engine, E> OneLike for Tracer<'engine, E>
+where
+    E: TracingEngine<OperationCarrier: SupportsOneLike<E::Type, E::Value>>,
+{
     #[inline]
     fn one_like(&self) -> Self {
         self.clone().unary(E::OperationCarrier::one_like_operation())

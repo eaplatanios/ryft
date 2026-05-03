@@ -376,8 +376,8 @@ where
     V: Traceable<ArrayType>,
     O: Clone
         + LinearOperation<ArrayType, V, O>
-        + SupportsAdd<ArrayType, V>
         + crate::operations::constants::SupportsZero<ArrayType, V>
+        + SupportsAdd<ArrayType, V>
         + From<ConditionOperation<V, O, ArrayType>>,
 {
     fn transpose(

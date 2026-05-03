@@ -71,7 +71,10 @@ pub trait SupportsSub<T: Type, V: Traceable<T>> {
     fn sub_operation() -> Self;
 }
 
-impl<'engine, E: TracingEngine<OperationCarrier: SupportsSub<E::Type, E::Value>>> Sub for Tracer<'engine, E> {
+impl<'engine, E> Sub for Tracer<'engine, E>
+where
+    E: TracingEngine<OperationCarrier: SupportsSub<E::Type, E::Value>>,
+{
     type Output = Self;
 
     #[inline]

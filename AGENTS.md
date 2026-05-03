@@ -77,8 +77,14 @@ update this file so that they do not need to remind you again in the future.
 - When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
   parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical
   abstraction and keep one source of truth.
-- Prefer putting type bounds directly in the generic type declarations over using `where` bounds later on in the same
-  signature.
+- Prefer putting short and simple type bounds directly in generic type declarations typically including the primary
+  identifying bound for each parameter (e.g., `T: Type`, `V: Value<T>`, `O: Operation<T>`, etc.). Move long or
+  structurally complex bounds, especially associated type constraints and bounds that wrap poorly under `rustfmt`,
+  into `where` clauses.
+- Order type bounds preferably as follows: `Clone`, `Debug`, `Display`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`,
+  `Type`, `Value`, `Typed`, `Traceable`, `Parameter`, `Operation`, `LinearOperation`, `DifferentiableOperation`,
+  `SupportsZero`, `SupportsOne`, `SupportsZeroLike`, `SupportsOneLike`, `SupportsNeg`, `SupportsAdd`, `SupportsSub`,
+  `SupportsMul`, `SupportsDiv`, etc.
 - When a helper semantically belongs to an existing core type such as `Program`, prefer an associated function in the
   relevant `impl` block over a free function unless there is a clear reuse reason that truly spans multiple owners.
 - When a generic API is centered on a parameterized input or output family, prefer using that family's canonical
