@@ -2,14 +2,14 @@ use crate::{
     DetachedOp, DialectHandle, Location, Operation, OperationBuilder, Type, TypeRef, Value, ValueRef, mlir_op,
 };
 
-/// Canonical MLIR operation name for [`VpashrOperation`].
-pub const VPASHR_OPERATION_NAME: &str = "llvm.intr.vp.ashr";
+/// Canonical MLIR operation name for [`VpAshrOperation`].
+pub const VP_ASHR_OPERATION_NAME: &str = "llvm.intr.vp.ashr";
 
 /// Operation trait for `llvm.intr.vp.ashr`.
-pub trait VpashrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpAshrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPASHR_OPERATION_NAME
+        VP_ASHR_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -38,7 +38,7 @@ pub trait VpashrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpashr);
+mlir_op!(VpAshr);
 
 /// Constructs a new detached `llvm.intr.vp.ashr` operation.
 pub fn intr_vp_ashr<
@@ -58,10 +58,10 @@ pub fn intr_vp_ashr<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpashrOperation<'c, 't> {
+) -> DetachedVpAshrOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPASHR_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_ASHR_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -73,14 +73,14 @@ pub fn intr_vp_ashr<
         .expect("invalid arguments to `llvm::intr_vp_ashr`")
 }
 
-/// Canonical MLIR operation name for [`VpaddOperation`].
-pub const VPADD_OPERATION_NAME: &str = "llvm.intr.vp.add";
+/// Canonical MLIR operation name for [`VpAddOperation`].
+pub const VP_ADD_OPERATION_NAME: &str = "llvm.intr.vp.add";
 
 /// Operation trait for `llvm.intr.vp.add`.
-pub trait VpaddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpAddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPADD_OPERATION_NAME
+        VP_ADD_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -109,7 +109,7 @@ pub trait VpaddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpadd);
+mlir_op!(VpAdd);
 
 /// Constructs a new detached `llvm.intr.vp.add` operation.
 pub fn intr_vp_add<
@@ -129,10 +129,10 @@ pub fn intr_vp_add<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpaddOperation<'c, 't> {
+) -> DetachedVpAddOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPADD_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_ADD_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -144,14 +144,14 @@ pub fn intr_vp_add<
         .expect("invalid arguments to `llvm::intr_vp_add`")
 }
 
-/// Canonical MLIR operation name for [`VpandOperation`].
-pub const VPAND_OPERATION_NAME: &str = "llvm.intr.vp.and";
+/// Canonical MLIR operation name for [`VpAndOperation`].
+pub const VP_AND_OPERATION_NAME: &str = "llvm.intr.vp.and";
 
 /// Operation trait for `llvm.intr.vp.and`.
-pub trait VpandOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpAndOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPAND_OPERATION_NAME
+        VP_AND_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -180,7 +180,7 @@ pub trait VpandOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpand);
+mlir_op!(VpAnd);
 
 /// Constructs a new detached `llvm.intr.vp.and` operation.
 pub fn intr_vp_and<
@@ -200,10 +200,10 @@ pub fn intr_vp_and<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpandOperation<'c, 't> {
+) -> DetachedVpAndOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPAND_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_AND_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -215,14 +215,14 @@ pub fn intr_vp_and<
         .expect("invalid arguments to `llvm::intr_vp_and`")
 }
 
-/// Canonical MLIR operation name for [`VpfaddOperation`].
-pub const VPFADD_OPERATION_NAME: &str = "llvm.intr.vp.fadd";
+/// Canonical MLIR operation name for [`VpFaddOperation`].
+pub const VP_FADD_OPERATION_NAME: &str = "llvm.intr.vp.fadd";
 
 /// Operation trait for `llvm.intr.vp.fadd`.
-pub trait VpfaddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFaddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFADD_OPERATION_NAME
+        VP_FADD_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -251,7 +251,7 @@ pub trait VpfaddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpfadd);
+mlir_op!(VpFadd);
 
 /// Constructs a new detached `llvm.intr.vp.fadd` operation.
 pub fn intr_vp_fadd<
@@ -271,10 +271,10 @@ pub fn intr_vp_fadd<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpfaddOperation<'c, 't> {
+) -> DetachedVpFaddOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFADD_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FADD_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -286,14 +286,14 @@ pub fn intr_vp_fadd<
         .expect("invalid arguments to `llvm::intr_vp_fadd`")
 }
 
-/// Canonical MLIR operation name for [`VpfdivOperation`].
-pub const VPFDIV_OPERATION_NAME: &str = "llvm.intr.vp.fdiv";
+/// Canonical MLIR operation name for [`VpFdivOperation`].
+pub const VP_FDIV_OPERATION_NAME: &str = "llvm.intr.vp.fdiv";
 
 /// Operation trait for `llvm.intr.vp.fdiv`.
-pub trait VpfdivOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFdivOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFDIV_OPERATION_NAME
+        VP_FDIV_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -322,7 +322,7 @@ pub trait VpfdivOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpfdiv);
+mlir_op!(VpFdiv);
 
 /// Constructs a new detached `llvm.intr.vp.fdiv` operation.
 pub fn intr_vp_fdiv<
@@ -342,10 +342,10 @@ pub fn intr_vp_fdiv<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpfdivOperation<'c, 't> {
+) -> DetachedVpFdivOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFDIV_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FDIV_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -357,14 +357,14 @@ pub fn intr_vp_fdiv<
         .expect("invalid arguments to `llvm::intr_vp_fdiv`")
 }
 
-/// Canonical MLIR operation name for [`VpfmulAddOperation`].
-pub const VPFMUL_ADD_OPERATION_NAME: &str = "llvm.intr.vp.fmuladd";
+/// Canonical MLIR operation name for [`VpFmulAddOperation`].
+pub const VP_FMUL_ADD_OPERATION_NAME: &str = "llvm.intr.vp.fmuladd";
 
 /// Operation trait for `llvm.intr.vp.fmuladd`.
-pub trait VpfmulAddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFmulAddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFMUL_ADD_OPERATION_NAME
+        VP_FMUL_ADD_OPERATION_NAME
     }
 
     /// Returns the `first` operand.
@@ -398,7 +398,7 @@ pub trait VpfmulAddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpfmulAdd);
+mlir_op!(VpFmulAdd);
 
 /// Constructs a new detached `llvm.intr.vp.fmuladd` operation.
 pub fn intr_vp_fmuladd<
@@ -420,10 +420,10 @@ pub fn intr_vp_fmuladd<
     explicit_vector_length: V4,
     result_type: T0,
     location: L,
-) -> DetachedVpfmulAddOperation<'c, 't> {
+) -> DetachedVpFmulAddOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFMUL_ADD_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FMUL_ADD_OPERATION_NAME, location);
     builder = builder.add_operand(first);
     builder = builder.add_operand(second);
     builder = builder.add_operand(third);
@@ -436,14 +436,14 @@ pub fn intr_vp_fmuladd<
         .expect("invalid arguments to `llvm::intr_vp_fmuladd`")
 }
 
-/// Canonical MLIR operation name for [`VpfmulOperation`].
-pub const VPFMUL_OPERATION_NAME: &str = "llvm.intr.vp.fmul";
+/// Canonical MLIR operation name for [`VpFmulOperation`].
+pub const VP_FMUL_OPERATION_NAME: &str = "llvm.intr.vp.fmul";
 
 /// Operation trait for `llvm.intr.vp.fmul`.
-pub trait VpfmulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFmulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFMUL_OPERATION_NAME
+        VP_FMUL_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -472,7 +472,7 @@ pub trait VpfmulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpfmul);
+mlir_op!(VpFmul);
 
 /// Constructs a new detached `llvm.intr.vp.fmul` operation.
 pub fn intr_vp_fmul<
@@ -492,10 +492,10 @@ pub fn intr_vp_fmul<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpfmulOperation<'c, 't> {
+) -> DetachedVpFmulOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFMUL_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FMUL_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -507,14 +507,14 @@ pub fn intr_vp_fmul<
         .expect("invalid arguments to `llvm::intr_vp_fmul`")
 }
 
-/// Canonical MLIR operation name for [`VpfnegOperation`].
-pub const VPFNEG_OPERATION_NAME: &str = "llvm.intr.vp.fneg";
+/// Canonical MLIR operation name for [`VpFnegOperation`].
+pub const VP_FNEG_OPERATION_NAME: &str = "llvm.intr.vp.fneg";
 
 /// Operation trait for `llvm.intr.vp.fneg`.
-pub trait VpfnegOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFnegOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFNEG_OPERATION_NAME
+        VP_FNEG_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -538,7 +538,7 @@ pub trait VpfnegOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpfneg);
+mlir_op!(VpFneg);
 
 /// Constructs a new detached `llvm.intr.vp.fneg` operation.
 pub fn intr_vp_fneg<
@@ -556,10 +556,10 @@ pub fn intr_vp_fneg<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVpfnegOperation<'c, 't> {
+) -> DetachedVpFnegOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFNEG_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FNEG_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -570,14 +570,14 @@ pub fn intr_vp_fneg<
         .expect("invalid arguments to `llvm::intr_vp_fneg`")
 }
 
-/// Canonical MLIR operation name for [`VpfpextOperation`].
-pub const VPFPEXT_OPERATION_NAME: &str = "llvm.intr.vp.fpext";
+/// Canonical MLIR operation name for [`VpFpextOperation`].
+pub const VP_FPEXT_OPERATION_NAME: &str = "llvm.intr.vp.fpext";
 
 /// Operation trait for `llvm.intr.vp.fpext`.
-pub trait VpfpextOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFpextOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFPEXT_OPERATION_NAME
+        VP_FPEXT_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -601,7 +601,7 @@ pub trait VpfpextOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpfpext);
+mlir_op!(VpFpext);
 
 /// Constructs a new detached `llvm.intr.vp.fpext` operation.
 pub fn intr_vp_fpext<
@@ -619,10 +619,10 @@ pub fn intr_vp_fpext<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVpfpextOperation<'c, 't> {
+) -> DetachedVpFpextOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFPEXT_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FPEXT_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -633,14 +633,14 @@ pub fn intr_vp_fpext<
         .expect("invalid arguments to `llvm::intr_vp_fpext`")
 }
 
-/// Canonical MLIR operation name for [`VpfptoSiOperation`].
-pub const VPFPTO_SI_OPERATION_NAME: &str = "llvm.intr.vp.fptosi";
+/// Canonical MLIR operation name for [`VpFptoSiOperation`].
+pub const VP_FPTO_SI_OPERATION_NAME: &str = "llvm.intr.vp.fptosi";
 
 /// Operation trait for `llvm.intr.vp.fptosi`.
-pub trait VpfptoSiOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFptoSiOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFPTO_SI_OPERATION_NAME
+        VP_FPTO_SI_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -664,7 +664,7 @@ pub trait VpfptoSiOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpfptoSi);
+mlir_op!(VpFptoSi);
 
 /// Constructs a new detached `llvm.intr.vp.fptosi` operation.
 pub fn intr_vp_fptosi<
@@ -682,10 +682,10 @@ pub fn intr_vp_fptosi<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVpfptoSiOperation<'c, 't> {
+) -> DetachedVpFptoSiOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFPTO_SI_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FPTO_SI_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -696,14 +696,14 @@ pub fn intr_vp_fptosi<
         .expect("invalid arguments to `llvm::intr_vp_fptosi`")
 }
 
-/// Canonical MLIR operation name for [`VpfptoUiOperation`].
-pub const VPFPTO_UI_OPERATION_NAME: &str = "llvm.intr.vp.fptoui";
+/// Canonical MLIR operation name for [`VpFptoUiOperation`].
+pub const VP_FPTO_UI_OPERATION_NAME: &str = "llvm.intr.vp.fptoui";
 
 /// Operation trait for `llvm.intr.vp.fptoui`.
-pub trait VpfptoUiOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFptoUiOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFPTO_UI_OPERATION_NAME
+        VP_FPTO_UI_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -727,7 +727,7 @@ pub trait VpfptoUiOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpfptoUi);
+mlir_op!(VpFptoUi);
 
 /// Constructs a new detached `llvm.intr.vp.fptoui` operation.
 pub fn intr_vp_fptoui<
@@ -745,10 +745,10 @@ pub fn intr_vp_fptoui<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVpfptoUiOperation<'c, 't> {
+) -> DetachedVpFptoUiOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFPTO_UI_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FPTO_UI_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -759,14 +759,14 @@ pub fn intr_vp_fptoui<
         .expect("invalid arguments to `llvm::intr_vp_fptoui`")
 }
 
-/// Canonical MLIR operation name for [`VpfptruncOperation`].
-pub const VPFPTRUNC_OPERATION_NAME: &str = "llvm.intr.vp.fptrunc";
+/// Canonical MLIR operation name for [`VpFptruncOperation`].
+pub const VP_FPTRUNC_OPERATION_NAME: &str = "llvm.intr.vp.fptrunc";
 
 /// Operation trait for `llvm.intr.vp.fptrunc`.
-pub trait VpfptruncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFptruncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFPTRUNC_OPERATION_NAME
+        VP_FPTRUNC_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -790,7 +790,7 @@ pub trait VpfptruncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpfptrunc);
+mlir_op!(VpFptrunc);
 
 /// Constructs a new detached `llvm.intr.vp.fptrunc` operation.
 pub fn intr_vp_fptrunc<
@@ -808,10 +808,10 @@ pub fn intr_vp_fptrunc<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVpfptruncOperation<'c, 't> {
+) -> DetachedVpFptruncOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFPTRUNC_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FPTRUNC_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -822,14 +822,14 @@ pub fn intr_vp_fptrunc<
         .expect("invalid arguments to `llvm::intr_vp_fptrunc`")
 }
 
-/// Canonical MLIR operation name for [`VpfremOperation`].
-pub const VPFREM_OPERATION_NAME: &str = "llvm.intr.vp.frem";
+/// Canonical MLIR operation name for [`VpFremOperation`].
+pub const VP_FREM_OPERATION_NAME: &str = "llvm.intr.vp.frem";
 
 /// Operation trait for `llvm.intr.vp.frem`.
-pub trait VpfremOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFremOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFREM_OPERATION_NAME
+        VP_FREM_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -858,7 +858,7 @@ pub trait VpfremOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpfrem);
+mlir_op!(VpFrem);
 
 /// Constructs a new detached `llvm.intr.vp.frem` operation.
 pub fn intr_vp_frem<
@@ -878,10 +878,10 @@ pub fn intr_vp_frem<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpfremOperation<'c, 't> {
+) -> DetachedVpFremOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFREM_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FREM_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -893,14 +893,14 @@ pub fn intr_vp_frem<
         .expect("invalid arguments to `llvm::intr_vp_frem`")
 }
 
-/// Canonical MLIR operation name for [`VpfsubOperation`].
-pub const VPFSUB_OPERATION_NAME: &str = "llvm.intr.vp.fsub";
+/// Canonical MLIR operation name for [`VpFsubOperation`].
+pub const VP_FSUB_OPERATION_NAME: &str = "llvm.intr.vp.fsub";
 
 /// Operation trait for `llvm.intr.vp.fsub`.
-pub trait VpfsubOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFsubOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFSUB_OPERATION_NAME
+        VP_FSUB_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -929,7 +929,7 @@ pub trait VpfsubOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpfsub);
+mlir_op!(VpFsub);
 
 /// Constructs a new detached `llvm.intr.vp.fsub` operation.
 pub fn intr_vp_fsub<
@@ -949,10 +949,10 @@ pub fn intr_vp_fsub<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpfsubOperation<'c, 't> {
+) -> DetachedVpFsubOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFSUB_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FSUB_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -964,14 +964,14 @@ pub fn intr_vp_fsub<
         .expect("invalid arguments to `llvm::intr_vp_fsub`")
 }
 
-/// Canonical MLIR operation name for [`VpfmaOperation`].
-pub const VPFMA_OPERATION_NAME: &str = "llvm.intr.vp.fma";
+/// Canonical MLIR operation name for [`VpFmaOperation`].
+pub const VP_FMA_OPERATION_NAME: &str = "llvm.intr.vp.fma";
 
 /// Operation trait for `llvm.intr.vp.fma`.
-pub trait VpfmaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpFmaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPFMA_OPERATION_NAME
+        VP_FMA_OPERATION_NAME
     }
 
     /// Returns the `first` operand.
@@ -1005,7 +1005,7 @@ pub trait VpfmaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpfma);
+mlir_op!(VpFma);
 
 /// Constructs a new detached `llvm.intr.vp.fma` operation.
 pub fn intr_vp_fma<
@@ -1027,10 +1027,10 @@ pub fn intr_vp_fma<
     explicit_vector_length: V4,
     result_type: T0,
     location: L,
-) -> DetachedVpfmaOperation<'c, 't> {
+) -> DetachedVpFmaOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPFMA_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_FMA_OPERATION_NAME, location);
     builder = builder.add_operand(first);
     builder = builder.add_operand(second);
     builder = builder.add_operand(third);
@@ -1043,14 +1043,14 @@ pub fn intr_vp_fma<
         .expect("invalid arguments to `llvm::intr_vp_fma`")
 }
 
-/// Canonical MLIR operation name for [`VpintToPtrOperation`].
-pub const VPINT_TO_PTR_OPERATION_NAME: &str = "llvm.intr.vp.inttoptr";
+/// Canonical MLIR operation name for [`VpIntToPtrOperation`].
+pub const VP_INT_TO_PTR_OPERATION_NAME: &str = "llvm.intr.vp.inttoptr";
 
 /// Operation trait for `llvm.intr.vp.inttoptr`.
-pub trait VpintToPtrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpIntToPtrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPINT_TO_PTR_OPERATION_NAME
+        VP_INT_TO_PTR_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -1074,7 +1074,7 @@ pub trait VpintToPtrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpintToPtr);
+mlir_op!(VpIntToPtr);
 
 /// Constructs a new detached `llvm.intr.vp.inttoptr` operation.
 pub fn intr_vp_inttoptr<
@@ -1092,10 +1092,10 @@ pub fn intr_vp_inttoptr<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVpintToPtrOperation<'c, 't> {
+) -> DetachedVpIntToPtrOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPINT_TO_PTR_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_INT_TO_PTR_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -1106,14 +1106,14 @@ pub fn intr_vp_inttoptr<
         .expect("invalid arguments to `llvm::intr_vp_inttoptr`")
 }
 
-/// Canonical MLIR operation name for [`VplshrOperation`].
-pub const VPLSHR_OPERATION_NAME: &str = "llvm.intr.vp.lshr";
+/// Canonical MLIR operation name for [`VpLshrOperation`].
+pub const VP_LSHR_OPERATION_NAME: &str = "llvm.intr.vp.lshr";
 
 /// Operation trait for `llvm.intr.vp.lshr`.
-pub trait VplshrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpLshrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPLSHR_OPERATION_NAME
+        VP_LSHR_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -1142,7 +1142,7 @@ pub trait VplshrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vplshr);
+mlir_op!(VpLshr);
 
 /// Constructs a new detached `llvm.intr.vp.lshr` operation.
 pub fn intr_vp_lshr<
@@ -1162,10 +1162,10 @@ pub fn intr_vp_lshr<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVplshrOperation<'c, 't> {
+) -> DetachedVpLshrOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPLSHR_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_LSHR_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -1177,14 +1177,14 @@ pub fn intr_vp_lshr<
         .expect("invalid arguments to `llvm::intr_vp_lshr`")
 }
 
-/// Canonical MLIR operation name for [`VploadOperation`].
-pub const VPLOAD_OPERATION_NAME: &str = "llvm.intr.vp.load";
+/// Canonical MLIR operation name for [`VpLoadOperation`].
+pub const VP_LOAD_OPERATION_NAME: &str = "llvm.intr.vp.load";
 
 /// Operation trait for `llvm.intr.vp.load`.
-pub trait VploadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPLOAD_OPERATION_NAME
+        VP_LOAD_OPERATION_NAME
     }
 
     /// Returns the `pointer` operand.
@@ -1208,7 +1208,7 @@ pub trait VploadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpload);
+mlir_op!(VpLoad);
 
 /// Constructs a new detached `llvm.intr.vp.load` operation.
 pub fn intr_vp_load<
@@ -1226,10 +1226,10 @@ pub fn intr_vp_load<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVploadOperation<'c, 't> {
+) -> DetachedVpLoadOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPLOAD_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_LOAD_OPERATION_NAME, location);
     builder = builder.add_operand(pointer);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -1240,14 +1240,14 @@ pub fn intr_vp_load<
         .expect("invalid arguments to `llvm::intr_vp_load`")
 }
 
-/// Canonical MLIR operation name for [`VpmergeMinOperation`].
-pub const VPMERGE_MIN_OPERATION_NAME: &str = "llvm.intr.vp.merge";
+/// Canonical MLIR operation name for [`VpMergeMinOperation`].
+pub const VP_MERGE_MIN_OPERATION_NAME: &str = "llvm.intr.vp.merge";
 
 /// Operation trait for `llvm.intr.vp.merge`.
-pub trait VpmergeMinOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpMergeMinOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPMERGE_MIN_OPERATION_NAME
+        VP_MERGE_MIN_OPERATION_NAME
     }
 
     /// Returns the `condition` operand.
@@ -1276,7 +1276,7 @@ pub trait VpmergeMinOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpmergeMin);
+mlir_op!(VpMergeMin);
 
 /// Constructs a new detached `llvm.intr.vp.merge` operation.
 pub fn intr_vp_merge<
@@ -1296,10 +1296,10 @@ pub fn intr_vp_merge<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpmergeMinOperation<'c, 't> {
+) -> DetachedVpMergeMinOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPMERGE_MIN_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_MERGE_MIN_OPERATION_NAME, location);
     builder = builder.add_operand(condition);
     builder = builder.add_operand(true_value);
     builder = builder.add_operand(false_value);
@@ -1311,14 +1311,14 @@ pub fn intr_vp_merge<
         .expect("invalid arguments to `llvm::intr_vp_merge`")
 }
 
-/// Canonical MLIR operation name for [`VpmulOperation`].
-pub const VPMUL_OPERATION_NAME: &str = "llvm.intr.vp.mul";
+/// Canonical MLIR operation name for [`VpMulOperation`].
+pub const VP_MUL_OPERATION_NAME: &str = "llvm.intr.vp.mul";
 
 /// Operation trait for `llvm.intr.vp.mul`.
-pub trait VpmulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpMulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPMUL_OPERATION_NAME
+        VP_MUL_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -1347,7 +1347,7 @@ pub trait VpmulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpmul);
+mlir_op!(VpMul);
 
 /// Constructs a new detached `llvm.intr.vp.mul` operation.
 pub fn intr_vp_mul<
@@ -1367,10 +1367,10 @@ pub fn intr_vp_mul<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpmulOperation<'c, 't> {
+) -> DetachedVpMulOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPMUL_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_MUL_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -1382,14 +1382,14 @@ pub fn intr_vp_mul<
         .expect("invalid arguments to `llvm::intr_vp_mul`")
 }
 
-/// Canonical MLIR operation name for [`VporOperation`].
-pub const VPOR_OPERATION_NAME: &str = "llvm.intr.vp.or";
+/// Canonical MLIR operation name for [`VpOrOperation`].
+pub const VP_OR_OPERATION_NAME: &str = "llvm.intr.vp.or";
 
 /// Operation trait for `llvm.intr.vp.or`.
-pub trait VporOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpOrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPOR_OPERATION_NAME
+        VP_OR_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -1418,7 +1418,7 @@ pub trait VporOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpor);
+mlir_op!(VpOr);
 
 /// Constructs a new detached `llvm.intr.vp.or` operation.
 pub fn intr_vp_or<
@@ -1438,10 +1438,10 @@ pub fn intr_vp_or<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVporOperation<'c, 't> {
+) -> DetachedVpOrOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPOR_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_OR_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -1453,14 +1453,14 @@ pub fn intr_vp_or<
         .expect("invalid arguments to `llvm::intr_vp_or`")
 }
 
-/// Canonical MLIR operation name for [`VpptrToIntOperation`].
-pub const VPPTR_TO_INT_OPERATION_NAME: &str = "llvm.intr.vp.ptrtoint";
+/// Canonical MLIR operation name for [`VpPtrToIntOperation`].
+pub const VP_PTR_TO_INT_OPERATION_NAME: &str = "llvm.intr.vp.ptrtoint";
 
 /// Operation trait for `llvm.intr.vp.ptrtoint`.
-pub trait VpptrToIntOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpPtrToIntOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPPTR_TO_INT_OPERATION_NAME
+        VP_PTR_TO_INT_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -1484,7 +1484,7 @@ pub trait VpptrToIntOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpptrToInt);
+mlir_op!(VpPtrToInt);
 
 /// Constructs a new detached `llvm.intr.vp.ptrtoint` operation.
 pub fn intr_vp_ptrtoint<
@@ -1502,10 +1502,10 @@ pub fn intr_vp_ptrtoint<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVpptrToIntOperation<'c, 't> {
+) -> DetachedVpPtrToIntOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPPTR_TO_INT_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_PTR_TO_INT_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -1516,14 +1516,14 @@ pub fn intr_vp_ptrtoint<
         .expect("invalid arguments to `llvm::intr_vp_ptrtoint`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceAddOperation`].
-pub const VPREDUCE_ADD_OPERATION_NAME: &str = "llvm.intr.vp.reduce.add";
+/// Canonical MLIR operation name for [`VpReduceAddOperation`].
+pub const VP_REDUCE_ADD_OPERATION_NAME: &str = "llvm.intr.vp.reduce.add";
 
 /// Operation trait for `llvm.intr.vp.reduce.add`.
-pub trait VpreduceAddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceAddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_ADD_OPERATION_NAME
+        VP_REDUCE_ADD_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -1552,7 +1552,7 @@ pub trait VpreduceAddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceAdd);
+mlir_op!(VpReduceAdd);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.add` operation.
 pub fn intr_vp_reduce_add<
@@ -1572,10 +1572,10 @@ pub fn intr_vp_reduce_add<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceAddOperation<'c, 't> {
+) -> DetachedVpReduceAddOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_ADD_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_ADD_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -1587,14 +1587,14 @@ pub fn intr_vp_reduce_add<
         .expect("invalid arguments to `llvm::intr_vp_reduce_add`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceAndOperation`].
-pub const VPREDUCE_AND_OPERATION_NAME: &str = "llvm.intr.vp.reduce.and";
+/// Canonical MLIR operation name for [`VpReduceAndOperation`].
+pub const VP_REDUCE_AND_OPERATION_NAME: &str = "llvm.intr.vp.reduce.and";
 
 /// Operation trait for `llvm.intr.vp.reduce.and`.
-pub trait VpreduceAndOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceAndOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_AND_OPERATION_NAME
+        VP_REDUCE_AND_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -1623,7 +1623,7 @@ pub trait VpreduceAndOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceAnd);
+mlir_op!(VpReduceAnd);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.and` operation.
 pub fn intr_vp_reduce_and<
@@ -1643,10 +1643,10 @@ pub fn intr_vp_reduce_and<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceAndOperation<'c, 't> {
+) -> DetachedVpReduceAndOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_AND_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_AND_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -1658,14 +1658,14 @@ pub fn intr_vp_reduce_and<
         .expect("invalid arguments to `llvm::intr_vp_reduce_and`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceFaddOperation`].
-pub const VPREDUCE_FADD_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fadd";
+/// Canonical MLIR operation name for [`VpReduceFaddOperation`].
+pub const VP_REDUCE_FADD_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fadd";
 
 /// Operation trait for `llvm.intr.vp.reduce.fadd`.
-pub trait VpreduceFaddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceFaddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_FADD_OPERATION_NAME
+        VP_REDUCE_FADD_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -1694,7 +1694,7 @@ pub trait VpreduceFaddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceFadd);
+mlir_op!(VpReduceFadd);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.fadd` operation.
 pub fn intr_vp_reduce_fadd<
@@ -1714,10 +1714,10 @@ pub fn intr_vp_reduce_fadd<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceFaddOperation<'c, 't> {
+) -> DetachedVpReduceFaddOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_FADD_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_FADD_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -1729,14 +1729,14 @@ pub fn intr_vp_reduce_fadd<
         .expect("invalid arguments to `llvm::intr_vp_reduce_fadd`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceFmaxOperation`].
-pub const VPREDUCE_FMAX_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fmax";
+/// Canonical MLIR operation name for [`VpReduceFmaxOperation`].
+pub const VP_REDUCE_FMAX_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fmax";
 
 /// Operation trait for `llvm.intr.vp.reduce.fmax`.
-pub trait VpreduceFmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceFmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_FMAX_OPERATION_NAME
+        VP_REDUCE_FMAX_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -1765,7 +1765,7 @@ pub trait VpreduceFmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceFmax);
+mlir_op!(VpReduceFmax);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.fmax` operation.
 pub fn intr_vp_reduce_fmax<
@@ -1785,10 +1785,10 @@ pub fn intr_vp_reduce_fmax<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceFmaxOperation<'c, 't> {
+) -> DetachedVpReduceFmaxOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_FMAX_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_FMAX_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -1800,14 +1800,14 @@ pub fn intr_vp_reduce_fmax<
         .expect("invalid arguments to `llvm::intr_vp_reduce_fmax`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceFminOperation`].
-pub const VPREDUCE_FMIN_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fmin";
+/// Canonical MLIR operation name for [`VpReduceFminOperation`].
+pub const VP_REDUCE_FMIN_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fmin";
 
 /// Operation trait for `llvm.intr.vp.reduce.fmin`.
-pub trait VpreduceFminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceFminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_FMIN_OPERATION_NAME
+        VP_REDUCE_FMIN_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -1836,7 +1836,7 @@ pub trait VpreduceFminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceFmin);
+mlir_op!(VpReduceFmin);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.fmin` operation.
 pub fn intr_vp_reduce_fmin<
@@ -1856,10 +1856,10 @@ pub fn intr_vp_reduce_fmin<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceFminOperation<'c, 't> {
+) -> DetachedVpReduceFminOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_FMIN_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_FMIN_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -1871,14 +1871,14 @@ pub fn intr_vp_reduce_fmin<
         .expect("invalid arguments to `llvm::intr_vp_reduce_fmin`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceFmulOperation`].
-pub const VPREDUCE_FMUL_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fmul";
+/// Canonical MLIR operation name for [`VpReduceFmulOperation`].
+pub const VP_REDUCE_FMUL_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fmul";
 
 /// Operation trait for `llvm.intr.vp.reduce.fmul`.
-pub trait VpreduceFmulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceFmulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_FMUL_OPERATION_NAME
+        VP_REDUCE_FMUL_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -1907,7 +1907,7 @@ pub trait VpreduceFmulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceFmul);
+mlir_op!(VpReduceFmul);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.fmul` operation.
 pub fn intr_vp_reduce_fmul<
@@ -1927,10 +1927,10 @@ pub fn intr_vp_reduce_fmul<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceFmulOperation<'c, 't> {
+) -> DetachedVpReduceFmulOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_FMUL_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_FMUL_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -1942,14 +1942,14 @@ pub fn intr_vp_reduce_fmul<
         .expect("invalid arguments to `llvm::intr_vp_reduce_fmul`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceMulOperation`].
-pub const VPREDUCE_MUL_OPERATION_NAME: &str = "llvm.intr.vp.reduce.mul";
+/// Canonical MLIR operation name for [`VpReduceMulOperation`].
+pub const VP_REDUCE_MUL_OPERATION_NAME: &str = "llvm.intr.vp.reduce.mul";
 
 /// Operation trait for `llvm.intr.vp.reduce.mul`.
-pub trait VpreduceMulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceMulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_MUL_OPERATION_NAME
+        VP_REDUCE_MUL_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -1978,7 +1978,7 @@ pub trait VpreduceMulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceMul);
+mlir_op!(VpReduceMul);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.mul` operation.
 pub fn intr_vp_reduce_mul<
@@ -1998,10 +1998,10 @@ pub fn intr_vp_reduce_mul<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceMulOperation<'c, 't> {
+) -> DetachedVpReduceMulOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_MUL_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_MUL_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -2013,14 +2013,14 @@ pub fn intr_vp_reduce_mul<
         .expect("invalid arguments to `llvm::intr_vp_reduce_mul`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceOrOperation`].
-pub const VPREDUCE_OR_OPERATION_NAME: &str = "llvm.intr.vp.reduce.or";
+/// Canonical MLIR operation name for [`VpReduceOrOperation`].
+pub const VP_REDUCE_OR_OPERATION_NAME: &str = "llvm.intr.vp.reduce.or";
 
 /// Operation trait for `llvm.intr.vp.reduce.or`.
-pub trait VpreduceOrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceOrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_OR_OPERATION_NAME
+        VP_REDUCE_OR_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -2049,7 +2049,7 @@ pub trait VpreduceOrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceOr);
+mlir_op!(VpReduceOr);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.or` operation.
 pub fn intr_vp_reduce_or<
@@ -2069,10 +2069,10 @@ pub fn intr_vp_reduce_or<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceOrOperation<'c, 't> {
+) -> DetachedVpReduceOrOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_OR_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_OR_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -2084,14 +2084,14 @@ pub fn intr_vp_reduce_or<
         .expect("invalid arguments to `llvm::intr_vp_reduce_or`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceSmaxOperation`].
-pub const VPREDUCE_SMAX_OPERATION_NAME: &str = "llvm.intr.vp.reduce.smax";
+/// Canonical MLIR operation name for [`VpReduceSmaxOperation`].
+pub const VP_REDUCE_SMAX_OPERATION_NAME: &str = "llvm.intr.vp.reduce.smax";
 
 /// Operation trait for `llvm.intr.vp.reduce.smax`.
-pub trait VpreduceSmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceSmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_SMAX_OPERATION_NAME
+        VP_REDUCE_SMAX_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -2120,7 +2120,7 @@ pub trait VpreduceSmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceSmax);
+mlir_op!(VpReduceSmax);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.smax` operation.
 pub fn intr_vp_reduce_smax<
@@ -2140,10 +2140,10 @@ pub fn intr_vp_reduce_smax<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceSmaxOperation<'c, 't> {
+) -> DetachedVpReduceSmaxOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_SMAX_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_SMAX_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -2155,14 +2155,14 @@ pub fn intr_vp_reduce_smax<
         .expect("invalid arguments to `llvm::intr_vp_reduce_smax`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceSminOperation`].
-pub const VPREDUCE_SMIN_OPERATION_NAME: &str = "llvm.intr.vp.reduce.smin";
+/// Canonical MLIR operation name for [`VpReduceSminOperation`].
+pub const VP_REDUCE_SMIN_OPERATION_NAME: &str = "llvm.intr.vp.reduce.smin";
 
 /// Operation trait for `llvm.intr.vp.reduce.smin`.
-pub trait VpreduceSminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceSminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_SMIN_OPERATION_NAME
+        VP_REDUCE_SMIN_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -2191,7 +2191,7 @@ pub trait VpreduceSminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceSmin);
+mlir_op!(VpReduceSmin);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.smin` operation.
 pub fn intr_vp_reduce_smin<
@@ -2211,10 +2211,10 @@ pub fn intr_vp_reduce_smin<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceSminOperation<'c, 't> {
+) -> DetachedVpReduceSminOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_SMIN_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_SMIN_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -2226,14 +2226,14 @@ pub fn intr_vp_reduce_smin<
         .expect("invalid arguments to `llvm::intr_vp_reduce_smin`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceUmaxOperation`].
-pub const VPREDUCE_UMAX_OPERATION_NAME: &str = "llvm.intr.vp.reduce.umax";
+/// Canonical MLIR operation name for [`VpReduceUmaxOperation`].
+pub const VP_REDUCE_UMAX_OPERATION_NAME: &str = "llvm.intr.vp.reduce.umax";
 
 /// Operation trait for `llvm.intr.vp.reduce.umax`.
-pub trait VpreduceUmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceUmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_UMAX_OPERATION_NAME
+        VP_REDUCE_UMAX_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -2262,7 +2262,7 @@ pub trait VpreduceUmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceUmax);
+mlir_op!(VpReduceUmax);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.umax` operation.
 pub fn intr_vp_reduce_umax<
@@ -2282,10 +2282,10 @@ pub fn intr_vp_reduce_umax<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceUmaxOperation<'c, 't> {
+) -> DetachedVpReduceUmaxOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_UMAX_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_UMAX_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -2297,14 +2297,14 @@ pub fn intr_vp_reduce_umax<
         .expect("invalid arguments to `llvm::intr_vp_reduce_umax`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceUminOperation`].
-pub const VPREDUCE_UMIN_OPERATION_NAME: &str = "llvm.intr.vp.reduce.umin";
+/// Canonical MLIR operation name for [`VpReduceUminOperation`].
+pub const VP_REDUCE_UMIN_OPERATION_NAME: &str = "llvm.intr.vp.reduce.umin";
 
 /// Operation trait for `llvm.intr.vp.reduce.umin`.
-pub trait VpreduceUminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceUminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_UMIN_OPERATION_NAME
+        VP_REDUCE_UMIN_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -2333,7 +2333,7 @@ pub trait VpreduceUminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceUmin);
+mlir_op!(VpReduceUmin);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.umin` operation.
 pub fn intr_vp_reduce_umin<
@@ -2353,10 +2353,10 @@ pub fn intr_vp_reduce_umin<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceUminOperation<'c, 't> {
+) -> DetachedVpReduceUminOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_UMIN_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_UMIN_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -2368,14 +2368,14 @@ pub fn intr_vp_reduce_umin<
         .expect("invalid arguments to `llvm::intr_vp_reduce_umin`")
 }
 
-/// Canonical MLIR operation name for [`VpreduceXorOperation`].
-pub const VPREDUCE_XOR_OPERATION_NAME: &str = "llvm.intr.vp.reduce.xor";
+/// Canonical MLIR operation name for [`VpReduceXorOperation`].
+pub const VP_REDUCE_XOR_OPERATION_NAME: &str = "llvm.intr.vp.reduce.xor";
 
 /// Operation trait for `llvm.intr.vp.reduce.xor`.
-pub trait VpreduceXorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpReduceXorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPREDUCE_XOR_OPERATION_NAME
+        VP_REDUCE_XOR_OPERATION_NAME
     }
 
     /// Returns the `start_value` operand.
@@ -2404,7 +2404,7 @@ pub trait VpreduceXorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpreduceXor);
+mlir_op!(VpReduceXor);
 
 /// Constructs a new detached `llvm.intr.vp.reduce.xor` operation.
 pub fn intr_vp_reduce_xor<
@@ -2424,10 +2424,10 @@ pub fn intr_vp_reduce_xor<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpreduceXorOperation<'c, 't> {
+) -> DetachedVpReduceXorOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPREDUCE_XOR_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_REDUCE_XOR_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(value);
     builder = builder.add_operand(mask);
@@ -2439,14 +2439,14 @@ pub fn intr_vp_reduce_xor<
         .expect("invalid arguments to `llvm::intr_vp_reduce_xor`")
 }
 
-/// Canonical MLIR operation name for [`VpsdivOperation`].
-pub const VPSDIV_OPERATION_NAME: &str = "llvm.intr.vp.sdiv";
+/// Canonical MLIR operation name for [`VpSdivOperation`].
+pub const VP_SDIV_OPERATION_NAME: &str = "llvm.intr.vp.sdiv";
 
 /// Operation trait for `llvm.intr.vp.sdiv`.
-pub trait VpsdivOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpSdivOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSDIV_OPERATION_NAME
+        VP_SDIV_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -2475,7 +2475,7 @@ pub trait VpsdivOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpsdiv);
+mlir_op!(VpSdiv);
 
 /// Constructs a new detached `llvm.intr.vp.sdiv` operation.
 pub fn intr_vp_sdiv<
@@ -2495,10 +2495,10 @@ pub fn intr_vp_sdiv<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpsdivOperation<'c, 't> {
+) -> DetachedVpSdivOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSDIV_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_SDIV_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -2510,14 +2510,14 @@ pub fn intr_vp_sdiv<
         .expect("invalid arguments to `llvm::intr_vp_sdiv`")
 }
 
-/// Canonical MLIR operation name for [`VpsextOperation`].
-pub const VPSEXT_OPERATION_NAME: &str = "llvm.intr.vp.sext";
+/// Canonical MLIR operation name for [`VpSextOperation`].
+pub const VP_SEXT_OPERATION_NAME: &str = "llvm.intr.vp.sext";
 
 /// Operation trait for `llvm.intr.vp.sext`.
-pub trait VpsextOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpSextOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSEXT_OPERATION_NAME
+        VP_SEXT_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -2541,7 +2541,7 @@ pub trait VpsextOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpsext);
+mlir_op!(VpSext);
 
 /// Constructs a new detached `llvm.intr.vp.sext` operation.
 pub fn intr_vp_sext<
@@ -2559,10 +2559,10 @@ pub fn intr_vp_sext<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVpsextOperation<'c, 't> {
+) -> DetachedVpSextOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSEXT_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_SEXT_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -2573,14 +2573,14 @@ pub fn intr_vp_sext<
         .expect("invalid arguments to `llvm::intr_vp_sext`")
 }
 
-/// Canonical MLIR operation name for [`VpsitoFpOperation`].
-pub const VPSITO_FP_OPERATION_NAME: &str = "llvm.intr.vp.sitofp";
+/// Canonical MLIR operation name for [`VpSitoFpOperation`].
+pub const VP_SITO_FP_OPERATION_NAME: &str = "llvm.intr.vp.sitofp";
 
 /// Operation trait for `llvm.intr.vp.sitofp`.
-pub trait VpsitoFpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpSitoFpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSITO_FP_OPERATION_NAME
+        VP_SITO_FP_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -2604,7 +2604,7 @@ pub trait VpsitoFpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpsitoFp);
+mlir_op!(VpSitoFp);
 
 /// Constructs a new detached `llvm.intr.vp.sitofp` operation.
 pub fn intr_vp_sitofp<
@@ -2622,10 +2622,10 @@ pub fn intr_vp_sitofp<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVpsitoFpOperation<'c, 't> {
+) -> DetachedVpSitoFpOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSITO_FP_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_SITO_FP_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -2636,14 +2636,14 @@ pub fn intr_vp_sitofp<
         .expect("invalid arguments to `llvm::intr_vp_sitofp`")
 }
 
-/// Canonical MLIR operation name for [`VpsmaxOperation`].
-pub const VPSMAX_OPERATION_NAME: &str = "llvm.intr.vp.smax";
+/// Canonical MLIR operation name for [`VpSmaxOperation`].
+pub const VP_SMAX_OPERATION_NAME: &str = "llvm.intr.vp.smax";
 
 /// Operation trait for `llvm.intr.vp.smax`.
-pub trait VpsmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpSmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSMAX_OPERATION_NAME
+        VP_SMAX_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -2672,7 +2672,7 @@ pub trait VpsmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpsmax);
+mlir_op!(VpSmax);
 
 /// Constructs a new detached `llvm.intr.vp.smax` operation.
 pub fn intr_vp_smax<
@@ -2692,10 +2692,10 @@ pub fn intr_vp_smax<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpsmaxOperation<'c, 't> {
+) -> DetachedVpSmaxOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSMAX_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_SMAX_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -2707,14 +2707,14 @@ pub fn intr_vp_smax<
         .expect("invalid arguments to `llvm::intr_vp_smax`")
 }
 
-/// Canonical MLIR operation name for [`VpsminOperation`].
-pub const VPSMIN_OPERATION_NAME: &str = "llvm.intr.vp.smin";
+/// Canonical MLIR operation name for [`VpSminOperation`].
+pub const VP_SMIN_OPERATION_NAME: &str = "llvm.intr.vp.smin";
 
 /// Operation trait for `llvm.intr.vp.smin`.
-pub trait VpsminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpSminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSMIN_OPERATION_NAME
+        VP_SMIN_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -2743,7 +2743,7 @@ pub trait VpsminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpsmin);
+mlir_op!(VpSmin);
 
 /// Constructs a new detached `llvm.intr.vp.smin` operation.
 pub fn intr_vp_smin<
@@ -2763,10 +2763,10 @@ pub fn intr_vp_smin<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpsminOperation<'c, 't> {
+) -> DetachedVpSminOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSMIN_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_SMIN_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -2778,14 +2778,14 @@ pub fn intr_vp_smin<
         .expect("invalid arguments to `llvm::intr_vp_smin`")
 }
 
-/// Canonical MLIR operation name for [`VpsremOperation`].
-pub const VPSREM_OPERATION_NAME: &str = "llvm.intr.vp.srem";
+/// Canonical MLIR operation name for [`VpSremOperation`].
+pub const VP_SREM_OPERATION_NAME: &str = "llvm.intr.vp.srem";
 
 /// Operation trait for `llvm.intr.vp.srem`.
-pub trait VpsremOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpSremOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSREM_OPERATION_NAME
+        VP_SREM_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -2814,7 +2814,7 @@ pub trait VpsremOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpsrem);
+mlir_op!(VpSrem);
 
 /// Constructs a new detached `llvm.intr.vp.srem` operation.
 pub fn intr_vp_srem<
@@ -2834,10 +2834,10 @@ pub fn intr_vp_srem<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpsremOperation<'c, 't> {
+) -> DetachedVpSremOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSREM_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_SREM_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -2849,14 +2849,14 @@ pub fn intr_vp_srem<
         .expect("invalid arguments to `llvm::intr_vp_srem`")
 }
 
-/// Canonical MLIR operation name for [`VpselectMinOperation`].
-pub const VPSELECT_MIN_OPERATION_NAME: &str = "llvm.intr.vp.select";
+/// Canonical MLIR operation name for [`VpSelectMinOperation`].
+pub const VP_SELECT_MIN_OPERATION_NAME: &str = "llvm.intr.vp.select";
 
 /// Operation trait for `llvm.intr.vp.select`.
-pub trait VpselectMinOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpSelectMinOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSELECT_MIN_OPERATION_NAME
+        VP_SELECT_MIN_OPERATION_NAME
     }
 
     /// Returns the `condition` operand.
@@ -2885,7 +2885,7 @@ pub trait VpselectMinOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpselectMin);
+mlir_op!(VpSelectMin);
 
 /// Constructs a new detached `llvm.intr.vp.select` operation.
 pub fn intr_vp_select<
@@ -2905,10 +2905,10 @@ pub fn intr_vp_select<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpselectMinOperation<'c, 't> {
+) -> DetachedVpSelectMinOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSELECT_MIN_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_SELECT_MIN_OPERATION_NAME, location);
     builder = builder.add_operand(condition);
     builder = builder.add_operand(true_value);
     builder = builder.add_operand(false_value);
@@ -2920,14 +2920,14 @@ pub fn intr_vp_select<
         .expect("invalid arguments to `llvm::intr_vp_select`")
 }
 
-/// Canonical MLIR operation name for [`VpshlOperation`].
-pub const VPSHL_OPERATION_NAME: &str = "llvm.intr.vp.shl";
+/// Canonical MLIR operation name for [`VpShlOperation`].
+pub const VP_SHL_OPERATION_NAME: &str = "llvm.intr.vp.shl";
 
 /// Operation trait for `llvm.intr.vp.shl`.
-pub trait VpshlOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpShlOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSHL_OPERATION_NAME
+        VP_SHL_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -2956,7 +2956,7 @@ pub trait VpshlOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpshl);
+mlir_op!(VpShl);
 
 /// Constructs a new detached `llvm.intr.vp.shl` operation.
 pub fn intr_vp_shl<
@@ -2976,10 +2976,10 @@ pub fn intr_vp_shl<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpshlOperation<'c, 't> {
+) -> DetachedVpShlOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSHL_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_SHL_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -2991,14 +2991,14 @@ pub fn intr_vp_shl<
         .expect("invalid arguments to `llvm::intr_vp_shl`")
 }
 
-/// Canonical MLIR operation name for [`VpstoreOperation`].
-pub const VPSTORE_OPERATION_NAME: &str = "llvm.intr.vp.store";
+/// Canonical MLIR operation name for [`VpStoreOperation`].
+pub const VP_STORE_OPERATION_NAME: &str = "llvm.intr.vp.store";
 
 /// Operation trait for `llvm.intr.vp.store`.
-pub trait VpstoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSTORE_OPERATION_NAME
+        VP_STORE_OPERATION_NAME
     }
 
     /// Returns the `value` operand.
@@ -3022,7 +3022,7 @@ pub trait VpstoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpstore);
+mlir_op!(VpStore);
 
 /// Constructs a new detached `llvm.intr.vp.store` operation.
 pub fn intr_vp_store<
@@ -3040,10 +3040,10 @@ pub fn intr_vp_store<
     mask: V2,
     explicit_vector_length: V3,
     location: L,
-) -> DetachedVpstoreOperation<'c, 't> {
+) -> DetachedVpStoreOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSTORE_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_STORE_OPERATION_NAME, location);
     builder = builder.add_operand(value);
     builder = builder.add_operand(pointer);
     builder = builder.add_operand(mask);
@@ -3054,14 +3054,14 @@ pub fn intr_vp_store<
         .expect("invalid arguments to `llvm::intr_vp_store`")
 }
 
-/// Canonical MLIR operation name for [`VpstridedLoadOperation`].
-pub const VPSTRIDED_LOAD_OPERATION_NAME: &str = "llvm.intr.experimental.vp.strided.load";
+/// Canonical MLIR operation name for [`VpStridedLoadOperation`].
+pub const VP_STRIDED_LOAD_OPERATION_NAME: &str = "llvm.intr.experimental.vp.strided.load";
 
 /// Operation trait for `llvm.intr.experimental.vp.strided.load`.
-pub trait VpstridedLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpStridedLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSTRIDED_LOAD_OPERATION_NAME
+        VP_STRIDED_LOAD_OPERATION_NAME
     }
 
     /// Returns the `pointer` operand.
@@ -3090,7 +3090,7 @@ pub trait VpstridedLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpstridedLoad);
+mlir_op!(VpStridedLoad);
 
 /// Constructs a new detached `llvm.intr.experimental.vp.strided.load` operation.
 pub fn intr_experimental_vp_strided_load<
@@ -3110,10 +3110,10 @@ pub fn intr_experimental_vp_strided_load<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpstridedLoadOperation<'c, 't> {
+) -> DetachedVpStridedLoadOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSTRIDED_LOAD_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_STRIDED_LOAD_OPERATION_NAME, location);
     builder = builder.add_operand(pointer);
     builder = builder.add_operand(stride);
     builder = builder.add_operand(mask);
@@ -3125,14 +3125,14 @@ pub fn intr_experimental_vp_strided_load<
         .expect("invalid arguments to `llvm::intr_experimental_vp_strided_load`")
 }
 
-/// Canonical MLIR operation name for [`VpstridedStoreOperation`].
-pub const VPSTRIDED_STORE_OPERATION_NAME: &str = "llvm.intr.experimental.vp.strided.store";
+/// Canonical MLIR operation name for [`VpStridedStoreOperation`].
+pub const VP_STRIDED_STORE_OPERATION_NAME: &str = "llvm.intr.experimental.vp.strided.store";
 
 /// Operation trait for `llvm.intr.experimental.vp.strided.store`.
-pub trait VpstridedStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpStridedStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSTRIDED_STORE_OPERATION_NAME
+        VP_STRIDED_STORE_OPERATION_NAME
     }
 
     /// Returns the `value` operand.
@@ -3161,7 +3161,7 @@ pub trait VpstridedStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpstridedStore);
+mlir_op!(VpStridedStore);
 
 /// Constructs a new detached `llvm.intr.experimental.vp.strided.store` operation.
 pub fn intr_experimental_vp_strided_store<
@@ -3181,10 +3181,10 @@ pub fn intr_experimental_vp_strided_store<
     mask: V3,
     explicit_vector_length: V4,
     location: L,
-) -> DetachedVpstridedStoreOperation<'c, 't> {
+) -> DetachedVpStridedStoreOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSTRIDED_STORE_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_STRIDED_STORE_OPERATION_NAME, location);
     builder = builder.add_operand(value);
     builder = builder.add_operand(pointer);
     builder = builder.add_operand(stride);
@@ -3196,14 +3196,14 @@ pub fn intr_experimental_vp_strided_store<
         .expect("invalid arguments to `llvm::intr_experimental_vp_strided_store`")
 }
 
-/// Canonical MLIR operation name for [`VpsubOperation`].
-pub const VPSUB_OPERATION_NAME: &str = "llvm.intr.vp.sub";
+/// Canonical MLIR operation name for [`VpSubOperation`].
+pub const VP_SUB_OPERATION_NAME: &str = "llvm.intr.vp.sub";
 
 /// Operation trait for `llvm.intr.vp.sub`.
-pub trait VpsubOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpSubOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPSUB_OPERATION_NAME
+        VP_SUB_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -3232,7 +3232,7 @@ pub trait VpsubOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpsub);
+mlir_op!(VpSub);
 
 /// Constructs a new detached `llvm.intr.vp.sub` operation.
 pub fn intr_vp_sub<
@@ -3252,10 +3252,10 @@ pub fn intr_vp_sub<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpsubOperation<'c, 't> {
+) -> DetachedVpSubOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPSUB_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_SUB_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -3267,14 +3267,14 @@ pub fn intr_vp_sub<
         .expect("invalid arguments to `llvm::intr_vp_sub`")
 }
 
-/// Canonical MLIR operation name for [`VptruncOperation`].
-pub const VPTRUNC_OPERATION_NAME: &str = "llvm.intr.vp.trunc";
+/// Canonical MLIR operation name for [`VpTruncOperation`].
+pub const VP_TRUNC_OPERATION_NAME: &str = "llvm.intr.vp.trunc";
 
 /// Operation trait for `llvm.intr.vp.trunc`.
-pub trait VptruncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpTruncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPTRUNC_OPERATION_NAME
+        VP_TRUNC_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -3298,7 +3298,7 @@ pub trait VptruncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vptrunc);
+mlir_op!(VpTrunc);
 
 /// Constructs a new detached `llvm.intr.vp.trunc` operation.
 pub fn intr_vp_trunc<
@@ -3316,10 +3316,10 @@ pub fn intr_vp_trunc<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVptruncOperation<'c, 't> {
+) -> DetachedVpTruncOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPTRUNC_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_TRUNC_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -3330,14 +3330,14 @@ pub fn intr_vp_trunc<
         .expect("invalid arguments to `llvm::intr_vp_trunc`")
 }
 
-/// Canonical MLIR operation name for [`VpudivOperation`].
-pub const VPUDIV_OPERATION_NAME: &str = "llvm.intr.vp.udiv";
+/// Canonical MLIR operation name for [`VpUdivOperation`].
+pub const VP_UDIV_OPERATION_NAME: &str = "llvm.intr.vp.udiv";
 
 /// Operation trait for `llvm.intr.vp.udiv`.
-pub trait VpudivOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpUdivOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPUDIV_OPERATION_NAME
+        VP_UDIV_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -3366,7 +3366,7 @@ pub trait VpudivOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpudiv);
+mlir_op!(VpUdiv);
 
 /// Constructs a new detached `llvm.intr.vp.udiv` operation.
 pub fn intr_vp_udiv<
@@ -3386,10 +3386,10 @@ pub fn intr_vp_udiv<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpudivOperation<'c, 't> {
+) -> DetachedVpUdivOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPUDIV_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_UDIV_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -3401,14 +3401,14 @@ pub fn intr_vp_udiv<
         .expect("invalid arguments to `llvm::intr_vp_udiv`")
 }
 
-/// Canonical MLIR operation name for [`VpuitoFpOperation`].
-pub const VPUITO_FP_OPERATION_NAME: &str = "llvm.intr.vp.uitofp";
+/// Canonical MLIR operation name for [`VpUitoFpOperation`].
+pub const VP_UITO_FP_OPERATION_NAME: &str = "llvm.intr.vp.uitofp";
 
 /// Operation trait for `llvm.intr.vp.uitofp`.
-pub trait VpuitoFpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpUitoFpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPUITO_FP_OPERATION_NAME
+        VP_UITO_FP_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -3432,7 +3432,7 @@ pub trait VpuitoFpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(VpuitoFp);
+mlir_op!(VpUitoFp);
 
 /// Constructs a new detached `llvm.intr.vp.uitofp` operation.
 pub fn intr_vp_uitofp<
@@ -3450,10 +3450,10 @@ pub fn intr_vp_uitofp<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVpuitoFpOperation<'c, 't> {
+) -> DetachedVpUitoFpOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPUITO_FP_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_UITO_FP_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
@@ -3464,14 +3464,14 @@ pub fn intr_vp_uitofp<
         .expect("invalid arguments to `llvm::intr_vp_uitofp`")
 }
 
-/// Canonical MLIR operation name for [`VpumaxOperation`].
-pub const VPUMAX_OPERATION_NAME: &str = "llvm.intr.vp.umax";
+/// Canonical MLIR operation name for [`VpUmaxOperation`].
+pub const VP_UMAX_OPERATION_NAME: &str = "llvm.intr.vp.umax";
 
 /// Operation trait for `llvm.intr.vp.umax`.
-pub trait VpumaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpUmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPUMAX_OPERATION_NAME
+        VP_UMAX_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -3500,7 +3500,7 @@ pub trait VpumaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpumax);
+mlir_op!(VpUmax);
 
 /// Constructs a new detached `llvm.intr.vp.umax` operation.
 pub fn intr_vp_umax<
@@ -3520,10 +3520,10 @@ pub fn intr_vp_umax<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpumaxOperation<'c, 't> {
+) -> DetachedVpUmaxOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPUMAX_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_UMAX_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -3535,14 +3535,14 @@ pub fn intr_vp_umax<
         .expect("invalid arguments to `llvm::intr_vp_umax`")
 }
 
-/// Canonical MLIR operation name for [`VpuminOperation`].
-pub const VPUMIN_OPERATION_NAME: &str = "llvm.intr.vp.umin";
+/// Canonical MLIR operation name for [`VpUminOperation`].
+pub const VP_UMIN_OPERATION_NAME: &str = "llvm.intr.vp.umin";
 
 /// Operation trait for `llvm.intr.vp.umin`.
-pub trait VpuminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpUminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPUMIN_OPERATION_NAME
+        VP_UMIN_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -3571,7 +3571,7 @@ pub trait VpuminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpumin);
+mlir_op!(VpUmin);
 
 /// Constructs a new detached `llvm.intr.vp.umin` operation.
 pub fn intr_vp_umin<
@@ -3591,10 +3591,10 @@ pub fn intr_vp_umin<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpuminOperation<'c, 't> {
+) -> DetachedVpUminOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPUMIN_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_UMIN_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -3606,14 +3606,14 @@ pub fn intr_vp_umin<
         .expect("invalid arguments to `llvm::intr_vp_umin`")
 }
 
-/// Canonical MLIR operation name for [`VpuremOperation`].
-pub const VPUREM_OPERATION_NAME: &str = "llvm.intr.vp.urem";
+/// Canonical MLIR operation name for [`VpUremOperation`].
+pub const VP_UREM_OPERATION_NAME: &str = "llvm.intr.vp.urem";
 
 /// Operation trait for `llvm.intr.vp.urem`.
-pub trait VpuremOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpUremOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPUREM_OPERATION_NAME
+        VP_UREM_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -3642,7 +3642,7 @@ pub trait VpuremOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpurem);
+mlir_op!(VpUrem);
 
 /// Constructs a new detached `llvm.intr.vp.urem` operation.
 pub fn intr_vp_urem<
@@ -3662,10 +3662,10 @@ pub fn intr_vp_urem<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpuremOperation<'c, 't> {
+) -> DetachedVpUremOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPUREM_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_UREM_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -3677,14 +3677,14 @@ pub fn intr_vp_urem<
         .expect("invalid arguments to `llvm::intr_vp_urem`")
 }
 
-/// Canonical MLIR operation name for [`VpxorOperation`].
-pub const VPXOR_OPERATION_NAME: &str = "llvm.intr.vp.xor";
+/// Canonical MLIR operation name for [`VpXorOperation`].
+pub const VP_XOR_OPERATION_NAME: &str = "llvm.intr.vp.xor";
 
 /// Operation trait for `llvm.intr.vp.xor`.
-pub trait VpxorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpXorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPXOR_OPERATION_NAME
+        VP_XOR_OPERATION_NAME
     }
 
     /// Returns the `lhs` operand.
@@ -3713,7 +3713,7 @@ pub trait VpxorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpxor);
+mlir_op!(VpXor);
 
 /// Constructs a new detached `llvm.intr.vp.xor` operation.
 pub fn intr_vp_xor<
@@ -3733,10 +3733,10 @@ pub fn intr_vp_xor<
     explicit_vector_length: V3,
     result_type: T0,
     location: L,
-) -> DetachedVpxorOperation<'c, 't> {
+) -> DetachedVpXorOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPXOR_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_XOR_OPERATION_NAME, location);
     builder = builder.add_operand(lhs);
     builder = builder.add_operand(rhs);
     builder = builder.add_operand(mask);
@@ -3748,14 +3748,14 @@ pub fn intr_vp_xor<
         .expect("invalid arguments to `llvm::intr_vp_xor`")
 }
 
-/// Canonical MLIR operation name for [`VpzextOperation`].
-pub const VPZEXT_OPERATION_NAME: &str = "llvm.intr.vp.zext";
+/// Canonical MLIR operation name for [`VpZextOperation`].
+pub const VP_ZEXT_OPERATION_NAME: &str = "llvm.intr.vp.zext";
 
 /// Operation trait for `llvm.intr.vp.zext`.
-pub trait VpzextOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait VpZextOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        VPZEXT_OPERATION_NAME
+        VP_ZEXT_OPERATION_NAME
     }
 
     /// Returns the `input` operand.
@@ -3779,7 +3779,7 @@ pub trait VpzextOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(Vpzext);
+mlir_op!(VpZext);
 
 /// Constructs a new detached `llvm.intr.vp.zext` operation.
 pub fn intr_vp_zext<
@@ -3797,10 +3797,10 @@ pub fn intr_vp_zext<
     explicit_vector_length: V2,
     result_type: T0,
     location: L,
-) -> DetachedVpzextOperation<'c, 't> {
+) -> DetachedVpZextOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(VPZEXT_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(VP_ZEXT_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(explicit_vector_length);
