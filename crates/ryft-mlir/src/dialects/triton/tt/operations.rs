@@ -2884,7 +2884,7 @@ mod tests {
             let tensor_i32_type = context.tensor_type(i32_type, &[Size::Static(4)], None, location).unwrap();
             let tensor_f32_type = context.tensor_type(f32_type, &[Size::Static(4)], None, location).unwrap();
             let pointer_type = context.triton_tt_pointer_type(f32_type, 1);
-            let tensor_desc_type = context.triton_tt_tensor_desc_type(tensor_f32_type);
+            let tensor_desc_type = context.triton_tt_tensor_desc_type(&[Size::Static(4)], f32_type, None);
             let function_type = context.function_type(&[i32_type], &[i32_type]);
 
             Self {

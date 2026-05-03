@@ -934,6 +934,25 @@ pub enum CollectiveOperationType {
     AllCollectives = 8,
 }
 
+/// Memory mode for XLA GPU collective operations.
+///
+/// This type corresponds to `DebugOptions.CollectivesMode` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum CollectivesMode {
+    /// Invalid or unrecognized collective memory mode.
+    Invalid = 0,
+
+    /// Collective operations use per-device private memory.
+    PrivateMemory = 1,
+
+    /// Collective operations use symmetric device memory across participating ranks.
+    SymmetricMemory = 2,
+
+    /// Collective operations use peer memory access directly.
+    PeerMemory = 3,
+}
+
 /// GPU command types for command buffer recording and execution. Command buffers allow batching multiple GPU operations
 /// together for more efficient execution. This enum identifies the type of command being recorded.
 ///
@@ -1428,6 +1447,10 @@ pub struct DebugOptions {
     #[prost(int64, optional, tag = "237")]
     pub xla_gpu_collective_permute_decomposer_threshold: Option<i64>,
 
+    /// Memory mode for collective-permute buffers.
+    #[prost(enumeration = "CollectivesMode", optional, tag = "473")]
+    pub xla_gpu_collective_permute_mode: Option<i32>,
+
     /// If `true`, collective cliques will not be locked for each XLA GPU execution, using permanent cliques instead.
     /// This disables deadlock prevention.
     #[prost(bool, optional, tag = "354")]
@@ -1746,14 +1769,6 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "388")]
     pub xla_gpu_experimental_enable_nvshmem: Option<bool>,
 
-    /// If `true`, OneHot patterns will be rewritten into Gather operations during GPU lowering.
-    #[prost(bool, optional, tag = "458")]
-    pub xla_gpu_experimental_enable_onehot_rewriter: Option<bool>,
-
-    /// If `true`, GEMMs that underutilize the GPU will be split along the K dimension.
-    #[prost(bool, optional, tag = "386")]
-    pub xla_gpu_experimental_enable_split_k_rewrite: Option<bool>,
-
     /// If `true`, fusion for subchannel dequantization sequences will be enabled.
     #[prost(bool, optional, tag = "368")]
     pub xla_gpu_experimental_enable_subchannel_dequantisation_fusion: Option<bool>,
@@ -1766,9 +1781,21 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "421")]
     pub xla_gpu_experimental_enable_triton_warp_specialization: Option<bool>,
 
+    /// Forces a specific split-K value. Zero means the heuristic is used.
+    #[prost(int32, optional, tag = "472")]
+    pub xla_gpu_experimental_force_split_k: Option<i32>,
+
+    /// If `true`, the GEMM fusion v2 pass will build Triton fusions.
+    #[prost(bool, optional, tag = "475")]
+    pub xla_gpu_experimental_gemm_fusion_v2: Option<bool>,
+
     /// Maximum unroll factor to allow on Blackwell architectures.
     #[prost(int32, optional, tag = "459")]
     pub xla_gpu_experimental_max_unroll_factor: Option<i32>,
+
+    /// If `true`, GEMM and convolution autotuning will run after fusion passes.
+    #[prost(bool, optional, tag = "477")]
+    pub xla_gpu_experimental_move_gemm_conv_autotuner: Option<bool>,
 
     /// If `true`, sub-byte dot operands will be laid out along the contracting (K) dimension.
     #[prost(bool, optional, tag = "362")]
@@ -2159,6 +2186,10 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "131")]
     pub xla_dump_include_timestamp: Option<bool>,
 
+    /// If `true`, HLO modules will be dumped in a subfolder named after the module.
+    #[prost(bool, optional, tag = "502")]
+    pub xla_dump_hlo_to_subfolder: Option<bool>,
+
     /// Maximum number of HLO modules to dump per directory. A negative value means unbounded.
     #[prost(int32, optional, tag = "132")]
     pub xla_dump_max_hlo_modules: Option<i32>,
@@ -2310,6 +2341,10 @@ pub struct DebugOptions {
     /// If `true`, experimental tiling propagation will be enabled in GPU compiler passes.
     #[prost(bool, optional, tag = "456")]
     pub xla_gpu_experimental_enable_tiling_propagation: Option<bool>,
+
+    /// Cost model options for experimental GEMM fusion tiling decisions.
+    #[prost(map = "string, string", tag = "474")]
+    pub xla_gpu_experimental_cost_model_gemm_tiling_options: HashMap<String, String>,
 
     /// Extra backend-specific options as key-value pairs.
     #[prost(map = "string, string", tag = "500")]

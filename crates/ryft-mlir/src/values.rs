@@ -5,10 +5,11 @@ use std::marker::PhantomData;
 
 use ryft_xla_sys::bindings::{
     MlirContext, MlirOpOperand, MlirValue, mlirBlockArgumentGetArgNumber, mlirBlockArgumentGetOwner,
-    mlirOpOperandGetNextUse, mlirOpOperandGetOperandNumber, mlirOpOperandGetOwner, mlirOpOperandGetValue,
-    mlirOpOperandIsNull, mlirOpResultGetOwner, mlirOpResultGetResultNumber, mlirValueDump, mlirValueGetFirstUse,
-    mlirValueGetLocation, mlirValueGetType, mlirValueIsABlockArgument, mlirValueIsAOpResult, mlirValuePrintAsOperand,
-    mlirValueReplaceAllUsesExcept, mlirValueReplaceAllUsesOfWith, mlirValueSetType,
+    mlirBlockArgumentSetLocation, mlirBlockArgumentSetType, mlirOpOperandGetNextUse, mlirOpOperandGetOperandNumber,
+    mlirOpOperandGetOwner, mlirOpOperandGetValue, mlirOpOperandIsNull, mlirOpResultGetOwner,
+    mlirOpResultGetResultNumber, mlirValueDump, mlirValueGetFirstUse, mlirValueGetLocation, mlirValueGetType,
+    mlirValueIsABlockArgument, mlirValueIsAOpResult, mlirValuePrintAsOperand, mlirValueReplaceAllUsesExcept,
+    mlirValueReplaceAllUsesOfWith, mlirValueSetType,
 };
 
 use crate::support::write_to_string_callback;
@@ -258,6 +259,24 @@ impl<'b, 'c, 't> BlockArgumentRef<'b, 'c, 't> {
     pub fn argument_index(&self) -> usize {
         let _guard = self.context.borrow();
         unsafe { mlirBlockArgumentGetArgNumber(self.handle).cast_unsigned() }
+    }
+
+    /// Sets the [`Type`] of this [`BlockArgumentRef`].
+    pub fn set_type<T: Type<'c, 't>>(&mut self, r#type: T) {
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
+        // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
+        // internals that we have when working with the MLIR C API.
+        let _guard = self.context.borrow_mut();
+        unsafe { mlirBlockArgumentSetType(self.handle, r#type.to_c_api()) }
+    }
+
+    /// Sets the [`Location`] of this [`BlockArgumentRef`].
+    pub fn set_location<L: Location<'c, 't>>(&mut self, location: L) {
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
+        // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
+        // internals that we have when working with the MLIR C API.
+        let _guard = self.context.borrow_mut();
+        unsafe { mlirBlockArgumentSetLocation(self.handle, location.to_c_api()) }
     }
 }
 
@@ -538,7 +557,7 @@ mod tests {
         let index_type = context.index_type();
         let f64_type = context.float64_type();
         let block = context.block(&[(index_type, location)]);
-        let block_argument = block.argument(0).unwrap();
+        let mut block_argument = block.argument(0).unwrap();
         assert_eq!(block_argument.context(), &context);
         assert_eq!(block_argument.name(false, false).ok().flatten(), None);
         assert_eq!(block_argument.name(true, false).ok().flatten(), None);
@@ -553,6 +572,9 @@ mod tests {
         assert_eq!(block_argument.block(), block);
         block_argument.set_type(f64_type);
         assert_eq!(block_argument.r#type(), f64_type);
+        let new_location = context.file_location("foo.mlir", 2, 3);
+        block_argument.set_location(new_location);
+        assert_eq!(block_argument.location(), new_location);
     }
 
     #[test]

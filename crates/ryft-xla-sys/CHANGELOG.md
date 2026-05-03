@@ -11,12 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Added support for Linux AArch64.
-- Added C++ bindings for the `affine`, `arith`, `gpu`, `mosaic_gpu`, `mosaic_tpu`, and `triton` MLIR dialects.
+- Added C++ bindings for the `affine`, `arith`, `gpu`, `llvm`, `mosaic_gpu`, `mosaic_tpu`, `nvgpu`, `shape`,
+  `sparse_tensor`, `transform`, and Triton `tt` MLIR dialects.
 
 ### Changed
 
-- Upgraded the OpenXLA dependency pin to commit `7b1be14958aac5c83f1b9f7bcdfc51fdbd29acba`.
-- Synchronized the mirrored protobuf definitions with the upstream PJRT and StreamExecutor schema changes.
+- Upgraded the OpenXLA dependency pin to commit `20a3e2cdd937424f351533165b3ac8e0589e5957`.
+- Synchronized the mirrored `DebugOptions` protobuf definitions with upstream `xla.proto` changes.
+- Synchronized StableHLO C API bindings with upstream mesh and sub-axis attributes.
 - Pinned macOS Bazel artifacts to a macOS `11.0` deployment target so the published static library remains linkable
   from Rust consumers that target the workspace baseline.
 

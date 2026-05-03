@@ -6,9 +6,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 # XLA
 # ----------------------------------------------------
 
-XLA_COMMIT = "7b1be14958aac5c83f1b9f7bcdfc51fdbd29acba"
+XLA_COMMIT = "20a3e2cdd937424f351533165b3ac8e0589e5957"
 
-XLA_SHA256 = "9ed81c034535e6398e8463882d6b517e303e0abdc2d8147dd66fd245ace33b54"
+XLA_SHA256 = "54f6bb1a23ee2fd753901d211e87526f84e56add0556d802f5319ace74750cef"
 
 JAX_COMMIT = "a33ed614c58ee8a10d0b7536c50c2609c38500c1"
 
@@ -38,10 +38,10 @@ http_archive(
 
 http_archive(
     name = "rules_ml_toolchain",
-    sha256 = "f2c924e85a22ba2eaa0c08657e5f5467fedbc3d0506f9cc0c69dd97ed9fbaf28",
-    strip_prefix = "rules_ml_toolchain-99c43dfe995a0e81c767d5b6d686191992672fe6",
+    sha256 = "0b42f693a60c6050d87db1e0a0eaeb84ab3f54191fce094d86334faedc807da0",
+    strip_prefix = "rules_ml_toolchain-398d613aea7a4c294da49b79a6d6f3f8732bd84c",
     urls = [
-        "https://github.com/google-ml-infra/rules_ml_toolchain/archive/99c43dfe995a0e81c767d5b6d686191992672fe6.tar.gz",
+        "https://github.com/google-ml-infra/rules_ml_toolchain/archive/398d613aea7a4c294da49b79a6d6f3f8732bd84c.tar.gz",
     ],
 )
 
@@ -74,19 +74,20 @@ load("@xla//third_party/py:python_init_rules.bzl", "python_init_rules")
 
 python_init_rules()
 
-load("@xla//third_party/py:python_init_repositories.bzl", "python_init_repositories")
+load("@rules_ml_toolchain//py:python_init_repositories.bzl", "python_init_repositories")
 
 python_init_repositories(
     requirements = {
         "3.11": "@xla//:requirements_lock_3_11.txt",
+        "3.12": "@xla//:requirements_lock_3_12.txt",
     },
 )
 
-load("@xla//third_party/py:python_init_toolchains.bzl", "python_init_toolchains")
+load("@rules_ml_toolchain//py:python_register_toolchain.bzl", "python_register_toolchain")
 
-python_init_toolchains()
+python_register_toolchain()
 
-load("@xla//third_party/py:python_init_pip.bzl", "python_init_pip")
+load("@rules_ml_toolchain//py:python_init_pip.bzl", "python_init_pip")
 
 python_init_pip()
 
@@ -178,6 +179,14 @@ load(
 nvshmem_redist_init_repository(
     nvshmem_redistributions = NVSHMEM_REDISTRIBUTIONS,
 )
+
+load("@xla//build_tools/pjrt_wheels:nightly.bzl", "nightly_timestamp_repo")
+
+nightly_timestamp_repo(name = "nightly_timestamp")
+
+load("@xla//build_tools/pjrt_wheels:release_candidate.bzl", "rc_number_repo")
+
+rc_number_repo(name = "rc_number")
 
 load("@jax//third_party/flatbuffers:workspace.bzl", flatbuffers = "repo")
 

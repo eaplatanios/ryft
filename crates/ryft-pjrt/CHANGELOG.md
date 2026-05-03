@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Added support for the new `PJRT_Buffer_Bitcast` C API function.
+- Added support for the new `PJRT_Device_ClearMemoryStats` C API function.
 - Added support for the new `PJRT_Error_ForEachPayload` C API function and for providing payload-aware safe Rust
   wrappers for error buffers and execution poisoning.
 - Added support for querying executable parameter memory kinds and topology fingerprints.
@@ -18,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Updated our PJRT C API bindings for version `0.104`.
+- Updated our PJRT C API bindings for version `0.107`.
+- Changed `BufferSpecification` to carry a concrete `Layout`, materializing dense defaults during construction and
+  parsing before values cross layout-sensitive PJRT C API calls.
 - Expanded executable compiled-memory statistics support to include total allocator bytes, indefinite allocations,
   and peak unpadded heap bytes.
 - Changed `TiledLayout::minor_to_major` to `Vec<u64>` from `Vec<i64>`.

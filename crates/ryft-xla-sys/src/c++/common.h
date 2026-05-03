@@ -9,6 +9,7 @@
 
 #include "absl/status/status.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
+#include "xla/pjrt/c/pjrt_c_api_status_utils.h"
 #include "xla/pjrt/distributed/distributed.h"
 
 extern "C" {
@@ -20,11 +21,8 @@ typedef xla::DistributedRuntimeClient PJRT_Distributed_Runtime_Client;
 #else
 typedef struct _DistributedRuntimeService PJRT_Distributed_Runtime_Service;
 typedef struct _DistributedRuntimeClient PJRT_Distributed_Runtime_Client;
+typedef struct PJRT_Error PJRT_Error;
 #endif
-
-struct PJRT_Error {
-  absl::Status status;
-};
 
 #ifdef __cplusplus
 }
@@ -35,27 +33,26 @@ struct PJRT_Error {
 
 #ifdef __cplusplus
 
-#define PJRT_RETURN_IF_ERROR(expr)                                \
-  do {                                                            \
-    absl::Status _status = (expr);                                \
-    if (!_status.ok()) {                                          \
-      PJRT_Error *_c_status = new PJRT_Error{std::move(_status)}; \
-      return _c_status;                                           \
-    }                                                             \
+#define PJRT_RETURN_IF_ERROR(expr)                                         \
+  do {                                                                     \
+    absl::Status _status = (expr);                                         \
+    if (!_status.ok()) {                                                   \
+      PJRT_Error *_c_status = pjrt::StatusToPjRtError(std::move(_status)); \
+      return _c_status;                                                    \
+    }                                                                      \
   } while (false)
 
-#define PJRT_ASSIGN_OR_RETURN(lhs, rexpr)                                      \
+#define PJRT_ASSIGN_OR_RETURN(lhs, rexpr)                                       \
   _PJRT_ASSIGN_OR_RETURN_IMPL(_PJRT_CONCAT(_status_or_value, __COUNTER__), lhs, \
-                              rexpr,                                           \
+                              rexpr,                                            \
                               _PJRT_CONCAT(_c_status, __COUNTER__));
 
-#define _PJRT_ASSIGN_OR_RETURN_IMPL(statusor, lhs, rexpr, c_status) \
-  auto statusor = (rexpr);                                          \
-  if (!statusor.ok()) {                                             \
-    PJRT_Error *c_status = new PJRT_Error();                        \
-    c_status->status = statusor.status();                           \
-    return c_status;                                                \
-  }                                                                 \
+#define _PJRT_ASSIGN_OR_RETURN_IMPL(statusor, lhs, rexpr, c_status)    \
+  auto statusor = (rexpr);                                             \
+  if (!statusor.ok()) {                                                \
+    PJRT_Error *c_status = pjrt::StatusToPjRtError(statusor.status()); \
+    return c_status;                                                   \
+  }                                                                    \
   lhs = std::move(*statusor)
 
 #define _PJRT_CONCAT(x, y) _PJRT_CONCAT_IMPL(x, y)

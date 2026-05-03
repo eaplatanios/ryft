@@ -716,6 +716,13 @@ impl Layout {
         }
     }
 
+    /// Creates the default dense [`Layout::Tiled`] for buffers with `rank` dimensions. The resulting [`Layout`] has no
+    /// tiles and orders dimensions from the most minor physical dimension to the most major physical dimension, which
+    /// corresponds to dense major-to-minor logical storage.
+    pub fn dense_major_to_minor(rank: usize) -> Self {
+        Layout::Tiled(TiledLayout::new((0..rank as u64).rev().collect(), Vec::new()))
+    }
+
     /// Parses a rendered [`Layout`] (e.g., an XLA layout string) into a [`Layout`].
     #[allow(clippy::should_implement_trait)]
     pub fn from_str<S: AsRef<str>>(value: S) -> Result<Self, Error> {
@@ -1198,7 +1205,7 @@ impl Buffer<'_> {
             element_type: self.element_type()?,
             dimensions: self.dimensions()?,
             #[allow(deprecated)]
-            layout: Some(self.layout()?),
+            layout: self.layout()?,
         })
     }
 
@@ -1214,7 +1221,7 @@ impl Buffer<'_> {
     /// based on the provided [`BufferSpecification`]).
     pub fn bitcast<D: AsRef<[u64]>>(&self, specification: BufferSpecification<D>) -> Result<Self, Error> {
         use ffi::PJRT_Buffer_Bitcast_Args;
-        let layout = specification.layout.map(|layout| unsafe { layout.to_c_api() });
+        let mut layout = unsafe { specification.layout.to_c_api() };
         invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Buffer_Bitcast,
@@ -1223,7 +1230,7 @@ impl Buffer<'_> {
                 element_type = specification.element_type.to_c_api(),
                 dims = specification.dimensions.as_ref().as_ptr() as *const i64,
                 num_dims = specification.dimensions.as_ref().len(),
-                device_layout = layout.map(|layout| &layout as *const _ as *mut _).unwrap_or(std::ptr::null_mut()),
+                device_layout = &mut layout as *mut _,
             },
             { out_buffer },
         )
@@ -1596,9 +1603,8 @@ pub struct BufferSpecification<D: AsRef<[u64]>> {
     /// Dimensions (i.e., shape) of the buffer.
     pub dimensions: D,
 
-    /// Optional memory [`Layout`] of the buffer. If [`None`], then it is assumed to be a dense layout
-    /// with dimensions in major-to-minor order.
-    pub layout: Option<Layout>,
+    /// Memory [`Layout`] of the buffer.
+    pub layout: Layout,
 }
 
 impl BufferSpecification<Vec<u64>> {
@@ -1646,7 +1652,8 @@ impl BufferSpecification<Vec<u64>> {
         };
 
         let layout = value[(closing_bracket_index + 1)..].trim();
-        let layout = if layout.is_empty() { None } else { Some(Layout::from_str(layout)?) };
+        let layout =
+            if layout.is_empty() { Layout::dense_major_to_minor(dimensions.len()) } else { Layout::from_str(layout)? };
 
         Ok(BufferSpecification { element_type, dimensions, layout })
     }
@@ -1676,12 +1683,27 @@ impl BufferSpecification<Vec<u64>> {
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?,
-            layout: shape.layout.map(|layout| Layout::from_proto(*layout)).transpose()?,
+            layout: shape
+                .layout
+                .map(|layout| Layout::from_proto(*layout))
+                .transpose()?
+                .unwrap_or_else(|| Layout::dense_major_to_minor(shape.dimensions.len())),
         })
     }
 }
 
 impl<D: AsRef<[u64]>> BufferSpecification<D> {
+    /// Creates a new [`BufferSpecification`] using the default dense major-to-minor [`Layout::Tiled`].
+    pub fn new(element_type: BufferType, dimensions: D) -> Self {
+        let layout = Layout::dense_major_to_minor(dimensions.as_ref().len());
+        Self { element_type, dimensions, layout }
+    }
+
+    /// Creates a new [`BufferSpecification`] using the provided [`Layout`].
+    pub fn with_layout(element_type: BufferType, dimensions: D, layout: Layout) -> Self {
+        Self { element_type, dimensions, layout }
+    }
+
     /// Returns the [`Shape`](crate::protos::Shape) Protobuf that corresponds to this [`BufferSpecification`].
     pub fn proto(&self) -> Result<crate::protos::Shape, Error> {
         Ok(crate::protos::Shape {
@@ -1689,7 +1711,7 @@ impl<D: AsRef<[u64]>> BufferSpecification<D> {
             dimensions: self.dimensions.as_ref().iter().map(|dimension| *dimension as i64).collect::<Vec<_>>(),
             is_dynamic_dimension: vec![false; self.dimensions.as_ref().len()],
             tuple_shapes: Vec::new(),
-            layout: self.layout.as_ref().map(Layout::proto).transpose()?.map(Box::new),
+            layout: Some(Box::new(self.layout.proto()?)),
         })
     }
 }
@@ -1704,9 +1726,7 @@ impl<D: AsRef<[u64]>> Display for BufferSpecification<D> {
             dimensions.try_for_each(|dimension| write!(formatter, ",{dimension}"))?;
         }
         write!(formatter, "]")?;
-        if let Some(layout) = &self.layout {
-            write!(formatter, "{layout}")?;
-        }
+        write!(formatter, "{}", self.layout)?;
         Ok(())
     }
 }
@@ -2021,7 +2041,7 @@ impl<'c> DmaMappedBuffer<'c> {
                 specification.dimensions,
                 None,
                 memory,
-                specification.layout,
+                Some(specification.layout),
             )
             .map(|buffer| unsafe { std::mem::transmute::<_, Buffer<'c>>(buffer) })
     }
@@ -2233,7 +2253,7 @@ impl<'s> Client<'s> {
         memory: M,
     ) -> Result<Buffer<'_>, Error> {
         use ffi::PJRT_Client_CreateUninitializedBuffer_Args;
-        let layout = specification.layout.map(|layout| unsafe { layout.to_c_api() });
+        let mut layout = unsafe { specification.layout.to_c_api() };
         invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Client_CreateUninitializedBuffer,
@@ -2242,7 +2262,7 @@ impl<'s> Client<'s> {
                 shape_dims = specification.dimensions.as_ref().as_ptr() as *const i64,
                 shape_num_dims = specification.dimensions.as_ref().len(),
                 shape_element_type = specification.element_type.to_c_api(),
-                shape_layout = layout.map(|layout| &layout as *const _ as *mut _).unwrap_or(std::ptr::null_mut()),
+                shape_layout = &mut layout as *mut _,
                 device = std::ptr::null_mut(),
                 memory = memory.default_memory().to_c_api(),
             },
@@ -2291,7 +2311,7 @@ impl<'s> Client<'s> {
         stream: Option<*mut std::ffi::c_void>,
     ) -> Result<Buffer<'_>, Error> {
         use ffi::PJRT_Client_CreateViewOfDeviceBuffer_Args;
-        let layout = specification.layout.map(|layout| unsafe { layout.to_c_api() });
+        let mut layout = unsafe { specification.layout.to_c_api() };
 
         extern "C" fn callback<F: FnOnce()>(_ptr: *mut std::ffi::c_void, arg: *mut std::ffi::c_void) {
             unsafe { Box::from_raw(arg as *mut F)() };
@@ -2306,7 +2326,7 @@ impl<'s> Client<'s> {
                 dims = specification.dimensions.as_ref().as_ptr() as *const i64,
                 num_dims = specification.dimensions.as_ref().len(),
                 element_type = specification.element_type.to_c_api(),
-                layout = layout.map(|layout| &layout as *const _ as *mut _).unwrap_or(std::ptr::null_mut()),
+                layout = &mut layout as *mut _,
                 device = std::ptr::null_mut(),
                 memory = memory.default_memory().to_c_api(),
                 stream = stream.unwrap_or(std::ptr::null_mut()) as isize,
@@ -2361,7 +2381,7 @@ impl<'s> Client<'s> {
         V: AsRef<str>,
     {
         use ffi::PJRT_Client_CreateErrorBuffer_Args;
-        let layout = specification.layout.map(|layout| unsafe { layout.to_c_api() });
+        let mut layout = unsafe { specification.layout.to_c_api() };
         let error_message = error.message();
         let payload = payload
             .into_iter()
@@ -2381,7 +2401,7 @@ impl<'s> Client<'s> {
                 shape_dims = specification.dimensions.as_ref().as_ptr() as *const i64,
                 shape_num_dims = specification.dimensions.as_ref().len(),
                 shape_element_type = specification.element_type.to_c_api(),
-                shape_layout = layout.map(|layout| &layout as *const _ as *mut _).unwrap_or(std::ptr::null_mut()),
+                shape_layout = &mut layout as *mut _,
                 memory = memory.default_memory().to_c_api(),
                 payload = payload,
                 payload_size = payload_size,
@@ -2434,7 +2454,7 @@ impl<'s> Client<'s> {
         memory: M,
     ) -> Result<(Buffer<'_>, AliasBufferFulfillmentToken), Error> {
         use ffi::PJRT_Client_CreateAliasBuffer_Args;
-        let layout = specification.layout.map(|layout| unsafe { layout.to_c_api() });
+        let mut layout = unsafe { specification.layout.to_c_api() };
         invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Client_CreateAliasBuffer,
@@ -2444,7 +2464,7 @@ impl<'s> Client<'s> {
                 shape_dims = specification.dimensions.as_ref().as_ptr() as *const i64,
                 shape_num_dims = specification.dimensions.as_ref().len(),
                 shape_element_type = specification.element_type.to_c_api(),
-                shape_layout = layout.map(|layout| &layout as *const _ as *mut _).unwrap_or(std::ptr::null_mut()),
+                shape_layout = &mut layout as *mut _,
             },
             { alias_buffer, fulfill_alias_buffer_cb },
         )
@@ -3723,6 +3743,15 @@ mod tests {
         assert_eq!(format!("{layout}"), "{1,0:T(4,*)}");
         assert_eq!(format!("{layout:?}"), "Layout[{1,0:T(4,*)}]");
 
+        // Test creating and round-tripping a dense major-to-minor [`Layout`].
+        let layout = Layout::dense_major_to_minor(3);
+        assert_eq!(layout, Layout::Tiled(TiledLayout::new(vec![2, 1, 0], Vec::new())));
+        assert_eq!(unsafe { Layout::from_c_api(&layout.to_c_api() as *const _) }, Ok(layout.clone()));
+        assert_eq!(Layout::from_str(layout.clone().to_string()), Ok(layout.clone()));
+        assert_eq!(Layout::from_proto(layout.clone().proto().unwrap()), Ok(layout.clone()));
+        assert_eq!(format!("{layout}"), "{2,1,0}");
+        assert_eq!(format!("{layout:?}"), "Layout[{2,1,0}]");
+
         // Test round-tripping a [`StridedLayout`] through the C API.
         let layout = Layout::Strided(StridedLayout::new(vec![16, 4]));
         assert_eq!(unsafe { Layout::from_c_api(&layout.to_c_api() as *const _) }, Ok(layout.clone()));
@@ -3813,12 +3842,12 @@ mod tests {
             Ok(BufferSpecification {
                 element_type: BufferType::U8,
                 dimensions: [4u64],
-                layout: Some(Layout::Tiled(TiledLayout {
+                layout: Layout::Tiled(TiledLayout {
                     minor_to_major,
                     tile_dimensions,
                     tile_dimension_sizes,
                     tile_count: 0,
-                })),
+                }),
             }) if minor_to_major == &[0] && tile_dimensions.is_empty() && tile_dimension_sizes.is_empty(),
         ));
         assert_eq!(buffer.on_device_size_in_bytes(), Ok(4));
@@ -3863,9 +3892,7 @@ mod tests {
         let client = test_cpu_client();
         let device = client.addressable_devices().unwrap()[0].clone();
         let buffer = client.buffer(&[1u8, 2u8, 3u8, 4u8], BufferType::U8, [4u64], None, device, None).unwrap();
-        let buffer = buffer
-            .bitcast(BufferSpecification { element_type: BufferType::U32, dimensions: [1u64], layout: None })
-            .unwrap();
+        let buffer = buffer.bitcast(BufferSpecification::new(BufferType::U32, [1u64])).unwrap();
         assert_eq!(buffer.element_type(), Ok(BufferType::U32));
         assert_eq!(buffer.dimensions(), Ok([1u64].as_slice()));
     }
@@ -4027,23 +4054,38 @@ mod tests {
         let specification = BufferSpecification {
             element_type: BufferType::F32,
             dimensions: vec![2, 3],
-            layout: Some(Layout::Tiled(TiledLayout::new(
+            layout: Layout::Tiled(TiledLayout::new(
                 vec![1, 0],
                 vec![
                     Tile { dimensions: vec![TileDimension::sized(4), TileDimension::sized(2)] },
                     Tile { dimensions: vec![TileDimension::combined()] },
                 ],
-            ))),
+            )),
         };
         assert_eq!(BufferSpecification::from_str(specification.to_string()), Ok(specification.clone()));
         assert_eq!(BufferSpecification::from_proto(specification.proto().unwrap()), Ok(specification.clone()));
         assert_eq!(format!("{specification}"), "f32[2,3]{1,0:T(4,2)(*)}");
         assert_eq!(format!("{specification:?}"), "BufferSpecification[f32[2,3]{1,0:T(4,2)(*)}]");
 
+        let specification = BufferSpecification::new(BufferType::F32, vec![2, 3]);
+        assert_eq!(BufferSpecification::from_str("f32[2,3]"), Ok(specification.clone()));
+        assert_eq!(
+            BufferSpecification::from_proto(crate::protos::Shape {
+                element_type: BufferType::F32.proto() as i32,
+                dimensions: vec![2, 3],
+                is_dynamic_dimension: vec![false, false],
+                tuple_shapes: Vec::new(),
+                layout: None,
+            }),
+            Ok(specification.clone()),
+        );
+        assert_eq!(format!("{specification}"), "f32[2,3]{1,0}");
+        assert_eq!(format!("{specification:?}"), "BufferSpecification[f32[2,3]{1,0}]");
+
         let specification = BufferSpecification {
             element_type: BufferType::F32,
             dimensions: vec![2, 3],
-            layout: Some(Layout::Strided(StridedLayout::new(vec![12, 4]))),
+            layout: Layout::Strided(StridedLayout::new(vec![12, 4])),
         };
         assert_eq!(BufferSpecification::from_str(specification.to_string()), Ok(specification.clone()));
         assert!(matches!(
@@ -4140,11 +4182,7 @@ mod tests {
                     assert!(!dma_mapped_buffer.is_empty());
                     let buffer = unsafe {
                         dma_mapped_buffer.into_buffer(
-                            BufferSpecification {
-                                element_type: BufferType::U8,
-                                dimensions: [data.len() as u64],
-                                layout: None,
-                            },
+                            BufferSpecification::new(BufferType::U8, [data.len() as u64]),
                             device.default_memory().unwrap(),
                         )
                     }
@@ -4201,7 +4239,7 @@ mod tests {
     fn test_client_uninitialized_buffer() {
         let client = test_cpu_client();
         let device = client.addressable_devices().unwrap()[0].clone();
-        let specification = BufferSpecification { element_type: BufferType::U8, dimensions: [4u64], layout: None };
+        let specification = BufferSpecification::new(BufferType::U8, [4u64]);
         let buffer = client.uninitialized_buffer(specification, device.clone()).unwrap();
         assert_eq!(buffer.element_type(), Ok(BufferType::U8));
         assert_eq!(buffer.dimensions(), Ok([4u64].as_slice()));
@@ -4217,7 +4255,7 @@ mod tests {
         let specification = BufferSpecification {
             element_type: buffer.element_type().unwrap(),
             dimensions: buffer.dimensions().unwrap().to_vec(),
-            layout: None,
+            layout: Layout::dense_major_to_minor(buffer.rank().unwrap()),
         };
         let borrowed_buffer = unsafe {
             client
@@ -4235,7 +4273,7 @@ mod tests {
         let client = test_cpu_client();
         let device = client.addressable_devices().unwrap()[0].clone();
         let error = Error::aborted("test error");
-        let specification = BufferSpecification { element_type: BufferType::U8, dimensions: [4u64], layout: None };
+        let specification = BufferSpecification::new(BufferType::U8, [4u64]);
 
         let buffer = client.error_buffer(error.clone(), specification.clone(), device.clone()).unwrap();
         assert!(matches!(
@@ -4264,7 +4302,7 @@ mod tests {
     fn test_client_alias_buffer_and_fulfillment() {
         let client = test_cpu_client();
         let device = client.addressable_devices().unwrap()[0].clone();
-        let specification = BufferSpecification { element_type: BufferType::U8, dimensions: [4u64], layout: None };
+        let specification = BufferSpecification::new(BufferType::U8, [4u64]);
 
         // Create a new alias buffer and fulfill it with some other buffer.
         let (alias_buffer, token) = client.alias_buffer(specification.clone(), device.clone()).unwrap();

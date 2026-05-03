@@ -13,16 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added missing `affine` dialect operations.
 - Added missing `arith` dialect operations.
 - Added support for the `async` dialect.
+- Added support for the `emit_c` dialect.
 - Added support for the `gpu` dialect.
 - Added support for the `linalg` dialect.
+- Added support for the `llvm` dialect.
 - Added support for the `memref` dialect.
 - Added support for the `nvgpu` dialect.
 - Added support for the `scf` dialect.
 - Added support for the `shape` dialect.
+- Added support for the `sparse_tensor` dialect.
 - Added support for the `tensor` dialect.
+- Added support for the `transform` dialect.
 - Added support for the Triton `tt` dialect.
 - Added support for the Mosaic GPU dialect.
 - Added support for the Mosaic TPU dialect.
+- Added StableHLO mesh and sub-axis attribute wrappers.
 
 ### Changed
 

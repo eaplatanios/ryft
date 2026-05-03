@@ -83,7 +83,6 @@ fn main() {
 
 ## Roadmap / TODOs
 
-- [ ] Add support for `mlirOperationReplaceUsesOfWith` and `mlirBlockArgumentSetLocation`.
 - [ ] Add `Context` constructors like `i32_type`, etc. Maybe also `bool_type` as an alias for `i1_type`?
 - [ ] Clean up the API we have around elements attributes and use stronger typing, if possible.
 - [ ] `BooleanAttributeRef::is<IntegerAttributeRef>` panics (and the same for a 1-bit integer attribute in reverse).
@@ -99,17 +98,12 @@ fn main() {
     - [x] `builtin`
     - [x] `cf`
     - [ ] `chlo`
-    - [ ] `emit_c`
-        - [ ] Add support for types: `EmitCArrayType`, `EmitCLValueType`, `EmitCOpaqueType`, `EmitCPointerType`,
-          `EmitCPtrDiffTType`, `EmitCSignedSizeTType`, `EmitCSizeTType`.
-        - [ ] Add support for operations.
+    - [x] `emit_c`
     - [x] `func`
     - [x] `gpu`
     - [x] `index`
     - [x] `linalg`
-    - [ ] `llvm`
-        - [ ] Add support for types: `LLVMPointerType`, `LLVMStructType`.
-        - [ ] Add support for operations.
+    - [x] `llvm`
     - [x] `memref`
     - [ ] `mhlo`
     - [x] [`mosaic_gpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
@@ -120,16 +114,13 @@ fn main() {
           `PDLTypeType`, `PDLValueType`.
         - [ ] Add support for operations.
     - [x] `quant`
-        - [ ] Add support for types: `QuantizedType`, `AnyQuantizedType`, `CalibratedQuantizedType`,
-          `UniformQuantizedPerAxisType`, `UniformQuantizedType`, `UniformQuantizedSubChannelType`.
-        - [ ] Add support for operations.
     - [x] `scf`
     - [x] `shape`
     - [/] `shardy`: Current support for the Shardy dialect is only partial and aimed at attributes and operations that
       are relevant when building StableHLO programs to be compiled by XLA, and not covering attributes and operations
       that are internal to the Shardy compiler. Also, the current support was added hastily and is likely to change as
       we start using these attributes and operations in practice.
-    - [ ] `sparse_tensor`
+    - [x] `sparse_tensor`
     - [x] `stable_hlo`
         - [ ] For `stable_hlo::bitcast_convert` can we have the constructor only require the output data type and infer
           the output shape automatically?
@@ -154,10 +145,7 @@ fn main() {
       - [ ] `gluon`
       - [ ] `proton`
       - [ ] `proton_gpu`
-    - [ ] `transform`
-        - [ ] Add support for types: `TransformAnyOpType`, `TransformAnyParamType`, `TransformAnyValueType`,
-          `TransformOperationType`, `TransformParamType`.
-        - [ ] Add support for operations.
+    - [x] `transform`
     - [ ] `versioned_hlo`
 
 #### License

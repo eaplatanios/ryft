@@ -716,6 +716,8 @@ impl BuildConfiguration {
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("arith.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.h"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("llvm.cc"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("llvm.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_gpu.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_gpu.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_tpu.cc"),
@@ -724,6 +726,10 @@ impl BuildConfiguration {
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("nvgpu.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("shape.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("shape.h"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("sparse_tensor.cc"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("sparse_tensor.h"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("transform.cc"),
+            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("transform.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.h"),
             PathBuf::from("WORKSPACE"),
@@ -861,31 +867,31 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("8126d1a90570a9a1197332fbee5974d33d180e641bd0bfd101820471adffd6de")
+                Some("4259a698570e8ca1f80c2a628c1ad626b2ce25653244262a958c5d546b3b48a3")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::AArch64, Device::Cpu) => {
-                Some("1a4bc38ae4f887b0afe54a51d8afa799d1b8f32dccf3efabf6c222643de08559")
+                Some("b6ee92d7705137e9b79239144793f6fd3fde08d4bfbc4c55d3dd32409729dbe7")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("47e0455c46f35552e3b3b0088bad4a2553c476893bcd95e206f97d4f08f92836")
+                Some("aecb33b9c2071794ea5be9f64503488d1a93e5b81e9a2c051327f02a62e295a8")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("88414a0c6be15d184cdb6868615d6b0422e1bad8b0a5f453efd85feb2ed60eeb")
+                Some("076353050b86bc2584afd5b30152e566d021e69be5125dbd4f072928077dc684")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
-                Some("42212b3567785b5fc11584ca71913b5bf51e4b5c9c983c79f949a48703f5f9c0")
+                Some("6e32c0b9dc06fde3252c4a4bb6981432d27decf20e597a4d2a23bb9f342d0cd4")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda12) => {
-                Some("d2559bc848c040f8e913679a604757b3331ec9ab930b5d362205a4f52d2c8859")
+                Some("4db656eaccc55e9b1744b2f249b9d9384df897883c3298d9ce9bd41359dece5a")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => {
-                Some("d6e56235bae018121897d8cf4d7292a5b6738caf00614226cf541b246097207f")
+                Some("feb39092a113f707cbbb909d8ee8adee38f6a55e0ee39e2ef1ffe2b230eed582")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda13) => {
-                Some("cb2fd87858b810501e9323b0d707980d4760a6e1d8d8dca1ce12103ea5ffd261")
+                Some("28878197b4281ae362e09420ff4c156f06fcdc30d98f0d6d2433f01a7c40c89b")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => {
-                Some("5800d5ec2b7ea62416c8a5a6bceb9407ced61a8819d390076c7c9546cc0a5748")
+                Some("95f116ab81f72811f1cb20f8ee0c4f0ba7dafbebf27d7ab945231a9f0c3f3753")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
                 Some("5e600d7797ac801d0c903f52ae46c03538bb77817a48579aa581faa8d2a8a734")
