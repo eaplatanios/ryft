@@ -104,28 +104,25 @@ where
         let left = &inputs[0];
         let right = &inputs[1];
         let left_term = context
-            .apply_operation(
-                &[left.tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(right.primal.clone()),
-                1,
+                &[left.tangent],
             )?
             .into_iter()
             .next()
             .expect("mul jvp scale should produce one tangent");
         let right_term = context
-            .apply_operation(
-                &[right.tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(left.primal.clone()),
-                1,
+                &[right.tangent],
             )?
             .into_iter()
             .next()
             .expect("mul jvp scale should produce one tangent");
         let tangent = context
-            .apply_operation(
-                &[left_term, right_term],
+            .stage(
                 <E::LinearOperationCarrier as SupportsAdd<E::Type, E::Value>>::add_operation(),
-                1,
+                &[left_term, right_term],
             )?
             .into_iter()
             .next()

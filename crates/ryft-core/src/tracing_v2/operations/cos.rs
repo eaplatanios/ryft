@@ -114,22 +114,17 @@ where
         check_input_count!(inputs, 1, TracingError);
         let input = &inputs[0];
         let scaled = context
-            .apply_operation(
-                &[input.tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(
                     input.primal.clone().sin(),
                 ),
-                1,
+                &[input.tangent],
             )?
             .into_iter()
             .next()
             .expect("cos jvp scale should produce one tangent");
         let tangent = context
-            .apply_operation(
-                &[scaled],
-                <E::LinearOperationCarrier as SupportsNeg<E::Type, E::Value>>::neg_operation(),
-                1,
-            )?
+            .stage(<E::LinearOperationCarrier as SupportsNeg<E::Type, E::Value>>::neg_operation(), &[scaled])?
             .into_iter()
             .next()
             .expect("cos jvp neg should produce one tangent");

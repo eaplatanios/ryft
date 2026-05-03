@@ -130,7 +130,7 @@ where
     let false_pushforward = condition.false_branch.linearize(context.engine, primal_inputs)?;
     let linear_condition = ConditionOperation::with_captured_predicate(*predicate, true_pushforward, false_pushforward)
         .map_err(TracingError::from)?;
-    let tangent_outputs = context.apply_operation(
+    let tangent_outputs = context.stage(
         tangent_inputs.as_slice(),
         LinearArrayOperation::Condition(Box::new(linear_condition)),
         condition.output_types().len(),
@@ -402,7 +402,7 @@ impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
                 if tangent_inputs.is_empty() && !remat.body.output_types.as_slice().is_empty() {
                     return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
                 }
-                let tangent_outputs = context.apply_operation(
+                let tangent_outputs = context.stage(
                     tangent_inputs.as_slice(),
                     LinearArrayOperation::Rematerialize(Box::new(make_linear_xla_rematerialize(
                         context.engine,
@@ -469,7 +469,7 @@ impl DifferentiableOperation<TracingContext<'static, XlaEngine<'static>>> for Xl
                     .next()
                     .expect("with_sharding_constraint should produce one primal output");
                 let tangent = context
-                    .apply_operation(
+                    .stage(
                         &[input.tangent],
                         LinearArrayOperation::Custom(Arc::new(op.to_tracer_linear_custom_primitive())),
                         1,

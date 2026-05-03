@@ -1824,13 +1824,12 @@ where
                 let factor_tracer = context.engine.constant(factor.clone());
                 let tangent =
                     context
-                        .apply_operation(
-                            &[input.tangent],
+                        .stage(
                             <EInner::LinearOperationCarrier<'engine> as SupportsScale<
                                 DataType,
                                 Tracer<'engine, EInner>,
                             >>::scale_operation(factor_tracer.clone()),
-                            1,
+                            &[input.tangent],
                         )?
                         .into_iter()
                         .next()
@@ -2121,13 +2120,12 @@ where
                 let factor_tracer = context.engine.constant(factor.clone());
                 let tangent =
                     context
-                        .apply_operation(
-                            &[input.tangent],
+                        .stage(
                             <EInner::LinearOperationCarrier<'engine> as SupportsScale<
                                 DataType,
                                 Tracer<'engine, EInner>,
                             >>::scale_operation(factor_tracer.clone()),
-                            1,
+                            &[input.tangent],
                         )?
                         .into_iter()
                         .next()

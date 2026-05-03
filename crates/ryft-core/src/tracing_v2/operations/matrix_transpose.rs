@@ -90,11 +90,10 @@ where
         check_input_count!(inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().transpose_matrix();
         let tangent = context
-            .apply_operation(
-                &[inputs[0].tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsMatrixTranspose<ArrayType, E::Value>>::matrix_transpose_operation(
                 ),
-                1,
+                &[inputs[0].tangent],
             )?
             .into_iter()
             .next()

@@ -145,7 +145,7 @@ where
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
         let tangent = context
-            .apply_operation(&[inputs[0].tangent], LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, 1)?
+            .stage(&[inputs[0].tangent], LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, 1)?
             .into_iter()
             .next()
             .expect("with_sharding_constraint jvp should produce one tangent");

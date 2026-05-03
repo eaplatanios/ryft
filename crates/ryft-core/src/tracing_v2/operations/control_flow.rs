@@ -200,11 +200,7 @@ fn replay_linear_program_on_atoms<E: LinearizableEngine<Type = ArrayType> + ?Siz
             .iter()
             .map(|input| values[input.index].ok_or(TracingError::UnboundAtomId { id: *input }))
             .collect::<Result<Vec<_>, _>>()?;
-        let outputs = context.apply_operation(
-            instruction_inputs.as_slice(),
-            instruction.operation.clone(),
-            instruction.outputs.len(),
-        )?;
+        let outputs = context.stage(instruction.operation.clone(), instruction_inputs.as_slice())?;
         for (output, value) in instruction.outputs.iter().copied().zip(outputs) {
             values[output.index] = Some(value);
         }
@@ -1138,11 +1134,7 @@ mod tests {
                     ensure_input_count(1, inputs.len(), self.name())?;
                     let primal_outputs = self.interpret(std::slice::from_ref(&inputs[0].primal))?;
                     let tangent = context
-                        .apply_operation(
-                            &[inputs[0].tangent],
-                            TestLinearOperation::Scale { factor: factor.clone() },
-                            1,
-                        )?
+                        .stage(TestLinearOperation::Scale { factor: factor.clone() }, &[inputs[0].tangent])?
                         .into_iter()
                         .next()
                         .expect("test scale jvp should produce one tangent");

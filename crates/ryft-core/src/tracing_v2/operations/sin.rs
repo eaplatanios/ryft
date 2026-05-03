@@ -114,12 +114,11 @@ where
         check_input_count!(inputs, 1, TracingError);
         let input = &inputs[0];
         let tangent = context
-            .apply_operation(
-                &[input.tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(
                     input.primal.clone().cos(),
                 ),
-                1,
+                &[input.tangent],
             )?
             .into_iter()
             .next()

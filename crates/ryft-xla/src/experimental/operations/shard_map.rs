@@ -286,7 +286,7 @@ impl ShardMapOperation<ShardMapTracer> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret_with_tracing_builder(tracing_builder, primal_inputs.as_slice())?;
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
-        let tangent_outputs = context.apply_operation(
+        let tangent_outputs = context.stage(
             tangent_inputs.as_slice(),
             LinearArrayOperation::Custom(Arc::new(
                 make_linear_shard_map(&self.body, primal_inputs)
@@ -358,7 +358,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
             .trace(XlaOperation::LinearShardMap(Box::new(self.clone())), primal_input_refs.as_slice())?;
         let traced_op = self.to_tracer_linear_op(primal_inputs.as_slice())?;
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
-        let tangent_outputs = context.apply_operation(
+        let tangent_outputs = context.stage(
             tangent_inputs.as_slice(),
             LinearArrayOperation::Custom(Arc::new(traced_op.to_tracer_linear_custom_primitive())),
             self.output_types.len(),
@@ -594,7 +594,7 @@ where
         if tangent_inputs.is_empty() && !self.output_types.is_empty() {
             return Err(missing_linear_shard_map_staging_context());
         }
-        let tangent_outputs = context.apply_operation(
+        let tangent_outputs = context.stage(
             tangent_inputs.as_slice(),
             LinearArrayOperation::Custom(Arc::new(
                 make_linear_tensor_shard_map(&self.body)
@@ -631,7 +631,7 @@ where
         if tangent_inputs.is_empty() && !self.output_types.is_empty() {
             return Err(missing_linear_shard_map_staging_context());
         }
-        let tangent_outputs = context.apply_operation(
+        let tangent_outputs = context.stage(
             tangent_inputs.as_slice(),
             LinearArrayOperation::Custom(Arc::new(self.to_tensor_linear_custom_primitive())),
             self.output_types.len(),

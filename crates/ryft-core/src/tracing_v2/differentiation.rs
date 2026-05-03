@@ -187,19 +187,11 @@ impl<'a, E: LinearizableEngine + ?Sized> JvpContext<'a, E> {
     }
 
     /// Stages one operation in the currently active linear program.
-    pub fn apply_operation(
-        &self,
-        inputs: &[AtomId],
-        operation: E::LinearOperationCarrier,
-        output_count: usize,
-    ) -> Result<Vec<AtomId>, TracingError> {
+    pub fn stage(&self, operation: E::LinearOperationCarrier, inputs: &[AtomId]) -> Result<Vec<AtomId>, TracingError> {
         let mut builder_borrow = self.builder.borrow_mut();
         let input_types =
             inputs.iter().map(|atom| builder_borrow.atoms[atom.index].r#type().into_owned()).collect::<Vec<_>>();
         let output_types = operation.infer_output_types(&input_types)?;
-        if output_types.len() != output_count {
-            return Err(TracingError::InvalidOutputCount { expected: output_count, got: output_types.len() });
-        }
         let outputs = output_types.into_iter().map(|r#type| builder_borrow.add_variable(r#type)).collect::<Vec<_>>();
         builder_borrow
             .instructions

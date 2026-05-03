@@ -217,13 +217,12 @@ where
             >::from_parts(body_output_types, body_input_types, pullback),
         );
 
-        let tangent_outputs = context.apply_operation(
-            tangent_inputs.as_slice(),
+        let tangent_outputs = context.stage(
             <EInner::LinearOperationCarrier<'engine> as SupportsLinearRematerialize<
                 ArrayType,
                 Tracer<'engine, EInner>,
             >>::rematerialize_operation(linear_remat),
-            self.body.output_types.as_slice().len(),
+            tangent_inputs.as_slice(),
         )?;
 
         Ok(primal_outputs
@@ -265,14 +264,13 @@ where
         if tangent_inputs.is_empty() && !self.body.output_types.is_empty() {
             return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
         }
-        let tangent_outputs = context.apply_operation(
-            tangent_inputs.as_slice(),
+        let tangent_outputs = context.stage(
             LinearArrayOperation::Rematerialize(Box::new(make_linear_rematerialize(
                 context.engine,
                 &self.body,
                 primal_inputs,
             )?)),
-            self.body.output_types.len(),
+            tangent_inputs.as_slice(),
         )?;
         Ok(primal_outputs
             .into_iter()

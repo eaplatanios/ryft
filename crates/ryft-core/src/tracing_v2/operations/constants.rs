@@ -38,10 +38,9 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 0, TracingError);
         let tangent = context
-            .apply_operation(
-                &[],
+            .stage(
                 <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(self.r#type.clone()),
-                1,
+                &[],
             )?
             .into_iter()
             .next()
@@ -77,10 +76,9 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 0, TracingError);
         let tangent = context
-            .apply_operation(
-                &[],
+            .stage(
                 <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(self.r#type.clone()),
-                1,
+                &[],
             )?
             .into_iter()
             .next()
@@ -116,10 +114,9 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
         let tangent = context
-            .apply_operation(
-                &[inputs[0].tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
-                1,
+                &[inputs[0].tangent],
             )?
             .into_iter()
             .next()
@@ -155,10 +152,9 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
         let tangent = context
-            .apply_operation(
-                &[inputs[0].tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
-                1,
+                &[inputs[0].tangent],
             )?
             .into_iter()
             .next()

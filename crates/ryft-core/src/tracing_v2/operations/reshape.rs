@@ -312,13 +312,12 @@ where
         check_input_count!(inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().reshape(self.output_shape.clone())?;
         let tangent = context
-            .apply_operation(
-                &[inputs[0].tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsReshape<ArrayType, E::Value>>::reshape_operation(
                     self.input_shape.clone(),
                     self.output_shape.clone(),
                 ),
-                1,
+                &[inputs[0].tangent],
             )?
             .into_iter()
             .next()

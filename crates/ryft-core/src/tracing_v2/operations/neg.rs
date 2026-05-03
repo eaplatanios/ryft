@@ -137,10 +137,9 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 1, TracingError);
         let tangent = context
-            .apply_operation(
-                &[inputs[0].tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsNeg<E::Type, E::Value>>::neg_operation(),
-                1,
+                &[inputs[0].tangent],
             )?
             .into_iter()
             .next()

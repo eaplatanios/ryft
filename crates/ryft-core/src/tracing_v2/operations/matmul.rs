@@ -72,32 +72,29 @@ where
         let right = &inputs[1];
         let primal = left.primal.clone().matmul(right.primal.clone());
         let left_term = context
-            .apply_operation(
-                &[left.tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsRightMatMul<ArrayType, E::Value>>::right_matmul_operation(
                     right.primal.clone(),
                 ),
-                1,
+                &[left.tangent],
             )?
             .into_iter()
             .next()
             .expect("matmul jvp right matmul should produce one tangent");
         let right_term = context
-            .apply_operation(
-                &[right.tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsLeftMatMul<ArrayType, E::Value>>::left_matmul_operation(
                     left.primal.clone(),
                 ),
-                1,
+                &[right.tangent],
             )?
             .into_iter()
             .next()
             .expect("matmul jvp left matmul should produce one tangent");
         let tangent = context
-            .apply_operation(
-                &[left_term, right_term],
+            .stage(
                 <E::LinearOperationCarrier as SupportsAdd<ArrayType, E::Value>>::add_operation(),
-                1,
+                &[left_term, right_term],
             )?
             .into_iter()
             .next()

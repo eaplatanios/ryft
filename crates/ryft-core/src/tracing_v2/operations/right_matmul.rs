@@ -119,12 +119,11 @@ where
         check_input_count!(inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().matmul(self.factor.clone());
         let tangent = context
-            .apply_operation(
-                &[inputs[0].tangent],
+            .stage(
                 <E::LinearOperationCarrier as SupportsRightMatMul<ArrayType, V>>::right_matmul_operation(
                     self.factor.clone(),
                 ),
-                1,
+                &[inputs[0].tangent],
             )?
             .into_iter()
             .next()
@@ -154,13 +153,12 @@ where
         let primal = inputs[0].primal.clone().matmul(factor_tracer.clone());
         let tangent =
             context
-                .apply_operation(
-                    &[inputs[0].tangent],
+                .stage(
                     <EInner::LinearOperationCarrier<'engine> as SupportsRightMatMul<
                         ArrayType,
                         Tracer<'engine, EInner>,
                     >>::right_matmul_operation(factor_tracer),
-                    1,
+                    &[inputs[0].tangent],
                 )?
                 .into_iter()
                 .next()
