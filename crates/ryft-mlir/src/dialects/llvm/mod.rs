@@ -17,6 +17,14 @@ use ryft_xla_sys::bindings::{mlirGetDialectHandle__llvm__, mlirRegisterAllLLVMTr
 
 use crate::{Context, DialectHandle};
 
+pub mod attributes;
+pub mod operations;
+pub mod types;
+
+pub use attributes::*;
+pub use operations::*;
+pub use types::*;
+
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `llvm` [`Dialect`](crate::Dialect).
     pub fn llvm() -> Self {
