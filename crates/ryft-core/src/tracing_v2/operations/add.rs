@@ -7,18 +7,17 @@ use crate::tracing::TranspositionContext;
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearizableEngine};
+use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
 use crate::types::Type;
 
-impl<T: PartialEq + Type, V: Traceable<T>> LinearOperation<T, V, LinearArrayOperation<V, T>> for AddOperation
+impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> LinearOperation<T, V, O> for AddOperation
 where
     AddOperation: Operation<T>,
-    LinearArrayOperation<V, T>: Operation<T>,
 {
     #[inline]
     fn transpose(
         &self,
-        _context: &mut TranspositionContext<T, V, LinearArrayOperation<V, T>>,
+        _context: &mut TranspositionContext<T, V, O>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);

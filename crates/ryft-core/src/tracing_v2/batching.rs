@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
-use std::ops::{Add, Mul, Neg};
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::macros::check_count;
+use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, SubOperation};
 use crate::operations::constants::{One, Zero};
 use crate::operations::constants::{OneLike, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
@@ -298,7 +299,9 @@ where
 impl<
     V: Value<ArrayType>
         + Add<Output = V>
+        + Sub<Output = V>
         + Mul<Output = V>
+        + Div<Output = V>
         + Neg<Output = V>
         + Sin
         + Cos
@@ -317,8 +320,10 @@ where
         match self {
             Self::Zero(zero) => batch_by_interpreting_physical_operation(zero, inputs),
             Self::One(one) => batch_by_interpreting_physical_operation(one, inputs),
-            Self::Add => batch_by_interpreting_physical_operation(&crate::operations::arithmetic::AddOperation, inputs),
-            Self::Mul => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::MulOperation, inputs),
+            Self::Add => batch_by_interpreting_physical_operation(&AddOperation, inputs),
+            Self::Sub => batch_by_interpreting_physical_operation(&SubOperation, inputs),
+            Self::Mul => batch_by_interpreting_physical_operation(&MulOperation, inputs),
+            Self::Div => batch_by_interpreting_physical_operation(&DivOperation, inputs),
             Self::Neg => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::NegOperation, inputs),
             Self::Sin => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::SinOperation, inputs),
             Self::Cos => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::CosOperation, inputs),
@@ -353,6 +358,7 @@ where
 impl<
     V: Value<ArrayType>
         + Add<Output = V>
+        + Sub<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
         + Zero<ArrayType>

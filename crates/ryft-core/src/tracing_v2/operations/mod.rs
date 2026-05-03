@@ -13,6 +13,9 @@ pub mod control_flow;
 /// Custom-primitive escape hatch.
 pub mod custom;
 
+/// Elementwise division differentiation rules.
+pub mod div;
+
 /// Linear left matrix multiplication.
 pub mod left_matmul;
 
@@ -25,7 +28,7 @@ pub mod matmul;
 /// Matrix transposition.
 pub mod matrix_transpose;
 
-/// Elementwise multiplication.
+/// Elementwise multiplication differentiation rules.
 pub mod mul;
 
 /// Elementwise negation.
@@ -49,6 +52,9 @@ pub mod scale;
 /// Elementwise sine.
 pub mod sin;
 
+/// Elementwise subtraction linearization and differentiation rules.
+pub mod sub;
+
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
     flat_program_input_types, flat_program_output_types,
@@ -61,7 +67,6 @@ pub use custom::{
 pub use left_matmul::{LeftMatMulOperation, SupportsLeftMatMul};
 pub use matmul::{MatMulOperation, SupportsMatMul};
 pub use matrix_transpose::{MatrixTransposeOperation, SupportsMatrixTranspose};
-pub use mul::{MulOperation, SupportsMul};
 pub use neg::{NegOperation, SupportsNeg};
 pub use primitive::{ArrayOperation, LinearArrayOperation, LinearScalarOperation, ScalarOperation};
 pub use rematerialize::{

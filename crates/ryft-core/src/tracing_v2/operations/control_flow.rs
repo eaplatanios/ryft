@@ -691,7 +691,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::operations::arithmetic::SupportsAdd;
+    use crate::operations::arithmetic::{ADD_OPERATION_NAME, SUB_OPERATION_NAME, SupportsAdd};
     use crate::operations::constants::OneLike;
     use crate::operations::constants::{One, Zero};
     use crate::parameters::{Parameter, Placeholder};
@@ -814,8 +814,8 @@ mod tests {
         #[inline]
         fn name(&self) -> &'static str {
             match self {
-                Self::Add => "add",
-                Self::Sub => "sub",
+                Self::Add => ADD_OPERATION_NAME,
+                Self::Sub => SUB_OPERATION_NAME,
                 Self::IsPositive => "is_positive",
                 Self::Condition(condition) => condition.name(),
                 Self::While(while_operation) => while_operation.name(),

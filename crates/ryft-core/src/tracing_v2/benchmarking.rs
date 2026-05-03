@@ -4,6 +4,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::operations::Operation;
+use crate::operations::arithmetic::{ADD_OPERATION_NAME, MUL_OPERATION_NAME};
 use crate::parameters::Parameterized;
 use crate::tracing::{Atom, AtomId, Program, Traceable, TracingError};
 use crate::types::Type;
@@ -197,8 +198,8 @@ pub fn record(
 ///   - `name`: Operation name to normalize.
 pub(crate) fn normalize_op_name(name: &str) -> String {
     match name {
-        "add" | "add_any" => "add".to_string(),
-        "mul" => "mul".to_string(),
+        ADD_OPERATION_NAME | "add_any" => ADD_OPERATION_NAME.to_string(),
+        MUL_OPERATION_NAME => MUL_OPERATION_NAME.to_string(),
         "neg" => "neg".to_string(),
         "sin" => "sin".to_string(),
         "cos" => "cos".to_string(),
@@ -336,7 +337,7 @@ mod tests {
                 output_leaf_count: 1,
                 instruction_count: 2,
                 constant_count: 1,
-                op_histogram: BTreeMap::from([("add".to_string(), 1usize), ("sin".to_string(), 1usize),]),
+                op_histogram: BTreeMap::from([(ADD_OPERATION_NAME.to_string(), 1usize), ("sin".to_string(), 1usize),]),
                 nested_region_count: 0,
                 nested_regions: Vec::new(),
                 max_dependency_depth: 2,

@@ -13,6 +13,9 @@ pub trait Zero<T: Type>: Sized {
     fn zero(r#type: &T) -> Result<Self, TracingError>;
 }
 
+/// Canonical operation name for [`ZeroOperation`].
+pub const ZERO_OPERATION_NAME: &'static str = "zero";
+
 /// [`Operation`] that has no inputs and that produces a single output that corresponds to the _zero_ value for the
 /// [`Type`] that it holds (i.e., for its `r#type` field). Note that for arrays, this would typically correspond to an
 /// array of the right type and shape filled with zeros.
@@ -32,14 +35,14 @@ impl<T: Type> ZeroOperation<T> {
 
 impl<T: Type> Display for ZeroOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
+        formatter.write_str(ZERO_OPERATION_NAME)
     }
 }
 
 impl<T: Type> Operation<T> for ZeroOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
-        "zero"
+        ZERO_OPERATION_NAME
     }
 
     #[inline]
@@ -50,7 +53,7 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?
+        OperationFormatter::new(formatter, indentation, ZERO_OPERATION_NAME)?
             .bracketed(|operation| operation.field("type", &self.r#type))
     }
 }
@@ -109,9 +112,9 @@ mod tests {
         assert_eq!(f64::zero(&DataType::F64), Ok(0.0f64));
 
         let operation = ZeroOperation::new(DataType::F64);
-        assert_eq!(Operation::<DataType>::name(&operation), "zero");
+        assert_eq!(Operation::<DataType>::name(&operation), ZERO_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "ZeroOperation { type: F64 }");
-        assert_eq!(format!("{operation}"), "zero");
+        assert_eq!(format!("{operation}"), ZERO_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![0.0]));
         assert_eq!(

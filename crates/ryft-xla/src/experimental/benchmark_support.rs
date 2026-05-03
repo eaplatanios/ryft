@@ -1,3 +1,4 @@
+use ryft_core::operations::arithmetic::MUL_OPERATION_NAME;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::Program;
@@ -389,8 +390,8 @@ mod tests {
         };
         assert_eq!(nested_region("shard_map.body").op_histogram.get("sin"), Some(&1));
         assert_eq!(nested_region("linear_shard_map.residual_body").op_histogram.get("cos"), Some(&1));
-        assert_eq!(nested_region("linear_shard_map.apply_body").op_histogram.get("mul"), Some(&1));
+        assert_eq!(nested_region("linear_shard_map.apply_body").op_histogram.get(MUL_OPERATION_NAME), Some(&1));
         assert_eq!(nested_region("linear_shard_map.transpose_body").op_histogram.get("cos"), Some(&1));
-        assert_eq!(nested_region("linear_shard_map.transpose_body").op_histogram.get("mul"), Some(&1));
+        assert_eq!(nested_region("linear_shard_map.transpose_body").op_histogram.get(MUL_OPERATION_NAME), Some(&1));
     }
 }

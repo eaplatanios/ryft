@@ -3,7 +3,7 @@ use std::fmt::Display;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
-use crate::types::{DataType, Type, TypeError, Typed};
+use crate::types::{Type, TypeError, Typed};
 
 /// Synthesizes a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart to
 /// [`Zero`](crate::operations::constants::Zero); it is what [`ZeroLikeOperation`] needs for its
@@ -13,6 +13,9 @@ pub trait ZeroLike {
     fn zero_like(&self) -> Self;
 }
 
+/// Canonical operation name for [`ZeroLikeOperation`].
+pub const ZERO_LIKE_OPERATION_NAME: &'static str = "zero_like";
+
 /// [`Operation`] that has one exemplar input and that produces a single output that corresponds to the _zero_ value
 /// with the same [`Type`] as that input.
 #[derive(Copy, Clone, Debug, Default)]
@@ -20,14 +23,14 @@ pub struct ZeroLikeOperation;
 
 impl Display for ZeroLikeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(<Self as Operation<DataType>>::name(self))
+        formatter.write_str(ZERO_LIKE_OPERATION_NAME)
     }
 }
 
 impl<T: Type> Operation<T> for ZeroLikeOperation {
     #[inline]
     fn name(&self) -> &'static str {
-        "zero_like"
+        ZERO_LIKE_OPERATION_NAME
     }
 
     #[inline]
@@ -86,9 +89,9 @@ mod tests {
         assert_eq!(7.0f64.zero_like(), 0.0f64);
 
         let operation = ZeroLikeOperation;
-        assert_eq!(Operation::<DataType>::name(&operation), "zero_like");
+        assert_eq!(Operation::<DataType>::name(&operation), ZERO_LIKE_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "ZeroLikeOperation");
-        assert_eq!(format!("{operation}"), "zero_like");
+        assert_eq!(format!("{operation}"), ZERO_LIKE_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]), Ok(vec![0.0]));
         assert_eq!(

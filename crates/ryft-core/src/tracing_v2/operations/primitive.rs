@@ -1,12 +1,15 @@
 use std::fmt::{Debug, Display};
-use std::ops::{Add, Mul, Neg};
+use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::Arc;
 
 use crate::macros::check_count;
-use crate::operations::arithmetic::{AddOperation, SupportsAdd};
+use crate::operations::arithmetic::{
+    ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
+    SUB_OPERATION_NAME, SubOperation, SupportsAdd, SupportsDiv, SupportsMul, SupportsSub,
+};
 use crate::operations::constants::{
-    One, OneLike, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike, Zero,
-    ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ONE_LIKE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
+    SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
@@ -18,8 +21,8 @@ use crate::tracing_v2::operations::control_flow::{ConditionOperation, ControlFlo
 use crate::tracing_v2::operations::left_matmul::left_matmul_abstract_eval;
 use crate::tracing_v2::operations::right_matmul::right_matmul_abstract_eval;
 use crate::tracing_v2::operations::{
-    CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
-    ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
+    CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, NegOperation, ReshapeOperation,
+    RightMatMulOperation, ScaleOperation, SinOperation,
 };
 use crate::tracing_v2::{
     Cos, DifferentiableOperation, DifferentiableTracingEngine, LinearizableEngine, MatrixOps, Sin,
@@ -31,7 +34,6 @@ use super::custom::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, Supp
 use super::left_matmul::SupportsLeftMatMul;
 use super::matmul::SupportsMatMul;
 use super::matrix_transpose::SupportsMatrixTranspose;
-use super::mul::SupportsMul;
 use super::neg::SupportsNeg;
 use super::rematerialize::{SupportsLinearRematerialize, SupportsRematerialize};
 use super::reshape::SupportsReshape;
@@ -66,8 +68,14 @@ where
     /// Elementwise addition.
     Add,
 
+    /// Elementwise subtraction.
+    Sub,
+
     /// Elementwise multiplication.
     Mul,
+
+    /// Elementwise division.
+    Div,
 
     /// Elementwise negation.
     Neg,
@@ -144,6 +152,9 @@ where
     /// Elementwise addition.
     Add,
 
+    /// Elementwise subtraction.
+    Sub,
+
     /// Elementwise negation.
     Neg,
 
@@ -214,23 +225,29 @@ where
     /// Scalar exemplar-derived one.
     OneLike,
 
+    /// Scalar negation.
+    Neg,
+
     /// Scalar addition.
     Add,
+
+    /// Scalar subtraction.
+    Sub,
+
+    /// Scalar scaling by a captured factor.
+    Scale { factor: V },
 
     /// Scalar multiplication.
     Mul,
 
-    /// Scalar negation.
-    Neg,
+    /// Scalar division.
+    Div,
 
     /// Scalar sine.
     Sin,
 
     /// Scalar cosine.
     Cos,
-
-    /// Scalar scaling by a captured factor.
-    Scale { factor: V },
 
     /// Escape hatch for user- or crate-defined scalar operations.
     Custom(Arc<CustomPrimitive<DataType, V>>),
@@ -254,11 +271,14 @@ where
     /// Scalar exemplar-derived one map.
     OneLike,
 
+    /// Scalar negation.
+    Neg,
+
     /// Scalar addition.
     Add,
 
-    /// Scalar negation.
-    Neg,
+    /// Scalar subtraction.
+    Sub,
 
     /// Scalar scaling by a captured factor.
     Scale { factor: V },
@@ -292,6 +312,16 @@ where
     }
 }
 
+impl<V> SupportsSub<DataType, V> for ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn sub_operation() -> Self {
+        Self::Sub
+    }
+}
+
 impl<V> SupportsMul<DataType, V> for ScalarOperation<V>
 where
     V: Traceable<DataType> + Parameter,
@@ -299,6 +329,16 @@ where
     #[inline]
     fn mul_operation() -> Self {
         Self::Mul
+    }
+}
+
+impl<V> SupportsDiv<DataType, V> for ScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn div_operation() -> Self {
+        Self::Div
     }
 }
 
@@ -410,6 +450,16 @@ where
     }
 }
 
+impl<V> SupportsSub<DataType, V> for LinearScalarOperation<V>
+where
+    V: Traceable<DataType> + Parameter,
+{
+    #[inline]
+    fn sub_operation() -> Self {
+        Self::Sub
+    }
+}
+
 impl<V> SupportsZero<DataType, V> for LinearScalarOperation<V>
 where
     V: Traceable<DataType> + Parameter,
@@ -504,6 +554,17 @@ where
     }
 }
 
+impl<T, V> SupportsSub<T, V> for ArrayOperation<V, T>
+where
+    T: PartialEq + Type,
+    V: Traceable<T> + Parameter,
+{
+    #[inline]
+    fn sub_operation() -> Self {
+        ArrayOperation::Sub
+    }
+}
+
 impl<T, V> SupportsMul<T, V> for ArrayOperation<V, T>
 where
     T: PartialEq + Type,
@@ -512,6 +573,17 @@ where
     #[inline]
     fn mul_operation() -> Self {
         ArrayOperation::Mul
+    }
+}
+
+impl<T, V> SupportsDiv<T, V> for ArrayOperation<V, T>
+where
+    T: PartialEq + Type,
+    V: Traceable<T> + Parameter,
+{
+    #[inline]
+    fn div_operation() -> Self {
+        ArrayOperation::Div
     }
 }
 
@@ -670,6 +742,17 @@ where
     }
 }
 
+impl<T, V> SupportsSub<T, V> for LinearArrayOperation<V, T>
+where
+    T: PartialEq + Type,
+    V: Traceable<T> + Parameter,
+{
+    #[inline]
+    fn sub_operation() -> Self {
+        LinearArrayOperation::Sub
+    }
+}
+
 impl<T, V> SupportsZero<T, V> for LinearArrayOperation<V, T>
 where
     T: PartialEq + Type,
@@ -818,10 +901,12 @@ where
         match self {
             Self::Zero(zero) => zero.name(),
             Self::One(one) => one.name(),
-            Self::ZeroLike => "zero_like",
-            Self::OneLike => "one_like",
-            Self::Add => "add",
-            Self::Mul => "mul",
+            Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
+            Self::OneLike => ONE_LIKE_OPERATION_NAME,
+            Self::Add => ADD_OPERATION_NAME,
+            Self::Sub => SUB_OPERATION_NAME,
+            Self::Mul => MUL_OPERATION_NAME,
+            Self::Div => DIV_OPERATION_NAME,
             Self::Neg => "neg",
             Self::Sin => "sin",
             Self::Cos => "cos",
@@ -847,9 +932,10 @@ where
         match self {
             Self::Zero(zero) => zero.name(),
             Self::One(one) => one.name(),
-            Self::ZeroLike => "zero_like",
-            Self::OneLike => "one_like",
-            Self::Add => "add",
+            Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
+            Self::OneLike => ONE_LIKE_OPERATION_NAME,
+            Self::Add => ADD_OPERATION_NAME,
+            Self::Sub => SUB_OPERATION_NAME,
             Self::Neg => "neg",
             Self::Transpose => "matrix_transpose",
             Self::Scale { .. } => "scale",
@@ -873,10 +959,12 @@ where
         match self {
             Self::Zero(zero) => zero.name(),
             Self::One(one) => one.name(),
-            Self::ZeroLike => "zero_like",
-            Self::OneLike => "one_like",
-            Self::Add => "add",
-            Self::Mul => "mul",
+            Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
+            Self::OneLike => ONE_LIKE_OPERATION_NAME,
+            Self::Add => ADD_OPERATION_NAME,
+            Self::Sub => SUB_OPERATION_NAME,
+            Self::Mul => MUL_OPERATION_NAME,
+            Self::Div => DIV_OPERATION_NAME,
             Self::Neg => "neg",
             Self::Sin => "sin",
             Self::Cos => "cos",
@@ -895,9 +983,10 @@ where
         match self {
             Self::Zero(zero) => zero.name(),
             Self::One(one) => one.name(),
-            Self::ZeroLike => "zero_like",
-            Self::OneLike => "one_like",
-            Self::Add => "add",
+            Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
+            Self::OneLike => ONE_LIKE_OPERATION_NAME,
+            Self::Add => ADD_OPERATION_NAME,
+            Self::Sub => SUB_OPERATION_NAME,
             Self::Neg => "neg",
             Self::Scale { .. } => "scale",
             Self::Custom(op) => op.name(),
@@ -966,7 +1055,9 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ScalarOperation
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
             Self::Add => AddOperation.infer_output_types(input_types),
+            Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
+            Self::Div => DivOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
@@ -1000,6 +1091,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearScalarOpe
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
             Self::Add => AddOperation.infer_output_types(input_types),
+            Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Scale { .. } => ScaleOperation::<DataType, V>::abstract_eval_static(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
@@ -1031,7 +1123,9 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for ArrayOperatio
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
             Self::Add => AddOperation.infer_output_types(input_types),
+            Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
+            Self::Div => DivOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
@@ -1079,7 +1173,9 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ArrayOperation<
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
             Self::Add => AddOperation.infer_output_types(input_types),
+            Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
+            Self::Div => DivOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
@@ -1125,6 +1221,7 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for LinearArrayOp
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
             Self::Add => AddOperation.infer_output_types(input_types),
+            Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Transpose => MatrixTransposeOperation.infer_output_types(input_types),
             Self::Scale { .. } => ScaleOperation::<ArrayType, V>::abstract_eval_static(input_types),
@@ -1181,6 +1278,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearArrayOper
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
             Self::Add => AddOperation.infer_output_types(input_types),
+            Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Scale { .. } => ScaleOperation::<DataType, V>::abstract_eval_static(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
@@ -1220,7 +1318,9 @@ impl<
     V: Traceable<DataType>
         + Parameter
         + Add<Output = V>
+        + Sub<Output = V>
         + Mul<Output = V>
+        + Div<Output = V>
         + Neg<Output = V>
         + Sin
         + Cos
@@ -1239,7 +1339,9 @@ where
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
+            Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
             Self::Mul => <MulOperation as InterpretableOperation<DataType, V>>::interpret(&MulOperation, inputs),
+            Self::Div => <DivOperation as InterpretableOperation<DataType, V>>::interpret(&DivOperation, inputs),
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Sin => <SinOperation as InterpretableOperation<DataType, V>>::interpret(&SinOperation, inputs),
             Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
@@ -1253,6 +1355,7 @@ impl<
     V: Traceable<DataType>
         + Parameter
         + Add<Output = V>
+        + Sub<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
         + Zero<DataType>
@@ -1270,6 +1373,7 @@ where
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
+            Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
@@ -1281,6 +1385,7 @@ impl<'engine, E> InterpretableOperation<DataType, Tracer<'engine, E>> for Linear
 where
     E: DifferentiableTracingEngine<Type = DataType> + ?Sized + 'static,
     Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
+        + Sub<Output = Tracer<'engine, E>>
         + Neg<Output = Tracer<'engine, E>>
         + Mul<Output = Tracer<'engine, E>>
         + ZeroLike
@@ -1308,6 +1413,9 @@ where
             Self::Add => {
                 <AddOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&AddOperation, inputs)
             }
+            Self::Sub => {
+                <SubOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&SubOperation, inputs)
+            }
             Self::Neg => {
                 <NegOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&NegOperation, inputs)
             }
@@ -1327,7 +1435,9 @@ impl<
     V: Traceable<ArrayType>
         + Parameter
         + Add<Output = V>
+        + Sub<Output = V>
         + Mul<Output = V>
+        + Div<Output = V>
         + Neg<Output = V>
         + Sin
         + Cos
@@ -1349,7 +1459,9 @@ where
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => AddOperation.interpret(inputs),
+            Self::Sub => SubOperation.interpret(inputs),
             Self::Mul => MulOperation.interpret(inputs),
+            Self::Div => DivOperation.interpret(inputs),
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
@@ -1371,7 +1483,9 @@ impl<
     V: Traceable<DataType>
         + Parameter
         + Add<Output = V>
+        + Sub<Output = V>
         + Mul<Output = V>
+        + Div<Output = V>
         + Neg<Output = V>
         + Sin
         + Cos
@@ -1390,7 +1504,9 @@ where
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
+            Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
             Self::Mul => <MulOperation as InterpretableOperation<DataType, V>>::interpret(&MulOperation, inputs),
+            Self::Div => <DivOperation as InterpretableOperation<DataType, V>>::interpret(&DivOperation, inputs),
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Sin => <SinOperation as InterpretableOperation<DataType, V>>::interpret(&SinOperation, inputs),
             Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
@@ -1410,6 +1526,7 @@ impl<
     V: Traceable<ArrayType>
         + Parameter
         + Add<Output = V>
+        + Sub<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
         + Zero<ArrayType>
@@ -1430,6 +1547,7 @@ where
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => AddOperation.interpret(inputs),
+            Self::Sub => SubOperation.interpret(inputs),
             Self::Neg => NegOperation.interpret(inputs),
             Self::Transpose => MatrixTransposeOperation.interpret(inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
@@ -1450,6 +1568,7 @@ impl<
     V: Traceable<DataType>
         + Parameter
         + Add<Output = V>
+        + Sub<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
         + Zero<DataType>
@@ -1467,6 +1586,7 @@ where
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
+            Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
@@ -1486,6 +1606,7 @@ impl<'engine, E> InterpretableOperation<ArrayType, Tracer<'engine, E>>
 where
     E: DifferentiableTracingEngine<Type = ArrayType> + ?Sized + 'static,
     Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
+        + Sub<Output = Tracer<'engine, E>>
         + Neg<Output = Tracer<'engine, E>>
         + Mul<Output = Tracer<'engine, E>>
         + ZeroLike
@@ -1517,6 +1638,10 @@ where
                 &AddOperation,
                 inputs,
             ),
+            Self::Sub => <SubOperation as InterpretableOperation<ArrayType, Tracer<'engine, E>>>::interpret(
+                &SubOperation,
+                inputs,
+            ),
             Self::Neg => <NegOperation as InterpretableOperation<ArrayType, Tracer<'engine, E>>>::interpret(
                 &NegOperation,
                 inputs,
@@ -1541,6 +1666,7 @@ impl<'engine, E> InterpretableOperation<DataType, Tracer<'engine, E>>
 where
     E: DifferentiableTracingEngine<Type = DataType> + ?Sized + 'static,
     Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
+        + Sub<Output = Tracer<'engine, E>>
         + Neg<Output = Tracer<'engine, E>>
         + Mul<Output = Tracer<'engine, E>>
         + ZeroLike
@@ -1567,6 +1693,9 @@ where
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => {
                 <AddOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&AddOperation, inputs)
+            }
+            Self::Sub => {
+                <SubOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&SubOperation, inputs)
             }
             Self::Neg => {
                 <NegOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&NegOperation, inputs)
@@ -1603,6 +1732,7 @@ where
                 check_count!("output", output_cotangents, 1, TracingError);
                 Ok(vec![output_cotangents[0], output_cotangents[0]])
             }
+            Self::Sub => SubOperation.transpose(context, output_cotangents),
             Self::Neg => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match output_cotangents[0] {
@@ -1663,6 +1793,7 @@ where
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => AddOperation.transpose(context, output_cotangents),
+            Self::Sub => SubOperation.transpose(context, output_cotangents),
             Self::Neg => NegOperation.transpose(context, output_cotangents),
             Self::Transpose => MatrixTransposeOperation.transpose(context, output_cotangents),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).transpose(context, output_cotangents),
@@ -1703,6 +1834,7 @@ where
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => AddOperation.transpose(context, output_cotangents),
+            Self::Sub => SubOperation.transpose(context, output_cotangents),
             Self::Neg => NegOperation.transpose(context, output_cotangents),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).transpose(context, output_cotangents),
             Self::Custom(op) => op.transpose(context, output_cotangents),
@@ -1720,7 +1852,9 @@ where
 impl<
     V: Value<DataType>
         + Add<Output = V>
+        + Sub<Output = V>
         + Mul<Output = V>
+        + Div<Output = V>
         + Neg<Output = V>
         + Sin
         + Cos
@@ -1737,6 +1871,7 @@ where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearScalarOperation<V>: SupportsAdd<DataType, V>
+        + SupportsSub<DataType, V>
         + super::SupportsNeg<DataType, V>
         + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>
@@ -1753,7 +1888,9 @@ where
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
+            Self::Sub => SubOperation.jvp(context, inputs),
             Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Div => DivOperation.jvp(context, inputs),
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
@@ -1771,7 +1908,9 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: Value<DataType>
         + Add<Output = V>
+        + Sub<Output = V>
         + Mul<Output = V>
+        + Div<Output = V>
         + Neg<Output = V>
         + Sin
         + Cos
@@ -1789,6 +1928,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearScalarOperation<V>: Clone
         + SupportsAdd<DataType, V>
+        + SupportsSub<DataType, V>
         + super::SupportsNeg<DataType, V>
         + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>
@@ -1796,7 +1936,9 @@ where
         + InterpretableOperation<DataType, V>
         + LinearOperation<DataType, V, LinearScalarOperation<V>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
+        + Sub<Output = Tracer<'engine, EInner>>
         + Mul<Output = Tracer<'engine, EInner>>
+        + Div<Output = Tracer<'engine, EInner>>
         + Neg<Output = Tracer<'engine, EInner>>
         + Sin
         + Cos
@@ -1805,6 +1947,8 @@ where
     EInner::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<DataType, Tracer<'engine, EInner>>
         + LinearOperation<DataType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
+        + SupportsAdd<DataType, Tracer<'engine, EInner>>
+        + SupportsSub<DataType, Tracer<'engine, EInner>>
         + SupportsScale<DataType, Tracer<'engine, EInner>>
         + SupportsZeroLike<DataType, Tracer<'engine, EInner>>
         + SupportsZero<DataType, Tracer<'engine, EInner>>,
@@ -1820,7 +1964,9 @@ where
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
+            Self::Sub => SubOperation.jvp(context, inputs),
             Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Div => DivOperation.jvp(context, inputs),
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
@@ -1849,7 +1995,9 @@ where
 impl<
     V: Value<ArrayType>
         + Add<Output = V>
+        + Sub<Output = V>
         + Mul<Output = V>
+        + Div<Output = V>
         + Neg<Output = V>
         + Sin
         + Cos
@@ -1871,6 +2019,7 @@ where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V, ArrayType>: SupportsAdd<ArrayType, V>
+        + SupportsSub<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
@@ -1891,7 +2040,9 @@ where
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
+            Self::Sub => SubOperation.jvp(context, inputs),
             Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Div => DivOperation.jvp(context, inputs),
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
@@ -1912,7 +2063,9 @@ where
 impl<
     V: Value<DataType>
         + Add<Output = V>
+        + Sub<Output = V>
         + Mul<Output = V>
+        + Div<Output = V>
         + Neg<Output = V>
         + Sin
         + Cos
@@ -1930,6 +2083,7 @@ where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V, DataType>: SupportsAdd<DataType, V>
+        + SupportsSub<DataType, V>
         + super::SupportsNeg<DataType, V>
         + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>
@@ -1946,7 +2100,9 @@ where
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
+            Self::Sub => SubOperation.jvp(context, inputs),
             Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Div => DivOperation.jvp(context, inputs),
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
@@ -1979,7 +2135,9 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: Value<ArrayType>
         + Add<Output = V>
+        + Sub<Output = V>
         + Mul<Output = V>
+        + Div<Output = V>
         + Neg<Output = V>
         + Sin
         + Cos
@@ -2000,6 +2158,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V, ArrayType>: Clone
         + SupportsAdd<ArrayType, V>
+        + SupportsSub<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
@@ -2011,7 +2170,9 @@ where
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
+        + Sub<Output = Tracer<'engine, EInner>>
         + Mul<Output = Tracer<'engine, EInner>>
+        + Div<Output = Tracer<'engine, EInner>>
         + Neg<Output = Tracer<'engine, EInner>>
         + Sin
         + Cos
@@ -2021,9 +2182,12 @@ where
     EInner::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, EInner>>
         + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
+        + SupportsAdd<ArrayType, Tracer<'engine, EInner>>
+        + SupportsSub<ArrayType, Tracer<'engine, EInner>>
         + SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>
         + SupportsRightMatMul<ArrayType, Tracer<'engine, EInner>>
         + SupportsMatrixTranspose<ArrayType, Tracer<'engine, EInner>>
+        + SupportsScale<ArrayType, Tracer<'engine, EInner>>
         + SupportsReshape<ArrayType, Tracer<'engine, EInner>>
         + SupportsZeroLike<ArrayType, Tracer<'engine, EInner>>
         + SupportsZero<ArrayType, Tracer<'engine, EInner>>
@@ -2040,7 +2204,9 @@ where
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
+            Self::Sub => SubOperation.jvp(context, inputs),
             Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Div => DivOperation.jvp(context, inputs),
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
@@ -2063,7 +2229,9 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: Value<DataType>
         + Add<Output = V>
+        + Sub<Output = V>
         + Mul<Output = V>
+        + Div<Output = V>
         + Neg<Output = V>
         + Sin
         + Cos
@@ -2081,6 +2249,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearArrayOperation<V, DataType>: Clone
         + SupportsAdd<DataType, V>
+        + SupportsSub<DataType, V>
         + super::SupportsNeg<DataType, V>
         + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>
@@ -2088,7 +2257,9 @@ where
         + InterpretableOperation<DataType, V>
         + LinearOperation<DataType, V, LinearArrayOperation<V, DataType>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
+        + Sub<Output = Tracer<'engine, EInner>>
         + Mul<Output = Tracer<'engine, EInner>>
+        + Div<Output = Tracer<'engine, EInner>>
         + Neg<Output = Tracer<'engine, EInner>>
         + Sin
         + Cos
@@ -2097,6 +2268,8 @@ where
     EInner::LinearOperationCarrier<'engine>: Clone
         + InterpretableOperation<DataType, Tracer<'engine, EInner>>
         + LinearOperation<DataType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
+        + SupportsAdd<DataType, Tracer<'engine, EInner>>
+        + SupportsSub<DataType, Tracer<'engine, EInner>>
         + SupportsScale<DataType, Tracer<'engine, EInner>>
         + SupportsZeroLike<DataType, Tracer<'engine, EInner>>
         + SupportsZero<DataType, Tracer<'engine, EInner>>,
@@ -2112,7 +2285,9 @@ where
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
+            Self::Sub => SubOperation.jvp(context, inputs),
             Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Div => DivOperation.jvp(context, inputs),
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),

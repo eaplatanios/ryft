@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
-use std::ops::{Add, Mul, Neg};
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use ndarray::{Array2, ArrayD, Ix2, IxDyn, Zip};
 use thiserror::Error;
@@ -27,8 +27,14 @@ pub trait NdArrayElement: Copy + Clone + Debug + Display + PartialEq + 'static {
     /// Adds two element values.
     fn add(left: Self, right: Self) -> Self;
 
+    /// Subtracts two element values.
+    fn subtract(left: Self, right: Self) -> Self;
+
     /// Multiplies two element values.
     fn multiply(left: Self, right: Self) -> Self;
+
+    /// Divides two element values.
+    fn divide(left: Self, right: Self) -> Self;
 
     /// Negates one element value.
     fn negate(value: Self) -> Self;
@@ -59,8 +65,18 @@ impl NdArrayElement for f32 {
     }
 
     #[inline]
+    fn subtract(left: Self, right: Self) -> Self {
+        left - right
+    }
+
+    #[inline]
     fn multiply(left: Self, right: Self) -> Self {
         left * right
+    }
+
+    #[inline]
+    fn divide(left: Self, right: Self) -> Self {
+        left / right
     }
 
     #[inline]
@@ -98,8 +114,18 @@ impl NdArrayElement for f64 {
     }
 
     #[inline]
+    fn subtract(left: Self, right: Self) -> Self {
+        left - right
+    }
+
+    #[inline]
     fn multiply(left: Self, right: Self) -> Self {
         left * right
+    }
+
+    #[inline]
+    fn divide(left: Self, right: Self) -> Self {
+        left / right
     }
 
     #[inline]
@@ -315,12 +341,30 @@ impl<T: NdArrayElement> Add for Array<T> {
     }
 }
 
+impl<T: NdArrayElement> Sub for Array<T> {
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, rhs: Self) -> Self::Output {
+        binary_elementwise(self, rhs, T::subtract)
+    }
+}
+
 impl<T: NdArrayElement> Mul for Array<T> {
     type Output = Self;
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         binary_elementwise(self, rhs, T::multiply)
+    }
+}
+
+impl<T: NdArrayElement> Div for Array<T> {
+    type Output = Self;
+
+    #[inline]
+    fn div(self, rhs: Self) -> Self::Output {
+        binary_elementwise(self, rhs, T::divide)
     }
 }
 
@@ -516,10 +560,14 @@ mod tests {
         let right = Array::from_shape_vec([1, 3], vec![10.0, 20.0, 30.0]).unwrap();
 
         let sum = left.clone() + right.clone();
-        let product = left * right;
+        let difference = left.clone() - right.clone();
+        let product = left.clone() * right.clone();
+        let quotient = right / left;
 
         assert_eq!(sum.as_ndarray(), &arr2(&[[11.0, 21.0, 31.0], [12.0, 22.0, 32.0]]).into_dyn());
+        assert_eq!(difference.as_ndarray(), &arr2(&[[-9.0, -19.0, -29.0], [-8.0, -18.0, -28.0]]).into_dyn());
         assert_eq!(product.as_ndarray(), &arr2(&[[10.0, 20.0, 30.0], [20.0, 40.0, 60.0]]).into_dyn());
+        assert_eq!(quotient.as_ndarray(), &arr2(&[[10.0, 20.0, 30.0], [5.0, 10.0, 15.0]]).into_dyn());
     }
 
     #[test]

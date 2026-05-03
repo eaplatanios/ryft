@@ -13,6 +13,9 @@ pub trait One<T: Type>: Sized {
     fn one(r#type: &T) -> Result<Self, TracingError>;
 }
 
+/// Canonical operation name for [`OneOperation`].
+pub const ONE_OPERATION_NAME: &'static str = "one";
+
 /// [`Operation`] that has no inputs and that produces a single output that corresponds to the _one_ value for the
 /// [`Type`] that it holds (i.e., for its `r#type` field). Note that for arrays, this would typically correspond to an
 /// array of the right type and shape filled with ones.
@@ -32,14 +35,14 @@ impl<T: Type> OneOperation<T> {
 
 impl<T: Type> Display for OneOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
+        formatter.write_str(ONE_OPERATION_NAME)
     }
 }
 
 impl<T: Type> Operation<T> for OneOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
-        "one"
+        ONE_OPERATION_NAME
     }
 
     #[inline]
@@ -50,7 +53,7 @@ impl<T: Type> Operation<T> for OneOperation<T> {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?
+        OperationFormatter::new(formatter, indentation, ONE_OPERATION_NAME)?
             .bracketed(|operation| operation.field("type", &self.r#type))
     }
 }
@@ -101,9 +104,9 @@ mod tests {
         assert_eq!(f64::one(&DataType::F64), Ok(1.0f64));
 
         let operation = OneOperation::new(DataType::F64);
-        assert_eq!(Operation::<DataType>::name(&operation), "one");
+        assert_eq!(Operation::<DataType>::name(&operation), ONE_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "OneOperation { type: F64 }");
-        assert_eq!(format!("{operation}"), "one");
+        assert_eq!(format!("{operation}"), ONE_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![1.0]));
         assert_eq!(

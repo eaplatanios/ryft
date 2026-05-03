@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::Display;
-use std::ops::{Add, Mul, Neg};
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::broadcasting::Broadcastable;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
@@ -170,11 +170,27 @@ impl Add for TestArray {
     }
 }
 
+impl Sub for TestArray {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        self.binary(rhs, |left, right| left - right)
+    }
+}
+
 impl Mul for TestArray {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
         self.binary(rhs, |left, right| left * right)
+    }
+}
+
+impl Div for TestArray {
+    type Output = Self;
+
+    fn div(self, rhs: Self) -> Self::Output {
+        self.binary(rhs, |left, right| left / right)
     }
 }
 

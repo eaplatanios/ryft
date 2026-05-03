@@ -2,10 +2,13 @@ use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
 use ryft_core::macros::check_count;
-use ryft_core::operations::arithmetic::{AddOperation, SupportsAdd};
+use ryft_core::operations::arithmetic::{
+    ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
+    SUB_OPERATION_NAME, SubOperation, SupportsAdd, SupportsDiv, SupportsMul, SupportsSub,
+};
 use ryft_core::operations::constants::{
-    OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike, ZeroLikeOperation,
-    ZeroOperation,
+    ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
+    SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::engines::TracingContext;
@@ -13,10 +16,10 @@ use ryft_core::tracing::{AtomId, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
     ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation, FlatTracedRematerialize,
-    LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
-    RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation, SupportsCos, SupportsCustom,
-    SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg, SupportsRematerialize, SupportsReshape,
-    SupportsScale, SupportsSin, WhileOperation,
+    LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation, NegOperation, RematerializeOperation,
+    ReshapeOperation, ScaleOperation, SinOperation, SupportsCos, SupportsCustom, SupportsMatMul,
+    SupportsMatrixTranspose, SupportsNeg, SupportsRematerialize, SupportsReshape, SupportsScale, SupportsSin,
+    WhileOperation,
 };
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableEngine, DifferentiableOperation, DifferentiationError,
@@ -160,8 +163,14 @@ pub enum XlaOperation {
     /// Elementwise addition.
     Add,
 
+    /// Elementwise subtraction.
+    Sub,
+
     /// Elementwise multiplication.
     Mul,
+
+    /// Elementwise division.
+    Div,
 
     /// Elementwise negation.
     Neg,
@@ -223,10 +232,12 @@ impl Operation<ArrayType> for XlaOperation {
         match self {
             Self::Zero(zero) => zero.name(),
             Self::One(one) => one.name(),
-            Self::ZeroLike => "zero_like",
-            Self::OneLike => "one_like",
-            Self::Add => "add",
-            Self::Mul => "mul",
+            Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
+            Self::OneLike => ONE_LIKE_OPERATION_NAME,
+            Self::Add => ADD_OPERATION_NAME,
+            Self::Sub => SUB_OPERATION_NAME,
+            Self::Mul => MUL_OPERATION_NAME,
+            Self::Div => DIV_OPERATION_NAME,
             Self::Neg => "neg",
             Self::Sin => "sin",
             Self::Cos => "cos",
@@ -251,7 +262,9 @@ impl Operation<ArrayType> for XlaOperation {
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
             Self::Add => AddOperation.infer_output_types(input_types),
+            Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
+            Self::Div => DivOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
@@ -280,7 +293,9 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaOperation {
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => AddOperation.interpret(inputs),
+            Self::Sub => SubOperation.interpret(inputs),
             Self::Mul => MulOperation.interpret(inputs),
+            Self::Div => DivOperation.interpret(inputs),
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
@@ -321,7 +336,9 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => AddOperation.interpret(inputs),
+            Self::Sub => SubOperation.interpret(inputs),
             Self::Mul => MulOperation.interpret(inputs),
+            Self::Div => DivOperation.interpret(inputs),
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
@@ -384,7 +401,9 @@ impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
+            Self::Sub => SubOperation.jvp(context, inputs),
             Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Div => DivOperation.jvp(context, inputs),
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
@@ -441,7 +460,9 @@ impl DifferentiableOperation<TracingContext<'static, XlaEngine<'static>>> for Xl
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
+            Self::Sub => SubOperation.jvp(context, inputs),
             Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Div => DivOperation.jvp(context, inputs),
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
@@ -485,9 +506,21 @@ impl SupportsAdd<ArrayType, ShardMapTensor> for XlaOperation {
     }
 }
 
+impl SupportsSub<ArrayType, ShardMapTensor> for XlaOperation {
+    fn sub_operation() -> Self {
+        XlaOperation::Sub
+    }
+}
+
 impl SupportsMul<ArrayType, ShardMapTensor> for XlaOperation {
     fn mul_operation() -> Self {
         XlaOperation::Mul
+    }
+}
+
+impl SupportsDiv<ArrayType, ShardMapTensor> for XlaOperation {
+    fn div_operation() -> Self {
+        XlaOperation::Div
     }
 }
 

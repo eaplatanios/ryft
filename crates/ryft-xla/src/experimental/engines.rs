@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
 
+use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
@@ -128,12 +129,12 @@ impl<'c> Engine for XlaEngine<'c> {
     type Value = ShardMapTensor;
 
     fn zero(&self, array_type: &ArrayType) -> Result<ShardMapTensor, TracingError> {
-        validate_identity_synthesis("zero", array_type)?;
+        validate_identity_synthesis(ZERO_OPERATION_NAME, array_type)?;
         Ok(ShardMapTensor::zero(array_type.clone()))
     }
 
     fn one(&self, array_type: &ArrayType) -> Result<ShardMapTensor, TracingError> {
-        validate_identity_synthesis("one", array_type)?;
+        validate_identity_synthesis(ONE_OPERATION_NAME, array_type)?;
         Ok(ShardMapTensor::one(array_type.clone()))
     }
 }

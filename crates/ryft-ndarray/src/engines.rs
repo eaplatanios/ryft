@@ -68,6 +68,7 @@ mod tests {
     use ndarray::{arr1, arr2};
     use pretty_assertions::assert_eq;
     use ryft_core::operations::Operation;
+    use ryft_core::operations::arithmetic::ADD_OPERATION_NAME;
     use ryft_core::tracing::TracingError;
     use ryft_core::tracing::engines::{Engine, TracingEngine};
     use ryft_core::tracing_v2::{DifferentiationError, MatrixOps, Sin, compile_grad, grad, jvp};
@@ -123,7 +124,7 @@ mod tests {
 
         assert_eq!(output_type, input_type);
         assert_eq!(program.instructions.len(), 1);
-        assert_eq!(program.instructions[0].operation.name(), "add");
+        assert_eq!(program.instructions[0].operation.name(), ADD_OPERATION_NAME);
     }
 
     #[test]

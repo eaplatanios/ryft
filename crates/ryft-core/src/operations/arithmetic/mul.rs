@@ -1,5 +1,5 @@
 use std::fmt::Display;
-use std::ops::Add;
+use std::ops::Mul;
 
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
@@ -7,38 +7,38 @@ use crate::operations::{ElementwiseArrayOperation, InterpretableOperation, Opera
 use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-/// Canonical operation name for [`AddOperation`].
-pub const ADD_OPERATION_NAME: &'static str = "add";
+/// Canonical operation name for [`MulOperation`].
+pub const MUL_OPERATION_NAME: &'static str = "mul";
 
-/// [`Operation`] that adds two values and typically supports broadcasting semantics for arrays.
+/// [`Operation`] that multiplies two values and typically supports broadcasting semantics for arrays.
 #[derive(Clone, Debug, Default)]
-pub struct AddOperation;
+pub struct MulOperation;
 
-impl Display for AddOperation {
+impl Display for MulOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(ADD_OPERATION_NAME)
+        formatter.write_str(MUL_OPERATION_NAME)
     }
 }
 
-impl Operation<DataType> for AddOperation {
+impl Operation<DataType> for MulOperation {
     #[inline]
     fn name(&self) -> &'static str {
-        ADD_OPERATION_NAME
+        MUL_OPERATION_NAME
     }
 
     #[inline]
     fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         input_types[0].broadcast(&input_types[1]).map(|output| vec![output]).map_err(|_| TypeError {
-            message: format!("{ADD_OPERATION_NAME} input types are not broadcast-compatible"),
+            message: format!("{MUL_OPERATION_NAME} input types are not broadcast-compatible"),
         })
     }
 }
 
-impl ElementwiseArrayOperation for AddOperation {
+impl ElementwiseArrayOperation for MulOperation {
     #[inline]
     fn name(&self) -> &'static str {
-        ADD_OPERATION_NAME
+        MUL_OPERATION_NAME
     }
 
     #[inline]
@@ -47,36 +47,36 @@ impl ElementwiseArrayOperation for AddOperation {
     }
 }
 
-impl<V: Clone + Typed<DataType> + Add<Output = V>> InterpretableOperation<DataType, V> for AddOperation {
+impl<V: Clone + Typed<DataType> + Mul<Output = V>> InterpretableOperation<DataType, V> for MulOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
-        Ok(vec![inputs[0].clone() + inputs[1].clone()])
+        Ok(vec![inputs[0].clone() * inputs[1].clone()])
     }
 }
 
-impl<V: Clone + Typed<ArrayType> + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
+impl<V: Clone + Typed<ArrayType> + Mul<Output = V>> InterpretableOperation<ArrayType, V> for MulOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
-        Ok(vec![inputs[0].clone() + inputs[1].clone()])
+        Ok(vec![inputs[0].clone() * inputs[1].clone()])
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`AddOperation`]. Backend-owned closed
-/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`AddOperation`] without
+/// Trait that represents [`Operation`] carrier types that support/include [`MulOperation`]. Backend-owned closed
+/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`MulOperation`] without
 /// knowing which carrier is in use.
-pub trait SupportsAdd<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of [`AddOperation`].
-    fn add_operation() -> Self;
+pub trait SupportsMul<T: Type, V: Traceable<T>> {
+    /// Constructs the carrier-specific representation of [`MulOperation`].
+    fn mul_operation() -> Self;
 }
 
-impl<'engine, E: TracingEngine<OperationCarrier: SupportsAdd<E::Type, E::Value>> + ?Sized> Add for Tracer<'engine, E> {
+impl<'engine, E: TracingEngine<OperationCarrier: SupportsMul<E::Type, E::Value>> + ?Sized> Mul for Tracer<'engine, E> {
     type Output = Self;
 
     #[inline]
-    fn add(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, E::OperationCarrier::add_operation())
+    fn mul(self, rhs: Self) -> Self::Output {
+        self.binary(rhs, E::OperationCarrier::mul_operation())
     }
 }
 
@@ -95,22 +95,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_add() {
-        let operation = AddOperation;
+    fn test_mul() {
+        let operation = MulOperation;
 
         // Operation identity and concrete interpretation.
-        assert_eq!(Operation::<DataType>::name(&operation), ADD_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "AddOperation");
-        assert_eq!(format!("{operation}"), ADD_OPERATION_NAME);
+        assert_eq!(Operation::<DataType>::name(&operation), MUL_OPERATION_NAME);
+        assert_eq!(format!("{operation:?}"), "MulOperation");
+        assert_eq!(format!("{operation}"), MUL_OPERATION_NAME);
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64]),
             Ok(vec![DataType::F64]),
         );
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0, 3.5]), Ok(vec![5.5]));
-        assert_eq!(InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0, 3.5]), Ok(vec![5.5]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0, 3.5]), Ok(vec![7.0]));
+        assert_eq!(InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0, 3.5]), Ok(vec![7.0]));
 
         // Array type inference broadcasts shapes and promotes data types.
-        let output = <AddOperation as Operation<ArrayType>>::infer_output_types(
+        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(
             &operation,
             &[
                 ArrayType::scalar(DataType::F32),
@@ -126,7 +126,7 @@ mod tests {
         );
 
         // Array type inference drops layout metadata when inputs disagree.
-        let output = <AddOperation as Operation<ArrayType>>::infer_output_types(
+        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(
             &operation,
             &[
                 ArrayType::new(DataType::F32, Shape::scalar(), Some(Layout::Strided(StridedLayout::new(vec![]))), None)
@@ -175,7 +175,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let output = <AddOperation as Operation<ArrayType>>::infer_output_types(&operation, &[left, right]).unwrap();
+        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(&operation, &[left, right]).unwrap();
         assert_eq!(
             output[0].sharding.as_ref().unwrap().varying_manual_axes,
             BTreeSet::from(["x".to_string(), "y".to_string()])
@@ -200,9 +200,9 @@ mod tests {
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),
-            Err(TypeError { message: format!("{ADD_OPERATION_NAME} input types are not broadcast-compatible") }),
+            Err(TypeError { message: format!("{MUL_OPERATION_NAME} input types are not broadcast-compatible") }),
         );
-        let error = <AddOperation as Operation<ArrayType>>::infer_output_types(
+        let error = <MulOperation as Operation<ArrayType>>::infer_output_types(
             &operation,
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
@@ -212,11 +212,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error,
-            TypeError { message: format!("{ADD_OPERATION_NAME} input types are not broadcast-compatible") }
+            TypeError { message: format!("{MUL_OPERATION_NAME} input types are not broadcast-compatible") }
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<DataType, f64, AddOperation>::new();
+        let mut builder = ProgramBuilder::<DataType, f64, MulOperation>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, vec![left, right]).unwrap()[0];
@@ -225,7 +225,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64, %1:f64 .
-                let %2:f64 = add %0 %1
+                let %2:f64 = mul %0 %1
                 in (%2)
             "}
             .trim_end(),

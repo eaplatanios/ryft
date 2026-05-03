@@ -474,7 +474,7 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::macros::check_count;
-    use crate::operations::arithmetic::{AddOperation, SupportsAdd};
+    use crate::operations::arithmetic::{ADD_OPERATION_NAME, AddOperation, SupportsAdd};
     use crate::operations::constants::{One, Zero};
     use crate::operations::constants::{OneLike, ZeroLike};
     use crate::operations::{InterpretableOperation, Operation};
@@ -581,7 +581,7 @@ mod tests {
     impl Operation<TestType> for AddOperation {
         #[inline]
         fn name(&self) -> &'static str {
-            "add"
+            ADD_OPERATION_NAME
         }
 
         fn infer_output_types(&self, input_types: &[TestType]) -> Result<Vec<TestType>, TypeError> {
@@ -607,7 +607,7 @@ mod tests {
         #[inline]
         fn name(&self) -> &'static str {
             match self {
-                Self::Add => "add",
+                Self::Add => ADD_OPERATION_NAME,
                 Self::Neg => "neg",
                 Self::Scale { .. } => "scale",
             }

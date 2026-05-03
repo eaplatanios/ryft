@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Debug, Display};
-use std::ops::{Add, Mul, Neg};
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use ryft_macros::Parameter;
 #[cfg(test)]
@@ -14,7 +14,7 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use ryft_core::macros::check_count;
-use ryft_core::operations::arithmetic::AddOperation;
+use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, SubOperation};
 use ryft_core::operations::constants::{One, Zero};
 use ryft_core::operations::constants::{OneLike, ZeroLike};
 use ryft_core::operations::{InterpretableOperation, Operation};
@@ -23,7 +23,7 @@ use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension
 use ryft_core::tracing::engines::{Tracer, TracingEngine};
 use ryft_core::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::{
-    ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
+    ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation,
 };
 use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin};
 
@@ -403,6 +403,24 @@ impl Add for ShardMapTensor {
     }
 }
 
+impl Sub for ShardMapTensor {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        let output_type = SubOperation
+            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
+            .expect("abstract shard-map sub should preserve compatible types")
+            .into_iter()
+            .next()
+            .expect("sub should produce one output type");
+        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
+            (Some(ShardMapConstantKind::Zero), Some(ShardMapConstantKind::Zero)) => Some(ShardMapConstantKind::Zero),
+            _ => None,
+        };
+        Self { array_type: output_type, constant_kind }
+    }
+}
+
 impl Mul for ShardMapTensor {
     type Output = Self;
 
@@ -417,6 +435,25 @@ impl Mul for ShardMapTensor {
             (Some(ShardMapConstantKind::Zero), _) | (_, Some(ShardMapConstantKind::Zero)) => {
                 Some(ShardMapConstantKind::Zero)
             }
+            (Some(ShardMapConstantKind::One), Some(ShardMapConstantKind::One)) => Some(ShardMapConstantKind::One),
+            _ => None,
+        };
+        Self { array_type: output_type, constant_kind }
+    }
+}
+
+impl Div for ShardMapTensor {
+    type Output = Self;
+
+    fn div(self, rhs: Self) -> Self::Output {
+        let output_type = DivOperation
+            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
+            .expect("abstract shard-map div should preserve compatible types")
+            .into_iter()
+            .next()
+            .expect("div should produce one output type");
+        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
+            (Some(ShardMapConstantKind::Zero), _) => Some(ShardMapConstantKind::Zero),
             (Some(ShardMapConstantKind::One), Some(ShardMapConstantKind::One)) => Some(ShardMapConstantKind::One),
             _ => None,
         };
@@ -496,7 +533,9 @@ fn xla_op_supports_constant_folding(op: &XlaOperation) -> bool {
         XlaOperation::Zero(_)
             | XlaOperation::One(_)
             | XlaOperation::Add
+            | XlaOperation::Sub
             | XlaOperation::Mul
+            | XlaOperation::Div
             | XlaOperation::Neg
             | XlaOperation::Sin
             | XlaOperation::Cos

@@ -3,7 +3,7 @@ use std::fmt::Display;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
-use crate::types::{DataType, Type, TypeError, Typed};
+use crate::types::{Type, TypeError, Typed};
 
 /// Synthesizes a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart to
 /// [`One`](crate::operations::constants::One); it is what [`OneLikeOperation`] needs for its
@@ -13,6 +13,9 @@ pub trait OneLike {
     fn one_like(&self) -> Self;
 }
 
+/// Canonical operation name for [`OneLikeOperation`].
+pub const ONE_LIKE_OPERATION_NAME: &'static str = "one_like";
+
 /// [`Operation`] that has one exemplar input and that produces a single output that corresponds to the _one_ value
 /// with the same [`Type`] as that input.
 #[derive(Copy, Clone, Debug, Default)]
@@ -20,14 +23,14 @@ pub struct OneLikeOperation;
 
 impl Display for OneLikeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(<Self as Operation<DataType>>::name(self))
+        formatter.write_str(ONE_LIKE_OPERATION_NAME)
     }
 }
 
 impl<T: Type> Operation<T> for OneLikeOperation {
     #[inline]
     fn name(&self) -> &'static str {
-        "one_like"
+        ONE_LIKE_OPERATION_NAME
     }
 
     #[inline]
@@ -86,9 +89,9 @@ mod tests {
         assert_eq!(7.0f64.one_like(), 1.0f64);
 
         let operation = OneLikeOperation;
-        assert_eq!(Operation::<DataType>::name(&operation), "one_like");
+        assert_eq!(Operation::<DataType>::name(&operation), ONE_LIKE_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "OneLikeOperation");
-        assert_eq!(format!("{operation}"), "one_like");
+        assert_eq!(format!("{operation}"), ONE_LIKE_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]), Ok(vec![1.0]));
         assert_eq!(

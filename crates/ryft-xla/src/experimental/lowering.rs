@@ -11,15 +11,14 @@ use ryft_ndarray::Array as NdArrayValue;
 
 use ryft_core::macros::check_count;
 use ryft_core::operations::Operation;
-use ryft_core::operations::arithmetic::AddOperation;
+use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, SubOperation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing::{AtomId, Instruction, Program, Traceable, TracingError};
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use ryft_core::tracing_v2::operations::{
     CosOperation, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation,
-    MulOperation, NegOperation, RematerializeOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation,
-    SinOperation,
+    NegOperation, RematerializeOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
 };
 use ryft_core::tracing_v2::{ArrayOperation, CustomPrimitive, LinearArrayOperation, MatrixOps};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
@@ -225,6 +224,22 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AddOperation {
     }
 }
 
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SubOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result =
+            lowerer
+                .block
+                .append_operation(stable_hlo::subtract(input_values[0], input_values[1], lowerer.location));
+        Ok(vec![result.result(0).expect("stablehlo.subtract should return one result").as_ref()])
+    }
+}
+
 impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MulOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -238,6 +253,22 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MulOperation {
                 .block
                 .append_operation(stable_hlo::multiply(input_values[0], input_values[1], lowerer.location));
         Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DivOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result =
+            lowerer
+                .block
+                .append_operation(stable_hlo::divide(input_values[0], input_values[1], lowerer.location));
+        Ok(vec![result.result(0).expect("stablehlo.divide should return one result").as_ref()])
     }
 }
 
@@ -507,8 +538,22 @@ impl LowerableXlaOperation<ShardMapTensor> for XlaOperation {
                 mode,
                 lowerer,
             ),
+            Self::Sub => <SubOperation as LowerableXlaOperation<ShardMapTensor>>::lower_to_mlir(
+                &SubOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
             Self::Mul => <MulOperation as LowerableXlaOperation<ShardMapTensor>>::lower_to_mlir(
                 &MulOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Div => <DivOperation as LowerableXlaOperation<ShardMapTensor>>::lower_to_mlir(
+                &DivOperation,
                 input_values,
                 output_types,
                 mode,
@@ -715,8 +760,22 @@ impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for ArrayOperat
                 mode,
                 lowerer,
             ),
+            ArrayOperation::Sub => <SubOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                &SubOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
             ArrayOperation::Mul => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &MulOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Div => <DivOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                &DivOperation,
                 input_values,
                 output_types,
                 mode,
@@ -852,6 +911,13 @@ impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for LinearArray
             ),
             LinearArrayOperation::Add => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &AddOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            LinearArrayOperation::Sub => <SubOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                &SubOperation,
                 input_values,
                 output_types,
                 mode,
@@ -2044,6 +2110,14 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
             Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()])
         }
+        XlaOperation::Sub => {
+            let result = lowerer.block.append_operation(stable_hlo::subtract(
+                input_values[0],
+                input_values[1],
+                lowerer.location,
+            ));
+            Ok(vec![result.result(0).expect("stablehlo.subtract should return one result").as_ref()])
+        }
         XlaOperation::Mul => {
             let result = lowerer.block.append_operation(stable_hlo::multiply(
                 input_values[0],
@@ -2051,6 +2125,13 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 lowerer.location,
             ));
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
+        }
+        XlaOperation::Div => {
+            let result =
+                lowerer
+                    .block
+                    .append_operation(stable_hlo::divide(input_values[0], input_values[1], lowerer.location));
+            Ok(vec![result.result(0).expect("stablehlo.divide should return one result").as_ref()])
         }
         XlaOperation::Neg => {
             let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
@@ -2467,7 +2548,7 @@ fn unsigned_integer_width(data_type: DataType) -> Result<usize, LoweringError> {
 mod tests {
     use std::borrow::Cow;
     use std::fmt::Display;
-    use std::ops::{Add, Mul, Neg};
+    use std::ops::{Add, Div, Mul, Neg, Sub};
     use std::sync::Arc;
 
     use indoc::indoc;
@@ -2616,11 +2697,27 @@ mod tests {
         }
     }
 
+    impl Sub for TestArray {
+        type Output = Self;
+
+        fn sub(self, rhs: Self) -> Self::Output {
+            self.binary(rhs, |left, right| left - right)
+        }
+    }
+
     impl Mul for TestArray {
         type Output = Self;
 
         fn mul(self, rhs: Self) -> Self::Output {
             self.binary(rhs, |left, right| left * right)
+        }
+    }
+
+    impl Div for TestArray {
+        type Output = Self;
+
+        fn div(self, rhs: Self) -> Self::Output {
+            self.binary(rhs, |left, right| left / right)
         }
     }
 
