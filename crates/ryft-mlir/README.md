@@ -83,7 +83,6 @@ fn main() {
 
 ## Roadmap / TODOs
 
-- [ ] Add `Context` constructors like `i32_type`, etc. Maybe also `bool_type` as an alias for `i1_type`?
 - [ ] Clean up the API we have around elements attributes and use stronger typing, if possible.
 - [ ] Remove uses of `.expect` and `panic!` (and `.unwrap` where it makes sense), and rely on error propagation
   instead, similar to what we are doing in `ryft_pjrt`. Note that this is quite challenging in this case since MLIR
