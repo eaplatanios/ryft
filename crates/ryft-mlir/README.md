@@ -104,8 +104,8 @@ fn main() {
     - [x] `llvm`
     - [x] `memref`
     - [ ] `mhlo`
-    - [x] [`mosaic_gpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
-    - [x] [`mosaic_tpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/tpu/tpu.td)
+    - [x] `mosaic_gpu`
+    - [x] `mosaic_tpu`
     - [x] `nvgpu`
     - [x] `pdl`
     - [x] `quant`
