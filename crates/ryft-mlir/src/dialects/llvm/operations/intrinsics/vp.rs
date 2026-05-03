@@ -72,6 +72,7 @@ pub fn intr_vp_ashr<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_ashr`")
 }
+
 /// Canonical MLIR operation name for [`VpaddOperation`].
 pub const VPADD_OPERATION_NAME: &str = "llvm.intr.vp.add";
 
@@ -142,6 +143,7 @@ pub fn intr_vp_add<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_add`")
 }
+
 /// Canonical MLIR operation name for [`VpandOperation`].
 pub const VPAND_OPERATION_NAME: &str = "llvm.intr.vp.and";
 
@@ -212,6 +214,7 @@ pub fn intr_vp_and<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_and`")
 }
+
 /// Canonical MLIR operation name for [`VpfaddOperation`].
 pub const VPFADD_OPERATION_NAME: &str = "llvm.intr.vp.fadd";
 
@@ -282,6 +285,7 @@ pub fn intr_vp_fadd<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_fadd`")
 }
+
 /// Canonical MLIR operation name for [`VpfdivOperation`].
 pub const VPFDIV_OPERATION_NAME: &str = "llvm.intr.vp.fdiv";
 
@@ -352,6 +356,7 @@ pub fn intr_vp_fdiv<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_fdiv`")
 }
+
 /// Canonical MLIR operation name for [`VpfmulAddOperation`].
 pub const VPFMUL_ADD_OPERATION_NAME: &str = "llvm.intr.vp.fmuladd";
 
@@ -430,6 +435,7 @@ pub fn intr_vp_fmuladd<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_fmuladd`")
 }
+
 /// Canonical MLIR operation name for [`VpfmulOperation`].
 pub const VPFMUL_OPERATION_NAME: &str = "llvm.intr.vp.fmul";
 
@@ -500,6 +506,7 @@ pub fn intr_vp_fmul<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_fmul`")
 }
+
 /// Canonical MLIR operation name for [`VpfnegOperation`].
 pub const VPFNEG_OPERATION_NAME: &str = "llvm.intr.vp.fneg";
 
@@ -562,6 +569,7 @@ pub fn intr_vp_fneg<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_fneg`")
 }
+
 /// Canonical MLIR operation name for [`VpfpextOperation`].
 pub const VPFPEXT_OPERATION_NAME: &str = "llvm.intr.vp.fpext";
 
@@ -624,6 +632,7 @@ pub fn intr_vp_fpext<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_fpext`")
 }
+
 /// Canonical MLIR operation name for [`VpfptoSiOperation`].
 pub const VPFPTO_SI_OPERATION_NAME: &str = "llvm.intr.vp.fptosi";
 
@@ -686,6 +695,7 @@ pub fn intr_vp_fptosi<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_fptosi`")
 }
+
 /// Canonical MLIR operation name for [`VpfptoUiOperation`].
 pub const VPFPTO_UI_OPERATION_NAME: &str = "llvm.intr.vp.fptoui";
 
@@ -748,6 +758,7 @@ pub fn intr_vp_fptoui<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_fptoui`")
 }
+
 /// Canonical MLIR operation name for [`VpfptruncOperation`].
 pub const VPFPTRUNC_OPERATION_NAME: &str = "llvm.intr.vp.fptrunc";
 
@@ -810,6 +821,7 @@ pub fn intr_vp_fptrunc<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_fptrunc`")
 }
+
 /// Canonical MLIR operation name for [`VpfremOperation`].
 pub const VPFREM_OPERATION_NAME: &str = "llvm.intr.vp.frem";
 
@@ -880,6 +892,7 @@ pub fn intr_vp_frem<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_frem`")
 }
+
 /// Canonical MLIR operation name for [`VpfsubOperation`].
 pub const VPFSUB_OPERATION_NAME: &str = "llvm.intr.vp.fsub";
 
@@ -950,6 +963,7 @@ pub fn intr_vp_fsub<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_fsub`")
 }
+
 /// Canonical MLIR operation name for [`VpfmaOperation`].
 pub const VPFMA_OPERATION_NAME: &str = "llvm.intr.vp.fma";
 
@@ -1028,6 +1042,7 @@ pub fn intr_vp_fma<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_fma`")
 }
+
 /// Canonical MLIR operation name for [`VpintToPtrOperation`].
 pub const VPINT_TO_PTR_OPERATION_NAME: &str = "llvm.intr.vp.inttoptr";
 
@@ -1090,6 +1105,7 @@ pub fn intr_vp_inttoptr<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_inttoptr`")
 }
+
 /// Canonical MLIR operation name for [`VplshrOperation`].
 pub const VPLSHR_OPERATION_NAME: &str = "llvm.intr.vp.lshr";
 
@@ -1160,6 +1176,7 @@ pub fn intr_vp_lshr<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_lshr`")
 }
+
 /// Canonical MLIR operation name for [`VploadOperation`].
 pub const VPLOAD_OPERATION_NAME: &str = "llvm.intr.vp.load";
 
@@ -1222,6 +1239,7 @@ pub fn intr_vp_load<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_load`")
 }
+
 /// Canonical MLIR operation name for [`VpmergeMinOperation`].
 pub const VPMERGE_MIN_OPERATION_NAME: &str = "llvm.intr.vp.merge";
 
@@ -1292,6 +1310,7 @@ pub fn intr_vp_merge<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_merge`")
 }
+
 /// Canonical MLIR operation name for [`VpmulOperation`].
 pub const VPMUL_OPERATION_NAME: &str = "llvm.intr.vp.mul";
 
@@ -1362,6 +1381,7 @@ pub fn intr_vp_mul<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_mul`")
 }
+
 /// Canonical MLIR operation name for [`VporOperation`].
 pub const VPOR_OPERATION_NAME: &str = "llvm.intr.vp.or";
 
@@ -1432,6 +1452,7 @@ pub fn intr_vp_or<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_or`")
 }
+
 /// Canonical MLIR operation name for [`VpptrToIntOperation`].
 pub const VPPTR_TO_INT_OPERATION_NAME: &str = "llvm.intr.vp.ptrtoint";
 
@@ -1494,6 +1515,7 @@ pub fn intr_vp_ptrtoint<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_ptrtoint`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceAddOperation`].
 pub const VPREDUCE_ADD_OPERATION_NAME: &str = "llvm.intr.vp.reduce.add";
 
@@ -1564,6 +1586,7 @@ pub fn intr_vp_reduce_add<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_add`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceAndOperation`].
 pub const VPREDUCE_AND_OPERATION_NAME: &str = "llvm.intr.vp.reduce.and";
 
@@ -1634,6 +1657,7 @@ pub fn intr_vp_reduce_and<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_and`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceFaddOperation`].
 pub const VPREDUCE_FADD_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fadd";
 
@@ -1704,6 +1728,7 @@ pub fn intr_vp_reduce_fadd<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_fadd`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceFmaxOperation`].
 pub const VPREDUCE_FMAX_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fmax";
 
@@ -1774,6 +1799,7 @@ pub fn intr_vp_reduce_fmax<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_fmax`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceFminOperation`].
 pub const VPREDUCE_FMIN_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fmin";
 
@@ -1844,6 +1870,7 @@ pub fn intr_vp_reduce_fmin<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_fmin`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceFmulOperation`].
 pub const VPREDUCE_FMUL_OPERATION_NAME: &str = "llvm.intr.vp.reduce.fmul";
 
@@ -1914,6 +1941,7 @@ pub fn intr_vp_reduce_fmul<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_fmul`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceMulOperation`].
 pub const VPREDUCE_MUL_OPERATION_NAME: &str = "llvm.intr.vp.reduce.mul";
 
@@ -1984,6 +2012,7 @@ pub fn intr_vp_reduce_mul<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_mul`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceOrOperation`].
 pub const VPREDUCE_OR_OPERATION_NAME: &str = "llvm.intr.vp.reduce.or";
 
@@ -2054,6 +2083,7 @@ pub fn intr_vp_reduce_or<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_or`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceSmaxOperation`].
 pub const VPREDUCE_SMAX_OPERATION_NAME: &str = "llvm.intr.vp.reduce.smax";
 
@@ -2124,6 +2154,7 @@ pub fn intr_vp_reduce_smax<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_smax`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceSminOperation`].
 pub const VPREDUCE_SMIN_OPERATION_NAME: &str = "llvm.intr.vp.reduce.smin";
 
@@ -2194,6 +2225,7 @@ pub fn intr_vp_reduce_smin<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_smin`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceUmaxOperation`].
 pub const VPREDUCE_UMAX_OPERATION_NAME: &str = "llvm.intr.vp.reduce.umax";
 
@@ -2264,6 +2296,7 @@ pub fn intr_vp_reduce_umax<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_umax`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceUminOperation`].
 pub const VPREDUCE_UMIN_OPERATION_NAME: &str = "llvm.intr.vp.reduce.umin";
 
@@ -2334,6 +2367,7 @@ pub fn intr_vp_reduce_umin<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_umin`")
 }
+
 /// Canonical MLIR operation name for [`VpreduceXorOperation`].
 pub const VPREDUCE_XOR_OPERATION_NAME: &str = "llvm.intr.vp.reduce.xor";
 
@@ -2404,6 +2438,7 @@ pub fn intr_vp_reduce_xor<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_reduce_xor`")
 }
+
 /// Canonical MLIR operation name for [`VpsdivOperation`].
 pub const VPSDIV_OPERATION_NAME: &str = "llvm.intr.vp.sdiv";
 
@@ -2474,6 +2509,7 @@ pub fn intr_vp_sdiv<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_sdiv`")
 }
+
 /// Canonical MLIR operation name for [`VpsextOperation`].
 pub const VPSEXT_OPERATION_NAME: &str = "llvm.intr.vp.sext";
 
@@ -2536,6 +2572,7 @@ pub fn intr_vp_sext<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_sext`")
 }
+
 /// Canonical MLIR operation name for [`VpsitoFpOperation`].
 pub const VPSITO_FP_OPERATION_NAME: &str = "llvm.intr.vp.sitofp";
 
@@ -2598,6 +2635,7 @@ pub fn intr_vp_sitofp<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_sitofp`")
 }
+
 /// Canonical MLIR operation name for [`VpsmaxOperation`].
 pub const VPSMAX_OPERATION_NAME: &str = "llvm.intr.vp.smax";
 
@@ -2668,6 +2706,7 @@ pub fn intr_vp_smax<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_smax`")
 }
+
 /// Canonical MLIR operation name for [`VpsminOperation`].
 pub const VPSMIN_OPERATION_NAME: &str = "llvm.intr.vp.smin";
 
@@ -2738,6 +2777,7 @@ pub fn intr_vp_smin<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_smin`")
 }
+
 /// Canonical MLIR operation name for [`VpsremOperation`].
 pub const VPSREM_OPERATION_NAME: &str = "llvm.intr.vp.srem";
 
@@ -2808,6 +2848,7 @@ pub fn intr_vp_srem<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_srem`")
 }
+
 /// Canonical MLIR operation name for [`VpselectMinOperation`].
 pub const VPSELECT_MIN_OPERATION_NAME: &str = "llvm.intr.vp.select";
 
@@ -2878,6 +2919,7 @@ pub fn intr_vp_select<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_select`")
 }
+
 /// Canonical MLIR operation name for [`VpshlOperation`].
 pub const VPSHL_OPERATION_NAME: &str = "llvm.intr.vp.shl";
 
@@ -2948,6 +2990,7 @@ pub fn intr_vp_shl<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_shl`")
 }
+
 /// Canonical MLIR operation name for [`VpstoreOperation`].
 pub const VPSTORE_OPERATION_NAME: &str = "llvm.intr.vp.store";
 
@@ -3010,6 +3053,7 @@ pub fn intr_vp_store<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_store`")
 }
+
 /// Canonical MLIR operation name for [`VpstridedLoadOperation`].
 pub const VPSTRIDED_LOAD_OPERATION_NAME: &str = "llvm.intr.experimental.vp.strided.load";
 
@@ -3080,6 +3124,7 @@ pub fn intr_experimental_vp_strided_load<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_experimental_vp_strided_load`")
 }
+
 /// Canonical MLIR operation name for [`VpstridedStoreOperation`].
 pub const VPSTRIDED_STORE_OPERATION_NAME: &str = "llvm.intr.experimental.vp.strided.store";
 
@@ -3150,6 +3195,7 @@ pub fn intr_experimental_vp_strided_store<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_experimental_vp_strided_store`")
 }
+
 /// Canonical MLIR operation name for [`VpsubOperation`].
 pub const VPSUB_OPERATION_NAME: &str = "llvm.intr.vp.sub";
 
@@ -3220,6 +3266,7 @@ pub fn intr_vp_sub<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_sub`")
 }
+
 /// Canonical MLIR operation name for [`VptruncOperation`].
 pub const VPTRUNC_OPERATION_NAME: &str = "llvm.intr.vp.trunc";
 
@@ -3282,6 +3329,7 @@ pub fn intr_vp_trunc<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_trunc`")
 }
+
 /// Canonical MLIR operation name for [`VpudivOperation`].
 pub const VPUDIV_OPERATION_NAME: &str = "llvm.intr.vp.udiv";
 
@@ -3352,6 +3400,7 @@ pub fn intr_vp_udiv<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_udiv`")
 }
+
 /// Canonical MLIR operation name for [`VpuitoFpOperation`].
 pub const VPUITO_FP_OPERATION_NAME: &str = "llvm.intr.vp.uitofp";
 
@@ -3414,6 +3463,7 @@ pub fn intr_vp_uitofp<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_uitofp`")
 }
+
 /// Canonical MLIR operation name for [`VpumaxOperation`].
 pub const VPUMAX_OPERATION_NAME: &str = "llvm.intr.vp.umax";
 
@@ -3484,6 +3534,7 @@ pub fn intr_vp_umax<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_umax`")
 }
+
 /// Canonical MLIR operation name for [`VpuminOperation`].
 pub const VPUMIN_OPERATION_NAME: &str = "llvm.intr.vp.umin";
 
@@ -3554,6 +3605,7 @@ pub fn intr_vp_umin<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_umin`")
 }
+
 /// Canonical MLIR operation name for [`VpuremOperation`].
 pub const VPUREM_OPERATION_NAME: &str = "llvm.intr.vp.urem";
 
@@ -3624,6 +3676,7 @@ pub fn intr_vp_urem<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_urem`")
 }
+
 /// Canonical MLIR operation name for [`VpxorOperation`].
 pub const VPXOR_OPERATION_NAME: &str = "llvm.intr.vp.xor";
 
@@ -3694,6 +3747,7 @@ pub fn intr_vp_xor<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_xor`")
 }
+
 /// Canonical MLIR operation name for [`VpzextOperation`].
 pub const VPZEXT_OPERATION_NAME: &str = "llvm.intr.vp.zext";
 
@@ -3755,4 +3809,3097 @@ pub fn intr_vp_zext<
         .build()
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_vp_zext`")
+}
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::dialects::func;
+    use crate::{Block, Context, DialectHandle, Operation, Type};
+
+    use super::*;
+
+    #[test]
+    fn test_intr_vp_ashr() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_ashr(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.ashr");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_ashr_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_ashr_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.ashr\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_add() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_add(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.add");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_add_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_add_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.add\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_and() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_and(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.and");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_and_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_and_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.and\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_fadd() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_fadd(arg_0, arg_1, arg_2, arg_3, vector_f32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.fadd");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_fadd_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into(), vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_fadd_test(%arg0: vector<4xf32>, %arg1: vector<4xf32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.fadd\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xf32>, vector<4xf32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_fdiv() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_fdiv(arg_0, arg_1, arg_2, arg_3, vector_f32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.fdiv");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_fdiv_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into(), vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_fdiv_test(%arg0: vector<4xf32>, %arg1: vector<4xf32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.fdiv\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xf32>, vector<4xf32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_fmuladd() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let arg_4 = block.argument(4).unwrap();
+            let op = intr_vp_fmuladd(arg_0, arg_1, arg_2, arg_3, arg_4, vector_f32_type, location);
+            assert_eq!(op.first(), arg_0);
+            assert_eq!(op.second(), arg_1);
+            assert_eq!(op.third(), arg_2);
+            assert_eq!(op.mask(), arg_3);
+            assert_eq!(op.explicit_vector_length(), arg_4);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.fmuladd");
+            assert_eq!(op.operands().count(), 5);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_fmuladd_test",
+                func::FuncAttributes {
+                    arguments: vec![
+                        vector_f32_type.into(),
+                        vector_f32_type.into(),
+                        vector_f32_type.into(),
+                        mask_type.into(),
+                        i32_type.into(),
+                    ],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_fmuladd_test(%arg0: vector<4xf32>, %arg1: vector<4xf32>, %arg2: vector<4xf32>, %arg3: vector<4xi1>, %arg4: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.fmuladd\"(%arg0, %arg1, %arg2, %arg3, %arg4) : (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_fmul() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_fmul(arg_0, arg_1, arg_2, arg_3, vector_f32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.fmul");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_fmul_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into(), vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_fmul_test(%arg0: vector<4xf32>, %arg1: vector<4xf32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.fmul\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xf32>, vector<4xf32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_fneg() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_fneg(arg_0, arg_1, arg_2, vector_f32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.fneg");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_fneg_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_fneg_test(%arg0: vector<4xf32>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.fneg\"(%arg0, %arg1, %arg2) : (vector<4xf32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_fpext() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_fpext(arg_0, arg_1, arg_2, vector_f32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.fpext");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_fpext_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_fpext_test(%arg0: vector<4xf32>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.fpext\"(%arg0, %arg1, %arg2) : (vector<4xf32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_fptosi() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_fptosi(arg_0, arg_1, arg_2, vector_i32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.fptosi");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_fptosi_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_fptosi_test(%arg0: vector<4xf32>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.fptosi\"(%arg0, %arg1, %arg2) : (vector<4xf32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_fptoui() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_fptoui(arg_0, arg_1, arg_2, vector_i32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.fptoui");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_fptoui_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_fptoui_test(%arg0: vector<4xf32>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.fptoui\"(%arg0, %arg1, %arg2) : (vector<4xf32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_fptrunc() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_fptrunc(arg_0, arg_1, arg_2, vector_f32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.fptrunc");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_fptrunc_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_fptrunc_test(%arg0: vector<4xf32>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.fptrunc\"(%arg0, %arg1, %arg2) : (vector<4xf32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_frem() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_frem(arg_0, arg_1, arg_2, arg_3, vector_f32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.frem");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_frem_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into(), vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_frem_test(%arg0: vector<4xf32>, %arg1: vector<4xf32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.frem\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xf32>, vector<4xf32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_fsub() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_fsub(arg_0, arg_1, arg_2, arg_3, vector_f32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.fsub");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_fsub_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into(), vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_fsub_test(%arg0: vector<4xf32>, %arg1: vector<4xf32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.fsub\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xf32>, vector<4xf32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_fma() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let arg_4 = block.argument(4).unwrap();
+            let op = intr_vp_fma(arg_0, arg_1, arg_2, arg_3, arg_4, vector_f32_type, location);
+            assert_eq!(op.first(), arg_0);
+            assert_eq!(op.second(), arg_1);
+            assert_eq!(op.third(), arg_2);
+            assert_eq!(op.mask(), arg_3);
+            assert_eq!(op.explicit_vector_length(), arg_4);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.fma");
+            assert_eq!(op.operands().count(), 5);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_fma_test",
+                func::FuncAttributes {
+                    arguments: vec![
+                        vector_f32_type.into(),
+                        vector_f32_type.into(),
+                        vector_f32_type.into(),
+                        mask_type.into(),
+                        i32_type.into(),
+                    ],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_fma_test(%arg0: vector<4xf32>, %arg1: vector<4xf32>, %arg2: vector<4xf32>, %arg3: vector<4xi1>, %arg4: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.fma\"(%arg0, %arg1, %arg2, %arg3, %arg4) : (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_inttoptr() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i64_type = context.parse_type("vector<4xi64>").unwrap();
+        let vector_pointer_type = context.parse_type("vector<4x!llvm.ptr>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i64_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_inttoptr(arg_0, arg_1, arg_2, vector_pointer_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_pointer_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.inttoptr");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_inttoptr_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i64_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_pointer_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_inttoptr_test(%arg0: vector<4xi64>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4x!llvm.ptr> {
+                    %0 = \"llvm.intr.vp.inttoptr\"(%arg0, %arg1, %arg2) : (vector<4xi64>, vector<4xi1>, i32) -> vector<4x!llvm.ptr>
+                    return %0 : vector<4x!llvm.ptr>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_lshr() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_lshr(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.lshr");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_lshr_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_lshr_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.lshr\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_load() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let pointer_type = context.llvm_pointer_type(0);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (pointer_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_load(arg_0, arg_1, arg_2, vector_i32_type, location);
+            assert_eq!(op.pointer(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.load");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_load_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_load_test(%arg0: !llvm.ptr, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.load\"(%arg0, %arg1, %arg2) : (!llvm.ptr, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_merge() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (mask_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_merge(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.condition(), arg_0);
+            assert_eq!(op.true_value(), arg_1);
+            assert_eq!(op.false_value(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.merge");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_merge_test",
+                func::FuncAttributes {
+                    arguments: vec![mask_type.into(), vector_i32_type.into(), vector_i32_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_merge_test(%arg0: vector<4xi1>, %arg1: vector<4xi32>, %arg2: vector<4xi32>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.merge\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi1>, vector<4xi32>, vector<4xi32>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_mul() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_mul(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.mul");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_mul_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_mul_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.mul\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_or() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_or(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.or");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_or_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_or_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.or\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_ptrtoint() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i64_type = context.parse_type("vector<4xi64>").unwrap();
+        let vector_pointer_type = context.parse_type("vector<4x!llvm.ptr>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_pointer_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_ptrtoint(arg_0, arg_1, arg_2, vector_i64_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_i64_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.ptrtoint");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_ptrtoint_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_pointer_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i64_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_ptrtoint_test(%arg0: vector<4x!llvm.ptr>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xi64> {
+                    %0 = \"llvm.intr.vp.ptrtoint\"(%arg0, %arg1, %arg2) : (vector<4x!llvm.ptr>, vector<4xi1>, i32) -> vector<4xi64>
+                    return %0 : vector<4xi64>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_add() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_add(arg_0, arg_1, arg_2, arg_3, i32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.add");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_add_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_add_test(%arg0: i32, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> i32 {
+                    %0 = \"llvm.intr.vp.reduce.add\"(%arg0, %arg1, %arg2, %arg3) : (i32, vector<4xi32>, vector<4xi1>, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_and() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_and(arg_0, arg_1, arg_2, arg_3, i32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.and");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_and_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_and_test(%arg0: i32, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> i32 {
+                    %0 = \"llvm.intr.vp.reduce.and\"(%arg0, %arg1, %arg2, %arg3) : (i32, vector<4xi32>, vector<4xi1>, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_fadd() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let f32_type = context.float32_type();
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_fadd(arg_0, arg_1, arg_2, arg_3, f32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.fadd");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_fadd_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_fadd_test(%arg0: f32, %arg1: vector<4xf32>, %arg2: vector<4xi1>, %arg3: i32) -> f32 {
+                    %0 = \"llvm.intr.vp.reduce.fadd\"(%arg0, %arg1, %arg2, %arg3) : (f32, vector<4xf32>, vector<4xi1>, i32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_fmax() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let f32_type = context.float32_type();
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_fmax(arg_0, arg_1, arg_2, arg_3, f32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.fmax");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_fmax_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_fmax_test(%arg0: f32, %arg1: vector<4xf32>, %arg2: vector<4xi1>, %arg3: i32) -> f32 {
+                    %0 = \"llvm.intr.vp.reduce.fmax\"(%arg0, %arg1, %arg2, %arg3) : (f32, vector<4xf32>, vector<4xi1>, i32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_fmin() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let f32_type = context.float32_type();
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_fmin(arg_0, arg_1, arg_2, arg_3, f32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.fmin");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_fmin_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_fmin_test(%arg0: f32, %arg1: vector<4xf32>, %arg2: vector<4xi1>, %arg3: i32) -> f32 {
+                    %0 = \"llvm.intr.vp.reduce.fmin\"(%arg0, %arg1, %arg2, %arg3) : (f32, vector<4xf32>, vector<4xi1>, i32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_fmul() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let f32_type = context.float32_type();
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (f32_type.as_ref(), location),
+                (vector_f32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_fmul(arg_0, arg_1, arg_2, arg_3, f32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.fmul");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_fmul_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), vector_f32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_fmul_test(%arg0: f32, %arg1: vector<4xf32>, %arg2: vector<4xi1>, %arg3: i32) -> f32 {
+                    %0 = \"llvm.intr.vp.reduce.fmul\"(%arg0, %arg1, %arg2, %arg3) : (f32, vector<4xf32>, vector<4xi1>, i32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_mul() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_mul(arg_0, arg_1, arg_2, arg_3, i32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.mul");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_mul_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_mul_test(%arg0: i32, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> i32 {
+                    %0 = \"llvm.intr.vp.reduce.mul\"(%arg0, %arg1, %arg2, %arg3) : (i32, vector<4xi32>, vector<4xi1>, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_or() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_or(arg_0, arg_1, arg_2, arg_3, i32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.or");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_or_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_or_test(%arg0: i32, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> i32 {
+                    %0 = \"llvm.intr.vp.reduce.or\"(%arg0, %arg1, %arg2, %arg3) : (i32, vector<4xi32>, vector<4xi1>, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_smax() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_smax(arg_0, arg_1, arg_2, arg_3, i32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.smax");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_smax_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_smax_test(%arg0: i32, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> i32 {
+                    %0 = \"llvm.intr.vp.reduce.smax\"(%arg0, %arg1, %arg2, %arg3) : (i32, vector<4xi32>, vector<4xi1>, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_smin() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_smin(arg_0, arg_1, arg_2, arg_3, i32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.smin");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_smin_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_smin_test(%arg0: i32, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> i32 {
+                    %0 = \"llvm.intr.vp.reduce.smin\"(%arg0, %arg1, %arg2, %arg3) : (i32, vector<4xi32>, vector<4xi1>, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_umax() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_umax(arg_0, arg_1, arg_2, arg_3, i32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.umax");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_umax_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_umax_test(%arg0: i32, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> i32 {
+                    %0 = \"llvm.intr.vp.reduce.umax\"(%arg0, %arg1, %arg2, %arg3) : (i32, vector<4xi32>, vector<4xi1>, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_umin() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_umin(arg_0, arg_1, arg_2, arg_3, i32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.umin");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_umin_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_umin_test(%arg0: i32, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> i32 {
+                    %0 = \"llvm.intr.vp.reduce.umin\"(%arg0, %arg1, %arg2, %arg3) : (i32, vector<4xi32>, vector<4xi1>, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_reduce_xor() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_reduce_xor(arg_0, arg_1, arg_2, arg_3, i32_type, location);
+            assert_eq!(op.start_value(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.reduce.xor");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_reduce_xor_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_reduce_xor_test(%arg0: i32, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> i32 {
+                    %0 = \"llvm.intr.vp.reduce.xor\"(%arg0, %arg1, %arg2, %arg3) : (i32, vector<4xi32>, vector<4xi1>, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_sdiv() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_sdiv(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.sdiv");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_sdiv_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_sdiv_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.sdiv\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_sext() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_sext(arg_0, arg_1, arg_2, vector_i32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.sext");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_sext_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_sext_test(%arg0: vector<4xi32>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.sext\"(%arg0, %arg1, %arg2) : (vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_sitofp() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_sitofp(arg_0, arg_1, arg_2, vector_f32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.sitofp");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_sitofp_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_sitofp_test(%arg0: vector<4xi32>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.sitofp\"(%arg0, %arg1, %arg2) : (vector<4xi32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_smax() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_smax(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.smax");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_smax_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_smax_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.smax\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_smin() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_smin(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.smin");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_smin_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_smin_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.smin\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_srem() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_srem(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.srem");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_srem_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_srem_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.srem\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_select() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (mask_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_select(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.condition(), arg_0);
+            assert_eq!(op.true_value(), arg_1);
+            assert_eq!(op.false_value(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.select");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_select_test",
+                func::FuncAttributes {
+                    arguments: vec![mask_type.into(), vector_i32_type.into(), vector_i32_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_select_test(%arg0: vector<4xi1>, %arg1: vector<4xi32>, %arg2: vector<4xi32>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.select\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi1>, vector<4xi32>, vector<4xi32>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_shl() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_shl(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.shl");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_shl_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_shl_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.shl\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_store() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let pointer_type = context.llvm_pointer_type(0);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_store(arg_0, arg_1, arg_2, arg_3, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.pointer(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.store");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_vp_store_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), pointer_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_store_test(%arg0: vector<4xi32>, %arg1: !llvm.ptr, %arg2: vector<4xi1>, %arg3: i32) {
+                    \"llvm.intr.vp.store\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, !llvm.ptr, vector<4xi1>, i32) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_vp_strided_load() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (pointer_type.as_ref(), location),
+                (i64_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_experimental_vp_strided_load(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.pointer(), arg_0);
+            assert_eq!(op.stride(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.vp.strided.load");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_vp_strided_load_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), i64_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_vp_strided_load_test(%arg0: !llvm.ptr, %arg1: i64, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.experimental.vp.strided.load\"(%arg0, %arg1, %arg2, %arg3) : (!llvm.ptr, i64, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_vp_strided_store() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (i64_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let arg_4 = block.argument(4).unwrap();
+            let op = intr_experimental_vp_strided_store(arg_0, arg_1, arg_2, arg_3, arg_4, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.pointer(), arg_1);
+            assert_eq!(op.stride(), arg_2);
+            assert_eq!(op.mask(), arg_3);
+            assert_eq!(op.explicit_vector_length(), arg_4);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.vp.strided.store");
+            assert_eq!(op.operands().count(), 5);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_experimental_vp_strided_store_test",
+                func::FuncAttributes {
+                    arguments: vec![
+                        vector_i32_type.into(),
+                        pointer_type.into(),
+                        i64_type.into(),
+                        mask_type.into(),
+                        i32_type.into(),
+                    ],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_vp_strided_store_test(%arg0: vector<4xi32>, %arg1: !llvm.ptr, %arg2: i64, %arg3: vector<4xi1>, %arg4: i32) {
+                    \"llvm.intr.experimental.vp.strided.store\"(%arg0, %arg1, %arg2, %arg3, %arg4) : (vector<4xi32>, !llvm.ptr, i64, vector<4xi1>, i32) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_sub() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_sub(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.sub");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_sub_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_sub_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.sub\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_trunc() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_trunc(arg_0, arg_1, arg_2, vector_i32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.trunc");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_trunc_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_trunc_test(%arg0: vector<4xi32>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.trunc\"(%arg0, %arg1, %arg2) : (vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_udiv() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_udiv(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.udiv");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_udiv_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_udiv_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.udiv\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_uitofp() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_uitofp(arg_0, arg_1, arg_2, vector_f32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.uitofp");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_uitofp_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_uitofp_test(%arg0: vector<4xi32>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xf32> {
+                    %0 = \"llvm.intr.vp.uitofp\"(%arg0, %arg1, %arg2) : (vector<4xi32>, vector<4xi1>, i32) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_umax() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_umax(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.umax");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_umax_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_umax_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.umax\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_umin() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_umin(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.umin");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_umin_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_umin_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.umin\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_urem() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_urem(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.urem");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_urem_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_urem_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.urem\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_xor() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_vp_xor(arg_0, arg_1, arg_2, arg_3, vector_i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.explicit_vector_length(), arg_3);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.xor");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_xor_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_xor_test(%arg0: vector<4xi32>, %arg1: vector<4xi32>, %arg2: vector<4xi1>, %arg3: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.xor\"(%arg0, %arg1, %arg2, %arg3) : (vector<4xi32>, vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_vp_zext() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_vp_zext(arg_0, arg_1, arg_2, vector_i32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.explicit_vector_length(), arg_2);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.vp.zext");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_vp_zext_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), mask_type.into(), i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vp_zext_test(%arg0: vector<4xi32>, %arg1: vector<4xi1>, %arg2: i32) -> vector<4xi32> {
+                    %0 = \"llvm.intr.vp.zext\"(%arg0, %arg1, %arg2) : (vector<4xi32>, vector<4xi1>, i32) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
 }
