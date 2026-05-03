@@ -38,7 +38,7 @@ impl<
     E: LinearizableEngine<
             Value: Sub<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
             LinearOperationCarrier: SupportsSub<E::Type, E::Value>,
-        > + ?Sized,
+        >,
 > DifferentiableOperation<E> for SubOperation
 where
     SubOperation: Operation<E::Type>,

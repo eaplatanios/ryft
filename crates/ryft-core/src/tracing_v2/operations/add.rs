@@ -29,7 +29,7 @@ impl<
     E: LinearizableEngine<
             Value: Add<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
             LinearOperationCarrier: SupportsAdd<E::Type, E::Value>,
-        > + ?Sized,
+        >,
 > DifferentiableOperation<E> for AddOperation
 where
     AddOperation: Operation<E::Type>,

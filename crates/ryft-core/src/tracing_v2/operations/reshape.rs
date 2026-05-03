@@ -190,7 +190,7 @@ impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
 impl<'engine, V: Traceable<ArrayType>, E> ReshapeOps for Tracer<'engine, E>
 where
-    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: TracingEngine<Type = ArrayType, Value = V>,
     E::OperationCarrier: SupportsReshape<ArrayType, V>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
@@ -296,7 +296,7 @@ impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, Arra
 
 impl<E> DifferentiableOperation<E> for ReshapeOperation
 where
-    E: LinearizableEngine<Type = ArrayType> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType>,
     E::Value: ReshapeValue + Differentiable<ArrayType, Tangent = E::Value>,
     E::LinearOperationCarrier: SupportsReshape<ArrayType, E::Value>,
 {

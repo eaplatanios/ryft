@@ -99,9 +99,7 @@ where
 #[doc(hidden)]
 pub trait CustomTracedLinearizationRule<
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-        + ?Sized
-        + 'static,
+    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>> + 'static,
 >
 {
     /// Applies the custom primitive's traced-linearization JVP rule.
@@ -115,16 +113,12 @@ pub trait CustomTracedLinearizationRule<
 /// Engine-keyed wrapper for one traced-linearization rule stored inside [`CustomPrimitiveExtensions`].
 struct TracedLinearizationRule<
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-        + ?Sized
-        + 'static,
+    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>> + 'static,
 >(Arc<dyn CustomTracedLinearizationRule<V, E>>);
 
 impl<
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-        + ?Sized
-        + 'static,
+    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>> + 'static,
 > TracedLinearizationRule<V, E>
 {
     fn rule(&self) -> &dyn CustomTracedLinearizationRule<V, E> {
@@ -227,7 +221,6 @@ impl<T: PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static> Custo
     where
         V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
         E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-            + ?Sized
             + 'static,
     {
         self.extensions
@@ -255,7 +248,6 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
     where
         V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
         E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-            + ?Sized
             + 'static,
         Rule: CustomTracedLinearizationRule<V, E> + 'static,
     {
@@ -358,7 +350,6 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
 where
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + 'static,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-        + ?Sized
         + 'static,
 {
     fn jvp(

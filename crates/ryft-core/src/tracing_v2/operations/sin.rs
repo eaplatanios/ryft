@@ -101,7 +101,7 @@ impl<V: Clone + Typed<DataType> + Sin> InterpretableOperation<DataType, V> for S
 
 impl<E> DifferentiableOperation<E> for SinOperation
 where
-    E: LinearizableEngine + ?Sized,
+    E: LinearizableEngine,
     SinOperation: Operation<E::Type>,
     E::Value: Sin + Cos + Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperationCarrier: SupportsScale<E::Type, E::Value>,
@@ -126,7 +126,7 @@ where
 
 impl<'engine, E> Sin for Tracer<'engine, E>
 where
-    E: TracingEngine + ?Sized,
+    E: TracingEngine,
     E::Value: Sin,
     E::OperationCarrier: SupportsSin<E::Type, E::Value>,
 {

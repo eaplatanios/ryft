@@ -60,7 +60,7 @@ impl<V: ControlFlowValue, T: Clone + Debug + crate::parameters::Parameter> Contr
 impl<'engine, V, E> ControlFlowValue for Tracer<'engine, E>
 where
     V: Traceable<ArrayType>,
-    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: TracingEngine<Type = ArrayType, Value = V>,
 {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
@@ -172,7 +172,7 @@ fn ensure_input_count(expected: usize, got: usize, operation: &'static str) -> R
 
 /// Replays one staged linear program by inlining its instructions into an existing linear builder
 /// owned by a [`JvpContext`].
-fn replay_linear_program_on_atoms<E: LinearizableEngine<Type = ArrayType> + ?Sized>(
+fn replay_linear_program_on_atoms<E: LinearizableEngine<Type = ArrayType>>(
     context: &JvpContext<'_, E>,
     program: &FlatProgram<E::Value, E::LinearOperationCarrier>,
     inputs: &[crate::tracing::AtomId],
@@ -445,7 +445,7 @@ where
 impl<V, E, O> DifferentiableOperation<E> for ConditionOperation<V, O, ArrayType>
 where
     V: ControlFlowValue + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType>,
-    E: LinearizableEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType, Value = V>,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     <E as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Operation<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
@@ -486,7 +486,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
     for ConditionOperation<V, EInner::OperationCarrier, ArrayType>
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + 'static,
     EInner::OperationCarrier: Clone + SupportsAdd<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
@@ -626,7 +626,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
     for WhileOperation<V, EInner::OperationCarrier, ArrayType>
 where
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + 'static,
     EInner::OperationCarrier: Clone + SupportsAdd<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
@@ -643,7 +643,7 @@ where
 impl<V, E, O> DifferentiableOperation<E> for WhileOperation<V, O, ArrayType>
 where
     V: ControlFlowValue + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType>,
-    E: LinearizableEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType, Value = V>,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     <E as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Operation<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,

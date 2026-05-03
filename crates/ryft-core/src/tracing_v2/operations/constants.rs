@@ -26,7 +26,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for ZeroOperation<E::Type>
 where
-    E: LinearizableEngine + ?Sized,
+    E: LinearizableEngine,
     ZeroOperation<E::Type>: Operation<E::Type>,
     E::Value: Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperationCarrier: SupportsZero<E::Type, E::Value>,
@@ -61,7 +61,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for OneOperation<E::Type>
 where
-    E: LinearizableEngine + ?Sized,
+    E: LinearizableEngine,
     OneOperation<E::Type>: Operation<E::Type>,
     E::Value: Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperationCarrier: SupportsZero<E::Type, E::Value>,
@@ -96,7 +96,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for ZeroLikeOperation
 where
-    E: LinearizableEngine + ?Sized,
+    E: LinearizableEngine,
     ZeroLikeOperation: Operation<E::Type>,
     E::Value: ZeroLike + Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperationCarrier: SupportsZeroLike<E::Type, E::Value>,
@@ -131,7 +131,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for OneLikeOperation
 where
-    E: LinearizableEngine + ?Sized,
+    E: LinearizableEngine,
     OneLikeOperation: Operation<E::Type>,
     E::Value: OneLike + Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperationCarrier: SupportsZeroLike<E::Type, E::Value>,

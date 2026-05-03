@@ -76,7 +76,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, Array
 
 impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
 where
-    E: LinearizableEngine<Type = ArrayType> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType>,
     E::Value: MatrixValue + Differentiable<ArrayType, Tangent = E::Value>,
     E::LinearOperationCarrier: SupportsMatrixTranspose<ArrayType, E::Value>,
 {

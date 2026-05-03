@@ -116,7 +116,7 @@ where
 impl<V, E> DifferentiableOperation<E> for ScaleOperation<ArrayType, V>
 where
     V: Differentiable<ArrayType, Tangent = V> + Mul<Output = V>,
-    E: LinearizableEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType, Value = V>,
     E::LinearOperationCarrier: SupportsScale<ArrayType, V>,
 {
     fn jvp(
@@ -138,7 +138,7 @@ where
 impl<V, E> DifferentiableOperation<E> for ScaleOperation<DataType, V>
 where
     V: Differentiable<DataType, Tangent = V> + Mul<Output = V>,
-    E: LinearizableEngine<Type = DataType, Value = V> + ?Sized,
+    E: LinearizableEngine<Type = DataType, Value = V>,
     E::LinearOperationCarrier: SupportsScale<DataType, V>,
 {
     fn jvp(
@@ -169,7 +169,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
     for ScaleOperation<ArrayType, V>
 where
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V>,
     EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
     Tracer<'engine, EInner>: Mul<Output = Tracer<'engine, EInner>>,
     EInner::LinearOperationCarrier<'engine>: SupportsScale<ArrayType, Tracer<'engine, EInner>>,

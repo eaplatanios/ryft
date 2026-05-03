@@ -11,7 +11,7 @@ use super::SupportsScale;
 
 impl<E> DifferentiableOperation<E> for MulOperation
 where
-    E: LinearizableEngine + ?Sized,
+    E: LinearizableEngine,
     MulOperation: Operation<E::Type>,
     E::Value: Mul<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperationCarrier: SupportsAdd<E::Type, E::Value> + SupportsScale<E::Type, E::Value>,

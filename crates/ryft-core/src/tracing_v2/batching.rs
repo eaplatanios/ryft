@@ -423,7 +423,7 @@ pub fn vmap<'engine, E, F, Input, Output, V>(
     batch_axis: usize,
 ) -> Result<Output, TracingError>
 where
-    E: crate::tracing::engines::TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: crate::tracing::engines::TracingEngine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
     Input: Parameterized<
             V,

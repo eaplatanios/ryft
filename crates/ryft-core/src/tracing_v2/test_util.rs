@@ -618,8 +618,7 @@ mod tests {
         primitive: CustomPrimitive<ArrayType, TestArray>,
     ) -> Result<Tracer<'engine, E>, TracingError>
     where
-        E: TracingEngine<Type = ArrayType, Value = TestArray, OperationCarrier = ArrayOperation<TestArray, ArrayType>>
-            + ?Sized,
+        E: TracingEngine<Type = ArrayType, Value = TestArray, OperationCarrier = ArrayOperation<TestArray, ArrayType>>,
     {
         let context = input.context.clone();
         Ok(context
@@ -634,8 +633,7 @@ mod tests {
         primitive: CustomPrimitive<ArrayType, TestArray>,
     ) -> Tracer<'engine, E>
     where
-        E: TracingEngine<Type = ArrayType, Value = TestArray, OperationCarrier = ArrayOperation<TestArray, ArrayType>>
-            + ?Sized,
+        E: TracingEngine<Type = ArrayType, Value = TestArray, OperationCarrier = ArrayOperation<TestArray, ArrayType>>,
     {
         apply_custom_traced_unary(input, primitive).expect("custom primitive staging should succeed")
     }

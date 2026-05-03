@@ -84,7 +84,7 @@ pub trait Differentiable<T: Type>: Traceable<T> {
 
 impl<'engine, E> Differentiable<E::Type> for Tracer<'engine, E>
 where
-    E: TracingEngine + ?Sized,
+    E: TracingEngine,
     E::Value: Differentiable<E::Type>,
 {
     type Tangent = Self;
@@ -142,7 +142,7 @@ pub trait DifferentiableEngine: LinearizableEngine {
 /// Primitive rules usually stage tangent operations through [`JvpContext::apply_operation`].
 /// Higher-order rules use [`JvpContext::engine`] to recurse into nested programs with the same
 /// engine.
-pub trait DifferentiableOperation<E: LinearizableEngine + ?Sized>: Operation<E::Type> {
+pub trait DifferentiableOperation<E: LinearizableEngine>: Operation<E::Type> {
     /// Applies this operation's forward-mode Jacobian-Vector Product (JVP) rule.
     ///
     /// The returned vector must be aligned with this operation's outputs and must carry both the
@@ -167,7 +167,7 @@ pub trait DifferentiableOperation<E: LinearizableEngine + ?Sized>: Operation<E::
 /// [`TranspositionContext`](crate::tracing::transposition::TranspositionContext): JVP rules call
 /// [`apply_operation`](Self::apply_operation) to stage tangent ops on the active builder.
 #[doc(hidden)]
-pub struct JvpContext<'a, E: LinearizableEngine + ?Sized> {
+pub struct JvpContext<'a, E: LinearizableEngine> {
     /// [`LinearizableEngine`] borrowed by this [`JvpContext`] for type-driven value synthesis and operation selection.
     pub engine: &'a E,
 
@@ -176,7 +176,7 @@ pub struct JvpContext<'a, E: LinearizableEngine + ?Sized> {
     pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::LinearOperationCarrier>>>,
 }
 
-impl<'a, E: LinearizableEngine + ?Sized> JvpContext<'a, E> {
+impl<'a, E: LinearizableEngine> JvpContext<'a, E> {
     /// Creates a JVP context that stages into `builder`.
     #[doc(hidden)]
     pub fn new(
@@ -254,7 +254,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     ///   - `engine`: Linearizing engine that supplies the linear operation carrier and primitive
     ///     JVP rules.
     ///   - `input_primals`: Concrete primal values aligned with this program's input atoms.
-    pub fn linearize<E: LinearizableEngine<Type = T, Value = V> + ?Sized>(
+    pub fn linearize<E: LinearizableEngine<Type = T, Value = V>>(
         &self,
         engine: &E,
         input_primals: Vec<V>,
@@ -398,12 +398,12 @@ pub trait DifferentiableTracingEngine: TracingEngine {
 /// `Tracer<'engine, DifferentiableOperationTracingEngine<E>>`. Once those APIs hide the concrete
 /// active tracer carrier, this adapter can become a `pub(crate)` implementation detail.
 #[repr(transparent)]
-pub struct DifferentiableOperationTracingEngine<E: DifferentiableEngine + ?Sized> {
+pub struct DifferentiableOperationTracingEngine<E: DifferentiableEngine> {
     /// Engine viewed through its differentiable operation carrier.
     engine: E,
 }
 
-impl<E: DifferentiableEngine + ?Sized> DifferentiableOperationTracingEngine<E> {
+impl<E: DifferentiableEngine> DifferentiableOperationTracingEngine<E> {
     /// Reborrows `engine` as a differentiable operation tracing view.
     #[inline]
     pub const fn new(engine: &E) -> &Self {
@@ -421,13 +421,13 @@ impl<E: DifferentiableEngine + ?Sized> DifferentiableOperationTracingEngine<E> {
     }
 }
 
-impl<E: DifferentiableEngine + ?Sized> std::fmt::Debug for DifferentiableOperationTracingEngine<E> {
+impl<E: DifferentiableEngine> std::fmt::Debug for DifferentiableOperationTracingEngine<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("DifferentiableOperationTracingEngine").finish_non_exhaustive()
     }
 }
 
-impl<E: DifferentiableEngine + ?Sized> Engine for DifferentiableOperationTracingEngine<E> {
+impl<E: DifferentiableEngine> Engine for DifferentiableOperationTracingEngine<E> {
     type Type = E::Type;
     type Value = E::Value;
 
@@ -442,18 +442,18 @@ impl<E: DifferentiableEngine + ?Sized> Engine for DifferentiableOperationTracing
     }
 }
 
-impl<E: DifferentiableEngine + ?Sized> TracingEngine for DifferentiableOperationTracingEngine<E> {
+impl<E: DifferentiableEngine> TracingEngine for DifferentiableOperationTracingEngine<E> {
     type OperationCarrier = E::DifferentiableOperationCarrier;
 }
 
-impl<E: DifferentiableEngine + ?Sized> LinearizableEngine for DifferentiableOperationTracingEngine<E> {
+impl<E: DifferentiableEngine> LinearizableEngine for DifferentiableOperationTracingEngine<E> {
     type LinearOperationCarrier = E::LinearOperationCarrier;
 }
 
 impl<
     E: DifferentiableEngine<
-            DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
-        > + ?Sized,
+        DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+    >,
 > DifferentiableEngine for DifferentiableOperationTracingEngine<E>
 {
     type DifferentiableOperationCarrier = E::DifferentiableOperationCarrier;
@@ -461,14 +461,14 @@ impl<
 
 impl<'engine, E> LinearizableEngine for TracingContext<'engine, E>
 where
-    E: DifferentiableTracingEngine + ?Sized,
+    E: DifferentiableTracingEngine,
 {
     type LinearOperationCarrier = E::LinearOperationCarrier<'engine>;
 }
 
 impl<'engine, E> DifferentiableEngine for TracingContext<'engine, E>
 where
-    E: DifferentiableTracingEngine + ?Sized,
+    E: DifferentiableTracingEngine,
     E::Value: Differentiable<E::Type, Tangent = E::Value>,
     E::OperationCarrier: SupportsAdd<E::Type, E::Value>,
     AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,

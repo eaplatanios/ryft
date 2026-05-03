@@ -150,7 +150,7 @@ fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
 
 impl<'engine, V: Traceable<ArrayType>, E> MatrixOps for Tracer<'engine, E>
 where
-    E: crate::tracing::engines::TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: crate::tracing::engines::TracingEngine<Type = ArrayType, Value = V>,
     E::OperationCarrier: SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
 {
     #[inline]

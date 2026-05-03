@@ -20,7 +20,7 @@ pub trait SupportsNeg<T: Type, V: Traceable<T>> {
     fn neg_operation() -> Self;
 }
 
-impl<'engine, E: TracingEngine + ?Sized> Neg for Tracer<'engine, E>
+impl<'engine, E: TracingEngine> Neg for Tracer<'engine, E>
 where
     E::OperationCarrier: SupportsNeg<E::Type, E::Value>,
 {
@@ -121,7 +121,7 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + Z
 
 impl<E> DifferentiableOperation<E> for NegOperation
 where
-    E: LinearizableEngine + ?Sized,
+    E: LinearizableEngine,
     NegOperation: Operation<E::Type>,
     E::Value: Neg<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
     E::LinearOperationCarrier: SupportsNeg<E::Type, E::Value>,

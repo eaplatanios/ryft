@@ -281,7 +281,7 @@ impl ShardMapOperation<ShardMapTracer> {
                 Type = ArrayType,
                 Value = ShardMapTracer,
                 LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
-            > + ?Sized,
+            >,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret_with_tracing_builder(tracing_builder, primal_inputs.as_slice())?;
@@ -351,7 +351,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
                 Type = ArrayType,
                 Value = ShardMapTracer,
                 LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
-            > + ?Sized,
+            >,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
@@ -583,7 +583,7 @@ where
             Type = ArrayType,
             Value = ShardMapTensor,
             LinearOperationCarrier = LinearArrayOperation<ShardMapTensor, ArrayType>,
-        > + ?Sized,
+        >,
     ShardMapTensor: Differentiable<ArrayType, Tangent = ShardMapTensor>,
 {
     fn jvp(
@@ -621,7 +621,7 @@ where
             Type = ArrayType,
             Value = ShardMapTensor,
             LinearOperationCarrier = LinearArrayOperation<ShardMapTensor, ArrayType>,
-        > + ?Sized,
+        >,
     ShardMapTensor: Differentiable<ArrayType, Tangent = ShardMapTensor>,
 {
     fn jvp(
@@ -742,7 +742,7 @@ where
             Type = ArrayType,
             Value = ShardMapTracer,
             LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
-        > + ?Sized,
+        >,
     ShardMapTracer: Differentiable<ArrayType, Tangent = ShardMapTracer>,
 {
     fn jvp(

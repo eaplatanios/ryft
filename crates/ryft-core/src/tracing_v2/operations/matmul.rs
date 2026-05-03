@@ -56,7 +56,7 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
 
 impl<E> DifferentiableOperation<E> for MatMulOperation
 where
-    E: LinearizableEngine<Type = ArrayType> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType>,
     E::Value: MatrixValue + Differentiable<ArrayType, Tangent = E::Value>,
     E::LinearOperationCarrier: SupportsAdd<ArrayType, E::Value>
         + SupportsLeftMatMul<ArrayType, E::Value>

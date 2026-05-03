@@ -12,7 +12,7 @@ use super::SupportsScale;
 
 impl<E> DifferentiableOperation<E> for DivOperation
 where
-    E: LinearizableEngine + ?Sized,
+    E: LinearizableEngine,
     DivOperation: Operation<E::Type>,
     E::Value: Clone
         + Div<Output = E::Value>

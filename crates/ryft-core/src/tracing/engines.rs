@@ -18,7 +18,7 @@ use crate::types::{DataType, Type, TypeError, Typed};
 /// differentiation, and potentially other [`Program`] transforms. They also define the kinds of [`Type`]s and
 /// [`Traceable`] values that each backend supports and they are effectively what lets higher-order transforms
 /// remain backend-invariant.
-pub trait Engine {
+pub trait Engine: Sized {
     /// [`Type`]s that this [`Engine`] uses to represent the abstract metadata associated with its [`Traceable`] values.
     /// A commonly used [`Type`] is [`ArrayType`](crate::ArrayType), though scalar-only engines can use
     /// [`DataType`] and richer backends may use richer metadata.
@@ -209,7 +209,7 @@ impl_tracing_engine_for_scalar!(f64, DataType::F64, 0.0, 1.0);
 
 /// Context that is used while _tracing_ [`Program`]s. This context bundles an underlying [`TracingEngine`]
 /// with a [`ProgramBuilder`] and uses [`Tracer`]s to represent values.
-pub struct TracingContext<'engine, E: TracingEngine + ?Sized> {
+pub struct TracingContext<'engine, E: TracingEngine> {
     /// [`TracingEngine`] borrowed by this [`TracingContext`] for type-driven value synthesis and operation selection.
     pub engine: &'engine E,
 
@@ -217,7 +217,7 @@ pub struct TracingContext<'engine, E: TracingEngine + ?Sized> {
     pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::OperationCarrier>>>,
 }
 
-impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
+impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
     /// Creates a new [`TracingContext`] that borrows the provided [`TracingEngine`].
     #[inline]
     pub fn new(
@@ -304,19 +304,19 @@ impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
     }
 }
 
-impl<'engine, E: TracingEngine + ?Sized> Clone for TracingContext<'engine, E> {
+impl<'engine, E: TracingEngine> Clone for TracingContext<'engine, E> {
     fn clone(&self) -> Self {
         Self { engine: self.engine, builder: self.builder.clone() }
     }
 }
 
-impl<'engine, E: TracingEngine + ?Sized> Debug for TracingContext<'engine, E> {
+impl<'engine, E: TracingEngine> Debug for TracingContext<'engine, E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("TracingContext").finish_non_exhaustive()
     }
 }
 
-impl<'engine, E: TracingEngine + ?Sized> Engine for TracingContext<'engine, E> {
+impl<'engine, E: TracingEngine> Engine for TracingContext<'engine, E> {
     type Type = E::Type;
     type Value = Tracer<'engine, E>;
 
@@ -348,7 +348,7 @@ pub enum TracerState {
 /// [`ProgramBuilder`] instead of executing those instructions, and return new [`Tracer`]s for the staged outputs.
 /// When tracing fails, later operations return _poisoned_ tracers which are represented using [`TracerState::Poison`].
 #[derive(Parameter)]
-pub struct Tracer<'engine, E: TracingEngine + ?Sized> {
+pub struct Tracer<'engine, E: TracingEngine> {
     /// [`TracerState`] of this [`Tracer`].
     pub state: TracerState,
 
@@ -359,7 +359,7 @@ pub struct Tracer<'engine, E: TracingEngine + ?Sized> {
     pub context: TracingContext<'engine, E>,
 }
 
-impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
+impl<'engine, E: TracingEngine> Tracer<'engine, E> {
     /// Returns the [`TracingEngine`] associated with this [`Tracer`].
     #[inline]
     pub fn engine(&self) -> &'engine E {
@@ -418,13 +418,13 @@ impl<'engine, E: TracingEngine + ?Sized> Tracer<'engine, E> {
     }
 }
 
-impl<'engine, E: TracingEngine + ?Sized> Clone for Tracer<'engine, E> {
+impl<'engine, E: TracingEngine> Clone for Tracer<'engine, E> {
     fn clone(&self) -> Self {
         Self { state: self.state.clone(), r#type: self.r#type.clone(), context: self.context.clone() }
     }
 }
 
-impl<'engine, E: TracingEngine<Type: Debug> + ?Sized> Debug for Tracer<'engine, E> {
+impl<'engine, E: TracingEngine<Type: Debug>> Debug for Tracer<'engine, E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Tracer")
@@ -434,7 +434,7 @@ impl<'engine, E: TracingEngine<Type: Debug> + ?Sized> Debug for Tracer<'engine, 
     }
 }
 
-impl<'engine, E: TracingEngine + ?Sized> Display for Tracer<'engine, E> {
+impl<'engine, E: TracingEngine> Display for Tracer<'engine, E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.state {
             TracerState::Live(atom_id) => write!(formatter, "{atom_id}"),
@@ -443,14 +443,14 @@ impl<'engine, E: TracingEngine + ?Sized> Display for Tracer<'engine, E> {
     }
 }
 
-impl<'engine, E: TracingEngine + ?Sized> Typed<E::Type> for Tracer<'engine, E> {
+impl<'engine, E: TracingEngine> Typed<E::Type> for Tracer<'engine, E> {
     #[inline]
     fn r#type(&self) -> Cow<'_, E::Type> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl<'engine, E: TracingEngine + ?Sized> Traceable<E::Type> for Tracer<'engine, E> {}
+impl<'engine, E: TracingEngine> Traceable<E::Type> for Tracer<'engine, E> {}
 
 #[cfg(test)]
 mod tests {

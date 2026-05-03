@@ -107,7 +107,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, Array
 impl<V, E> DifferentiableOperation<E> for LeftMatMulOperation<V>
 where
     V: MatrixValue + ZeroLike + Differentiable<ArrayType, Tangent = V>,
-    E: LinearizableEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: LinearizableEngine<Type = ArrayType, Value = V>,
     E::LinearOperationCarrier: SupportsLeftMatMul<ArrayType, V>,
 {
     fn jvp(
@@ -132,7 +132,7 @@ impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::Tracin
     for LeftMatMulOperation<V>
 where
     V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V>,
     EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
     EInner::LinearOperationCarrier<'engine>: SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>,
     Tracer<'engine, EInner>: MatrixOps,

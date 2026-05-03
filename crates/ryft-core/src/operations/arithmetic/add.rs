@@ -71,7 +71,7 @@ pub trait SupportsAdd<T: Type, V: Traceable<T>> {
     fn add_operation() -> Self;
 }
 
-impl<'engine, E: TracingEngine<OperationCarrier: SupportsAdd<E::Type, E::Value>> + ?Sized> Add for Tracer<'engine, E> {
+impl<'engine, E: TracingEngine<OperationCarrier: SupportsAdd<E::Type, E::Value>>> Add for Tracer<'engine, E> {
     type Output = Self;
 
     #[inline]

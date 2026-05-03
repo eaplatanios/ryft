@@ -134,7 +134,7 @@ where
             Type = ArrayType,
             Value = ShardMapTensor,
             LinearOperationCarrier = LinearArrayOperation<ShardMapTensor, ArrayType>,
-        > + ?Sized,
+        >,
 {
     fn jvp(
         &self,

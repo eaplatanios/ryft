@@ -5,7 +5,7 @@ use crate::types::Type;
 
 use super::*;
 
-impl<'engine, E: DifferentiableTracingEngine + ?Sized> TracingContext<'engine, E> {
+impl<'engine, E: DifferentiableTracingEngine> TracingContext<'engine, E> {
     /// Builds a staged linear program by replaying a traced primal program on symbolic dual inputs.
     ///
     /// In the overall architecture, this is the traced-program analogue of
@@ -63,7 +63,7 @@ impl<'engine, E: DifferentiableTracingEngine + ?Sized> TracingContext<'engine, E
         where
             T: Type,
             V: Traceable<T>,
-            E: DifferentiableTracingEngine<Type = T, Value = V> + ?Sized,
+            E: DifferentiableTracingEngine<Type = T, Value = V>,
             E::OperationCarrier: SupportsZeroLike<T, V>,
         {
             if let Some(atom) = tangents[atom_id.index] {

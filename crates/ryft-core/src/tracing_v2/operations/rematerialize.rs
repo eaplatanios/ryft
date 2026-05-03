@@ -153,7 +153,7 @@ where
         + crate::operations::constants::Zero<ArrayType>
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + 'static,
     EInner::OperationCarrier: Clone
         + InterpretableOperation<ArrayType, V>
         + SupportsAdd<ArrayType, V>
@@ -242,7 +242,6 @@ impl<
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
     E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V, ArrayType>>
-        + ?Sized
         + 'static,
     O: Clone + Operation<ArrayType>,
 > DifferentiableOperation<E> for RematerializeOperation<ArrayType, V, O, E::LinearOperationCarrier>
@@ -287,7 +286,7 @@ where
 impl<
     'engine,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + TracingEngine + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + TracingEngine,
 > InterpretableOperation<ArrayType, Tracer<'engine, E>>
     for RematerializeOperation<ArrayType, V, E::OperationCarrier, E::LinearOperationCarrier>
 where
@@ -465,7 +464,6 @@ where
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
     E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V, ArrayType>>
-        + ?Sized
         + 'static,
 {
     let body_program = &body.program;
@@ -517,7 +515,7 @@ impl<
     Output: Parameterized<Tracer<'engine, E>, To<Tracer<'engine, E>> = Output>,
 > RematerializeInvocationLeaf<Input, Output> for Tracer<'engine, E>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + TracingEngine + ?Sized + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + TracingEngine + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input, To<V> = Input::To<V>>,

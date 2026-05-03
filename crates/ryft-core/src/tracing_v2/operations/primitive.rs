@@ -1383,7 +1383,7 @@ where
 
 impl<'engine, E> InterpretableOperation<DataType, Tracer<'engine, E>> for LinearScalarOperation<Tracer<'engine, E>>
 where
-    E: DifferentiableTracingEngine<Type = DataType> + ?Sized + 'static,
+    E: DifferentiableTracingEngine<Type = DataType> + 'static,
     Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
         + Sub<Output = Tracer<'engine, E>>
         + Neg<Output = Tracer<'engine, E>>
@@ -1604,7 +1604,7 @@ where
 impl<'engine, E> InterpretableOperation<ArrayType, Tracer<'engine, E>>
     for LinearArrayOperation<Tracer<'engine, E>, ArrayType>
 where
-    E: DifferentiableTracingEngine<Type = ArrayType> + ?Sized + 'static,
+    E: DifferentiableTracingEngine<Type = ArrayType> + 'static,
     Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
         + Sub<Output = Tracer<'engine, E>>
         + Neg<Output = Tracer<'engine, E>>
@@ -1664,7 +1664,7 @@ where
 impl<'engine, E> InterpretableOperation<DataType, Tracer<'engine, E>>
     for LinearArrayOperation<Tracer<'engine, E>, DataType>
 where
-    E: DifferentiableTracingEngine<Type = DataType> + ?Sized + 'static,
+    E: DifferentiableTracingEngine<Type = DataType> + 'static,
     Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
         + Sub<Output = Tracer<'engine, E>>
         + Neg<Output = Tracer<'engine, E>>
@@ -1921,9 +1921,7 @@ where
         + Parameterized<V>
         + Differentiable<DataType, Tangent = V>
         + 'static,
-    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, OperationCarrier = ScalarOperation<V>>
-        + ?Sized
-        + 'static,
+    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, OperationCarrier = ScalarOperation<V>> + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     LinearScalarOperation<V>: Clone
@@ -2152,7 +2150,6 @@ where
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-        + ?Sized
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -2243,7 +2240,6 @@ where
         + Differentiable<DataType, Tangent = V>
         + 'static,
     EInner: DifferentiableTracingEngine<Type = DataType, Value = V, OperationCarrier = ArrayOperation<V, DataType>>
-        + ?Sized
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,

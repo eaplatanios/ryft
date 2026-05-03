@@ -56,9 +56,7 @@ pub trait SupportsZeroLike<T: Type, V: Traceable<T>> {
     fn zero_like_operation() -> Self;
 }
 
-impl<'engine, E: TracingEngine<OperationCarrier: SupportsZeroLike<E::Type, E::Value>> + ?Sized> ZeroLike
-    for Tracer<'engine, E>
-{
+impl<'engine, E: TracingEngine<OperationCarrier: SupportsZeroLike<E::Type, E::Value>>> ZeroLike for Tracer<'engine, E> {
     #[inline]
     fn zero_like(&self) -> Self {
         self.clone().unary(E::OperationCarrier::zero_like_operation())

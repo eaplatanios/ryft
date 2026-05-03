@@ -84,7 +84,7 @@ pub fn vjp<
     Ok((output, pullback))
 }
 
-impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
+impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
     /// Linearizes one traced scalar-output program and stages its pullback with a unit cotangent seed.
     ///
     /// This is the internal core of traced reverse-mode for scalar-output functions. Given a staged

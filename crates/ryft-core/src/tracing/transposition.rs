@@ -246,7 +246,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     }
 }
 
-impl<'engine, E: TracingEngine + ?Sized> TracingContext<'engine, E> {
+impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
     /// Transposes a traced linear [`Program`] using this [`TracingContext`] for zero materialization.
     ///
     /// The transpose program itself is staged in a fresh linear-program builder. Any zero operation
