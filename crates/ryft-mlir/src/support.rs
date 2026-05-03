@@ -116,7 +116,8 @@ impl<'o> TryFrom<StringRef<'o>> for &'o str {
 
 impl<'p> From<&'p Path> for StringRef<'p> {
     fn from(value: &'p Path) -> Self {
-        value.to_str().expect("non-UTF-8 paths cannot be converted to MLIR `StringRef`s").into()
+        let bytes = value.as_os_str().as_encoded_bytes();
+        unsafe { Self::from_c_api(MlirStringRef { data: bytes.as_ptr() as *const _, length: bytes.len() }) }
     }
 }
 
