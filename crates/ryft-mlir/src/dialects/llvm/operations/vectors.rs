@@ -46,7 +46,7 @@ pub fn extract_element<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>,
     builder
         .build()
         .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::extractelement`")
+        .expect("invalid arguments to `llvm::extract_element`")
 }
 
 /// Canonical MLIR operation name for [`InsertElementOperation`].
@@ -161,7 +161,7 @@ pub fn shuffle_vector<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>, 
     builder
         .build()
         .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::shufflevector`")
+        .expect("invalid arguments to `llvm::shuffle_vector`")
 }
 
 #[cfg(test)]
