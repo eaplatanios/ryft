@@ -85,7 +85,6 @@ fn main() {
 
 - [ ] Add `Context` constructors like `i32_type`, etc. Maybe also `bool_type` as an alias for `i1_type`?
 - [ ] Clean up the API we have around elements attributes and use stronger typing, if possible.
-- [ ] `BooleanAttributeRef::is<IntegerAttributeRef>` panics (and the same for a 1-bit integer attribute in reverse).
 - [ ] Remove uses of `.expect` and `panic!` (and `.unwrap` where it makes sense), and rely on error propagation
   instead, similar to what we are doing in `ryft_pjrt`. Note that this is quite challenging in this case since MLIR
   raises a lot of runtime errors and this is meant to be a library providing Rust bindings for MLIR. The original

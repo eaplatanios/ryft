@@ -46,8 +46,8 @@ impl<'t> Context<'t> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::IntoWithContext;
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
+    use crate::{IntegerAttributeRef, IntoWithContext};
 
     use super::*;
 
@@ -106,5 +106,16 @@ mod tests {
         let context = Context::new();
         let attribute = context.boolean_attribute(true);
         test_attribute_casting(attribute);
+
+        // Verify that a boolean attribute can be safely cast to an integer attribute with bit width 1.
+        assert!(attribute.is::<IntegerAttributeRef>());
+        let integer_attribute = attribute.cast::<IntegerAttributeRef>().unwrap();
+        assert_eq!(integer_attribute.value_bit_width(), 1);
+        assert_eq!(integer_attribute.value_words(), vec![1]);
+        let attribute = attribute.as_ref();
+        assert!(attribute.is::<IntegerAttributeRef>());
+        let integer_attribute = attribute.cast::<IntegerAttributeRef>().unwrap();
+        assert_eq!(integer_attribute.value_bit_width(), 1);
+        assert_eq!(integer_attribute.value_words(), vec![1]);
     }
 }
