@@ -58,6 +58,130 @@ mlir_generic_unary_op!(llvm, fptoui);
 mlir_generic_unary_op!(llvm, fpext);
 mlir_generic_unary_op!(llvm, fptrunc);
 
+/// Name of the attribute that stores LLVM comparison predicates.
+pub const PREDICATE_ATTRIBUTE: &str = "predicate";
+
+/// Operation trait for `llvm.icmp`.
+pub trait IcmpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
+    /// Returns the integer comparison predicate.
+    fn predicate(&self) -> AttributeRef<'c, 't> {
+        self.attribute(PREDICATE_ATTRIBUTE)
+            .unwrap_or_else(|| panic!("invalid '{PREDICATE_ATTRIBUTE}' attribute in `llvm::icmp`"))
+    }
+
+    /// Returns the left-hand side operand.
+    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the right-hand side operand.
+    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(1).unwrap()
+    }
+}
+
+mlir_op!(Icmp);
+mlir_op_trait!(Icmp, OneResult);
+mlir_op_trait!(Icmp, ZeroRegions);
+mlir_op_trait!(Icmp, ZeroSuccessors);
+
+/// Constructs a new detached [`IcmpOperation`].
+pub fn icmp<
+    'lhs,
+    'rhs,
+    'c: 'lhs + 'rhs,
+    't: 'c,
+    P: Attribute<'c, 't>,
+    Lhs: Value<'lhs, 'c, 't>,
+    Rhs: Value<'rhs, 'c, 't>,
+    T: Type<'c, 't>,
+    L: Location<'c, 't>,
+>(
+    predicate: P,
+    lhs: Lhs,
+    rhs: Rhs,
+    result_type: T,
+    location: L,
+) -> DetachedIcmpOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::llvm());
+    OperationBuilder::new("llvm.icmp", location)
+        .add_attribute(PREDICATE_ATTRIBUTE, predicate)
+        .add_operand(lhs)
+        .add_operand(rhs)
+        .add_result(result_type)
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `llvm::icmp`")
+}
+
+/// Name of the attribute that stores LLVM fast-math flags.
+pub const FASTMATH_FLAGS_ATTRIBUTE: &str = "fastmathFlags";
+
+/// Operation trait for `llvm.fcmp`.
+pub trait FcmpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
+    /// Returns the floating-point comparison predicate.
+    fn predicate(&self) -> AttributeRef<'c, 't> {
+        self.attribute(PREDICATE_ATTRIBUTE)
+            .unwrap_or_else(|| panic!("invalid '{PREDICATE_ATTRIBUTE}' attribute in `llvm::fcmp`"))
+    }
+
+    /// Returns the left-hand side operand.
+    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(0).unwrap()
+    }
+
+    /// Returns the right-hand side operand.
+    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
+        self.operand_value(1).unwrap()
+    }
+
+    /// Returns the optional fast-math flags.
+    fn fastmath_flags(&self) -> Option<AttributeRef<'c, 't>> {
+        self.attribute(FASTMATH_FLAGS_ATTRIBUTE)
+    }
+}
+
+mlir_op!(Fcmp);
+mlir_op_trait!(Fcmp, OneResult);
+mlir_op_trait!(Fcmp, ZeroRegions);
+mlir_op_trait!(Fcmp, ZeroSuccessors);
+
+/// Constructs a new detached [`FcmpOperation`].
+pub fn fcmp<
+    'lhs,
+    'rhs,
+    'c: 'lhs + 'rhs,
+    't: 'c,
+    P: Attribute<'c, 't>,
+    Lhs: Value<'lhs, 'c, 't>,
+    Rhs: Value<'rhs, 'c, 't>,
+    T: Type<'c, 't>,
+    L: Location<'c, 't>,
+>(
+    predicate: P,
+    lhs: Lhs,
+    rhs: Rhs,
+    result_type: T,
+    fastmath_flags: Option<AttributeRef<'c, 't>>,
+    location: L,
+) -> DetachedFcmpOperation<'c, 't> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::llvm());
+    let mut builder = OperationBuilder::new("llvm.fcmp", location)
+        .add_attribute(PREDICATE_ATTRIBUTE, predicate)
+        .add_operand(lhs)
+        .add_operand(rhs)
+        .add_result(result_type);
+    if let Some(fastmath_flags) = fastmath_flags {
+        builder = builder.add_attribute(FASTMATH_FLAGS_ATTRIBUTE, fastmath_flags);
+    }
+    builder
+        .build()
+        .and_then(|operation| unsafe { operation.cast() })
+        .expect("invalid arguments to `llvm::fcmp`")
+}
+
 /// Operation trait for `llvm.select`.
 pub trait SelectOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the condition operand.
@@ -1180,23 +1304,36 @@ mod tests {
     );
 
     #[test]
-    fn test_constant() {
+    fn test_icmp() {
         let context = Context::new();
         let location = context.unknown_location();
         let module = context.module(location);
-        let i32_type = context.signless_integer_type(32);
+        context.load_dialect(DialectHandle::llvm());
+        let input_type = context.signless_integer_type(32);
+        let output_type = context.signless_integer_type(1);
+        let predicate = context.integer_attribute(context.signless_integer_type(64), 4);
         module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = constant(context.integer_attribute(i32_type, 42), i32_type, location);
-            assert_eq!(op.value(), context.integer_attribute(i32_type, 42));
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operands().count(), 0);
+            let mut block = context.block(&[(input_type, location), (input_type, location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = icmp(predicate, lhs, rhs, output_type, location);
+            assert_eq!(op.predicate(), predicate);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(op.output_type(), output_type);
+            assert_eq!(op.operands().count(), 2);
             assert_eq!(op.results().count(), 1);
+            assert_eq!(op.regions().count(), 0);
+            assert_eq!(op.successors().count(), 0);
             let op = block.append_operation(op);
             block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
             func::func(
-                "llvm_constant_test",
-                func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
+                "llvm_icmp_test",
+                func::FuncAttributes {
+                    arguments: vec![input_type.into(), input_type.into()],
+                    results: vec![output_type.into()],
+                    ..Default::default()
+                },
                 block.into(),
                 location,
             )
@@ -1205,13 +1342,64 @@ mod tests {
         assert_eq!(
             module.to_string(),
             indoc! {"
-                module {
-                  func.func @llvm_constant_test() -> i32 {
-                    %0 = llvm.mlir.constant(42 : i32) : i32
-                    return %0 : i32
-                  }
-                }
-            "},
+            module {
+              func.func @llvm_icmp_test(%arg0: i32, %arg1: i32) -> i1 {
+                %0 = llvm.icmp \"sgt\" %arg0, %arg1 : i32
+                return %0 : i1
+              }
+            }
+            "}
+        );
+    }
+
+    #[test]
+    fn test_fcmp() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        context.load_dialect(DialectHandle::llvm());
+        let input_type = context.float32_type();
+        let output_type = context.signless_integer_type(1);
+        let predicate = context.integer_attribute(context.signless_integer_type(64), 2);
+        let fastmath_flags = context.parse_attribute("#llvm.fastmath<none>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(input_type, location), (input_type, location)]);
+            let lhs = block.argument(0).unwrap();
+            let rhs = block.argument(1).unwrap();
+            let op = fcmp(predicate, lhs, rhs, output_type, Some(fastmath_flags), location);
+            assert_eq!(op.predicate(), predicate);
+            assert_eq!(op.lhs(), lhs);
+            assert_eq!(op.rhs(), rhs);
+            assert_eq!(op.fastmath_flags().unwrap(), fastmath_flags);
+            assert_eq!(op.output_type(), output_type);
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            assert_eq!(op.regions().count(), 0);
+            assert_eq!(op.successors().count(), 0);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_fcmp_test",
+                func::FuncAttributes {
+                    arguments: vec![input_type.into(), input_type.into()],
+                    results: vec![output_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+            module {
+              func.func @llvm_fcmp_test(%arg0: f32, %arg1: f32) -> i1 {
+                %0 = llvm.fcmp \"ogt\" %arg0, %arg1 : f32
+                return %0 : i1
+              }
+            }
+            "}
         );
     }
 
@@ -1256,6 +1444,42 @@ mod tests {
                 module {
                   func.func @llvm_select_test(%arg0: i1, %arg1: i32, %arg2: i32) -> i32 {
                     %0 = llvm.select %arg0, %arg1, %arg2 : i1, i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_constant() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = constant(context.integer_attribute(i32_type, 42), i32_type, location);
+            assert_eq!(op.value(), context.integer_attribute(i32_type, 42));
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operands().count(), 0);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_constant_test",
+                func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_constant_test() -> i32 {
+                    %0 = llvm.mlir.constant(42 : i32) : i32
                     return %0 : i32
                   }
                 }
