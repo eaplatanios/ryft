@@ -14,6 +14,7 @@ use crate::{Parameter, TranspositionContext};
 impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike>
     LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for AddOperation
 {
+    #[inline]
     fn transpose(
         &self,
         _context: &mut TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
@@ -27,6 +28,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike>
 impl<V: Traceable<DataType> + Parameter + Add<Output = V> + ZeroLike>
     LinearOperation<DataType, V, LinearArrayOperation<V, DataType>> for AddOperation
 {
+    #[inline]
     fn transpose(
         &self,
         _context: &mut TranspositionContext<DataType, V, LinearArrayOperation<V, DataType>>,
@@ -46,6 +48,7 @@ impl<
 where
     AddOperation: Operation<E::Type>,
 {
+    #[inline]
     fn jvp(
         &self,
         context: &mut JvpContext<'_, E>,
@@ -58,7 +61,7 @@ where
                 .stage(E::LinearOperationCarrier::add_operation(), &[inputs[0].tangent, inputs[1].tangent])?
                 .into_iter()
                 .next()
-                .expect("add jvp should produce one tangent"),
+                .expect("`add` jvp should produce one tangent"),
         }])
     }
 }
