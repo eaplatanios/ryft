@@ -308,6 +308,8 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
   programmatically with typed operation constructors, assert typed accessors before insertion where practical, verify
   the module, and compare the canonical `module.to_string()` output. Avoid parsing a module and walking it with helper
   functions unless the operation has no constructor or the test is explicitly about parsing behavior.
+- For MLIR dialect operation tests, write one focused test per concrete operation in the same order as the operation
+  module. Do not replace per-operation coverage with broad scenario tests that cover many operations at once.
 - In MLIR dialect operation tests, inline trivial context/registry setup at the test site instead of adding tiny helpers
   that hides only one or two lines of code.
 

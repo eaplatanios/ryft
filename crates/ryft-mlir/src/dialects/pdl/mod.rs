@@ -9,6 +9,12 @@ use ryft_xla_sys::bindings::mlirGetDialectHandle__pdl__;
 
 use crate::DialectHandle;
 
+pub mod operations;
+pub mod types;
+
+pub use operations::*;
+pub use types::*;
+
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `pdl` [`Dialect`](crate::Dialect).
     pub fn pdl() -> Self {
