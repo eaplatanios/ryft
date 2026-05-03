@@ -36,8 +36,12 @@ pub fn jvp<
     engine: &'engine E,
     function: F,
     primals: Input,
-    tangents: Input,
-) -> Result<(Output, Output), TracingError> {
+    tangents: Input::To<D::Tangent>,
+) -> Result<(Output, Output::To<D::Tangent>), TracingError>
+where
+    Input::Family: ParameterizedFamily<D::Tangent>,
+    Output::Family: ParameterizedFamily<D::Tangent>,
+{
     D::invoke(engine, function, primals, tangents)
 }
 
@@ -51,13 +55,13 @@ pub(crate) struct JvpDispatchTracerMarker;
 ///
 /// The public transform is intentionally small; this trait is where the concrete, traced, and
 /// batched execution strategies branch apart.
-pub(crate) trait JvpDispatch<
-    'engine,
-    E: Engine,
+pub(crate) trait JvpDispatch<'engine, E: Engine, Input, Output, Marker>:
+    Differentiable<E::Type> + Parameter + Sized
+where
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<Self>,
-    Marker,
->: Parameter + Sized
+    Input::Family: ParameterizedFamily<Self::Tangent>,
+    Output::Family: ParameterizedFamily<Self::Tangent>,
 {
     /// Input type expected by the user-provided function.
     type FunctionInput;
@@ -70,8 +74,8 @@ pub(crate) trait JvpDispatch<
         engine: &'engine E,
         function: F,
         primals: Input,
-        tangents: Input,
-    ) -> Result<(Output, Output), TracingError>;
+        tangents: Input::To<Self::Tangent>,
+    ) -> Result<(Output, Output::To<Self::Tangent>), TracingError>;
 }
 
 /// Concrete-value dispatch for [`jvp`]: traces the user function with [`Tracer`] to build a staged
@@ -93,6 +97,7 @@ impl<
             V,
             Family: for<'call> ParameterizedFamily<Tracer<'call, DifferentiableOperationTracingEngine<E>>>,
             ParameterStructure: Debug + PartialEq,
+            To<V> = Input,
         >,
     Output: for<'call> Parameterized<
             V,
@@ -101,6 +106,7 @@ impl<
                 Tracer<'call, DifferentiableOperationTracingEngine<E>>,
                 To<V> = Output,
             >,
+            To<V> = Output,
         >,
 > JvpDispatch<'engine, E, Input, Output, JvpDispatchValueMarker> for V
 {
@@ -111,8 +117,8 @@ impl<
         engine: &'engine E,
         function: F,
         primals: Input,
-        tangents: Input,
-    ) -> Result<(Output, Output), TracingError> {
+        tangents: Input::To<Self::Tangent>,
+    ) -> Result<(Output, Output::To<Self::Tangent>), TracingError> {
         let primal_structure = primals.parameter_structure();
         let tangent_structure = tangents.parameter_structure();
         if primal_structure != tangent_structure {
@@ -160,8 +166,8 @@ where
         _engine: &'engine E,
         function: F,
         primals: Input,
-        tangents: Input,
-    ) -> Result<(Output, Output), TracingError> {
+        tangents: Input::To<Self::Tangent>,
+    ) -> Result<(Output, Output::To<Self::Tangent>), TracingError> {
         let primal_structure = primals.parameter_structure();
         let tangent_structure = tangents.parameter_structure();
         if primal_structure != tangent_structure {
