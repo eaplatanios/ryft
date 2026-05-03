@@ -738,3 +738,623 @@ pub fn intr_experimental_constrained_uito_fp<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_experimental_constrained_uito_fp`")
 }
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::dialects::func;
+    use crate::{Attribute, Block, Context, DialectHandle, Operation, Type};
+
+    use super::*;
+
+    #[test]
+    fn test_intr_experimental_constrained_fadd() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
+        let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_experimental_constrained_fadd(
+                arg_0,
+                arg_1,
+                f32_type,
+                roundingmode,
+                fp_exception_behavior,
+                location,
+            );
+            assert_eq!(op.argument_0(), arg_0);
+            assert_eq!(op.argument_1(), arg_1);
+            assert_eq!(op.roundingmode(), roundingmode);
+            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fadd");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_constrained_fadd_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_constrained_fadd_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.experimental.constrained.fadd %arg0, %arg1 tonearest ignore : f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_constrained_fdiv() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
+        let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_experimental_constrained_fdiv(
+                arg_0,
+                arg_1,
+                f32_type,
+                roundingmode,
+                fp_exception_behavior,
+                location,
+            );
+            assert_eq!(op.argument_0(), arg_0);
+            assert_eq!(op.argument_1(), arg_1);
+            assert_eq!(op.roundingmode(), roundingmode);
+            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fdiv");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_constrained_fdiv_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_constrained_fdiv_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.experimental.constrained.fdiv %arg0, %arg1 tonearest ignore : f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_constrained_fma() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
+        let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (f32_type.as_ref(), location),
+                (f32_type.as_ref(), location),
+                (f32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_experimental_constrained_fma(
+                arg_0,
+                arg_1,
+                arg_2,
+                f32_type,
+                roundingmode,
+                fp_exception_behavior,
+                location,
+            );
+            assert_eq!(op.argument_0(), arg_0);
+            assert_eq!(op.argument_1(), arg_1);
+            assert_eq!(op.argument_2(), arg_2);
+            assert_eq!(op.roundingmode(), roundingmode);
+            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fma");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_constrained_fma_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_constrained_fma_test(%arg0: f32, %arg1: f32, %arg2: f32) -> f32 {
+                    %0 = llvm.intr.experimental.constrained.fma %arg0, %arg1, %arg2 tonearest ignore : f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_constrained_fmuladd() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
+        let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (f32_type.as_ref(), location),
+                (f32_type.as_ref(), location),
+                (f32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_experimental_constrained_fmuladd(
+                arg_0,
+                arg_1,
+                arg_2,
+                f32_type,
+                roundingmode,
+                fp_exception_behavior,
+                location,
+            );
+            assert_eq!(op.argument_0(), arg_0);
+            assert_eq!(op.argument_1(), arg_1);
+            assert_eq!(op.argument_2(), arg_2);
+            assert_eq!(op.roundingmode(), roundingmode);
+            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fmuladd");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_constrained_fmuladd_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_constrained_fmuladd_test(%arg0: f32, %arg1: f32, %arg2: f32) -> f32 {
+                    %0 = llvm.intr.experimental.constrained.fmuladd %arg0, %arg1, %arg2 tonearest ignore : f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_constrained_fmul() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
+        let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_experimental_constrained_fmul(
+                arg_0,
+                arg_1,
+                f32_type,
+                roundingmode,
+                fp_exception_behavior,
+                location,
+            );
+            assert_eq!(op.argument_0(), arg_0);
+            assert_eq!(op.argument_1(), arg_1);
+            assert_eq!(op.roundingmode(), roundingmode);
+            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fmul");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_constrained_fmul_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_constrained_fmul_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.experimental.constrained.fmul %arg0, %arg1 tonearest ignore : f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_constrained_fpext() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        let f64_type = context.float64_type();
+        let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_experimental_constrained_fpext(arg_0, f64_type, fp_exception_behavior, location);
+            assert_eq!(op.argument_0(), arg_0);
+            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
+            assert_eq!(op.output_type(), f64_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fpext");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_constrained_fpext_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f64_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_constrained_fpext_test(%arg0: f32) -> f64 {
+                    %0 = llvm.intr.experimental.constrained.fpext %arg0 ignore : f32 to f64
+                    return %0 : f64
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_constrained_fptrunc() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
+        let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op =
+                intr_experimental_constrained_fptrunc(arg_0, f32_type, roundingmode, fp_exception_behavior, location);
+            assert_eq!(op.argument_0(), arg_0);
+            assert_eq!(op.roundingmode(), roundingmode);
+            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fptrunc");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_constrained_fptrunc_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_constrained_fptrunc_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.experimental.constrained.fptrunc %arg0 tonearest ignore : f32 to f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_constrained_frem() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
+        let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_experimental_constrained_frem(
+                arg_0,
+                arg_1,
+                f32_type,
+                roundingmode,
+                fp_exception_behavior,
+                location,
+            );
+            assert_eq!(op.argument_0(), arg_0);
+            assert_eq!(op.argument_1(), arg_1);
+            assert_eq!(op.roundingmode(), roundingmode);
+            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.frem");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_constrained_frem_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_constrained_frem_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.experimental.constrained.frem %arg0, %arg1 tonearest ignore : f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_constrained_fsub() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
+        let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_experimental_constrained_fsub(
+                arg_0,
+                arg_1,
+                f32_type,
+                roundingmode,
+                fp_exception_behavior,
+                location,
+            );
+            assert_eq!(op.argument_0(), arg_0);
+            assert_eq!(op.argument_1(), arg_1);
+            assert_eq!(op.roundingmode(), roundingmode);
+            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fsub");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_constrained_fsub_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_constrained_fsub_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.experimental.constrained.fsub %arg0, %arg1 tonearest ignore : f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_constrained_sito_fp() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
+        let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op =
+                intr_experimental_constrained_sito_fp(arg_0, f32_type, roundingmode, fp_exception_behavior, location);
+            assert_eq!(op.argument_0(), arg_0);
+            assert_eq!(op.roundingmode(), roundingmode);
+            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.sitofp");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_constrained_sitofp_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_constrained_sitofp_test(%arg0: i32) -> f32 {
+                    %0 = llvm.intr.experimental.constrained.sitofp %arg0 tonearest ignore : i32 to f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_constrained_uito_fp() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
+        let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op =
+                intr_experimental_constrained_uito_fp(arg_0, f32_type, roundingmode, fp_exception_behavior, location);
+            assert_eq!(op.argument_0(), arg_0);
+            assert_eq!(op.roundingmode(), roundingmode);
+            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.uitofp");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_experimental_constrained_uitofp_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_experimental_constrained_uitofp_test(%arg0: i32) -> f32 {
+                    %0 = llvm.intr.experimental.constrained.uitofp %arg0 tonearest ignore : i32 to f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+}
