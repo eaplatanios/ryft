@@ -178,8 +178,8 @@ impl<'t> Context<'t> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::IntoWithContext;
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
+    use crate::{BooleanAttributeRef, IntoWithContext};
 
     use super::*;
 
@@ -277,5 +277,21 @@ mod tests {
         let context = Context::new();
         let attribute = context.integer_attribute(context.signless_integer_type(64), 42);
         test_attribute_casting(attribute);
+
+        // Verify that an an integer attribute cannot be casted to a boolean attribute unless it has a bit width of 1.
+        assert!(!attribute.is::<BooleanAttributeRef>());
+        assert_eq!(attribute.cast::<BooleanAttributeRef>(), None);
+        let attribute = attribute.as_ref();
+        assert!(!attribute.is::<BooleanAttributeRef>());
+        assert_eq!(attribute.cast::<BooleanAttributeRef>(), None);
+
+        let attribute = context.integer_attribute(context.signless_integer_type(1), 1);
+        assert!(attribute.is::<BooleanAttributeRef>());
+        let boolean_attribute = attribute.cast::<BooleanAttributeRef>().unwrap();
+        assert_eq!(boolean_attribute.value(), true);
+        let attribute = attribute.as_ref();
+        assert!(attribute.is::<BooleanAttributeRef>());
+        let boolean_attribute = attribute.cast::<BooleanAttributeRef>().unwrap();
+        assert_eq!(boolean_attribute.value(), true);
     }
 }
