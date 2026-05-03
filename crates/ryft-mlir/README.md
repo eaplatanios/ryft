@@ -83,7 +83,6 @@ fn main() {
 
 ## Roadmap / TODOs
 
-- [ ] Add `Context` constructors like `i32_type`, etc. Maybe also `bool_type` as an alias for `i1_type`?
 - [ ] Clean up the API we have around elements attributes and use stronger typing, if possible.
 - [ ] Remove uses of `.expect` and `panic!` (and `.unwrap` where it makes sense), and rely on error propagation
   instead, similar to what we are doing in `ryft_pjrt`. Note that this is quite challenging in this case since MLIR
@@ -105,8 +104,8 @@ fn main() {
     - [x] `llvm`
     - [x] `memref`
     - [ ] `mhlo`
-    - [x] [`mosaic_gpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
-    - [x] [`mosaic_tpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/tpu/tpu.td)
+    - [x] `mosaic_gpu`
+    - [x] `mosaic_tpu`
     - [x] `nvgpu`
     - [x] `pdl`
     - [x] `quant`

@@ -83,6 +83,110 @@ impl<'t> Context<'t> {
                 .unwrap()
         }
     }
+
+    /// Creates a new signless 1-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn i1_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.signless_integer_type(1)
+    }
+
+    /// Creates a new signless 1-bit [`IntegerTypeRef`] owned by this [`Context`].
+    ///
+    /// This is an alias for [`Context::i1_type`] for APIs that model booleans as MLIR `i1` values.
+    #[inline]
+    pub fn bool_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.i1_type()
+    }
+
+    /// Creates a new signless 2-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn i2_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.signless_integer_type(2)
+    }
+
+    /// Creates a new signless 4-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn i4_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.signless_integer_type(4)
+    }
+
+    /// Creates a new signless 8-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn i8_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.signless_integer_type(8)
+    }
+
+    /// Creates a new signless 16-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn i16_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.signless_integer_type(16)
+    }
+
+    /// Creates a new signless 32-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn i32_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.signless_integer_type(32)
+    }
+
+    /// Creates a new signless 64-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn i64_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.signless_integer_type(64)
+    }
+
+    /// Creates a new signless 128-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn i128_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.signless_integer_type(128)
+    }
+
+    /// Creates a new unsigned 1-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn u1_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.unsigned_integer_type(1)
+    }
+
+    /// Creates a new unsigned 2-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn u2_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.unsigned_integer_type(2)
+    }
+
+    /// Creates a new unsigned 4-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn u4_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.unsigned_integer_type(4)
+    }
+
+    /// Creates a new unsigned 8-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn u8_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.unsigned_integer_type(8)
+    }
+
+    /// Creates a new unsigned 16-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn u16_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.unsigned_integer_type(16)
+    }
+
+    /// Creates a new unsigned 32-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn u32_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.unsigned_integer_type(32)
+    }
+
+    /// Creates a new unsigned 64-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn u64_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.unsigned_integer_type(64)
+    }
+
+    /// Creates a new unsigned 128-bit [`IntegerTypeRef`] owned by this [`Context`].
+    #[inline]
+    pub fn u128_type<'c>(&'c self) -> IntegerTypeRef<'c, 't> {
+        self.unsigned_integer_type(128)
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +234,45 @@ mod tests {
         assert!(!r#type.is_signless());
         assert!(!r#type.is_signed());
         assert!(r#type.is_unsigned());
+    }
+
+    #[test]
+    fn test_signless_integer_type_convenience_constructors() {
+        let context = Context::new();
+
+        assert_eq!(context.i1_type(), context.signless_integer_type(1));
+        assert_eq!(context.bool_type(), context.i1_type());
+        assert_eq!(context.i2_type(), context.signless_integer_type(2));
+        assert_eq!(context.i4_type(), context.signless_integer_type(4));
+        assert_eq!(context.i8_type(), context.signless_integer_type(8));
+        assert_eq!(context.i16_type(), context.signless_integer_type(16));
+        assert_eq!(context.i32_type(), context.signless_integer_type(32));
+        assert_eq!(context.i64_type(), context.signless_integer_type(64));
+        assert_eq!(context.i128_type(), context.signless_integer_type(128));
+
+        assert!(context.bool_type().is_signless());
+        assert_eq!(context.i2_type().to_string(), "i2");
+        assert_eq!(context.i32_type().bit_width(), 32);
+        assert_eq!(context.i32_type().to_string(), "i32");
+    }
+
+    #[test]
+    fn test_unsigned_integer_type_convenience_constructors() {
+        let context = Context::new();
+
+        assert_eq!(context.u1_type(), context.unsigned_integer_type(1));
+        assert_eq!(context.u2_type(), context.unsigned_integer_type(2));
+        assert_eq!(context.u4_type(), context.unsigned_integer_type(4));
+        assert_eq!(context.u8_type(), context.unsigned_integer_type(8));
+        assert_eq!(context.u16_type(), context.unsigned_integer_type(16));
+        assert_eq!(context.u32_type(), context.unsigned_integer_type(32));
+        assert_eq!(context.u64_type(), context.unsigned_integer_type(64));
+        assert_eq!(context.u128_type(), context.unsigned_integer_type(128));
+
+        assert!(context.u32_type().is_unsigned());
+        assert_eq!(context.u4_type().to_string(), "ui4");
+        assert_eq!(context.u32_type().bit_width(), 32);
+        assert_eq!(context.u32_type().to_string(), "ui32");
     }
 
     #[test]
