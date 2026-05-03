@@ -502,3 +502,471 @@ pub fn intr_coro_suspend<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_coro_suspend`")
 }
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::dialects::func;
+    use crate::{Block, Context, DialectHandle, Operation, Type};
+
+    use super::*;
+
+    #[test]
+    fn test_intr_coro_align() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = intr_coro_align(i64_type.as_ref(), location);
+            assert_eq!(op.output_type(), i64_type);
+            assert_eq!(op.operation_name(), "llvm.intr.coro.align");
+            assert_eq!(op.operands().count(), 0);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_coro_align_test",
+                func::FuncAttributes { arguments: vec![], results: vec![i64_type.into()], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_coro_align_test() -> i64 {
+                    %0 = llvm.intr.coro.align : i64
+                    return %0 : i64
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_coro_begin() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        let token_type = context.llvm_token_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(token_type.as_ref(), location), (pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_coro_begin(arg_0, arg_1, pointer_type, location);
+            assert_eq!(op.token(), arg_0);
+            assert_eq!(op.memory(), arg_1);
+            assert_eq!(op.output_type(), pointer_type);
+            assert_eq!(op.operation_name(), "llvm.intr.coro.begin");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_coro_begin_test",
+                func::FuncAttributes {
+                    arguments: vec![token_type.into(), pointer_type.into()],
+                    results: vec![pointer_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_coro_begin_test(%arg0: !llvm.token, %arg1: !llvm.ptr) -> !llvm.ptr {
+                    %0 = llvm.intr.coro.begin %arg0, %arg1 : (!llvm.token, !llvm.ptr) -> !llvm.ptr
+                    return %0 : !llvm.ptr
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_coro_end() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let pointer_type = context.llvm_pointer_type(0);
+        let token_type = context.llvm_token_type();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (pointer_type.as_ref(), location),
+                (i1_type.as_ref(), location),
+                (token_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_coro_end(arg_0, arg_1, arg_2, i1_type, location);
+            assert_eq!(op.handle(), arg_0);
+            assert_eq!(op.unwind(), arg_1);
+            assert_eq!(op.return_values(), arg_2);
+            assert_eq!(op.output_type(), i1_type);
+            assert_eq!(op.operation_name(), "llvm.intr.coro.end");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_coro_end_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), i1_type.into(), token_type.into()],
+                    results: vec![i1_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_coro_end_test(%arg0: !llvm.ptr, %arg1: i1, %arg2: !llvm.token) -> i1 {
+                    %0 = llvm.intr.coro.end %arg0, %arg1, %arg2 : (!llvm.ptr, i1, !llvm.token) -> i1
+                    return %0 : i1
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_coro_free() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        let token_type = context.llvm_token_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(token_type.as_ref(), location), (pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_coro_free(arg_0, arg_1, pointer_type, location);
+            assert_eq!(op.id(), arg_0);
+            assert_eq!(op.handle(), arg_1);
+            assert_eq!(op.output_type(), pointer_type);
+            assert_eq!(op.operation_name(), "llvm.intr.coro.free");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_coro_free_test",
+                func::FuncAttributes {
+                    arguments: vec![token_type.into(), pointer_type.into()],
+                    results: vec![pointer_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_coro_free_test(%arg0: !llvm.token, %arg1: !llvm.ptr) -> !llvm.ptr {
+                    %0 = llvm.intr.coro.free %arg0, %arg1 : (!llvm.token, !llvm.ptr) -> !llvm.ptr
+                    return %0 : !llvm.ptr
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_coro_id() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let pointer_type = context.llvm_pointer_type(0);
+        let token_type = context.llvm_token_type();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_coro_id(arg_0, arg_1, arg_2, arg_3, token_type, location);
+            assert_eq!(op.alignment(), arg_0);
+            assert_eq!(op.promise(), arg_1);
+            assert_eq!(op.coroutine_address(), arg_2);
+            assert_eq!(op.function_addresses(), arg_3);
+            assert_eq!(op.output_type(), token_type);
+            assert_eq!(op.operation_name(), "llvm.intr.coro.id");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_coro_id_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), pointer_type.into(), pointer_type.into(), pointer_type.into()],
+                    results: vec![token_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_coro_id_test(%arg0: i32, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr) -> !llvm.token {
+                    %0 = llvm.intr.coro.id %arg0, %arg1, %arg2, %arg3 : (i32, !llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.token
+                    return %0 : !llvm.token
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_coro_promise() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (pointer_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+                (i1_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_coro_promise(arg_0, arg_1, arg_2, pointer_type, location);
+            assert_eq!(op.handle(), arg_0);
+            assert_eq!(op.alignment(), arg_1);
+            assert_eq!(op.from(), arg_2);
+            assert_eq!(op.output_type(), pointer_type);
+            assert_eq!(op.operation_name(), "llvm.intr.coro.promise");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_coro_promise_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), i32_type.into(), i1_type.into()],
+                    results: vec![pointer_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_coro_promise_test(%arg0: !llvm.ptr, %arg1: i32, %arg2: i1) -> !llvm.ptr {
+                    %0 = llvm.intr.coro.promise %arg0, %arg1, %arg2 : (!llvm.ptr, i32, i1) -> !llvm.ptr
+                    return %0 : !llvm.ptr
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_coro_resume() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_coro_resume(arg_0, location);
+            assert_eq!(op.handle(), arg_0);
+            assert_eq!(op.operation_name(), "llvm.intr.coro.resume");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_coro_resume_test",
+                func::FuncAttributes { arguments: vec![pointer_type.into()], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_coro_resume_test(%arg0: !llvm.ptr) {
+                    llvm.intr.coro.resume %arg0 : !llvm.ptr
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_coro_save() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        let token_type = context.llvm_token_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_coro_save(arg_0, token_type, location);
+            assert_eq!(op.handle(), arg_0);
+            assert_eq!(op.output_type(), token_type);
+            assert_eq!(op.operation_name(), "llvm.intr.coro.save");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_coro_save_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into()],
+                    results: vec![token_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_coro_save_test(%arg0: !llvm.ptr) -> !llvm.token {
+                    %0 = llvm.intr.coro.save %arg0 : (!llvm.ptr) -> !llvm.token
+                    return %0 : !llvm.token
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_coro_size() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = intr_coro_size(i64_type.as_ref(), location);
+            assert_eq!(op.output_type(), i64_type);
+            assert_eq!(op.operation_name(), "llvm.intr.coro.size");
+            assert_eq!(op.operands().count(), 0);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_coro_size_test",
+                func::FuncAttributes { arguments: vec![], results: vec![i64_type.into()], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_coro_size_test() -> i64 {
+                    %0 = llvm.intr.coro.size : i64
+                    return %0 : i64
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_coro_suspend() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i8_type = context.signless_integer_type(8);
+        let token_type = context.llvm_token_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(token_type.as_ref(), location), (i1_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_coro_suspend(arg_0, arg_1, i8_type, location);
+            assert_eq!(op.save(), arg_0);
+            assert_eq!(op.final_suspend(), arg_1);
+            assert_eq!(op.output_type(), i8_type);
+            assert_eq!(op.operation_name(), "llvm.intr.coro.suspend");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_coro_suspend_test",
+                func::FuncAttributes {
+                    arguments: vec![token_type.into(), i1_type.into()],
+                    results: vec![i8_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_coro_suspend_test(%arg0: !llvm.token, %arg1: i1) -> i8 {
+                    %0 = llvm.intr.coro.suspend %arg0, %arg1 : i8
+                    return %0 : i8
+                  }
+                }
+            "},
+        );
+    }
+}

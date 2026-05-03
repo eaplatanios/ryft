@@ -3844,3 +3844,3347 @@ pub fn intr_usub_with_overflow<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_usub_with_overflow`")
 }
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::dialects::func;
+    use crate::{Attribute, Block, Context, DialectHandle, Operation, Type};
+
+    use super::*;
+
+    #[test]
+    fn test_intr_acos() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_acos(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.acos");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_acos_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_acos_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.acos(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_asin() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_asin(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.asin");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_asin_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_asin_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.asin(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_atan2() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_atan2(arg_0, arg_1, f32_type, None, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.atan2");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_atan2_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_atan2_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.atan2(%arg0, %arg1) : (f32, f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_atan() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_atan(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.atan");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_atan_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_atan_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.atan(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_abs() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let is_int_min_poison = context.boolean_attribute(false).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_abs(arg_0, i32_type, is_int_min_poison, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.is_int_min_poison(), is_int_min_poison);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.abs");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_abs_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_abs_test(%arg0: i32) -> i32 {
+                    %0 = \"llvm.intr.abs\"(%arg0) <{is_int_min_poison = false}> : (i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_assume() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        module.body().append_operation({
+            let mut block = context.block(&[(i1_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_assume(arg_0, location);
+            assert_eq!(op.condition(), arg_0);
+            assert_eq!(op.operation_name(), "llvm.intr.assume");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_assume_test",
+                func::FuncAttributes { arguments: vec![i1_type.into()], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_assume_test(%arg0: i1) {
+                    llvm.intr.assume %arg0 : i1
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_bit_reverse() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_bit_reverse(arg_0, i32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.bitreverse");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_bitreverse_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_bitreverse_test(%arg0: i32) -> i32 {
+                    %0 = llvm.intr.bitreverse(%arg0) : (i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_bswap() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_bswap(arg_0, i32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.bswap");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_bswap_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_bswap_test(%arg0: i32) -> i32 {
+                    %0 = llvm.intr.bswap(%arg0) : (i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_copy_sign() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_copy_sign(arg_0, arg_1, f32_type, None, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.copysign");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_copysign_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_copysign_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.copysign(%arg0, %arg1) : (f32, f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_cos() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_cos(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.cos");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_cos_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_cos_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.cos(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_cosh() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_cosh(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.cosh");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_cosh_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_cosh_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.cosh(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ctlz() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let is_zero_poison = context.boolean_attribute(false).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_ctlz(arg_0, i32_type, is_zero_poison, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.is_zero_poison(), is_zero_poison);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.ctlz");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_ctlz_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ctlz_test(%arg0: i32) -> i32 {
+                    %0 = \"llvm.intr.ctlz\"(%arg0) <{is_zero_poison = false}> : (i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_count_trailing_zeros() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let is_zero_poison = context.boolean_attribute(false).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_count_trailing_zeros(arg_0, i32_type, is_zero_poison, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.is_zero_poison(), is_zero_poison);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.cttz");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_cttz_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_cttz_test(%arg0: i32) -> i32 {
+                    %0 = \"llvm.intr.cttz\"(%arg0) <{is_zero_poison = false}> : (i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ct_pop() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_ct_pop(arg_0, i32_type, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.ctpop");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_ctpop_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ctpop_test(%arg0: i32) -> i32 {
+                    %0 = llvm.intr.ctpop(%arg0) : (i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_exp10() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_exp10(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.exp10");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_exp10_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_exp10_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.exp10(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_exp2() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_exp2(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.exp2");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_exp2_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_exp2_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.exp2(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_exp() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_exp(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.exp");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_exp_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_exp_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.exp(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_expect() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_expect(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.expected(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.expect");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_expect_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_expect_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.expect %arg0, %arg1 : i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_expect_with_probability() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let f64_type = context.float64_type();
+        let prob = context.float_attribute(f64_type, 5.000000e-01).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_expect_with_probability(arg_0, arg_1, i32_type, prob, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.expected(), arg_1);
+            assert_eq!(op.prob(), prob);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.expect.with.probability");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_expect_with_probability_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_expect_with_probability_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.expect.with.probability %arg0, %arg1, 5.000000e-01 : i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_fabs() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_fabs(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.fabs");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_fabs_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_fabs_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.fabs(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ceil() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_ceil(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.ceil");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_ceil_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ceil_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.ceil(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_floor() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_floor(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.floor");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_floor_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_floor_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.floor(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_fma() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (f32_type.as_ref(), location),
+                (f32_type.as_ref(), location),
+                (f32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_fma(arg_0, arg_1, arg_2, f32_type, None, location);
+            assert_eq!(op.first(), arg_0);
+            assert_eq!(op.second(), arg_1);
+            assert_eq!(op.third(), arg_2);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.fma");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_fma_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_fma_test(%arg0: f32, %arg1: f32, %arg2: f32) -> f32 {
+                    %0 = llvm.intr.fma(%arg0, %arg1, %arg2) : (f32, f32, f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_fmuladd() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (f32_type.as_ref(), location),
+                (f32_type.as_ref(), location),
+                (f32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_fmuladd(arg_0, arg_1, arg_2, f32_type, None, location);
+            assert_eq!(op.first(), arg_0);
+            assert_eq!(op.second(), arg_1);
+            assert_eq!(op.third(), arg_2);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.fmuladd");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_fmuladd_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_fmuladd_test(%arg0: f32, %arg1: f32, %arg2: f32) -> f32 {
+                    %0 = llvm.intr.fmuladd(%arg0, %arg1, %arg2) : (f32, f32, f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_trunc() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_trunc(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.trunc");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_trunc_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_trunc_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.trunc(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_frexp() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let result_type = context.llvm_literal_struct_type(&[f32_type.as_ref(), i32_type.as_ref()], false);
+            let op = intr_frexp(arg_0, result_type, None, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), result_type);
+            assert_eq!(op.operation_name(), "llvm.intr.frexp");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_frexp_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![result_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_frexp_test(%arg0: f32) -> !llvm.struct<(f32, i32)> {
+                    %0 = llvm.intr.frexp(%arg0) : (f32) -> !llvm.struct<(f32, i32)>
+                    return %0 : !llvm.struct<(f32, i32)>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_fshl() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_fshl(arg_0, arg_1, arg_2, i32_type, location);
+            assert_eq!(op.first(), arg_0);
+            assert_eq!(op.second(), arg_1);
+            assert_eq!(op.third(), arg_2);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.fshl");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_fshl_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_fshl_test(%arg0: i32, %arg1: i32, %arg2: i32) -> i32 {
+                    %0 = llvm.intr.fshl(%arg0, %arg1, %arg2) : (i32, i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_fshr() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_fshr(arg_0, arg_1, arg_2, i32_type, location);
+            assert_eq!(op.first(), arg_0);
+            assert_eq!(op.second(), arg_1);
+            assert_eq!(op.third(), arg_2);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.fshr");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_fshr_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_fshr_test(%arg0: i32, %arg1: i32, %arg2: i32) -> i32 {
+                    %0 = llvm.intr.fshr(%arg0, %arg1, %arg2) : (i32, i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_is_constant() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_is_constant(arg_0, i1_type, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.output_type(), i1_type);
+            assert_eq!(op.operation_name(), "llvm.intr.is.constant");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_is_constant_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into()],
+                    results: vec![i1_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_is_constant_test(%arg0: i32) -> i1 {
+                    %0 = \"llvm.intr.is.constant\"(%arg0) : (i32) -> i1
+                    return %0 : i1
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_is_fpclass() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        let f32_type = context.float32_type();
+        let bit = context.integer_attribute(i32_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_is_fpclass(arg_0, i1_type, bit, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.bit(), bit);
+            assert_eq!(op.output_type(), i1_type);
+            assert_eq!(op.operation_name(), "llvm.intr.is.fpclass");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_is_fpclass_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![i1_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_is_fpclass_test(%arg0: f32) -> i1 {
+                    %0 = \"llvm.intr.is.fpclass\"(%arg0) <{bit = 1 : i32}> : (f32) -> i1
+                    return %0 : i1
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_llrint() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_llrint(arg_0, i64_type, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.output_type(), i64_type);
+            assert_eq!(op.operation_name(), "llvm.intr.llrint");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_llrint_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![i64_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_llrint_test(%arg0: f32) -> i64 {
+                    %0 = llvm.intr.llrint(%arg0) : (f32) -> i64
+                    return %0 : i64
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_llround() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_llround(arg_0, i64_type, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.output_type(), i64_type);
+            assert_eq!(op.operation_name(), "llvm.intr.llround");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_llround_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![i64_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_llround_test(%arg0: f32) -> i64 {
+                    %0 = llvm.intr.llround(%arg0) : (f32) -> i64
+                    return %0 : i64
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ldexp() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_ldexp(arg_0, arg_1, f32_type, None, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.power(), arg_1);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.ldexp");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_ldexp_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), i32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ldexp_test(%arg0: f32, %arg1: i32) -> f32 {
+                    %0 = llvm.intr.ldexp(%arg0, %arg1) : (f32, i32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_log10() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_log10(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.log10");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_log10_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_log10_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.log10(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_log2() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_log2(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.log2");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_log2_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_log2_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.log2(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_log() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_log(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.log");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_log_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_log_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.log(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_lrint() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_lrint(arg_0, i64_type, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.output_type(), i64_type);
+            assert_eq!(op.operation_name(), "llvm.intr.lrint");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_lrint_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![i64_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_lrint_test(%arg0: f32) -> i64 {
+                    %0 = llvm.intr.lrint(%arg0) : (f32) -> i64
+                    return %0 : i64
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_lround() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_lround(arg_0, i64_type, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.output_type(), i64_type);
+            assert_eq!(op.operation_name(), "llvm.intr.lround");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_lround_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![i64_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_lround_test(%arg0: f32) -> i64 {
+                    %0 = llvm.intr.lround(%arg0) : (f32) -> i64
+                    return %0 : i64
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_maxnum() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_maxnum(arg_0, arg_1, f32_type, None, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.maxnum");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_maxnum_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_maxnum_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.maxnum(%arg0, %arg1) : (f32, f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_maximum() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_maximum(arg_0, arg_1, f32_type, None, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.maximum");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_maximum_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_maximum_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.maximum(%arg0, %arg1) : (f32, f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_min_num() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_min_num(arg_0, arg_1, f32_type, None, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.minnum");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_minnum_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_minnum_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.minnum(%arg0, %arg1) : (f32, f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_minimum() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_minimum(arg_0, arg_1, f32_type, None, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.minimum");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_minimum_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_minimum_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.minimum(%arg0, %arg1) : (f32, f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_nearby_int() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_nearby_int(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.nearbyint");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_nearbyint_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_nearbyint_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.nearbyint(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_powi() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_powi(arg_0, arg_1, f32_type, None, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.power(), arg_1);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.powi");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_powi_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), i32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_powi_test(%arg0: f32, %arg1: i32) -> f32 {
+                    %0 = llvm.intr.powi(%arg0, %arg1) : (f32, i32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_pow() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_pow(arg_0, arg_1, f32_type, None, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.pow");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_pow_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into(), f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_pow_test(%arg0: f32, %arg1: f32) -> f32 {
+                    %0 = llvm.intr.pow(%arg0, %arg1) : (f32, f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_rint() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_rint(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.rint");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_rint_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_rint_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.rint(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_round_even() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_round_even(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.roundeven");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_roundeven_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_roundeven_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.roundeven(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_round() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_round(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.round");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_round_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_round_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.round(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_sadd_sat() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_sadd_sat(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.sadd.sat");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_sadd_sat_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_sadd_sat_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.sadd.sat(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_sadd_with_overflow() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let result_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i1_type.as_ref()], false);
+            let op = intr_sadd_with_overflow(arg_0, arg_1, result_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), result_type);
+            assert_eq!(op.operation_name(), "llvm.intr.sadd.with.overflow");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_sadd_with_overflow_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![result_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_sadd_with_overflow_test(%arg0: i32, %arg1: i32) -> !llvm.struct<(i32, i1)> {
+                    %0 = \"llvm.intr.sadd.with.overflow\"(%arg0, %arg1) : (i32, i32) -> !llvm.struct<(i32, i1)>
+                    return %0 : !llvm.struct<(i32, i1)>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_scmp() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_scmp(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.scmp");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_scmp_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_scmp_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.scmp(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_smax() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_smax(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.smax");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_smax_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_smax_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.smax(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_smin() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_smin(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.smin");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_smin_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_smin_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.smin(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_smul_with_overflow() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let result_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i1_type.as_ref()], false);
+            let op = intr_smul_with_overflow(arg_0, arg_1, result_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), result_type);
+            assert_eq!(op.operation_name(), "llvm.intr.smul.with.overflow");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_smul_with_overflow_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![result_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_smul_with_overflow_test(%arg0: i32, %arg1: i32) -> !llvm.struct<(i32, i1)> {
+                    %0 = \"llvm.intr.smul.with.overflow\"(%arg0, %arg1) : (i32, i32) -> !llvm.struct<(i32, i1)>
+                    return %0 : !llvm.struct<(i32, i1)>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ssa_copy() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_ssa_copy(arg_0, i32_type, location);
+            assert_eq!(SsaCopyOperation::operand(&op), arg_0);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.ssa.copy");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_ssa_copy_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ssa_copy_test(%arg0: i32) -> i32 {
+                    %0 = llvm.intr.ssa.copy %arg0 : i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_sshl_sat() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_sshl_sat(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.sshl.sat");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_sshl_sat_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_sshl_sat_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.sshl.sat(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ssub_sat() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_ssub_sat(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.ssub.sat");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_ssub_sat_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ssub_sat_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.ssub.sat(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ssub_with_overflow() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let result_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i1_type.as_ref()], false);
+            let op = intr_ssub_with_overflow(arg_0, arg_1, result_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), result_type);
+            assert_eq!(op.operation_name(), "llvm.intr.ssub.with.overflow");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_ssub_with_overflow_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![result_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ssub_with_overflow_test(%arg0: i32, %arg1: i32) -> !llvm.struct<(i32, i1)> {
+                    %0 = \"llvm.intr.ssub.with.overflow\"(%arg0, %arg1) : (i32, i32) -> !llvm.struct<(i32, i1)>
+                    return %0 : !llvm.struct<(i32, i1)>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_sin() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_sin(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.sin");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_sin_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_sin_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.sin(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_sincos() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let result_type = context.llvm_literal_struct_type(&[f32_type.as_ref(), f32_type.as_ref()], false);
+            let op = intr_sincos(arg_0, result_type, None, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), result_type);
+            assert_eq!(op.operation_name(), "llvm.intr.sincos");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_sincos_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![result_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_sincos_test(%arg0: f32) -> !llvm.struct<(f32, f32)> {
+                    %0 = llvm.intr.sincos(%arg0) : (f32) -> !llvm.struct<(f32, f32)>
+                    return %0 : !llvm.struct<(f32, f32)>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_sinh() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_sinh(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.sinh");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_sinh_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_sinh_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.sinh(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_sqrt() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_sqrt(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.sqrt");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_sqrt_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_sqrt_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.sqrt(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_stepvector() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = intr_stepvector(vector_i32_type.as_ref(), location);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.stepvector");
+            assert_eq!(op.operands().count(), 0);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_stepvector_test",
+                func::FuncAttributes { arguments: vec![], results: vec![vector_i32_type.into()], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_stepvector_test() -> vector<4xi32> {
+                    %0 = llvm.intr.stepvector : vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_tan() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_tan(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.tan");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_tan_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_tan_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.tan(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_tanh() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let f32_type = context.float32_type();
+        module.body().append_operation({
+            let mut block = context.block(&[(f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_tanh(arg_0, f32_type, None, location);
+            assert_eq!(op.input(), arg_0);
+            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
+            assert_eq!(op.output_type(), f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.tanh");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_tanh_test",
+                func::FuncAttributes {
+                    arguments: vec![f32_type.into()],
+                    results: vec![f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_tanh_test(%arg0: f32) -> f32 {
+                    %0 = llvm.intr.tanh(%arg0) : (f32) -> f32
+                    return %0 : f32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_uadd_sat() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_uadd_sat(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.uadd.sat");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_uadd_sat_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_uadd_sat_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.uadd.sat(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_uadd_with_overflow() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let result_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i1_type.as_ref()], false);
+            let op = intr_uadd_with_overflow(arg_0, arg_1, result_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), result_type);
+            assert_eq!(op.operation_name(), "llvm.intr.uadd.with.overflow");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_uadd_with_overflow_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![result_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_uadd_with_overflow_test(%arg0: i32, %arg1: i32) -> !llvm.struct<(i32, i1)> {
+                    %0 = \"llvm.intr.uadd.with.overflow\"(%arg0, %arg1) : (i32, i32) -> !llvm.struct<(i32, i1)>
+                    return %0 : !llvm.struct<(i32, i1)>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ucmp() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_ucmp(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.ucmp");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_ucmp_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ucmp_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.ucmp(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_umax() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_umax(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.umax");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_umax_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_umax_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.umax(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_umin() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_umin(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.umin");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_umin_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_umin_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.umin(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_umul_with_overflow() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let result_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i1_type.as_ref()], false);
+            let op = intr_umul_with_overflow(arg_0, arg_1, result_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), result_type);
+            assert_eq!(op.operation_name(), "llvm.intr.umul.with.overflow");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_umul_with_overflow_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![result_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_umul_with_overflow_test(%arg0: i32, %arg1: i32) -> !llvm.struct<(i32, i1)> {
+                    %0 = \"llvm.intr.umul.with.overflow\"(%arg0, %arg1) : (i32, i32) -> !llvm.struct<(i32, i1)>
+                    return %0 : !llvm.struct<(i32, i1)>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ushl_sat() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_ushl_sat(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.ushl.sat");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_ushl_sat_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ushl_sat_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.ushl.sat(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_usub_sat() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_usub_sat(arg_0, arg_1, i32_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.usub.sat");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_usub_sat_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_usub_sat_test(%arg0: i32, %arg1: i32) -> i32 {
+                    %0 = llvm.intr.usub.sat(%arg0, %arg1) : (i32, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_usub_with_overflow() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i1_type = context.signless_integer_type(1);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let result_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i1_type.as_ref()], false);
+            let op = intr_usub_with_overflow(arg_0, arg_1, result_type, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.output_type(), result_type);
+            assert_eq!(op.operation_name(), "llvm.intr.usub.with.overflow");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_usub_with_overflow_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![result_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_usub_with_overflow_test(%arg0: i32, %arg1: i32) -> !llvm.struct<(i32, i1)> {
+                    %0 = \"llvm.intr.usub.with.overflow\"(%arg0, %arg1) : (i32, i32) -> !llvm.struct<(i32, i1)>
+                    return %0 : !llvm.struct<(i32, i1)>
+                  }
+                }
+            "},
+        );
+    }
+}

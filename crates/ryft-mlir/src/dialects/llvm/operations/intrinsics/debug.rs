@@ -425,3 +425,454 @@ pub fn intr_var_annotation<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_var_annotation`")
 }
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::dialects::func;
+    use crate::{Attribute, Block, Context, DialectHandle, Operation, Type};
+
+    use super::*;
+
+    #[test]
+    fn test_intr_annotation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (i32_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let op = intr_annotation(arg_0, arg_1, arg_2, arg_3, i32_type, location);
+            assert_eq!(op.integer(), arg_0);
+            assert_eq!(op.annotation(), arg_1);
+            assert_eq!(op.file_name(), arg_2);
+            assert_eq!(op.line(), arg_3);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.annotation");
+            assert_eq!(op.operands().count(), 4);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_annotation_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), pointer_type.into(), pointer_type.into(), i32_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_annotation_test(%arg0: i32, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: i32) -> i32 {
+                    %0 = \"llvm.intr.annotation\"(%arg0, %arg1, %arg2, %arg3) : (i32, !llvm.ptr, !llvm.ptr, i32) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_dbg_declare() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        let var_info = context.parse_attribute(r#"#llvm.di_local_variable<scope = #llvm.di_file<"file.c" in "/tmp">, name = "x", file = #llvm.di_file<"file.c" in "/tmp">, line = 1>"#).unwrap();
+        let location_expr = context.llvm_di_expression_attribute(&[]).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_dbg_declare(arg_0, var_info, location_expr, location);
+            assert_eq!(op.address(), arg_0);
+            assert_eq!(op.var_info(), var_info);
+            assert_eq!(op.location_expr(), location_expr);
+            assert_eq!(op.operation_name(), "llvm.intr.dbg.declare");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_dbg_declare_test",
+                func::FuncAttributes { arguments: vec![pointer_type.into()], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                #di_file = #llvm.di_file<\"file.c\" in \"/tmp\">
+                #di_local_variable = #llvm.di_local_variable<scope = #di_file, name = \"x\", file = #di_file, line = 1>
+                module {
+                  func.func @llvm_intr_dbg_declare_test(%arg0: !llvm.ptr) {
+                    llvm.intr.dbg.declare #di_local_variable = %arg0 : !llvm.ptr
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_dbg_label() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let label = context.parse_attribute(r#"#llvm.di_label<scope = #llvm.di_file<"file.c" in "/tmp">, name = "label", file = #llvm.di_file<"file.c" in "/tmp">, line = 1>"#).unwrap();
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = intr_dbg_label(label, location);
+            assert_eq!(op.label(), label);
+            assert_eq!(op.operation_name(), "llvm.intr.dbg.label");
+            assert_eq!(op.operands().count(), 0);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_dbg_label_test",
+                func::FuncAttributes { arguments: vec![], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                #di_file = #llvm.di_file<\"file.c\" in \"/tmp\">
+                #di_label = #llvm.di_label<scope = #di_file, name = \"label\", file = #di_file, line = 1>
+                module {
+                  func.func @llvm_intr_dbg_label_test() {
+                    llvm.intr.dbg.label #di_label
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_dbg_value() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let var_info = context.parse_attribute(r#"#llvm.di_local_variable<scope = #llvm.di_file<"file.c" in "/tmp">, name = "x", file = #llvm.di_file<"file.c" in "/tmp">, line = 1>"#).unwrap();
+        let location_expr = context.llvm_di_expression_attribute(&[]).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_dbg_value(arg_0, var_info, location_expr, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.var_info(), var_info);
+            assert_eq!(op.location_expr(), location_expr);
+            assert_eq!(op.operation_name(), "llvm.intr.dbg.value");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_dbg_value_test",
+                func::FuncAttributes { arguments: vec![i32_type.into()], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                #di_file = #llvm.di_file<\"file.c\" in \"/tmp\">
+                #di_local_variable = #llvm.di_local_variable<scope = #di_file, name = \"x\", file = #di_file, line = 1>
+                module {
+                  func.func @llvm_intr_dbg_value_test(%arg0: i32) {
+                    llvm.intr.dbg.value #di_local_variable = %arg0 : i32
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_debug_trap() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = intr_debug_trap(location);
+            assert_eq!(op.operation_name(), "llvm.intr.debugtrap");
+            assert_eq!(op.operands().count(), 0);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_debugtrap_test",
+                func::FuncAttributes { arguments: vec![], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_debugtrap_test() {
+                    llvm.intr.debugtrap
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_eh_type_id_for() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_eh_type_id_for(arg_0, i32_type, location);
+            assert_eq!(op.type_info(), arg_0);
+            assert_eq!(op.output_type(), i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.eh.typeid.for");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_eh_typeid_for_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into()],
+                    results: vec![i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_eh_typeid_for_test(%arg0: !llvm.ptr) -> i32 {
+                    %0 = llvm.intr.eh.typeid.for %arg0 : (!llvm.ptr) -> i32
+                    return %0 : i32
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_fake_use() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_fake_use(&[arg_0.into(), arg_1.into()], location);
+            assert_eq!(op.arguments(), vec![arg_0, arg_1]);
+            assert_eq!(op.operation_name(), "llvm.intr.fake.use");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_fake_use_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_fake_use_test(%arg0: i32, %arg1: i32) {
+                    llvm.intr.fake.use %arg0, %arg1 : i32, i32
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_trap() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = intr_trap(location);
+            assert_eq!(op.operation_name(), "llvm.intr.trap");
+            assert_eq!(op.operands().count(), 0);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_trap_test",
+                func::FuncAttributes { arguments: vec![], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_trap_test() {
+                    llvm.intr.trap
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ubsan_trap() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i8_type = context.signless_integer_type(8);
+        let failure_kind = context.integer_attribute(i8_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = intr_ubsan_trap(failure_kind, location);
+            assert_eq!(op.failure_kind(), failure_kind);
+            assert_eq!(op.operation_name(), "llvm.intr.ubsantrap");
+            assert_eq!(op.operands().count(), 0);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_ubsantrap_test",
+                func::FuncAttributes { arguments: vec![], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ubsantrap_test() {
+                    llvm.intr.ubsantrap <{failureKind = 1 : i8}>
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_var_annotation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (pointer_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let arg_4 = block.argument(4).unwrap();
+            let op = intr_var_annotation(arg_0, arg_1, arg_2, arg_3, arg_4, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.annotation(), arg_1);
+            assert_eq!(op.file_name(), arg_2);
+            assert_eq!(op.line(), arg_3);
+            assert_eq!(VarAnnotationOperation::attribute(&op), arg_4);
+            assert_eq!(op.operation_name(), "llvm.intr.var.annotation");
+            assert_eq!(op.operands().count(), 5);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_var_annotation_test",
+                func::FuncAttributes {
+                    arguments: vec![
+                        pointer_type.into(),
+                        pointer_type.into(),
+                        pointer_type.into(),
+                        i32_type.into(),
+                        pointer_type.into(),
+                    ],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_var_annotation_test(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: i32, %arg4: !llvm.ptr) {
+                    \"llvm.intr.var.annotation\"(%arg0, %arg1, %arg2, %arg3, %arg4) : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i32, !llvm.ptr) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+}
