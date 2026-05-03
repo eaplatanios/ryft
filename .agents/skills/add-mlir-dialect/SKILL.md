@@ -32,8 +32,12 @@ slicing unless that helper is genuinely shared across dialect modules.
 
 For the unit tests, make sure to have full coverage like we do in `ryft_mlir::dialects::stable_hlo` and
 `ryft_mlir::dialects::gpu` with attributes, types, and operations being tested in the order in which they appear in the
-corresponding modules. For operation tests, mirror the StableHLO operation test structure: build the containing module
-programmatically with typed operation constructors, assert typed accessors before insertion where practical, verify the
-module, and compare the canonical `module.to_string()` output. Avoid parsing a module and walking it with helper
-functions unless the operation has no constructor or the test is explicitly about parsing behavior. Inline trivial
-context/registry setup at each test site instead of adding tiny helpers that hide only one or two lines of code.
+corresponding modules.
+
+There must be exactly one test per attribute, type, and operation.
+
+For operation tests, mirror the StableHLO operation test structure: build the containing module programmatically with
+typed operation constructors, assert typed accessors before insertion where practical, verify the module, and compare
+the canonical `module.to_string()` output. Avoid parsing a module and walking it with helper functions unless the
+operation has no constructor or the test is explicitly about parsing behavior. Inline trivial context/registry setup at
+each test site instead of adding tiny helpers that hide only one or two lines of code.

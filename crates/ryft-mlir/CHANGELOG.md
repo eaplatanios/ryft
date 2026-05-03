@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the `llvm` dialect.
 - Added support for the `memref` dialect.
 - Added support for the `nvgpu` dialect.
+- Added support for the `pdl` dialect.
 - Added support for the `scf` dialect.
 - Added support for the `shape` dialect.
 - Added support for the `sparse_tensor` dialect.
