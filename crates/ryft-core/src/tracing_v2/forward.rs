@@ -16,38 +16,57 @@ use crate::tracing_v2::{
 };
 use crate::types::Typed;
 
+/// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
+///
+/// The returned pair is `(primal_output, tangent_output)`. Architecturally, [`jvp`] is the most
+/// direct forward-mode transform in the crate: it either traces the body once to build a staged
+/// pushforward or stages the whole JVP into an outer trace if the inputs are already symbolic.
+/// Primitive-specific local JVP rules live in [`crate::tracing_v2::operations`]; [`jvp`] is the
+/// orchestration layer that selects the concrete or traced execution path.
+#[allow(private_bounds, private_interfaces)]
+pub fn jvp<
+    'engine,
+    E: Engine,
+    F: FnOnce(D::FunctionInput) -> D::FunctionOutput,
+    Input: Parameterized<D, ParameterStructure: Debug + PartialEq>,
+    Output: Parameterized<D>,
+    D: JvpDispatch<'engine, E, Input, Output, Marker>,
+    Marker,
+>(
+    engine: &'engine E,
+    function: F,
+    primals: Input,
+    tangents: Input,
+) -> Result<(Output, Output), TracingError> {
+    D::invoke(engine, function, primals, tangents)
+}
+
 /// Marker selecting concrete-value [`jvp`] dispatch.
-#[doc(hidden)]
-pub struct ConcreteJvp;
+pub(crate) struct JvpDispatchValueMarker;
 
 /// Marker selecting already-traced [`jvp`] dispatch.
-#[doc(hidden)]
-pub struct TracedJvp;
+pub(crate) struct JvpDispatchTracerMarker;
 
 /// Dispatch trait used by [`jvp`] so it can operate both on concrete values and on already traced values.
 ///
 /// The public transform is intentionally small; this trait is where the concrete, traced, and
 /// batched execution strategies branch apart.
-#[doc(hidden)]
 pub(crate) trait JvpDispatch<
+    'engine,
     E: Engine,
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<Self>,
-    Mode,
+    Marker,
 >: Parameter + Sized
 {
     /// Input type expected by the user-provided function.
-    type FunctionInput<'engine>
-    where
-        E: 'engine;
+    type FunctionInput;
 
     /// Output type produced by the user-provided function.
-    type FunctionOutput<'engine>
-    where
-        E: 'engine;
+    type FunctionOutput;
 
     /// Invokes [`jvp`] for one leaf regime.
-    fn invoke<'engine, F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>>(
+    fn invoke<F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput>(
         engine: &'engine E,
         function: F,
         primals: Input,
@@ -58,6 +77,7 @@ pub(crate) trait JvpDispatch<
 /// Concrete-value dispatch for [`jvp`]: traces the user function with [`Tracer`] to build a staged
 /// pushforward via [`linearize`] and evaluates it at the supplied tangents.
 impl<
+    'engine,
     E: DifferentiableEngine<
             Value = V,
             LinearOperationCarrier: InterpretableOperation<E::Type, V>
@@ -71,7 +91,7 @@ impl<
         + Parameterized<V, ParameterStructure: PartialEq>,
     Input: Parameterized<
             V,
-            Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            Family: for<'call> ParameterizedFamily<Tracer<'call, DifferentiableOperationTracingEngine<E>>>,
             ParameterStructure: Debug + PartialEq,
         >,
     Output: for<'call> Parameterized<
@@ -82,18 +102,12 @@ impl<
                 To<V> = Output,
             >,
         >,
-> JvpDispatch<E, Input, Output, ConcreteJvp> for V
+> JvpDispatch<'engine, E, Input, Output, JvpDispatchValueMarker> for V
 {
-    type FunctionInput<'engine>
-        = Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>
-    where
-        E: 'engine;
-    type FunctionOutput<'engine>
-        = Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>
-    where
-        E: 'engine;
+    type FunctionInput = Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>;
+    type FunctionOutput = Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>;
 
-    fn invoke<'engine, F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>>(
+    fn invoke<F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput>(
         engine: &'engine E,
         function: F,
         primals: Input,
@@ -125,7 +139,7 @@ impl<
     V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + Parameterized<V, ParameterStructure = Placeholder>,
     Input,
     Output,
-> JvpDispatch<E, Input, Output, TracedJvp> for Tracer<'engine, E>
+> JvpDispatch<'engine, E, Input, Output, JvpDispatchTracerMarker> for Tracer<'engine, E>
 where
     E::OperationCarrier:
         DifferentiableOperation<TracingContext<'engine, E>> + SupportsZeroLike<E::Type, V> + SupportsAdd<E::Type, V>,
@@ -139,17 +153,11 @@ where
     Output::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Output>,
     AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
-    type FunctionInput<'call>
-        = Input
-    where
-        E: 'call;
-    type FunctionOutput<'call>
-        = Output
-    where
-        E: 'call;
+    type FunctionInput = Input;
+    type FunctionOutput = Output;
 
-    fn invoke<'call, F: FnOnce(Self::FunctionInput<'call>) -> Self::FunctionOutput<'call>>(
-        _engine: &'call E,
+    fn invoke<F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput>(
+        _engine: &'engine E,
         function: F,
         primals: Input,
         tangents: Input,
@@ -183,33 +191,6 @@ where
             Output::from_parameters(output_structure, traced_tangent_output)?,
         ))
     }
-}
-
-/// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
-///
-/// The returned pair is `(primal_output, tangent_output)`. Architecturally, [`jvp`] is the most
-/// direct forward-mode transform in the crate: it either traces the body once to build a staged
-/// pushforward or stages the whole JVP into an outer trace if the inputs are already symbolic.
-/// Primitive-specific local JVP rules live in [`crate::tracing_v2::operations`]; [`jvp`] is the
-/// orchestration layer that selects the concrete or traced execution path.
-#[allow(private_bounds, private_interfaces)]
-pub fn jvp<
-    'engine,
-    E: Engine,
-    F: FnOnce(
-        <Leaf as JvpDispatch<E, Input, Output, Mode>>::FunctionInput<'engine>,
-    ) -> <Leaf as JvpDispatch<E, Input, Output, Mode>>::FunctionOutput<'engine>,
-    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<Leaf>,
-    Leaf: JvpDispatch<E, Input, Output, Mode>,
-    Mode,
->(
-    engine: &'engine E,
-    function: F,
-    primals: Input,
-    tangents: Input,
-) -> Result<(Output, Output), TracingError> {
-    Leaf::invoke(engine, function, primals, tangents)
 }
 
 #[cfg(test)]
