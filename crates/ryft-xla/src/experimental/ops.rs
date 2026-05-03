@@ -1,6 +1,8 @@
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
+use ryft_core::macros::check_count;
+use ryft_core::operations::arithmetic::{AddOperation, SupportsAdd};
 use ryft_core::operations::constants::{
     OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike, ZeroLikeOperation,
     ZeroOperation,
@@ -10,9 +12,9 @@ use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{AtomId, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
-    AddOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation, FlatTracedRematerialize,
+    ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation, FlatTracedRematerialize,
     LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
-    RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation, SupportsAdd, SupportsCos, SupportsCustom,
+    RematerializeOperation, ReshapeOperation, ScaleOperation, SinOperation, SupportsCos, SupportsCustom,
     SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg, SupportsRematerialize, SupportsReshape,
     SupportsScale, SupportsSin, WhileOperation,
 };
@@ -87,9 +89,7 @@ fn replay_xla_program_with_tracers(
             .map(|input| values[input.index].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
             .collect::<Result<Vec<_>, _>>()?;
         let outputs = instruction.operation.interpret(inputs.as_slice())?;
-        if outputs.len() != instruction.outputs.len() {
-            return Err(TracingError::InvalidOutputCount { expected: instruction.outputs.len(), got: outputs.len() });
-        }
+        check_count!("output", outputs, instruction.outputs.len(), TracingError);
         for (output, value) in instruction.outputs.iter().copied().zip(outputs) {
             values[output.index] = Some(value);
         }
@@ -126,15 +126,14 @@ where
 
     let selected_branch = if *predicate { &condition.true_branch } else { &condition.false_branch };
     let primal_outputs = selected_branch.interpret(primal_inputs.clone())?;
+    check_count!("output", primal_outputs, condition.output_types().len(), TracingError);
     let true_pushforward = condition.true_branch.linearize(context.engine, primal_inputs.clone())?;
     let false_pushforward = condition.false_branch.linearize(context.engine, primal_inputs)?;
     let linear_condition = ConditionOperation::with_captured_predicate(*predicate, true_pushforward, false_pushforward)
         .map_err(TracingError::from)?;
-    let tangent_outputs = context.stage(
-        tangent_inputs.as_slice(),
-        LinearArrayOperation::Condition(Box::new(linear_condition)),
-        condition.output_types().len(),
-    )?;
+    let tangent_outputs =
+        context.stage(LinearArrayOperation::Condition(Box::new(linear_condition)), tangent_inputs.as_slice())?;
+    check_count!("output", tangent_outputs, condition.output_types().len(), TracingError);
     Ok(primal_outputs
         .into_iter()
         .zip(tangent_outputs)
@@ -399,18 +398,19 @@ impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
                 let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
                 let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
                 let primal_outputs = remat.interpret(primal_inputs.as_slice())?;
+                check_count!("output", primal_outputs, remat.body.output_types.as_slice().len(), TracingError);
                 if tangent_inputs.is_empty() && !remat.body.output_types.as_slice().is_empty() {
                     return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
                 }
                 let tangent_outputs = context.stage(
-                    tangent_inputs.as_slice(),
                     LinearArrayOperation::Rematerialize(Box::new(make_linear_xla_rematerialize(
                         context.engine,
                         &remat.body,
                         primal_inputs,
                     )?)),
-                    remat.body.output_types.as_slice().len(),
+                    tangent_inputs.as_slice(),
                 )?;
+                check_count!("output", tangent_outputs, remat.body.output_types.as_slice().len(), TracingError);
                 Ok(primal_outputs
                     .into_iter()
                     .zip(tangent_outputs)
@@ -460,24 +460,17 @@ impl DifferentiableOperation<TracingContext<'static, XlaEngine<'static>>> for Xl
             }
             Self::LinearShardMap(op) => op.jvp_traced_with_builders(context.engine.builder.clone(), context, inputs),
             Self::WithShardingConstraint(op) => {
-                let input = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                let primal = input
-                    .primal
-                    .context
-                    .trace(XlaOperation::WithShardingConstraint(op.clone()), &[&input.primal])?
-                    .into_iter()
-                    .next()
-                    .expect("with_sharding_constraint should produce one primal output");
-                let tangent = context
-                    .stage(
-                        &[input.tangent],
-                        LinearArrayOperation::Custom(Arc::new(op.to_tracer_linear_custom_primitive())),
-                        1,
-                    )?
-                    .into_iter()
-                    .next()
-                    .expect("with_sharding_constraint should produce one tangent output");
-                Ok(vec![JvpTracer { primal, tangent }])
+                check_count!("input", inputs, 1, TracingError);
+                let input = &inputs[0];
+                let primal_outputs =
+                    input.primal.context.trace(XlaOperation::WithShardingConstraint(op.clone()), &[&input.primal])?;
+                check_count!("output", primal_outputs, 1, TracingError);
+                let tangent_outputs = context.stage(
+                    LinearArrayOperation::Custom(Arc::new(op.to_tracer_linear_custom_primitive())),
+                    &[input.tangent],
+                )?;
+                check_count!("output", tangent_outputs, 1, TracingError);
+                Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs[0] }])
             }
             Self::Custom(op) => {
                 Err(CustomOperationError::MissingRule { op: op.name(), transform: "traced linearization" }.into())

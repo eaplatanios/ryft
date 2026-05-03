@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::ops::Mul;
 
 use crate::broadcasting::Broadcastable;
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::{ElementwiseArrayOperation, InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
@@ -66,7 +66,7 @@ impl Operation<DataType> for MulOperation {
     }
 
     fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        check_input_count!(input_types, 2, TypeError);
+        check_count!("input", input_types, 2, TypeError);
         input_types[0]
             .broadcast(&input_types[1])
             .map(|output| vec![output])
@@ -76,14 +76,14 @@ impl Operation<DataType> for MulOperation {
 
 impl<V: Typed<ArrayType> + Clone + Mul<Output = V>> InterpretableOperation<ArrayType, V> for MulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 2, TracingError);
+        check_count!("input", inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
     }
 }
 
 impl<V: Typed<DataType> + Clone + Mul<Output = V>> InterpretableOperation<DataType, V> for MulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 2, TracingError);
+        check_count!("input", inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
     }
 }
@@ -100,34 +100,25 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 2, TracingError);
+        check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
-        let left_term = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(right.primal.clone()),
-                &[left.tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("mul jvp scale should produce one tangent");
-        let right_term = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(left.primal.clone()),
-                &[right.tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("mul jvp scale should produce one tangent");
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsAdd<E::Type, E::Value>>::add_operation(),
-                &[left_term, right_term],
-            )?
-            .into_iter()
-            .next()
-            .expect("mul jvp add should produce one tangent");
-        Ok(vec![JvpTracer { primal: left.primal.clone() * right.primal.clone(), tangent }])
+        let left_term_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(right.primal.clone()),
+            &[left.tangent],
+        )?;
+        check_count!("output", left_term_outputs, 1, TracingError);
+        let right_term_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(left.primal.clone()),
+            &[right.tangent],
+        )?;
+        check_count!("output", right_term_outputs, 1, TracingError);
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsAdd<E::Type, E::Value>>::add_operation(),
+            &[left_term_outputs[0], right_term_outputs[0]],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: left.primal.clone() * right.primal.clone(), tangent: tangent_outputs[0] }])
     }
 }
 

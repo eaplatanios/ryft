@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ryft_core::macros::check_input_count;
+use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
@@ -285,16 +285,17 @@ impl ShardMapOperation<ShardMapTracer> {
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret_with_tracing_builder(tracing_builder, primal_inputs.as_slice())?;
+        check_count!("output", primal_outputs, self.output_types.len(), TracingError);
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let tangent_outputs = context.stage(
-            tangent_inputs.as_slice(),
             LinearArrayOperation::Custom(Arc::new(
                 make_linear_shard_map(&self.body, primal_inputs)
                     .map_err(trace_error_from_shard_map)?
                     .to_tracer_linear_custom_primitive(),
             )),
-            self.output_types.len(),
+            tangent_inputs.as_slice(),
         )?;
+        check_count!("output", tangent_outputs, self.output_types.len(), TracingError);
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
@@ -356,13 +357,14 @@ impl LinearShardMapOperation<ShardMapTensor> {
         let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
         let primal_outputs = TracingContext::new(XlaEngine::token(), tracing_builder)
             .trace(XlaOperation::LinearShardMap(Box::new(self.clone())), primal_input_refs.as_slice())?;
+        check_count!("output", primal_outputs, self.output_types.len(), TracingError);
         let traced_op = self.to_tracer_linear_op(primal_inputs.as_slice())?;
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let tangent_outputs = context.stage(
-            tangent_inputs.as_slice(),
             LinearArrayOperation::Custom(Arc::new(traced_op.to_tracer_linear_custom_primitive())),
-            self.output_types.len(),
+            tangent_inputs.as_slice(),
         )?;
+        check_count!("output", tangent_outputs, self.output_types.len(), TracingError);
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
@@ -451,7 +453,7 @@ fn infer_shard_map_output_types(
     captured_output_types: &[ArrayType],
     input_types: &[ArrayType],
 ) -> Result<Vec<ArrayType>, TypeError> {
-    check_input_count!(input_types, captured_input_types.len(), TypeError);
+    check_count!("input", input_types, captured_input_types.len(), TypeError);
     if !input_types
         .iter()
         .zip(captured_input_types.iter())
@@ -527,7 +529,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, self.output_types.len(), TracingError);
+        check_count!("output", output_cotangents, self.output_types.len(), TracingError);
         if output_cotangents.is_empty() {
             return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
         }
@@ -543,6 +545,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
             LinearArrayOperation::Custom(Arc::new(self.transpose_op().to_tensor_linear_custom_primitive())),
             materialized.as_slice(),
         )?;
+        check_count!("output", contributions, self.input_types.len(), TracingError);
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
 }
@@ -590,19 +593,20 @@ where
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = InterpretableOperation::interpret(self, primal_inputs.as_slice())?;
+        check_count!("output", primal_outputs, self.output_types.len(), TracingError);
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
         if tangent_inputs.is_empty() && !self.output_types.is_empty() {
             return Err(missing_linear_shard_map_staging_context());
         }
         let tangent_outputs = context.stage(
-            tangent_inputs.as_slice(),
             LinearArrayOperation::Custom(Arc::new(
                 make_linear_tensor_shard_map(&self.body)
                     .map_err(trace_error_from_shard_map)?
                     .to_tensor_linear_custom_primitive(),
             )),
-            self.output_types.len(),
+            tangent_inputs.as_slice(),
         )?;
+        check_count!("output", tangent_outputs, self.output_types.len(), TracingError);
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
@@ -627,15 +631,16 @@ where
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = InterpretableOperation::interpret(self, primal_inputs.as_slice())?;
+        check_count!("output", primal_outputs, self.output_types.len(), TracingError);
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
         if tangent_inputs.is_empty() && !self.output_types.is_empty() {
             return Err(missing_linear_shard_map_staging_context());
         }
         let tangent_outputs = context.stage(
-            tangent_inputs.as_slice(),
             LinearArrayOperation::Custom(Arc::new(self.to_tensor_linear_custom_primitive())),
-            self.output_types.len(),
+            tangent_inputs.as_slice(),
         )?;
+        check_count!("output", tangent_outputs, self.output_types.len(), TracingError);
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
@@ -710,7 +715,7 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, self.output_types.len(), TracingError);
+        check_count!("output", output_cotangents, self.output_types.len(), TracingError);
         if output_cotangents.is_empty() {
             return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
         }
@@ -726,6 +731,7 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
             LinearArrayOperation::Custom(Arc::new(self.transpose_op().to_tracer_linear_custom_primitive())),
             materialized.as_slice(),
         )?;
+        check_count!("output", contributions, self.input_types.len(), TracingError);
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
 }

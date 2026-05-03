@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::SupportsZero;
@@ -238,12 +239,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         O: LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
     {
         let expected_output_count = self.output_ids.len();
-        if output_examples.len() != expected_output_count {
-            return Err(TracingError::InvalidInputCount {
-                expected: expected_output_count,
-                got: output_examples.len(),
-            });
-        }
+        check_count!("output", output_examples, expected_output_count, TracingError);
         let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new()));
         let mut context = TranspositionContext::new(builder);
         context.transpose(self)

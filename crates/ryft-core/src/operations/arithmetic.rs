@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::ops::Add;
 
 use crate::broadcasting::Broadcastable;
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::{ElementwiseArrayOperation, InterpretableOperation, Operation};
 use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
@@ -25,7 +25,7 @@ impl Operation<DataType> for AddOperation {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        check_input_count!(input_types, 2, TypeError);
+        check_count!("input", input_types, 2, TypeError);
         input_types[0]
             .broadcast(&input_types[1])
             .map(|output| vec![output])
@@ -48,7 +48,7 @@ impl ElementwiseArrayOperation for AddOperation {
 impl<V: Typed<DataType> + Clone + Add<Output = V>> InterpretableOperation<DataType, V> for AddOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 2, TracingError);
+        check_count!("input", inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }
 }
@@ -56,7 +56,7 @@ impl<V: Typed<DataType> + Clone + Add<Output = V>> InterpretableOperation<DataTy
 impl<V: Typed<ArrayType> + Clone + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 2, TracingError);
+        check_count!("input", inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }
 }

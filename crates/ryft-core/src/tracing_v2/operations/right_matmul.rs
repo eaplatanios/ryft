@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::engines::Tracer;
@@ -45,7 +45,7 @@ impl<V: MatrixValue> RightMatMulOperation<V> {
 /// Backend carriers use this helper when they need the metadata rule for a captured right-matmul
 /// operation without first constructing a concrete [`RightMatMulOperation`].
 pub fn right_matmul_abstract_eval(factor_type: &ArrayType, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-    check_input_count!(inputs, 1, TypeError);
+    check_count!("input", inputs, 1, TypeError);
     Ok(vec![matmul_abstract(&inputs[0], factor_type, "right_matmul")?])
 }
 
@@ -73,7 +73,7 @@ impl<V: MatrixValue> Operation<ArrayType> for RightMatMulOperation<V> {
 
 impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for RightMatMulOperation<V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().matmul(self.factor.clone())])
     }
 }
@@ -88,18 +88,16 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, Array
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         match output_cotangents[0] {
-            Some(atom) => Ok(vec![Some(
-                context
-                    .stage(
-                        LinearArrayOperation::RightMatMul { factor: self.factor.clone().transpose_matrix() },
-                        &[atom],
-                    )?
-                    .into_iter()
-                    .next()
-                    .expect("right matmul should produce one cotangent contribution"),
-            )]),
+            Some(atom) => {
+                let cotangent_outputs = context.stage(
+                    LinearArrayOperation::RightMatMul { factor: self.factor.clone().transpose_matrix() },
+                    &[atom],
+                )?;
+                check_count!("output", cotangent_outputs, 1, TracingError);
+                Ok(vec![Some(cotangent_outputs[0])])
+            }
             None => Ok(vec![None]),
         }
     }
@@ -116,19 +114,16 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().matmul(self.factor.clone());
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsRightMatMul<ArrayType, V>>::right_matmul_operation(
-                    self.factor.clone(),
-                ),
-                &[inputs[0].tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("right matmul jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal, tangent }])
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsRightMatMul<ArrayType, V>>::right_matmul_operation(
+                self.factor.clone(),
+            ),
+            &[inputs[0].tangent],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
     }
 }
 
@@ -148,21 +143,17 @@ where
         context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         let factor_tracer = context.engine.constant(self.factor.clone());
         let primal = inputs[0].primal.clone().matmul(factor_tracer.clone());
-        let tangent =
-            context
-                .stage(
-                    <EInner::LinearOperationCarrier<'engine> as SupportsRightMatMul<
-                        ArrayType,
-                        Tracer<'engine, EInner>,
-                    >>::right_matmul_operation(factor_tracer),
-                    &[inputs[0].tangent],
-                )?
-                .into_iter()
-                .next()
-                .expect("right matmul jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal, tangent }])
+        let tangent_outputs = context.stage(
+            <EInner::LinearOperationCarrier<'engine> as SupportsRightMatMul<
+                ArrayType,
+                Tracer<'engine, EInner>,
+            >>::right_matmul_operation(factor_tracer),
+            &[inputs[0].tangent],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
     }
 }

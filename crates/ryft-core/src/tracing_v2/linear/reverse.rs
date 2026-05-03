@@ -473,7 +473,7 @@ mod tests {
 
     use ryft_macros::Parameter;
 
-    use crate::macros::check_input_count;
+    use crate::macros::check_count;
     use crate::operations::arithmetic::{AddOperation, SupportsAdd};
     use crate::operations::constants::{One, Zero};
     use crate::operations::constants::{OneLike, ZeroLike};
@@ -585,14 +585,14 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[TestType]) -> Result<Vec<TestType>, TypeError> {
-            check_input_count!(input_types, 2, TypeError);
+            check_count!("input", input_types, 2, TypeError);
             Ok(vec![TestType])
         }
     }
 
     impl InterpretableOperation<TestType, TestValue> for AddOperation {
         fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
-            check_input_count!(inputs, 2, TracingError);
+            check_count!("input", inputs, 2, TracingError);
             Ok(vec![inputs[0].clone() + inputs[1].clone()])
         }
     }
@@ -618,7 +618,7 @@ mod tests {
                 Self::Add => 2,
                 Self::Neg | Self::Scale { .. } => 1,
             };
-            check_input_count!(input_types, expected, TypeError);
+            check_count!("input", input_types, expected, TypeError);
             Ok(vec![TestType])
         }
     }
@@ -629,7 +629,7 @@ mod tests {
                 Self::Add => 2,
                 Self::Neg | Self::Scale { .. } => 1,
             };
-            check_input_count!(inputs, expected, TracingError);
+            check_count!("input", inputs, expected, TracingError);
             Ok(vec![match self {
                 Self::Add => inputs[0].clone() + inputs[1].clone(),
                 Self::Neg => -inputs[0].clone(),
@@ -662,18 +662,22 @@ mod tests {
             context: &mut crate::tracing::transposition::TranspositionContext<TestType, TestValue, TestLinearOperation>,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-            check_input_count!(output_cotangents, 1, TracingError);
+            check_count!("output", output_cotangents, 1, TracingError);
             Ok(match self {
                 Self::Add => vec![output_cotangents[0], output_cotangents[0]],
                 Self::Neg => match output_cotangents[0] {
                     Some(cotangent) => {
-                        vec![Some(context.stage(Self::Neg, &[cotangent])?[0])]
+                        let cotangent_outputs = context.stage(Self::Neg, &[cotangent])?;
+                        check_count!("output", cotangent_outputs, 1, TracingError);
+                        vec![Some(cotangent_outputs[0])]
                     }
                     None => vec![None],
                 },
                 Self::Scale { factor } => match output_cotangents[0] {
                     Some(cotangent) => {
-                        vec![Some(context.stage(Self::Scale { factor: factor.clone() }, &[cotangent])?[0])]
+                        let cotangent_outputs = context.stage(Self::Scale { factor: factor.clone() }, &[cotangent])?;
+                        check_count!("output", cotangent_outputs, 1, TracingError);
+                        vec![Some(cotangent_outputs[0])]
                     }
                     None => vec![None],
                 },

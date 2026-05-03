@@ -13,6 +13,8 @@ use ryft_mlir::dialects::shardy::{
 };
 use thiserror::Error;
 
+use ryft_core::macros::check_count;
+use ryft_core::operations::arithmetic::AddOperation;
 use ryft_core::operations::constants::{One, Zero};
 use ryft_core::operations::constants::{OneLike, ZeroLike};
 use ryft_core::operations::{InterpretableOperation, Operation};
@@ -21,7 +23,7 @@ use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension
 use ryft_core::tracing::engines::{Tracer, TracingEngine};
 use ryft_core::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::{
-    AddOperation, ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
+    ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
 };
 use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin};
 
@@ -538,12 +540,7 @@ pub(crate) fn fold_xla_program_constants<
         }
 
         let output_constants = instruction.operation.interpret(input_constants.as_slice())?;
-        if output_constants.len() != instruction.outputs.len() {
-            return Err(TracingError::InvalidOutputCount {
-                expected: instruction.outputs.len(),
-                got: output_constants.len(),
-            });
-        }
+        check_count!("output", output_constants, instruction.outputs.len(), TracingError);
 
         for (output_atom, output_value) in instruction.outputs.iter().copied().zip(output_constants.into_iter()) {
             let atom = atoms.get_mut(output_atom.index).ok_or(TracingError::UnboundAtomId { id: output_atom })?;

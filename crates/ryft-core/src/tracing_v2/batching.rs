@@ -5,6 +5,7 @@ use std::ops::{Add, Mul, Neg};
 use ryft_macros::Parameter;
 use thiserror::Error;
 
+use crate::macros::check_count;
 use crate::operations::constants::{One, Zero};
 use crate::operations::constants::{OneLike, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
@@ -272,9 +273,7 @@ where
     let output_types = operation.infer_output_types(input_types.as_slice())?;
     let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
     let output_values = operation.interpret(input_values.as_slice())?;
-    if output_values.len() != output_types.len() {
-        return Err(TracingError::InvalidOutputCount { expected: output_types.len(), got: output_values.len() });
-    }
+    check_count!("output", output_values, output_types.len(), TracingError);
 
     output_types
         .into_iter()
@@ -616,9 +615,7 @@ where
         lane_inputs.clear();
         lane_inputs.extend(inputs.iter().map(|input| input.lanes()[lane_index].clone()));
         let lane_outputs = operation.interpret(lane_inputs.as_slice())?;
-        if lane_outputs.len() != output_types.len() {
-            return Err(TracingError::InvalidOutputCount { expected: output_types.len(), got: lane_outputs.len() });
-        }
+        check_count!("output", lane_outputs, output_types.len(), TracingError);
         for (bucket, output) in output_lanes.iter_mut().zip(lane_outputs) {
             bucket.push(output);
         }

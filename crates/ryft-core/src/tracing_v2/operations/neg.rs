@@ -1,7 +1,7 @@
 use std::fmt::Display;
 use std::ops::Neg;
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
@@ -52,21 +52,21 @@ impl<T: Type> Operation<T> for NegOperation {
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(input_types, 1, TypeError);
+        check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
 }
 
 impl<V: Typed<ArrayType> + Clone + Neg<Output = V>> InterpretableOperation<ArrayType, V> for NegOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![-inputs[0].clone()])
     }
 }
 
 impl<V: Typed<DataType> + Clone + Neg<Output = V>> InterpretableOperation<DataType, V> for NegOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![-inputs[0].clone()])
     }
 }
@@ -83,15 +83,13 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike>
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         match output_cotangents[0] {
-            Some(atom) => Ok(vec![Some(
-                context
-                    .stage(LinearArrayOperation::Neg, &[atom])?
-                    .into_iter()
-                    .next()
-                    .expect("neg transpose should produce one cotangent contribution"),
-            )]),
+            Some(atom) => {
+                let cotangent_outputs = context.stage(LinearArrayOperation::Neg, &[atom])?;
+                check_count!("output", cotangent_outputs, 1, TracingError);
+                Ok(vec![Some(cotangent_outputs[0])])
+            }
             None => Ok(vec![None]),
         }
     }
@@ -109,15 +107,13 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + Z
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         match output_cotangents[0] {
-            Some(atom) => Ok(vec![Some(
-                context
-                    .stage(LinearArrayOperation::<V, DataType>::Neg, &[atom])?
-                    .into_iter()
-                    .next()
-                    .expect("neg transpose should produce one cotangent contribution"),
-            )]),
+            Some(atom) => {
+                let cotangent_outputs = context.stage(LinearArrayOperation::<V, DataType>::Neg, &[atom])?;
+                check_count!("output", cotangent_outputs, 1, TracingError);
+                Ok(vec![Some(cotangent_outputs[0])])
+            }
             None => Ok(vec![None]),
         }
     }
@@ -135,15 +131,12 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsNeg<E::Type, E::Value>>::neg_operation(),
-                &[inputs[0].tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("neg jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent }])
+        check_count!("input", inputs, 1, TracingError);
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsNeg<E::Type, E::Value>>::neg_operation(),
+            &[inputs[0].tangent],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: tangent_outputs[0] }])
     }
 }

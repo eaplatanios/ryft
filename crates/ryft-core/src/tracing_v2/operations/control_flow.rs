@@ -2,7 +2,7 @@ use std::fmt::{Debug, Display};
 
 use thiserror::Error;
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::constants::Zero;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
@@ -177,7 +177,7 @@ fn replay_linear_program_on_atoms<E: LinearizableEngine<Type = ArrayType> + ?Siz
     program: &FlatProgram<E::Value, E::LinearOperationCarrier>,
     inputs: &[crate::tracing::AtomId],
 ) -> Result<Vec<crate::tracing::AtomId>, TracingError> {
-    check_input_count!(inputs, program.input_ids.len(), TracingError);
+    check_count!("input", inputs, program.input_ids.len(), TracingError);
     if inputs.is_empty() && program.output_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -201,6 +201,7 @@ fn replay_linear_program_on_atoms<E: LinearizableEngine<Type = ArrayType> + ?Siz
             .map(|input| values[input.index].ok_or(TracingError::UnboundAtomId { id: *input }))
             .collect::<Result<Vec<_>, _>>()?;
         let outputs = context.stage(instruction.operation.clone(), instruction_inputs.as_slice())?;
+        check_count!("output", outputs, instruction.outputs.len(), TracingError);
         for (output, value) in instruction.outputs.iter().copied().zip(outputs) {
             values[output.index] = Some(value);
         }
@@ -410,6 +411,7 @@ where
             .map(|(cotangent, output_type)| stage_optional_cotangent(context, *cotangent, output_type))
             .collect::<Vec<_>>();
         let cotangents = context.stage(O::from(transposed_condition), materialized.as_slice())?;
+        check_count!("output", cotangents, self.input_types().len(), TracingError);
         Ok(cotangents.into_iter().map(Some).collect())
     }
 }
@@ -455,7 +457,7 @@ where
     ) -> Result<Vec<JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
         let operand_count = self.input_types().len();
         let expected_count = operand_count + usize::from(matches!(self.predicate, ConditionPredicate::RuntimeInput(_)));
-        check_input_count!(inputs, expected_count, TracingError);
+        check_count!("input", inputs, expected_count, TracingError);
         let (predicate, operands) = match self.predicate {
             ConditionPredicate::RuntimeInput(_) => (inputs[0].primal.control_flow_predicate()?, &inputs[1..]),
             ConditionPredicate::Captured(predicate) => (predicate, inputs),
@@ -593,16 +595,12 @@ where
         let mut state = inputs.to_vec();
         loop {
             let condition_outputs = self.condition.interpret(state.clone())?;
-            if condition_outputs.len() != 1 {
-                return Err(TracingError::InvalidOutputCount { expected: 1, got: condition_outputs.len() });
-            }
+            check_count!("output", condition_outputs, 1, TracingError);
             if !condition_outputs[0].control_flow_predicate()? {
                 return Ok(state);
             }
             state = self.body.interpret(state)?;
-            if state.len() != self.state_types().len() {
-                return Err(TracingError::InvalidOutputCount { expected: self.state_types().len(), got: state.len() });
-            }
+            check_count!("output", state, self.state_types().len(), TracingError);
         }
     }
 }
@@ -656,15 +654,13 @@ where
         inputs: &[JvpTracer<V, crate::tracing::AtomId>],
     ) -> Result<Vec<JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
         let state_count = self.state_types().len();
-        check_input_count!(inputs, state_count, TracingError);
+        check_count!("input", inputs, state_count, TracingError);
         let mut state_primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let mut state_tangents = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
 
         loop {
             let condition_outputs = self.condition.interpret(state_primals.clone())?;
-            if condition_outputs.len() != 1 {
-                return Err(TracingError::InvalidOutputCount { expected: 1, got: condition_outputs.len() });
-            }
+            check_count!("output", condition_outputs, 1, TracingError);
             if !condition_outputs[0].control_flow_predicate()? {
                 return Ok(state_primals
                     .into_iter()
@@ -676,12 +672,8 @@ where
             let pushforward = &self.body.linearize(context.engine, state_primals.clone())?;
             let next_primals = self.body.interpret(state_primals)?;
             let next_tangents = replay_linear_program_on_atoms(context, &pushforward, state_tangents.as_slice())?;
-            if next_primals.len() != state_count {
-                return Err(TracingError::InvalidOutputCount { expected: state_count, got: next_primals.len() });
-            }
-            if next_tangents.len() != state_count {
-                return Err(TracingError::InvalidOutputCount { expected: state_count, got: next_tangents.len() });
-            }
+            check_count!("output", next_primals, state_count, TracingError);
+            check_count!("output", next_tangents, state_count, TracingError);
             state_primals = next_primals;
             state_tangents = next_tangents;
         }
@@ -954,32 +946,28 @@ mod tests {
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
             match self {
                 Self::Add => {
-                    ensure_input_count(1, output_cotangents.len(), self.name())?;
+                    check_count!("output", output_cotangents, 1, TracingError);
                     Ok(vec![output_cotangents[0], output_cotangents[0]])
                 }
                 Self::Neg => {
-                    ensure_input_count(1, output_cotangents.len(), self.name())?;
+                    check_count!("output", output_cotangents, 1, TracingError);
                     match output_cotangents[0] {
-                        Some(atom) => Ok(vec![Some(
-                            context
-                                .stage(Self::Neg, &[atom])?
-                                .into_iter()
-                                .next()
-                                .expect("neg transpose should produce one cotangent contribution"),
-                        )]),
+                        Some(atom) => {
+                            let cotangent_outputs = context.stage(Self::Neg, &[atom])?;
+                            check_count!("output", cotangent_outputs, 1, TracingError);
+                            Ok(vec![Some(cotangent_outputs[0])])
+                        }
                         None => Ok(vec![None]),
                     }
                 }
                 Self::Scale { factor } => {
-                    ensure_input_count(1, output_cotangents.len(), self.name())?;
+                    check_count!("output", output_cotangents, 1, TracingError);
                     match output_cotangents[0] {
-                        Some(atom) => Ok(vec![Some(
-                            context
-                                .stage(Self::Scale { factor: factor.clone() }, &[atom])?
-                                .into_iter()
-                                .next()
-                                .expect("scale transpose should produce one cotangent contribution"),
-                        )]),
+                        Some(atom) => {
+                            let cotangent_outputs = context.stage(Self::Scale { factor: factor.clone() }, &[atom])?;
+                            check_count!("output", cotangent_outputs, 1, TracingError);
+                            Ok(vec![Some(cotangent_outputs[0])])
+                        }
                         None => Ok(vec![None]),
                     }
                 }
@@ -1133,12 +1121,10 @@ mod tests {
                 Self::Scale { factor } => {
                     ensure_input_count(1, inputs.len(), self.name())?;
                     let primal_outputs = self.interpret(std::slice::from_ref(&inputs[0].primal))?;
-                    let tangent = context
-                        .stage(TestLinearOperation::Scale { factor: factor.clone() }, &[inputs[0].tangent])?
-                        .into_iter()
-                        .next()
-                        .expect("test scale jvp should produce one tangent");
-                    Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent }])
+                    let tangent_outputs =
+                        context.stage(TestLinearOperation::Scale { factor: factor.clone() }, &[inputs[0].tangent])?;
+                    check_count!("output", tangent_outputs, 1, TracingError);
+                    Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs[0] }])
                 }
             }
         }

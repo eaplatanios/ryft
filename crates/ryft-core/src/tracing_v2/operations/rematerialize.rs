@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::constants::{SupportsZero, Zero};
 use crate::operations::constants::{SupportsZeroLike, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
@@ -106,7 +106,7 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>, L: Clone + D
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(input_types, self.body.input_types.len(), TypeError);
+        check_count!("input", input_types, self.body.input_types.len(), TypeError);
         if input_types != self.body.input_types.as_slice() {
             return Err(TypeError {
                 message: "rematerialize input types do not match the captured body signature".to_string(),
@@ -190,6 +190,7 @@ where
                 .context
                 .trace(EInner::OperationCarrier::rematerialize_operation(self.clone()), primal_input_refs.as_slice())?
         };
+        check_count!("output", primal_outputs, self.body.output_types.as_slice().len(), TracingError);
 
         if tangent_inputs.is_empty() && !self.body.output_types.is_empty() {
             return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
@@ -224,6 +225,7 @@ where
             >>::rematerialize_operation(linear_remat),
             tangent_inputs.as_slice(),
         )?;
+        check_count!("output", tangent_outputs, self.body.output_types.as_slice().len(), TracingError);
 
         Ok(primal_outputs
             .into_iter()
@@ -261,6 +263,7 @@ where
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
+        check_count!("output", primal_outputs, self.body.output_types.as_slice().len(), TracingError);
         if tangent_inputs.is_empty() && !self.body.output_types.is_empty() {
             return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
         }
@@ -272,6 +275,7 @@ where
             )?)),
             tangent_inputs.as_slice(),
         )?;
+        check_count!("output", tangent_outputs, self.body.output_types.as_slice().len(), TracingError);
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
@@ -353,7 +357,7 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> Operation<T>
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(input_types, self.body.input_types.len(), TypeError);
+        check_count!("input", input_types, self.body.input_types.len(), TypeError);
         if input_types != self.body.input_types.as_slice() {
             return Err(TypeError {
                 message: "rematerialize input types do not match the captured body signature".to_string(),
@@ -410,11 +414,10 @@ where
             .zip(transpose.body.input_types.as_slice().iter())
             .map(|(cotangent, input_type)| materialize_optional_cotangent(context, *cotangent, input_type))
             .collect::<Vec<_>>();
-        Ok(context
-            .stage(LinearArrayOperation::<V, T>::Rematerialize(Box::new(transpose)), materialized.as_slice())?
-            .into_iter()
-            .map(Some)
-            .collect::<Vec<_>>())
+        let contributions =
+            context.stage(LinearArrayOperation::<V, T>::Rematerialize(Box::new(transpose)), materialized.as_slice())?;
+        check_count!("output", contributions, self.body.input_types.as_slice().len(), TracingError);
+        Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
 }
 

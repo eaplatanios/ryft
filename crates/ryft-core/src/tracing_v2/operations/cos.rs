@@ -3,7 +3,7 @@ use std::ops::Neg;
 
 use half::{bf16, f16};
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
@@ -80,21 +80,21 @@ impl<T: Type> Operation<T> for CosOperation {
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(input_types, 1, TypeError);
+        check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
 }
 
 impl<V: Typed<ArrayType> + Clone + Cos> InterpretableOperation<ArrayType, V> for CosOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().cos()])
     }
 }
 
 impl<V: Typed<DataType> + Clone + Cos> InterpretableOperation<DataType, V> for CosOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().cos()])
     }
 }
@@ -111,24 +111,21 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let scaled = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(
-                    input.primal.clone().sin(),
-                ),
-                &[input.tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("cos jvp scale should produce one tangent");
-        let tangent = context
-            .stage(<E::LinearOperationCarrier as SupportsNeg<E::Type, E::Value>>::neg_operation(), &[scaled])?
-            .into_iter()
-            .next()
-            .expect("cos jvp neg should produce one tangent");
-        Ok(vec![JvpTracer { primal: input.primal.clone().cos(), tangent }])
+        let scaled_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(
+                input.primal.clone().sin(),
+            ),
+            &[input.tangent],
+        )?;
+        check_count!("output", scaled_outputs, 1, TracingError);
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsNeg<E::Type, E::Value>>::neg_operation(),
+            &[scaled_outputs[0]],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: input.primal.clone().cos(), tangent: tangent_outputs[0] }])
     }
 }
 

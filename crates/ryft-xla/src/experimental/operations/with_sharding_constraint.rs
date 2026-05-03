@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
-use ryft_core::macros::check_input_count;
+use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing::transposition::LinearOperation;
@@ -78,7 +78,7 @@ impl Operation<ArrayType> for WithShardingConstraintOperation {
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        check_input_count!(input_types, 1, TypeError);
+        check_count!("input", input_types, 1, TypeError);
         let mut output = input_types[0].clone();
         if output.rank() != self.sharding.rank() {
             return Err(TypeError {
@@ -98,7 +98,7 @@ impl Operation<ArrayType> for WithShardingConstraintOperation {
 
 impl InterpretableOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperation {
     fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone()])
     }
 }
@@ -115,15 +115,13 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         match output_cotangents[0] {
             Some(atom) => {
-                let contribution = context
-                    .stage(LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, &[atom])?
-                    .into_iter()
-                    .next()
-                    .expect("sharding constraint should produce one cotangent contribution");
-                Ok(vec![Some(contribution)])
+                let contribution_outputs =
+                    context.stage(LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, &[atom])?;
+                check_count!("output", contribution_outputs, 1, TracingError);
+                Ok(vec![Some(contribution_outputs[0])])
             }
             None => Ok(vec![None]),
         }
@@ -143,19 +141,17 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
-        let tangent = context
-            .stage(&[inputs[0].tangent], LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, 1)?
-            .into_iter()
-            .next()
-            .expect("with_sharding_constraint jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: inputs[0].primal.clone(), tangent }])
+        check_count!("input", inputs, 1, TracingError);
+        let tangent_outputs =
+            context.stage(LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, &[inputs[0].tangent])?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: inputs[0].primal.clone(), tangent: tangent_outputs[0] }])
     }
 }
 
 impl InterpretableOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperation {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone()])
     }
 }
@@ -172,15 +168,13 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
         >,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         match output_cotangents[0] {
             Some(atom) => {
-                let contribution = context
-                    .stage(LinearArrayOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())), &[atom])?
-                    .into_iter()
-                    .next()
-                    .expect("sharding constraint should produce one cotangent contribution");
-                Ok(vec![Some(contribution)])
+                let contribution_outputs = context
+                    .stage(LinearArrayOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())), &[atom])?;
+                check_count!("output", contribution_outputs, 1, TracingError);
+                Ok(vec![Some(contribution_outputs[0])])
             }
             None => Ok(vec![None]),
         }

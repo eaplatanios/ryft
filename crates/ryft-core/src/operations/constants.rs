@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
 use crate::types::{DataType, Type, TypeError, Typed};
@@ -45,7 +45,7 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(input_types, 0, TypeError);
+        check_count!("input", input_types, 0, TypeError);
         Ok(vec![self.r#type.clone()])
     }
 
@@ -59,7 +59,7 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
 impl<T: Type, V: Typed<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperation<T> {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 0, TracingError);
+        check_count!("input", inputs, 0, TracingError);
         Ok(vec![V::zero(&self.r#type)?])
     }
 }
@@ -106,7 +106,7 @@ impl<T: Type> Operation<T> for ZeroLikeOperation {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(input_types, 1, TypeError);
+        check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
 }
@@ -114,7 +114,7 @@ impl<T: Type> Operation<T> for ZeroLikeOperation {
 impl<T: Type, V: Typed<T> + ZeroLike> InterpretableOperation<T, V> for ZeroLikeOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].zero_like()])
     }
 }
@@ -174,7 +174,7 @@ impl<T: Type> Operation<T> for OneOperation<T> {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(input_types, 0, TypeError);
+        check_count!("input", input_types, 0, TypeError);
         Ok(vec![self.r#type.clone()])
     }
 
@@ -188,7 +188,7 @@ impl<T: Type> Operation<T> for OneOperation<T> {
 impl<T: Type, V: Typed<T> + One<T>> InterpretableOperation<T, V> for OneOperation<T> {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 0, TracingError);
+        check_count!("input", inputs, 0, TracingError);
         Ok(vec![V::one(&self.r#type)?])
     }
 }
@@ -227,7 +227,7 @@ impl<T: Type> Operation<T> for OneLikeOperation {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(input_types, 1, TypeError);
+        check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
 }
@@ -235,7 +235,7 @@ impl<T: Type> Operation<T> for OneLikeOperation {
 impl<T: Type, V: Typed<T> + OneLike> InterpretableOperation<T, V> for OneLikeOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].one_like()])
     }
 }

@@ -261,7 +261,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::macros::check_input_count;
+    use crate::macros::check_count;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
     use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
@@ -539,14 +539,14 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-            check_input_count!(input_types, 1, TypeError);
+            check_count!("input", input_types, 1, TypeError);
             Ok(vec![input_types[0].clone()])
         }
     }
 
     impl InterpretableOperation<ArrayType, TestArray> for ShiftOp {
         fn interpret(&self, inputs: &[TestArray]) -> Result<Vec<TestArray>, TracingError> {
-            check_input_count!(inputs, 1, TracingError);
+            check_count!("input", inputs, 1, TracingError);
             Ok(vec![TestArray {
                 r#type: inputs[0].r#type.clone(),
                 values: inputs[0].values.iter().map(|value| value + self.amount).collect(),
@@ -560,7 +560,7 @@ mod tests {
             _context: &mut TranspositionContext<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>,
             output_cotangents: &[Option<AtomId>],
         ) -> Result<Vec<Option<AtomId>>, TracingError> {
-            check_input_count!(output_cotangents, 1, TracingError);
+            check_count!("output", output_cotangents, 1, TracingError);
             Ok(vec![output_cotangents[0]])
         }
     }
@@ -571,7 +571,7 @@ mod tests {
             _context: &mut JvpContext<'_, TestArrayEngine>,
             inputs: &[JvpTracer<TestArray, AtomId>],
         ) -> Result<Vec<JvpTracer<TestArray, AtomId>>, TracingError> {
-            check_input_count!(inputs, 1, TracingError);
+            check_count!("input", inputs, 1, TracingError);
             Ok(vec![JvpTracer {
                 primal: TestArray {
                     r#type: inputs[0].primal.r#type.clone(),
@@ -588,7 +588,7 @@ mod tests {
             _context: &mut JvpContext<'_, TracingContext<'engine, TestArrayEngine>>,
             inputs: &[JvpTracer<Tracer<'engine, TestArrayEngine>, AtomId>],
         ) -> Result<Vec<JvpTracer<Tracer<'engine, TestArrayEngine>, AtomId>>, TracingError> {
-            check_input_count!(inputs, 1, TracingError);
+            check_count!("input", inputs, 1, TracingError);
             let primal = apply_custom_traced_unary(
                 inputs[0].primal.clone(),
                 CustomPrimitive::<ArrayType, TestArray>::new(self.clone()),

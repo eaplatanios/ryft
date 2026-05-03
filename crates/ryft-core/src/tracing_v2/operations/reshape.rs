@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::engines::{Tracer, TracingEngine};
@@ -241,7 +241,7 @@ impl Operation<ArrayType> for ReshapeOperation {
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        check_input_count!(input_types, 1, TypeError);
+        check_count!("input", input_types, 1, TypeError);
         if input_types[0].shape != *&self.input_shape {
             return Err(TypeError {
                 message: format!("reshape expected input shape {} but got {}", &self.input_shape, input_types[0].shape),
@@ -260,7 +260,7 @@ impl Operation<ArrayType> for ReshapeOperation {
 
 impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().reshape(self.output_shape.clone())?])
     }
 }
@@ -275,26 +275,22 @@ impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, Arra
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         let Some(atom) = output_cotangents[0] else {
             return Ok(vec![None]);
         };
         if &self.input_shape == &self.output_shape {
             return Ok(vec![Some(atom)]);
         }
-        Ok(vec![Some(
-            context
-                .stage(
-                    LinearArrayOperation::Reshape {
-                        input_shape: self.output_shape.clone(),
-                        output_shape: self.input_shape.clone(),
-                    },
-                    &[atom],
-                )?
-                .into_iter()
-                .next()
-                .expect("reshape should produce one cotangent contribution"),
-        )])
+        let cotangent_outputs = context.stage(
+            LinearArrayOperation::Reshape {
+                input_shape: self.output_shape.clone(),
+                output_shape: self.input_shape.clone(),
+            },
+            &[atom],
+        )?;
+        check_count!("output", cotangent_outputs, 1, TracingError);
+        Ok(vec![Some(cotangent_outputs[0])])
     }
 }
 
@@ -309,20 +305,17 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().reshape(self.output_shape.clone())?;
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsReshape<ArrayType, E::Value>>::reshape_operation(
-                    self.input_shape.clone(),
-                    self.output_shape.clone(),
-                ),
-                &[inputs[0].tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("reshape jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal, tangent }])
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsReshape<ArrayType, E::Value>>::reshape_operation(
+                self.input_shape.clone(),
+                self.output_shape.clone(),
+            ),
+            &[inputs[0].tangent],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
     }
 }
 

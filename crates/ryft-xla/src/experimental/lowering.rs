@@ -9,15 +9,17 @@ use ryft_mlir::{
 #[cfg(feature = "ndarray")]
 use ryft_ndarray::Array as NdArrayValue;
 
+use ryft_core::macros::check_count;
 use ryft_core::operations::Operation;
+use ryft_core::operations::arithmetic::AddOperation;
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing::{AtomId, Instruction, Program, Traceable, TracingError};
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use ryft_core::tracing_v2::operations::{
-    AddOperation, CosOperation, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation,
-    MatrixTransposeOperation, MulOperation, NegOperation, RematerializeOperation, ReshapeOperation,
-    RightMatMulOperation, ScaleOperation, SinOperation,
+    CosOperation, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation,
+    MulOperation, NegOperation, RematerializeOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation,
+    SinOperation,
 };
 use ryft_core::tracing_v2::{ArrayOperation, CustomPrimitive, LinearArrayOperation, MatrixOps};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
@@ -409,9 +411,8 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let output_type = output_types
-            .first()
-            .ok_or_else(|| LoweringError::from(TracingError::InvalidOutputCount { expected: 1, got: 0 }))?;
+        check_count!("output", output_types, 1, TracingError);
+        let output_type = &output_types[0];
         let output_shape = static_dimensions(output_type)?;
         let result = lowerer.block.append_operation(stable_hlo::reshape(
             input_values[0],
@@ -429,12 +430,8 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Location<'
     context: &'c MlirContext<'t>,
     location: L,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    let output_type = output_types
-        .first()
-        .ok_or_else(|| LoweringError::from(TracingError::InvalidOutputCount { expected: 1, got: 0 }))?;
-    if output_types.len() != 1 {
-        return Err(TracingError::InvalidOutputCount { expected: 1, got: output_types.len() }.into());
-    }
+    check_count!("output", output_types, 1, TracingError);
+    let output_type = &output_types[0];
     let tensor_type = lower_tensor_type(output_type, context, location)?;
     if !output_type.shape.dimensions.is_empty() {
         let scalar_tensor_type = context
@@ -2133,9 +2130,8 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
         XlaOperation::Reshape { .. } => {
-            let output_type = output_types
-                .first()
-                .ok_or_else(|| LoweringError::from(TracingError::InvalidOutputCount { expected: 1, got: 0 }))?;
+            check_count!("output", output_types, 1, TracingError);
+            let output_type = &output_types[0];
             let output_shape = static_dimensions(output_type)?;
             let result = lowerer.block.append_operation(stable_hlo::reshape(
                 input_values[0],
@@ -2480,7 +2476,7 @@ mod tests {
     use ryft_mlir::Value as MlirValue;
 
     use ryft_core::broadcasting::Broadcastable;
-    use ryft_core::macros::check_input_count;
+    use ryft_core::macros::check_count;
     use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
     use ryft_core::operations::{InterpretableOperation, Operation};
     use ryft_core::parameters::{Parameter, Placeholder};
@@ -2736,14 +2732,14 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-            check_input_count!(input_types, 1, TypeError);
+            check_count!("input", input_types, 1, TypeError);
             Ok(vec![input_types[0].clone()])
         }
     }
 
     impl InterpretableOperation<ArrayType, ShardMapTensor> for TestCustomLoweredOp {
         fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
-            check_input_count!(inputs, 1, TracingError);
+            check_count!("input", inputs, 1, TracingError);
             Ok(vec![inputs[0].clone()])
         }
     }

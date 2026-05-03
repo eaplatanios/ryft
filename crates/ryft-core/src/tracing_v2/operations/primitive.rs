@@ -2,7 +2,7 @@ use std::fmt::{Debug, Display};
 use std::ops::{Add, Mul, Neg};
 use std::sync::Arc;
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
 use crate::operations::constants::{
     One, OneLike, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike, Zero,
@@ -1600,24 +1600,30 @@ where
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => {
-                check_input_count!(output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, TracingError);
                 Ok(vec![output_cotangents[0], output_cotangents[0]])
             }
             Self::Neg => {
-                check_input_count!(output_cotangents, 1, TracingError);
-                output_cotangents[0]
-                    .map(|atom| context.stage(Self::Neg, &[atom]).map(|outputs| vec![Some(outputs[0])]))
-                    .unwrap_or_else(|| Ok(vec![None]))
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(Self::Neg, &[atom])?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
             }
             Self::Scale { factor } => {
-                check_input_count!(output_cotangents, 1, TracingError);
-                output_cotangents[0]
-                    .map(|atom| {
-                        context
-                            .stage(Self::Scale { factor: factor.clone() }, &[atom])
-                            .map(|outputs| vec![Some(outputs[0])])
-                    })
-                    .unwrap_or_else(|| Ok(vec![None]))
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(Self::Scale { factor: factor.clone() }, &[atom])?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
             }
             Self::Custom(_) => Err(TypeError {
                 message: "custom scalar linear transpose requires a carrier-specific transpose rule".to_string(),
@@ -1819,22 +1825,18 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => {
-                check_input_count!(inputs, 1, TracingError);
+                check_count!("input", inputs, 1, TracingError);
                 let input = &inputs[0];
                 let factor_tracer = context.engine.constant(factor.clone());
-                let tangent =
-                    context
-                        .stage(
-                            <EInner::LinearOperationCarrier<'engine> as SupportsScale<
-                                DataType,
-                                Tracer<'engine, EInner>,
-                            >>::scale_operation(factor_tracer.clone()),
-                            &[input.tangent],
-                        )?
-                        .into_iter()
-                        .next()
-                        .expect("scale jvp should produce one tangent");
-                Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent }])
+                let tangent_outputs = context.stage(
+                    <EInner::LinearOperationCarrier<'engine> as SupportsScale<
+                        DataType,
+                        Tracer<'engine, EInner>,
+                    >>::scale_operation(factor_tracer.clone()),
+                    &[input.tangent],
+                )?;
+                check_count!("output", tangent_outputs, 1, TracingError);
+                Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs[0] }])
             }
             Self::Custom(_) => {
                 Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
@@ -2115,22 +2117,18 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => {
-                check_input_count!(inputs, 1, TracingError);
+                check_count!("input", inputs, 1, TracingError);
                 let input = &inputs[0];
                 let factor_tracer = context.engine.constant(factor.clone());
-                let tangent =
-                    context
-                        .stage(
-                            <EInner::LinearOperationCarrier<'engine> as SupportsScale<
-                                DataType,
-                                Tracer<'engine, EInner>,
-                            >>::scale_operation(factor_tracer.clone()),
-                            &[input.tangent],
-                        )?
-                        .into_iter()
-                        .next()
-                        .expect("scale jvp should produce one tangent");
-                Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent }])
+                let tangent_outputs = context.stage(
+                    <EInner::LinearOperationCarrier<'engine> as SupportsScale<
+                        DataType,
+                        Tracer<'engine, EInner>,
+                    >>::scale_operation(factor_tracer.clone()),
+                    &[input.tangent],
+                )?;
+                check_count!("output", tangent_outputs, 1, TracingError);
+                Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs[0] }])
             }
             Self::MatrixMultiply
             | Self::Transpose

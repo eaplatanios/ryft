@@ -7,7 +7,7 @@ use half::{bf16, f16};
 use ryft_macros::Parameter;
 use thiserror::Error;
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
 use crate::operations::constants::{SupportsZero, Zero};
 use crate::operations::{InterpretableOperation, Operation};
@@ -283,7 +283,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             Ok(atom)
         }
 
-        check_input_count!(input_primals, self.input_ids.len(), TracingError);
+        check_count!("input", input_primals, self.input_ids.len(), TracingError);
         let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, E::LinearOperationCarrier>::new()));
         let mut primals: Vec<Option<V>> = vec![None; self.atoms.len()];
         let mut tangents: Vec<Option<AtomId>> = vec![None; self.atoms.len()];
@@ -320,12 +320,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                 })
                 .collect::<Result<Vec<_>, TracingError>>()?;
             let output_duals = instruction.operation.jvp(&mut context, input_duals.as_slice())?;
-            if output_duals.len() != instruction.outputs.len() {
-                return Err(TracingError::InvalidOutputCount {
-                    expected: instruction.outputs.len(),
-                    got: output_duals.len(),
-                });
-            }
+            check_count!("output", output_duals, instruction.outputs.len(), TracingError);
             for (output_atom, output_dual) in instruction.outputs.iter().copied().zip(output_duals.into_iter()) {
                 primals[output_atom.index] = Some(output_dual.primal);
                 tangents[output_atom.index] = Some(output_dual.tangent);

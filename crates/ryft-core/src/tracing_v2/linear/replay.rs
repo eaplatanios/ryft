@@ -1,3 +1,4 @@
+use crate::macros::check_count;
 use crate::tracing::engines::TracingContext;
 use crate::tracing_v2::JvpContext;
 use crate::types::Type;
@@ -118,12 +119,7 @@ impl<'engine, E: DifferentiableTracingEngine + ?Sized> TracingContext<'engine, E
                 })
                 .collect::<Result<Vec<_>, TracingError>>()?;
             let output_duals = instruction.operation.jvp(&mut context, input_duals.as_slice())?;
-            if output_duals.len() != instruction.outputs.len() {
-                return Err(TracingError::InvalidOutputCount {
-                    expected: instruction.outputs.len(),
-                    got: output_duals.len(),
-                });
-            }
+            check_count!("output", output_duals, instruction.outputs.len(), TracingError);
             for (output_atom, output_dual) in instruction.outputs.iter().copied().zip(output_duals.into_iter()) {
                 primal_values[output_atom.index] = Some(output_dual.primal);
                 tangents[output_atom.index] = Some(output_dual.tangent);

@@ -11,7 +11,7 @@ pub use arithmetic::*;
 pub use constants::*;
 
 use crate::broadcasting::Broadcastable;
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::parameters::Parameterized;
 use crate::tracing::{Program, Traceable, TracingError};
 use crate::types::{ArrayType, Type, TypeError, Typed};
@@ -164,7 +164,7 @@ pub trait ElementwiseArrayOperation: Debug {
     /// Infers the broadcasted output [`ArrayType`] for this elementwise [`Operation`].
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        check_input_count!(input_types, self.input_count(), TypeError);
+        check_count!("input", input_types, self.input_count(), TypeError);
         let input_type_refs = input_types.iter().collect::<Vec<_>>();
         match ArrayType::broadcasted(&input_type_refs) {
             Ok(output) => Ok(vec![output]),
@@ -214,7 +214,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::macros::check_input_count;
+    use crate::macros::check_count;
     use crate::parameters::Placeholder;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::{Program, ProgramBuilder};
@@ -232,14 +232,14 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            check_input_count!(input_types, 1, TypeError);
+            check_count!("input", input_types, 1, TypeError);
             Ok(vec![input_types[0]])
         }
     }
 
     impl InterpretableOperation<DataType, f64> for IdentityOperation {
         fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
-            check_input_count!(inputs, 1, TracingError);
+            check_count!("input", inputs, 1, TracingError);
             Ok(vec![inputs[0]])
         }
     }

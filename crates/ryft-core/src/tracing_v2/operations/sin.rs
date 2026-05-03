@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
@@ -80,21 +80,21 @@ impl<T: Type> Operation<T> for SinOperation {
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(input_types, 1, TypeError);
+        check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
 }
 
 impl<V: Typed<ArrayType> + Clone + Sin> InterpretableOperation<ArrayType, V> for SinOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().sin()])
     }
 }
 
 impl<V: Typed<DataType> + Clone + Sin> InterpretableOperation<DataType, V> for SinOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().sin()])
     }
 }
@@ -111,19 +111,16 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(
-                    input.primal.clone().cos(),
-                ),
-                &[input.tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("sin jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: input.primal.clone().sin(), tangent }])
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(
+                input.primal.clone().cos(),
+            ),
+            &[input.tangent],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: input.primal.clone().sin(), tangent: tangent_outputs[0] }])
     }
 }
 

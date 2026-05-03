@@ -7,7 +7,7 @@ use half::{bf16, f16};
 
 use ryft_macros::Parameter;
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::tracing::TracingError;
@@ -256,12 +256,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         let outputs = program_builder.add_instruction(instruction.operation.clone(), inputs)?;
-                        if outputs.len() != instruction.outputs.len() {
-                            return Err(TracingError::InvalidOutputCount {
-                                expected: instruction.outputs.len(),
-                                got: outputs.len(),
-                            });
-                        }
+                        check_count!("output", outputs, instruction.outputs.len(), TracingError);
                         instruction.outputs.iter().copied().zip(outputs.iter().copied()).for_each(|(old, new)| {
                             atom_id_mapping.insert(old, new);
                         });
@@ -399,12 +394,10 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         let Program { atoms, input_ids, output_ids, instructions, input_structure, output_structure, marker: _ } = self;
 
         let expected_input_count = input_structure.parameter_count();
-        check_input_count!(input_ids, expected_input_count, TracingError);
+        check_count!("input", input_ids, expected_input_count, TracingError);
 
         let expected_output_count = output_structure.parameter_count();
-        if output_ids.len() != expected_output_count {
-            return Err(TracingError::InvalidOutputCount { expected: expected_output_count, got: output_ids.len() });
-        }
+        check_count!("output", output_ids, expected_output_count, TracingError);
 
         let mut parent_instructions = vec![None; atoms.len()];
         for (instruction_index, instruction) in instructions.iter().enumerate() {
@@ -518,9 +511,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         LiftConstantFn: FnMut(AtomId, &V) -> Result<Value, Error>,
         InterpretInstructionFn: FnMut(&Instruction<O>, &[Value]) -> Result<Vec<Value>, Error>,
     {
-        if inputs.len() != self.input_ids.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: inputs.len() }.into());
-        }
+        check_count!("input", inputs, self.input_ids.len(), TracingError);
 
         // Count every future consumer of each atom, including final program outputs. These counts let us move each
         // value out on its last use and clone it only when a later consumer still needs it.
@@ -578,13 +569,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
 
             // Apply the operation using the supplied dispatcher and ensure it produces the expected number of outputs.
             let outputs = interpret_instruction(instruction, instruction_inputs.as_slice())?;
-            if outputs.len() != instruction.outputs.len() {
-                return Err(TracingError::InvalidOutputCount {
-                    expected: instruction.outputs.len(),
-                    got: outputs.len(),
-                }
-                .into());
-            }
+            check_count!("output", outputs, instruction.outputs.len(), TracingError);
 
             for (output_id, output) in instruction.outputs.iter().copied().zip(outputs) {
                 let Some(value) = values.get_mut(output_id.index) else {
@@ -774,12 +759,10 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         }
 
         let expected_input_count = input_structure.parameter_count();
-        check_input_count!(self.input_ids, expected_input_count, TracingError);
+        check_count!("input", self.input_ids, expected_input_count, TracingError);
 
         let expected_output_count = output_structure.parameter_count();
-        if output_ids.len() != expected_output_count {
-            return Err(TracingError::InvalidOutputCount { expected: expected_output_count, got: output_ids.len() });
-        }
+        check_count!("output", output_ids, expected_output_count, TracingError);
 
         // Verify that variable dependencies are either inputs or previous instruction outputs.
         let mut variable_has_provider = vec![false; self.atoms.len()];
@@ -842,7 +825,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::macros::check_input_count;
+    use crate::macros::check_count;
     use crate::operations::OperationFormatter;
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::tracing::TracingError;
@@ -869,7 +852,7 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            check_input_count!(input_types, 1, TypeError);
+            check_count!("input", input_types, 1, TypeError);
             Ok(vec![input_types[0].clone()])
         }
 

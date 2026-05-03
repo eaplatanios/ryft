@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
@@ -40,14 +40,14 @@ impl Operation<ArrayType> for MatrixTransposeOperation {
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        check_input_count!(input_types, 1, TypeError);
+        check_count!("input", input_types, 1, TypeError);
         Ok(vec![transpose_abstract(&input_types[0], "matrix_transpose")?])
     }
 }
 
 impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().transpose_matrix()])
     }
 }
@@ -62,15 +62,13 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, Array
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         match output_cotangents[0] {
-            Some(atom) => Ok(vec![Some(
-                context
-                    .stage(LinearArrayOperation::Transpose, &[atom])?
-                    .into_iter()
-                    .next()
-                    .expect("matrix transpose should produce one cotangent contribution"),
-            )]),
+            Some(atom) => {
+                let cotangent_outputs = context.stage(LinearArrayOperation::Transpose, &[atom])?;
+                check_count!("output", cotangent_outputs, 1, TracingError);
+                Ok(vec![Some(cotangent_outputs[0])])
+            }
             None => Ok(vec![None]),
         }
     }
@@ -87,17 +85,13 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().transpose_matrix();
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsMatrixTranspose<ArrayType, E::Value>>::matrix_transpose_operation(
-                ),
-                &[inputs[0].tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("matrix transpose jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal, tangent }])
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsMatrixTranspose<ArrayType, E::Value>>::matrix_transpose_operation(),
+            &[inputs[0].tangent],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
     }
 }

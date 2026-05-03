@@ -4,7 +4,7 @@ use std::ops::Mul;
 #[cfg(test)]
 use indoc::indoc;
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::engines::Tracer;
@@ -54,7 +54,7 @@ impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
     /// This is mainly used by carrier-level wrappers that want to construct or validate a scale op
     /// from type information before they have committed to a concrete `ScaleOperation` value.
     pub fn abstract_eval_static(inputs: &[T]) -> Result<Vec<T>, TypeError> {
-        check_input_count!(inputs, 1, TypeError);
+        check_count!("input", inputs, 1, TypeError);
         Ok(vec![inputs[0].clone()])
     }
 }
@@ -85,7 +85,7 @@ impl<T: Type, V: Typed<T> + Debug + Display + Clone + Mul<Output = V>> Interpret
     for ScaleOperation<T, V>
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         Ok(vec![self.factor.clone() * inputs[0].clone()])
     }
 }
@@ -100,15 +100,14 @@ where
         context: &mut crate::tracing::transposition::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         match output_cotangents[0] {
-            Some(atom) => Ok(vec![Some(
-                context
-                    .stage(LinearArrayOperation::<V, T>::Scale { factor: self.factor.clone() }, &[atom])?
-                    .into_iter()
-                    .next()
-                    .expect("scale transpose should produce one cotangent contribution"),
-            )]),
+            Some(atom) => {
+                let cotangent_outputs =
+                    context.stage(LinearArrayOperation::<V, T>::Scale { factor: self.factor.clone() }, &[atom])?;
+                check_count!("output", cotangent_outputs, 1, TracingError);
+                Ok(vec![Some(cotangent_outputs[0])])
+            }
             None => Ok(vec![None]),
         }
     }
@@ -125,17 +124,14 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsScale<ArrayType, V>>::scale_operation(self.factor.clone()),
-                &[input.tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("scale jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: self.factor.clone() * input.primal.clone(), tangent }])
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsScale<ArrayType, V>>::scale_operation(self.factor.clone()),
+            &[input.tangent],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: self.factor.clone() * input.primal.clone(), tangent: tangent_outputs[0] }])
     }
 }
 
@@ -150,17 +146,14 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<V, AtomId>],
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsScale<DataType, V>>::scale_operation(self.factor.clone()),
-                &[input.tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("scale jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: self.factor.clone() * input.primal.clone(), tangent }])
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsScale<DataType, V>>::scale_operation(self.factor.clone()),
+            &[input.tangent],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: self.factor.clone() * input.primal.clone(), tangent: tangent_outputs[0] }])
     }
 }
 
@@ -186,20 +179,18 @@ where
         context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
+        check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let factor_tracer = context.engine.constant(self.factor.clone());
-        let tangent = context
-            .stage(
-                <EInner::LinearOperationCarrier<'engine> as SupportsScale<ArrayType, Tracer<'engine, EInner>>>::scale_operation(
-                    factor_tracer.clone(),
-                ),
-                &[input.tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("scale jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent }])
+        let tangent_outputs = context.stage(
+            <EInner::LinearOperationCarrier<'engine> as SupportsScale<
+                ArrayType,
+                Tracer<'engine, EInner>,
+            >>::scale_operation(factor_tracer.clone()),
+            &[input.tangent],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs[0] }])
     }
 }
 

@@ -1,6 +1,6 @@
 use half::{bf16, f16};
 
-use crate::macros::check_input_count;
+use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::constants::{
     OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
@@ -19,7 +19,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
         _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
 }
@@ -36,16 +36,13 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 0, TracingError);
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(self.r#type.clone()),
-                &[],
-            )?
-            .into_iter()
-            .next()
-            .expect("zero jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: context.engine.zero(&self.r#type)?, tangent }])
+        check_count!("input", inputs, 0, TracingError);
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(self.r#type.clone()),
+            &[],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: context.engine.zero(&self.r#type)?, tangent: tangent_outputs[0] }])
     }
 }
 
@@ -57,7 +54,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
         _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
 }
@@ -74,16 +71,13 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 0, TracingError);
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(self.r#type.clone()),
-                &[],
-            )?
-            .into_iter()
-            .next()
-            .expect("one jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: context.engine.one(&self.r#type)?, tangent }])
+        check_count!("input", inputs, 0, TracingError);
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(self.r#type.clone()),
+            &[],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: context.engine.one(&self.r#type)?, tangent: tangent_outputs[0] }])
     }
 }
 
@@ -95,7 +89,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
         _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         Ok(vec![None])
     }
 }
@@ -112,16 +106,13 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
-                &[inputs[0].tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("zero_like jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent }])
+        check_count!("input", inputs, 1, TracingError);
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
+            &[inputs[0].tangent],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent: tangent_outputs[0] }])
     }
 }
 
@@ -133,7 +124,7 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
         _context: &mut TranspositionContext<T, V, LinearCarrier>,
         output_cotangents: &[Option<AtomId>],
     ) -> Result<Vec<Option<AtomId>>, TracingError> {
-        check_input_count!(output_cotangents, 1, TracingError);
+        check_count!("output", output_cotangents, 1, TracingError);
         Ok(vec![None])
     }
 }
@@ -150,16 +141,13 @@ where
         context: &mut JvpContext<'_, E>,
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        check_input_count!(inputs, 1, TracingError);
-        let tangent = context
-            .stage(
-                <E::LinearOperationCarrier as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
-                &[inputs[0].tangent],
-            )?
-            .into_iter()
-            .next()
-            .expect("one_like jvp should produce one tangent");
-        Ok(vec![JvpTracer { primal: inputs[0].primal.one_like(), tangent }])
+        check_count!("input", inputs, 1, TracingError);
+        let tangent_outputs = context.stage(
+            <E::LinearOperationCarrier as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
+            &[inputs[0].tangent],
+        )?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: inputs[0].primal.one_like(), tangent: tangent_outputs[0] }])
     }
 }
 
