@@ -93,8 +93,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_add_operation() {
+    fn test_add() {
         let operation = AddOperation;
+
+        // Operation identity and concrete interpretation.
         assert_eq!(Operation::<DataType>::name(&operation), "add");
         assert_eq!(format!("{operation:?}"), "AddOperation");
         assert_eq!(format!("{operation}"), "add");
@@ -104,47 +106,10 @@ mod tests {
         );
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0, 3.5]), Ok(vec![5.5]));
         assert_eq!(InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0, 3.5]), Ok(vec![5.5]));
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
-            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F64)]),
-            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]),
-            Err(TracingError::InvalidInputCount { expected: 2, got: 1 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0]),
-            Err(TracingError::InvalidInputCount { expected: 2, got: 1 }),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),
-            Err(TypeError { message: "add input types are not broadcast-compatible".to_string() }),
-        );
 
-        let mut builder = ProgramBuilder::<DataType, f64, AddOperation>::new();
-        let left = builder.add_input(DataType::F64);
-        let right = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![left, right]).unwrap()[0];
-        let program = builder.build::<(f64, f64), f64>(vec![output], (Placeholder, Placeholder), Placeholder).unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = add %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_add_array_operation_broadcasts_and_promotes_inputs() {
+        // Array type inference broadcasts shapes and promotes data types.
         let output = <AddOperation as Operation<ArrayType>>::infer_output_types(
-            &AddOperation,
+            &operation,
             &[
                 ArrayType::scalar(DataType::F32),
                 ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap(),
@@ -157,25 +122,10 @@ mod tests {
                 ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None,).unwrap()
             ]
         );
-    }
 
-    #[test]
-    fn test_add_array_operation_rejects_non_broadcastable_inputs() {
-        let error = <AddOperation as Operation<ArrayType>>::infer_output_types(
-            &AddOperation,
-            &[
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
-            ],
-        )
-        .unwrap_err();
-        assert_eq!(error, TypeError { message: "add input types are not broadcast-compatible".to_string() });
-    }
-
-    #[test]
-    fn test_add_array_operation_drops_layout_when_inputs_disagree() {
+        // Array type inference drops layout metadata when inputs disagree.
         let output = <AddOperation as Operation<ArrayType>>::infer_output_types(
-            &AddOperation,
+            &operation,
             &[
                 ArrayType::new(DataType::F32, Shape::scalar(), Some(Layout::Strided(StridedLayout::new(vec![]))), None)
                     .unwrap(),
@@ -184,10 +134,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, vec![ArrayType::scalar(DataType::F32)]);
-    }
 
-    #[test]
-    fn test_add_array_operation_merges_varying_manual_axes_for_compatible_inputs() {
+        // Array type inference tolerates compatible inputs that only disagree on varying manual axes.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -225,11 +173,57 @@ mod tests {
             ),
         )
         .unwrap();
-
-        let output = <AddOperation as Operation<ArrayType>>::infer_output_types(&AddOperation, &[left, right]).unwrap();
+        let output = <AddOperation as Operation<ArrayType>>::infer_output_types(&operation, &[left, right]).unwrap();
         assert_eq!(
             output[0].sharding.as_ref().unwrap().varying_manual_axes,
             BTreeSet::from(["x".to_string(), "y".to_string()])
+        );
+
+        // Invalid inputs report precise operation and interpreter errors.
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
+            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
+        );
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F64)]),
+            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
+        );
+        assert_eq!(
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]),
+            Err(TracingError::InvalidInputCount { expected: 2, got: 1 }),
+        );
+        assert_eq!(
+            InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0]),
+            Err(TracingError::InvalidInputCount { expected: 2, got: 1 }),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),
+            Err(TypeError { message: "add input types are not broadcast-compatible".to_string() }),
+        );
+        let error = <AddOperation as Operation<ArrayType>>::infer_output_types(
+            &operation,
+            &[
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error, TypeError { message: "add input types are not broadcast-compatible".to_string() });
+
+        // Program rendering uses the canonical operation name.
+        let mut builder = ProgramBuilder::<DataType, f64, AddOperation>::new();
+        let left = builder.add_input(DataType::F64);
+        let right = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(operation, vec![left, right]).unwrap()[0];
+        let program = builder.build::<(f64, f64), f64>(vec![output], (Placeholder, Placeholder), Placeholder).unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
         );
     }
 }
