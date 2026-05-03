@@ -57,6 +57,7 @@ pub fn intr_get_active_lane_mask<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_get_active_lane_mask`")
 }
+
 /// Canonical MLIR operation name for [`InvariantEndOperation`].
 pub const INVARIANT_END_OPERATION_NAME: &str = "llvm.intr.invariant.end";
 
@@ -103,6 +104,7 @@ pub fn intr_invariant_end<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, V1: Value<'
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_invariant_end`")
 }
+
 /// Canonical MLIR operation name for [`InvariantStartOperation`].
 pub const INVARIANT_START_OPERATION_NAME: &str = "llvm.intr.invariant.start";
 
@@ -149,6 +151,7 @@ pub fn intr_invariant_start<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_invariant_start`")
 }
+
 /// Canonical MLIR operation name for [`LaunderInvariantGroupOperation`].
 pub const LAUNDER_INVARIANT_GROUP_OPERATION_NAME: &str = "llvm.intr.launder.invariant.group";
 
@@ -195,6 +198,7 @@ pub fn intr_launder_invariant_group<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_launder_invariant_group`")
 }
+
 /// Canonical MLIR operation name for [`LifetimeEndOperation`].
 pub const LIFETIME_END_OPERATION_NAME: &str = "llvm.intr.lifetime.end";
 
@@ -227,6 +231,7 @@ pub fn intr_lifetime_end<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_lifetime_end`")
 }
+
 /// Canonical MLIR operation name for [`LifetimeStartOperation`].
 pub const LIFETIME_START_OPERATION_NAME: &str = "llvm.intr.lifetime.start";
 
@@ -259,6 +264,7 @@ pub fn intr_lifetime_start<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Locatio
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_lifetime_start`")
 }
+
 /// Canonical MLIR operation name for [`MaskedLoadOperation`].
 pub const MASKED_LOAD_OPERATION_NAME: &str = "llvm.intr.masked.load";
 
@@ -327,6 +333,7 @@ pub fn intr_masked_load<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_masked_load`")
 }
+
 /// Canonical MLIR operation name for [`MaskedStoreOperation`].
 pub const MASKED_STORE_OPERATION_NAME: &str = "llvm.intr.masked.store";
 
@@ -388,6 +395,7 @@ pub fn intr_masked_store<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_masked_store`")
 }
+
 /// Canonical MLIR operation name for [`MatrixColumnMajorLoadOperation`].
 pub const MATRIX_COLUMN_MAJOR_LOAD_OPERATION_NAME: &str = "llvm.intr.matrix.column.major.load";
 
@@ -463,6 +471,7 @@ pub fn intr_matrix_column_major_load<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_matrix_column_major_load`")
 }
+
 /// Canonical MLIR operation name for [`MatrixColumnMajorStoreOperation`].
 pub const MATRIX_COLUMN_MAJOR_STORE_OPERATION_NAME: &str = "llvm.intr.matrix.column.major.store";
 
@@ -538,6 +547,7 @@ pub fn intr_matrix_column_major_store<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_matrix_column_major_store`")
 }
+
 /// Canonical MLIR operation name for [`MatrixMultiplyOperation`].
 pub const MATRIX_MULTIPLY_OPERATION_NAME: &str = "llvm.intr.matrix.multiply";
 
@@ -613,6 +623,7 @@ pub fn intr_matrix_multiply<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_matrix_multiply`")
 }
+
 /// Canonical MLIR operation name for [`MatrixTransposeOperation`].
 pub const MATRIX_TRANSPOSE_OPERATION_NAME: &str = "llvm.intr.matrix.transpose";
 
@@ -666,6 +677,7 @@ pub fn intr_matrix_transpose<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_matrix_transpose`")
 }
+
 /// Canonical MLIR operation name for [`MemcpyInlineOperation`].
 pub const MEMCPY_INLINE_OPERATION_NAME: &str = "llvm.intr.memcpy.inline";
 
@@ -719,6 +731,7 @@ pub fn intr_memcpy_inline<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, V1: Value<'
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_memcpy_inline`")
 }
+
 /// Canonical MLIR operation name for [`MemcpyOperation`].
 pub const MEMCPY_OPERATION_NAME: &str = "llvm.intr.memcpy";
 
@@ -780,6 +793,7 @@ pub fn intr_memcpy<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_memcpy`")
 }
+
 /// Canonical MLIR operation name for [`MemmoveOperation`].
 pub const MEMMOVE_OPERATION_NAME: &str = "llvm.intr.memmove";
 
@@ -841,6 +855,7 @@ pub fn intr_memmove<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_memmove`")
 }
+
 /// Canonical MLIR operation name for [`MemsetInlineOperation`].
 pub const MEMSET_INLINE_OPERATION_NAME: &str = "llvm.intr.memset.inline";
 
@@ -894,6 +909,7 @@ pub fn intr_memset_inline<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, V1: Value<'
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_memset_inline`")
 }
+
 /// Canonical MLIR operation name for [`MemsetOperation`].
 pub const MEMSET_OPERATION_NAME: &str = "llvm.intr.memset";
 
@@ -955,6 +971,7 @@ pub fn intr_memset<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_memset`")
 }
+
 /// Canonical MLIR operation name for [`NoAliasScopeDeclOperation`].
 pub const NO_ALIAS_SCOPE_DECL_OPERATION_NAME: &str = "llvm.intr.experimental.noalias.scope.decl";
 
@@ -987,6 +1004,7 @@ pub fn intr_experimental_noalias_scope_decl<'v, 'c: 'v, 't: 'c, L: Location<'c, 
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_experimental_noalias_scope_decl`")
 }
+
 /// Canonical MLIR operation name for [`PrefetchOperation`].
 pub const PREFETCH_OPERATION_NAME: &str = "llvm.intr.prefetch";
 
@@ -1040,6 +1058,7 @@ pub fn intr_prefetch<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_prefetch`")
 }
+
 /// Canonical MLIR operation name for [`PtrAnnotationOperation`].
 pub const PTR_ANNOTATION_OPERATION_NAME: &str = "llvm.intr.ptr.annotation";
 
@@ -1118,6 +1137,7 @@ pub fn intr_ptr_annotation<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_ptr_annotation`")
 }
+
 /// Canonical MLIR operation name for [`PtrMaskOperation`].
 pub const PTR_MASK_OPERATION_NAME: &str = "llvm.intr.ptrmask";
 
@@ -1172,6 +1192,7 @@ pub fn intr_ptrmask<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_ptrmask`")
 }
+
 /// Canonical MLIR operation name for [`StackRestoreOperation`].
 pub const STACK_RESTORE_OPERATION_NAME: &str = "llvm.intr.stackrestore";
 
@@ -1191,7 +1212,7 @@ pub trait StackRestoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(StackRestore);
 
 /// Constructs a new detached `llvm.intr.stackrestore` operation.
-pub fn intr_stackrestore<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 't>>(
+pub fn intr_stack_restore<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     pointer: V0,
     location: L,
 ) -> DetachedStackRestoreOperation<'c, 't> {
@@ -1202,8 +1223,9 @@ pub fn intr_stackrestore<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<
     builder
         .build()
         .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_stackrestore`")
+        .expect("invalid arguments to `llvm::intr_stack_restore`")
 }
+
 /// Canonical MLIR operation name for [`StackSaveOperation`].
 pub const STACK_SAVE_OPERATION_NAME: &str = "llvm.intr.stacksave";
 
@@ -1223,7 +1245,7 @@ pub trait StackSaveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(StackSave);
 
 /// Constructs a new detached `llvm.intr.stacksave` operation.
-pub fn intr_stacksave<'v, 'c: 'v, 't: 'c, T0: Type<'c, 't>, L: Location<'c, 't>>(
+pub fn intr_stack_save<'v, 'c: 'v, 't: 'c, T0: Type<'c, 't>, L: Location<'c, 't>>(
     result_type: T0,
     location: L,
 ) -> DetachedStackSaveOperation<'c, 't> {
@@ -1234,8 +1256,9 @@ pub fn intr_stacksave<'v, 'c: 'v, 't: 'c, T0: Type<'c, 't>, L: Location<'c, 't>>
     builder
         .build()
         .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_stacksave`")
+        .expect("invalid arguments to `llvm::intr_stack_save`")
 }
+
 /// Canonical MLIR operation name for [`StripInvariantGroupOperation`].
 pub const STRIP_INVARIANT_GROUP_OPERATION_NAME: &str = "llvm.intr.strip.invariant.group";
 
@@ -1275,14 +1298,15 @@ pub fn intr_strip_invariant_group<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0:
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_strip_invariant_group`")
 }
+
 /// Canonical MLIR operation name for [`ThreadlocalAddressOperation`].
-pub const THREADLOCAL_ADDRESS_OPERATION_NAME: &str = "llvm.intr.threadlocal.address";
+pub const THREAD_LOCAL_ADDRESS_OPERATION_NAME: &str = "llvm.intr.threadlocal.address";
 
 /// Operation trait for `llvm.intr.threadlocal.address`.
-pub trait ThreadlocalAddressOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait ThreadLocalAddressOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        THREADLOCAL_ADDRESS_OPERATION_NAME
+        THREAD_LOCAL_ADDRESS_OPERATION_NAME
     }
 
     /// Returns the `global` operand.
@@ -1296,24 +1320,25 @@ pub trait ThreadlocalAddressOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't>
     }
 }
 
-mlir_op!(ThreadlocalAddress);
+mlir_op!(ThreadLocalAddress);
 
 /// Constructs a new detached `llvm.intr.threadlocal.address` operation.
-pub fn intr_threadlocal_address<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L: Location<'c, 't>>(
+pub fn intr_thread_local_address<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L: Location<'c, 't>>(
     global: V0,
     result_type: T0,
     location: L,
-) -> DetachedThreadlocalAddressOperation<'c, 't> {
+) -> DetachedThreadLocalAddressOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(THREADLOCAL_ADDRESS_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(THREAD_LOCAL_ADDRESS_OPERATION_NAME, location);
     builder = builder.add_operand(global);
     builder = builder.add_result(result_type);
     builder
         .build()
         .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_threadlocal_address`")
+        .expect("invalid arguments to `llvm::intr_thread_local_address`")
 }
+
 /// Canonical MLIR operation name for [`VaCopyOperation`].
 pub const VA_COPY_OPERATION_NAME: &str = "llvm.intr.vacopy";
 
@@ -1338,7 +1363,7 @@ pub trait VaCopyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(VaCopy);
 
 /// Constructs a new detached `llvm.intr.vacopy` operation.
-pub fn intr_vacopy<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, V1: Value<'v, 'c, 't>, L: Location<'c, 't>>(
+pub fn intr_va_copy<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, V1: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     destination_list: V0,
     source_list: V1,
     location: L,
@@ -1351,8 +1376,9 @@ pub fn intr_vacopy<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, V1: Value<'v, 'c, 
     builder
         .build()
         .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vacopy`")
+        .expect("invalid arguments to `llvm::intr_va_copy`")
 }
+
 /// Canonical MLIR operation name for [`VaEndOperation`].
 pub const VA_END_OPERATION_NAME: &str = "llvm.intr.vaend";
 
@@ -1372,7 +1398,7 @@ pub trait VaEndOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(VaEnd);
 
 /// Constructs a new detached `llvm.intr.vaend` operation.
-pub fn intr_vaend<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 't>>(
+pub fn intr_va_end<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     argument_list: V0,
     location: L,
 ) -> DetachedVaEndOperation<'c, 't> {
@@ -1383,8 +1409,9 @@ pub fn intr_vaend<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 't>
     builder
         .build()
         .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vaend`")
+        .expect("invalid arguments to `llvm::intr_va_end`")
 }
+
 /// Canonical MLIR operation name for [`VaStartOperation`].
 pub const VA_START_OPERATION_NAME: &str = "llvm.intr.vastart";
 
@@ -1404,7 +1431,7 @@ pub trait VaStartOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(VaStart);
 
 /// Constructs a new detached `llvm.intr.vastart` operation.
-pub fn intr_vastart<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 't>>(
+pub fn intr_va_start<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     argument_list: V0,
     location: L,
 ) -> DetachedVaStartOperation<'c, 't> {
@@ -1415,16 +1442,17 @@ pub fn intr_vastart<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, '
     builder
         .build()
         .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vastart`")
+        .expect("invalid arguments to `llvm::intr_va_start`")
 }
+
 /// Canonical MLIR operation name for [`MaskedCompressstoreOperation`].
-pub const MASKED_COMPRESSSTORE_OPERATION_NAME: &str = "llvm.intr.masked.compressstore";
+pub const MASKED_COMPRESS_STORE_OPERATION_NAME: &str = "llvm.intr.masked.compressstore";
 
 /// Operation trait for `llvm.intr.masked.compressstore`.
-pub trait MaskedCompressstoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait MaskedCompressStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        MASKED_COMPRESSSTORE_OPERATION_NAME
+        MASKED_COMPRESS_STORE_OPERATION_NAME
     }
 
     /// Returns the `value` operand.
@@ -1443,10 +1471,10 @@ pub trait MaskedCompressstoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't
     }
 }
 
-mlir_op!(MaskedCompressstore);
+mlir_op!(MaskedCompressStore);
 
 /// Constructs a new detached `llvm.intr.masked.compressstore` operation.
-pub fn intr_masked_compressstore<
+pub fn intr_masked_compress_store<
     'v,
     'c: 'v,
     't: 'c,
@@ -1459,26 +1487,27 @@ pub fn intr_masked_compressstore<
     pointer: V1,
     mask: V2,
     location: L,
-) -> DetachedMaskedCompressstoreOperation<'c, 't> {
+) -> DetachedMaskedCompressStoreOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(MASKED_COMPRESSSTORE_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(MASKED_COMPRESS_STORE_OPERATION_NAME, location);
     builder = builder.add_operand(value);
     builder = builder.add_operand(pointer);
     builder = builder.add_operand(mask);
     builder
         .build()
         .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_masked_compressstore`")
+        .expect("invalid arguments to `llvm::intr_masked_compress_store`")
 }
+
 /// Canonical MLIR operation name for [`MaskedExpandloadOperation`].
-pub const MASKED_EXPANDLOAD_OPERATION_NAME: &str = "llvm.intr.masked.expandload";
+pub const MASKED_EXPAND_LOAD_OPERATION_NAME: &str = "llvm.intr.masked.expandload";
 
 /// Operation trait for `llvm.intr.masked.expandload`.
-pub trait MaskedExpandloadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+pub trait MaskedExpandLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the canonical MLIR operation name.
     fn operation_name(&self) -> &'static str {
-        MASKED_EXPANDLOAD_OPERATION_NAME
+        MASKED_EXPAND_LOAD_OPERATION_NAME
     }
 
     /// Returns the `pointer` operand.
@@ -1502,10 +1531,10 @@ pub trait MaskedExpandloadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 }
 
-mlir_op!(MaskedExpandload);
+mlir_op!(MaskedExpandLoad);
 
 /// Constructs a new detached `llvm.intr.masked.expandload` operation.
-pub fn intr_masked_expandload<
+pub fn intr_masked_expand_load<
     'v,
     'c: 'v,
     't: 'c,
@@ -1520,10 +1549,10 @@ pub fn intr_masked_expandload<
     passthru: V2,
     result_type: T0,
     location: L,
-) -> DetachedMaskedExpandloadOperation<'c, 't> {
+) -> DetachedMaskedExpandLoadOperation<'c, 't> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm());
-    let mut builder = OperationBuilder::new(MASKED_EXPANDLOAD_OPERATION_NAME, location);
+    let mut builder = OperationBuilder::new(MASKED_EXPAND_LOAD_OPERATION_NAME, location);
     builder = builder.add_operand(pointer);
     builder = builder.add_operand(mask);
     builder = builder.add_operand(passthru);
@@ -1533,6 +1562,7 @@ pub fn intr_masked_expandload<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_masked_expandload`")
 }
+
 /// Canonical MLIR operation name for [`MaskedGatherOperation`].
 pub const MASKED_GATHER_OPERATION_NAME: &str = "llvm.intr.masked.gather";
 
@@ -1594,6 +1624,7 @@ pub fn intr_masked_gather<
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_masked_gather`")
 }
+
 /// Canonical MLIR operation name for [`MaskedScatterOperation`].
 pub const MASKED_SCATTER_OPERATION_NAME: &str = "llvm.intr.masked.scatter";
 
@@ -1654,4 +1685,1538 @@ pub fn intr_masked_scatter<
         .build()
         .and_then(|operation| unsafe { operation.cast() })
         .expect("invalid arguments to `llvm::intr_masked_scatter`")
+}
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::dialects::func;
+    use crate::{Attribute, Block, Context, DialectHandle, Operation, Type};
+
+    use super::*;
+
+    #[test]
+    fn test_intr_get_active_lane_mask() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_get_active_lane_mask(arg_0, arg_1, mask_type, location);
+            assert_eq!(op.base(), arg_0);
+            assert_eq!(op.bound(), arg_1);
+            assert_eq!(op.output_type(), mask_type);
+            assert_eq!(op.operation_name(), "llvm.intr.get.active.lane.mask");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_get_active_lane_mask_test",
+                func::FuncAttributes {
+                    arguments: vec![i32_type.into(), i32_type.into()],
+                    results: vec![mask_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_get_active_lane_mask_test(%arg0: i32, %arg1: i32) -> vector<4xi1> {
+                    %0 = llvm.intr.get.active.lane.mask %arg0, %arg1 : i32, i32 to vector<4xi1>
+                    return %0 : vector<4xi1>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_invariant_end() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        let size = context.integer_attribute(i64_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location), (pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_invariant_end(arg_0, arg_1, size, location);
+            assert_eq!(op.start(), arg_0);
+            assert_eq!(op.pointer(), arg_1);
+            assert_eq!(op.size(), size);
+            assert_eq!(op.operation_name(), "llvm.intr.invariant.end");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_invariant_end_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), pointer_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_invariant_end_test(%arg0: !llvm.ptr, %arg1: !llvm.ptr) {
+                    llvm.intr.invariant.end %arg0, 1, %arg1 : !llvm.ptr
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_invariant_start() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        let size = context.integer_attribute(i64_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_invariant_start(arg_0, pointer_type, size, location);
+            assert_eq!(op.pointer(), arg_0);
+            assert_eq!(op.size(), size);
+            assert_eq!(op.output_type(), pointer_type);
+            assert_eq!(op.operation_name(), "llvm.intr.invariant.start");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_invariant_start_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into()],
+                    results: vec![pointer_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_invariant_start_test(%arg0: !llvm.ptr) -> !llvm.ptr {
+                    %0 = llvm.intr.invariant.start 1, %arg0 : !llvm.ptr
+                    return %0 : !llvm.ptr
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_launder_invariant_group() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_launder_invariant_group(arg_0, pointer_type, location);
+            assert_eq!(op.pointer(), arg_0);
+            assert_eq!(op.output_type(), pointer_type);
+            assert_eq!(op.operation_name(), "llvm.intr.launder.invariant.group");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_launder_invariant_group_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into()],
+                    results: vec![pointer_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_launder_invariant_group_test(%arg0: !llvm.ptr) -> !llvm.ptr {
+                    %0 = llvm.intr.launder.invariant.group %arg0 : !llvm.ptr
+                    return %0 : !llvm.ptr
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_lifetime_end() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_lifetime_end(arg_0, location);
+            assert_eq!(op.pointer(), arg_0);
+            assert_eq!(op.operation_name(), "llvm.intr.lifetime.end");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_lifetime_end_test",
+                func::FuncAttributes { arguments: vec![pointer_type.into()], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_lifetime_end_test(%arg0: !llvm.ptr) {
+                    llvm.intr.lifetime.end %arg0 : !llvm.ptr
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_lifetime_start() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_lifetime_start(arg_0, location);
+            assert_eq!(op.pointer(), arg_0);
+            assert_eq!(op.operation_name(), "llvm.intr.lifetime.start");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_lifetime_start_test",
+                func::FuncAttributes { arguments: vec![pointer_type.into()], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_lifetime_start_test(%arg0: !llvm.ptr) {
+                    llvm.intr.lifetime.start %arg0 : !llvm.ptr
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_masked_load() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let pointer_type = context.llvm_pointer_type(0);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        let alignment = context.integer_attribute(i32_type, 1).as_ref();
+        let nontemporal = context.unit_attribute().as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location), (mask_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_masked_load(arg_0, arg_1, vector_i32_type, alignment, nontemporal, location);
+            assert_eq!(op.data(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.alignment(), alignment);
+            assert_eq!(op.nontemporal(), nontemporal);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.masked.load");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_masked_load_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), mask_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_masked_load_test(%arg0: !llvm.ptr, %arg1: vector<4xi1>) -> vector<4xi32> {
+                    %0 = llvm.intr.masked.load %arg0, %arg1 {alignment = 1 : i32, nontemporal} : (!llvm.ptr, vector<4xi1>) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_masked_store() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let pointer_type = context.llvm_pointer_type(0);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        let alignment = context.integer_attribute(i32_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_masked_store(arg_0, arg_1, arg_2, alignment, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.data(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.alignment(), alignment);
+            assert_eq!(op.operation_name(), "llvm.intr.masked.store");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_masked_store_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), pointer_type.into(), mask_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_masked_store_test(%arg0: vector<4xi32>, %arg1: !llvm.ptr, %arg2: vector<4xi1>) {
+                    llvm.intr.masked.store %arg0, %arg1, %arg2 {alignment = 1 : i32} : vector<4xi32>, vector<4xi1> into !llvm.ptr
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_matrix_column_major_load() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        let is_volatile = context.boolean_attribute(false).as_ref();
+        let rows = context.integer_attribute(i32_type, 1).as_ref();
+        let columns = context.integer_attribute(i32_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location), (i64_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_matrix_column_major_load(arg_0, arg_1, vector_i32_type, is_volatile, rows, columns, location);
+            assert_eq!(op.data(), arg_0);
+            assert_eq!(op.stride(), arg_1);
+            assert_eq!(op.is_volatile(), is_volatile);
+            assert_eq!(op.rows(), rows);
+            assert_eq!(op.columns(), columns);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.matrix.column.major.load");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_matrix_column_major_load_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), i64_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_matrix_column_major_load_test(%arg0: !llvm.ptr, %arg1: i64) -> vector<4xi32> {
+                    %0 = llvm.intr.matrix.column.major.load %arg0, <stride = %arg1> {columns = 1 : i32, isVolatile = false, rows = 1 : i32} : vector<4xi32> from !llvm.ptr stride i64
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_matrix_column_major_store() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        let is_volatile = context.boolean_attribute(false).as_ref();
+        let rows = context.integer_attribute(i32_type, 1).as_ref();
+        let columns = context.integer_attribute(i32_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (i64_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_matrix_column_major_store(arg_0, arg_1, arg_2, is_volatile, rows, columns, location);
+            assert_eq!(op.matrix(), arg_0);
+            assert_eq!(op.data(), arg_1);
+            assert_eq!(op.stride(), arg_2);
+            assert_eq!(op.is_volatile(), is_volatile);
+            assert_eq!(op.rows(), rows);
+            assert_eq!(op.columns(), columns);
+            assert_eq!(op.operation_name(), "llvm.intr.matrix.column.major.store");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_matrix_column_major_store_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), pointer_type.into(), i64_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_matrix_column_major_store_test(%arg0: vector<4xi32>, %arg1: !llvm.ptr, %arg2: i64) {
+                    llvm.intr.matrix.column.major.store %arg0, %arg1, <stride = %arg2> {columns = 1 : i32, isVolatile = false, rows = 1 : i32} : vector<4xi32> to !llvm.ptr stride i64
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_matrix_multiply() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        let lhs_rows = context.integer_attribute(i32_type, 1).as_ref();
+        let lhs_columns = context.integer_attribute(i32_type, 1).as_ref();
+        let rhs_columns = context.integer_attribute(i32_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block =
+                context.block(&[(vector_f32_type.as_ref(), location), (vector_f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_matrix_multiply(arg_0, arg_1, vector_f32_type, lhs_rows, lhs_columns, rhs_columns, location);
+            assert_eq!(op.lhs(), arg_0);
+            assert_eq!(op.rhs(), arg_1);
+            assert_eq!(op.lhs_rows(), lhs_rows);
+            assert_eq!(op.lhs_columns(), lhs_columns);
+            assert_eq!(op.rhs_columns(), rhs_columns);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.matrix.multiply");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_matrix_multiply_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into(), vector_f32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_matrix_multiply_test(%arg0: vector<4xf32>, %arg1: vector<4xf32>) -> vector<4xf32> {
+                    %0 = llvm.intr.matrix.multiply %arg0, %arg1 {lhs_columns = 1 : i32, lhs_rows = 1 : i32, rhs_columns = 1 : i32} : (vector<4xf32>, vector<4xf32>) -> vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_matrix_transpose() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
+        let rows = context.integer_attribute(i32_type, 1).as_ref();
+        let columns = context.integer_attribute(i32_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(vector_f32_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_matrix_transpose(arg_0, vector_f32_type, rows, columns, location);
+            assert_eq!(op.matrix(), arg_0);
+            assert_eq!(op.rows(), rows);
+            assert_eq!(op.columns(), columns);
+            assert_eq!(op.output_type(), vector_f32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.matrix.transpose");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_matrix_transpose_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_f32_type.into()],
+                    results: vec![vector_f32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_matrix_transpose_test(%arg0: vector<4xf32>) -> vector<4xf32> {
+                    %0 = llvm.intr.matrix.transpose %arg0 {columns = 1 : i32, rows = 1 : i32} : vector<4xf32> into vector<4xf32>
+                    return %0 : vector<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_memcpy_inline() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        let len = context.integer_attribute(i64_type, 1).as_ref();
+        let is_volatile = context.boolean_attribute(false).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location), (pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_memcpy_inline(arg_0, arg_1, len, is_volatile, location);
+            assert_eq!(op.destination(), arg_0);
+            assert_eq!(op.source(), arg_1);
+            assert_eq!(op.len(), len);
+            assert_eq!(op.is_volatile(), is_volatile);
+            assert_eq!(op.operation_name(), "llvm.intr.memcpy.inline");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_memcpy_inline_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), pointer_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_memcpy_inline_test(%arg0: !llvm.ptr, %arg1: !llvm.ptr) {
+                    \"llvm.intr.memcpy.inline\"(%arg0, %arg1) <{isVolatile = false, len = 1 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_memcpy() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        let is_volatile = context.boolean_attribute(false).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (pointer_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (i64_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_memcpy(arg_0, arg_1, arg_2, is_volatile, location);
+            assert_eq!(op.destination(), arg_0);
+            assert_eq!(op.source(), arg_1);
+            assert_eq!(op.length(), arg_2);
+            assert_eq!(op.is_volatile(), is_volatile);
+            assert_eq!(op.operation_name(), "llvm.intr.memcpy");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_memcpy_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), pointer_type.into(), i64_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_memcpy_test(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: i64) {
+                    \"llvm.intr.memcpy\"(%arg0, %arg1, %arg2) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i64) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_memmove() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        let is_volatile = context.boolean_attribute(false).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (pointer_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (i64_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_memmove(arg_0, arg_1, arg_2, is_volatile, location);
+            assert_eq!(op.destination(), arg_0);
+            assert_eq!(op.source(), arg_1);
+            assert_eq!(op.length(), arg_2);
+            assert_eq!(op.is_volatile(), is_volatile);
+            assert_eq!(op.operation_name(), "llvm.intr.memmove");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_memmove_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), pointer_type.into(), i64_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_memmove_test(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: i64) {
+                    \"llvm.intr.memmove\"(%arg0, %arg1, %arg2) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i64) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_memset_inline() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i8_type = context.signless_integer_type(8);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        let len = context.integer_attribute(i64_type, 1).as_ref();
+        let is_volatile = context.boolean_attribute(false).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location), (i8_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_memset_inline(arg_0, arg_1, len, is_volatile, location);
+            assert_eq!(op.destination(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.len(), len);
+            assert_eq!(op.is_volatile(), is_volatile);
+            assert_eq!(op.operation_name(), "llvm.intr.memset.inline");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_memset_inline_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), i8_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_memset_inline_test(%arg0: !llvm.ptr, %arg1: i8) {
+                    \"llvm.intr.memset.inline\"(%arg0, %arg1) <{isVolatile = false, len = 1 : i64}> : (!llvm.ptr, i8) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_memset() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i8_type = context.signless_integer_type(8);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        let is_volatile = context.boolean_attribute(false).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (pointer_type.as_ref(), location),
+                (i8_type.as_ref(), location),
+                (i64_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_memset(arg_0, arg_1, arg_2, is_volatile, location);
+            assert_eq!(op.destination(), arg_0);
+            assert_eq!(op.value(), arg_1);
+            assert_eq!(op.length(), arg_2);
+            assert_eq!(op.is_volatile(), is_volatile);
+            assert_eq!(op.operation_name(), "llvm.intr.memset");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_memset_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), i8_type.into(), i64_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_memset_test(%arg0: !llvm.ptr, %arg1: i8, %arg2: i64) {
+                    \"llvm.intr.memset\"(%arg0, %arg1, %arg2) <{isVolatile = false}> : (!llvm.ptr, i8, i64) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_experimental_noalias_scope_decl() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let scope = context.parse_attribute(r#"#llvm.alias_scope<id = "scope", domain = <id = "domain">>"#).unwrap();
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = intr_experimental_noalias_scope_decl(scope, location);
+            assert_eq!(op.scope(), scope);
+            assert_eq!(op.operation_name(), "llvm.intr.experimental.noalias.scope.decl");
+            assert_eq!(op.operands().count(), 0);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_experimental_noalias_scope_decl_test",
+                func::FuncAttributes { arguments: vec![], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                #alias_scope_domain = #llvm.alias_scope_domain<id = \"domain\">
+                #alias_scope = #llvm.alias_scope<id = \"scope\", domain = #alias_scope_domain>
+                module {
+                  func.func @llvm_intr_experimental_noalias_scope_decl_test() {
+                    llvm.intr.experimental.noalias.scope.decl #alias_scope
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_prefetch() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let pointer_type = context.llvm_pointer_type(0);
+        let rw = context.integer_attribute(i32_type, 1).as_ref();
+        let hint = context.integer_attribute(i32_type, 1).as_ref();
+        let cache = context.integer_attribute(i32_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_prefetch(arg_0, rw, hint, cache, location);
+            assert_eq!(op.address(), arg_0);
+            assert_eq!(op.rw(), rw);
+            assert_eq!(op.hint(), hint);
+            assert_eq!(op.cache(), cache);
+            assert_eq!(op.operation_name(), "llvm.intr.prefetch");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_prefetch_test",
+                func::FuncAttributes { arguments: vec![pointer_type.into()], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_prefetch_test(%arg0: !llvm.ptr) {
+                    \"llvm.intr.prefetch\"(%arg0) <{cache = 1 : i32, hint = 1 : i32, rw = 1 : i32}> : (!llvm.ptr) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ptr_annotation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (pointer_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (i32_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let arg_3 = block.argument(3).unwrap();
+            let arg_4 = block.argument(4).unwrap();
+            let op = intr_ptr_annotation(arg_0, arg_1, arg_2, arg_3, arg_4, pointer_type, location);
+            assert_eq!(op.pointer(), arg_0);
+            assert_eq!(op.annotation(), arg_1);
+            assert_eq!(op.file_name(), arg_2);
+            assert_eq!(op.line(), arg_3);
+            assert_eq!(PtrAnnotationOperation::attribute(&op), arg_4);
+            assert_eq!(op.output_type(), pointer_type);
+            assert_eq!(op.operation_name(), "llvm.intr.ptr.annotation");
+            assert_eq!(op.operands().count(), 5);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_ptr_annotation_test",
+                func::FuncAttributes {
+                    arguments: vec![
+                        pointer_type.into(),
+                        pointer_type.into(),
+                        pointer_type.into(),
+                        i32_type.into(),
+                        pointer_type.into(),
+                    ],
+                    results: vec![pointer_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ptr_annotation_test(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: i32, %arg4: !llvm.ptr) -> !llvm.ptr {
+                    %0 = \"llvm.intr.ptr.annotation\"(%arg0, %arg1, %arg2, %arg3, %arg4) : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i32, !llvm.ptr) -> !llvm.ptr
+                    return %0 : !llvm.ptr
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_ptrmask() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i64_type = context.signless_integer_type(64);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location), (i64_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_ptrmask(arg_0, arg_1, pointer_type, location);
+            assert_eq!(op.pointer(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.output_type(), pointer_type);
+            assert_eq!(op.operation_name(), "llvm.intr.ptrmask");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_ptrmask_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), i64_type.into()],
+                    results: vec![pointer_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_ptrmask_test(%arg0: !llvm.ptr, %arg1: i64) -> !llvm.ptr {
+                    %0 = llvm.intr.ptrmask %arg0, %arg1 : (!llvm.ptr, i64) -> !llvm.ptr
+                    return %0 : !llvm.ptr
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_stack_restore() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_stack_restore(arg_0, location);
+            assert_eq!(op.pointer(), arg_0);
+            assert_eq!(op.operation_name(), "llvm.intr.stackrestore");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_stackrestore_test",
+                func::FuncAttributes { arguments: vec![pointer_type.into()], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_stackrestore_test(%arg0: !llvm.ptr) {
+                    llvm.intr.stackrestore %arg0 : !llvm.ptr
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_stack_save() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block_with_no_arguments();
+            let op = intr_stack_save(pointer_type.as_ref(), location);
+            assert_eq!(op.output_type(), pointer_type);
+            assert_eq!(op.operation_name(), "llvm.intr.stacksave");
+            assert_eq!(op.operands().count(), 0);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_stacksave_test",
+                func::FuncAttributes { arguments: vec![], results: vec![pointer_type.into()], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_stacksave_test() -> !llvm.ptr {
+                    %0 = llvm.intr.stacksave : !llvm.ptr
+                    return %0 : !llvm.ptr
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_strip_invariant_group() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_strip_invariant_group(arg_0, pointer_type, location);
+            assert_eq!(op.pointer(), arg_0);
+            assert_eq!(op.output_type(), pointer_type);
+            assert_eq!(op.operation_name(), "llvm.intr.strip.invariant.group");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_strip_invariant_group_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into()],
+                    results: vec![pointer_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_strip_invariant_group_test(%arg0: !llvm.ptr) -> !llvm.ptr {
+                    %0 = llvm.intr.strip.invariant.group %arg0 : !llvm.ptr
+                    return %0 : !llvm.ptr
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_thread_local_address() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_thread_local_address(arg_0, pointer_type, location);
+            assert_eq!(op.global(), arg_0);
+            assert_eq!(op.output_type(), pointer_type);
+            assert_eq!(op.operation_name(), "llvm.intr.threadlocal.address");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_threadlocal_address_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into()],
+                    results: vec![pointer_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_threadlocal_address_test(%arg0: !llvm.ptr) -> !llvm.ptr {
+                    %0 = \"llvm.intr.threadlocal.address\"(%arg0) : (!llvm.ptr) -> !llvm.ptr
+                    return %0 : !llvm.ptr
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_va_copy() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location), (pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_va_copy(arg_0, arg_1, location);
+            assert_eq!(op.destination_list(), arg_0);
+            assert_eq!(op.source_list(), arg_1);
+            assert_eq!(op.operation_name(), "llvm.intr.vacopy");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_vacopy_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), pointer_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vacopy_test(%arg0: !llvm.ptr, %arg1: !llvm.ptr) {
+                    llvm.intr.vacopy %arg1 to %arg0 : !llvm.ptr, !llvm.ptr
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_va_end() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_va_end(arg_0, location);
+            assert_eq!(op.argument_list(), arg_0);
+            assert_eq!(op.operation_name(), "llvm.intr.vaend");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_vaend_test",
+                func::FuncAttributes { arguments: vec![pointer_type.into()], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vaend_test(%arg0: !llvm.ptr) {
+                    llvm.intr.vaend %arg0 : !llvm.ptr
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_va_start() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        module.body().append_operation({
+            let mut block = context.block(&[(pointer_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let op = intr_va_start(arg_0, location);
+            assert_eq!(op.argument_list(), arg_0);
+            assert_eq!(op.operation_name(), "llvm.intr.vastart");
+            assert_eq!(op.operands().count(), 1);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_vastart_test",
+                func::FuncAttributes { arguments: vec![pointer_type.into()], results: vec![], ..Default::default() },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_vastart_test(%arg0: !llvm.ptr) {
+                    llvm.intr.vastart %arg0 : !llvm.ptr
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_masked_compress_store() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (pointer_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_masked_compress_store(arg_0, arg_1, arg_2, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.pointer(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.operation_name(), "llvm.intr.masked.compressstore");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_masked_compressstore_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), pointer_type.into(), mask_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_masked_compressstore_test(%arg0: vector<4xi32>, %arg1: !llvm.ptr, %arg2: vector<4xi1>) {
+                    \"llvm.intr.masked.compressstore\"(%arg0, %arg1, %arg2) : (vector<4xi32>, !llvm.ptr, vector<4xi1>) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_masked_expand_load() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let pointer_type = context.llvm_pointer_type(0);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (pointer_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+                (vector_i32_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_masked_expand_load(arg_0, arg_1, arg_2, vector_i32_type, location);
+            assert_eq!(op.pointer(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.passthru(), arg_2);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.masked.expandload");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_masked_expandload_test",
+                func::FuncAttributes {
+                    arguments: vec![pointer_type.into(), mask_type.into(), vector_i32_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_masked_expandload_test(%arg0: !llvm.ptr, %arg1: vector<4xi1>, %arg2: vector<4xi32>) -> vector<4xi32> {
+                    %0 = \"llvm.intr.masked.expandload\"(%arg0, %arg1, %arg2) : (!llvm.ptr, vector<4xi1>, vector<4xi32>) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_masked_gather() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        let vector_pointer_type = context.parse_type("vector<4x!llvm.ptr>").unwrap();
+        let alignment = context.integer_attribute(i32_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[(vector_pointer_type.as_ref(), location), (mask_type.as_ref(), location)]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let op = intr_masked_gather(arg_0, arg_1, vector_i32_type, alignment, location);
+            assert_eq!(op.pointers(), arg_0);
+            assert_eq!(op.mask(), arg_1);
+            assert_eq!(op.alignment(), alignment);
+            assert_eq!(op.output_type(), vector_i32_type);
+            assert_eq!(op.operation_name(), "llvm.intr.masked.gather");
+            assert_eq!(op.operands().count(), 2);
+            assert_eq!(op.results().count(), 1);
+            let op = block.append_operation(op);
+            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+            func::func(
+                "llvm_intr_masked_gather_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_pointer_type.into(), mask_type.into()],
+                    results: vec![vector_i32_type.into()],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_masked_gather_test(%arg0: vector<4x!llvm.ptr>, %arg1: vector<4xi1>) -> vector<4xi32> {
+                    %0 = llvm.intr.masked.gather %arg0, %arg1 {alignment = 1 : i32} : (vector<4x!llvm.ptr>, vector<4xi1>) -> vector<4xi32>
+                    return %0 : vector<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_intr_masked_scatter() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::llvm());
+        let location = context.unknown_location();
+        let module = context.module(location);
+        let i32_type = context.signless_integer_type(32);
+        let mask_type = context.parse_type("vector<4xi1>").unwrap();
+        let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
+        let vector_pointer_type = context.parse_type("vector<4x!llvm.ptr>").unwrap();
+        let alignment = context.integer_attribute(i32_type, 1).as_ref();
+        module.body().append_operation({
+            let mut block = context.block(&[
+                (vector_i32_type.as_ref(), location),
+                (vector_pointer_type.as_ref(), location),
+                (mask_type.as_ref(), location),
+            ]);
+            let arg_0 = block.argument(0).unwrap();
+            let arg_1 = block.argument(1).unwrap();
+            let arg_2 = block.argument(2).unwrap();
+            let op = intr_masked_scatter(arg_0, arg_1, arg_2, alignment, location);
+            assert_eq!(op.value(), arg_0);
+            assert_eq!(op.pointers(), arg_1);
+            assert_eq!(op.mask(), arg_2);
+            assert_eq!(op.alignment(), alignment);
+            assert_eq!(op.operation_name(), "llvm.intr.masked.scatter");
+            assert_eq!(op.operands().count(), 3);
+            assert_eq!(op.results().count(), 0);
+            block.append_operation(op);
+            block.append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location));
+            func::func(
+                "llvm_intr_masked_scatter_test",
+                func::FuncAttributes {
+                    arguments: vec![vector_i32_type.into(), vector_pointer_type.into(), mask_type.into()],
+                    results: vec![],
+                    ..Default::default()
+                },
+                block.into(),
+                location,
+            )
+        });
+        assert!(module.verify());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @llvm_intr_masked_scatter_test(%arg0: vector<4xi32>, %arg1: vector<4x!llvm.ptr>, %arg2: vector<4xi1>) {
+                    llvm.intr.masked.scatter %arg0, %arg1, %arg2 {alignment = 1 : i32} : vector<4xi32>, vector<4xi1> into vector<4x!llvm.ptr>
+                    return
+                  }
+                }
+            "},
+        );
+    }
 }
