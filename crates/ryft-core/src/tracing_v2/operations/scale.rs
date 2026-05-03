@@ -59,13 +59,13 @@ impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Typed<T> + Debug + Display> Display for ScaleOperation<T, V> {
+impl<T: Type, V: Debug + Display + Typed<T>> Display for ScaleOperation<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
 }
 
-impl<T: Type, V: Typed<T> + Debug + Display> Operation<T> for ScaleOperation<T, V> {
+impl<T: Type, V: Debug + Display + Typed<T>> Operation<T> for ScaleOperation<T, V> {
     #[inline]
     fn name(&self) -> &'static str {
         "scale"
@@ -81,7 +81,7 @@ impl<T: Type, V: Typed<T> + Debug + Display> Operation<T> for ScaleOperation<T, 
     }
 }
 
-impl<T: Type, V: Typed<T> + Debug + Display + Clone + Mul<Output = V>> InterpretableOperation<T, V>
+impl<T: Type, V: Clone + Debug + Display + Typed<T> + Mul<Output = V>> InterpretableOperation<T, V>
     for ScaleOperation<T, V>
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -90,7 +90,7 @@ impl<T: Type, V: Typed<T> + Debug + Display + Clone + Mul<Output = V>> Interpret
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T> + crate::parameters::Parameter + Mul<Output = V> + ZeroLike>
+impl<T: PartialEq + Type, V: Traceable<T> + crate::parameters::Parameter + Mul<Output = V> + ZeroLike>
     LinearOperation<T, V, LinearArrayOperation<V, T>> for ScaleOperation<T, V>
 where
     LinearArrayOperation<V, T>: Operation<T>,

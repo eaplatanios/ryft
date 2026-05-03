@@ -111,7 +111,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O> + SupportsAdd
         &mut self,
         program: &Program<T, V, O, Input, Output>,
     ) -> Result<Program<T, V, O, Output, Input>, TracingError> {
-        fn accumulate<T: Type, V: Traceable<T>, O: SupportsAdd<T, V> + Operation<T> + Clone>(
+        fn accumulate<T: Type, V: Traceable<T>, O: Clone + SupportsAdd<T, V> + Operation<T>>(
             builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
             adjoints: &mut [Option<AtomId>],
             atom: AtomId,
@@ -134,7 +134,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O> + SupportsAdd
             Ok(())
         }
 
-        fn stage_zero<T: Type, V: Traceable<T>, O: SupportsZero<T, V> + Operation<T> + Clone>(
+        fn stage_zero<T: Type, V: Traceable<T>, O: Clone + SupportsZero<T, V> + Operation<T>>(
             builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
             r#type: T,
         ) -> AtomId {

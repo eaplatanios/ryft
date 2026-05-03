@@ -45,7 +45,7 @@ impl ElementwiseArrayOperation for AddOperation {
     }
 }
 
-impl<V: Typed<DataType> + Clone + Add<Output = V>> InterpretableOperation<DataType, V> for AddOperation {
+impl<V: Clone + Typed<DataType> + Add<Output = V>> InterpretableOperation<DataType, V> for AddOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
@@ -53,7 +53,7 @@ impl<V: Typed<DataType> + Clone + Add<Output = V>> InterpretableOperation<DataTy
     }
 }
 
-impl<V: Typed<ArrayType> + Clone + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
+impl<V: Clone + Typed<ArrayType> + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 2, TracingError);

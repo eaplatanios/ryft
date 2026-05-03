@@ -74,14 +74,14 @@ impl Operation<DataType> for MulOperation {
     }
 }
 
-impl<V: Typed<ArrayType> + Clone + Mul<Output = V>> InterpretableOperation<ArrayType, V> for MulOperation {
+impl<V: Clone + Typed<ArrayType> + Mul<Output = V>> InterpretableOperation<ArrayType, V> for MulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
     }
 }
 
-impl<V: Typed<DataType> + Clone + Mul<Output = V>> InterpretableOperation<DataType, V> for MulOperation {
+impl<V: Clone + Typed<DataType> + Mul<Output = V>> InterpretableOperation<DataType, V> for MulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
         Ok(vec![inputs[0].clone() * inputs[1].clone()])

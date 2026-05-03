@@ -423,7 +423,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
     }
 }
 
-fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Location<'c, 't> + Copy>(
+fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     output_types: &[ArrayType],
     constant_kind: ShardMapConstantKind,
     block: &mut B,
@@ -453,7 +453,7 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Location<'
     Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
 }
 
-fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Location<'c, 't> + Copy>(
+fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     constant_kind: ShardMapConstantKind,
@@ -1945,7 +1945,7 @@ fn lower_literal_value<'b, 'c: 'b, 't: 'c, B, V, L>(
 where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue,
-    L: Location<'c, 't> + Copy,
+    L: Copy + Location<'c, 't>,
 {
     let value_type = value.r#type();
     if !value_type.shape.dimensions.is_empty() {
@@ -1981,7 +1981,7 @@ fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
 where
     B: Block<'b, 'c, 't>,
-    L: Location<'c, 't> + Copy,
+    L: Copy + Location<'c, 't>,
 {
     let constant_kind = value.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id })?;
     let array_type = value.r#type();

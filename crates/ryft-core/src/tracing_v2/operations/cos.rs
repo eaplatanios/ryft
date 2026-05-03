@@ -85,14 +85,14 @@ impl<T: Type> Operation<T> for CosOperation {
     }
 }
 
-impl<V: Typed<ArrayType> + Clone + Cos> InterpretableOperation<ArrayType, V> for CosOperation {
+impl<V: Clone + Typed<ArrayType> + Cos> InterpretableOperation<ArrayType, V> for CosOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().cos()])
     }
 }
 
-impl<V: Typed<DataType> + Clone + Cos> InterpretableOperation<DataType, V> for CosOperation {
+impl<V: Clone + Typed<DataType> + Cos> InterpretableOperation<DataType, V> for CosOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().cos()])

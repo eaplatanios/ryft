@@ -70,7 +70,7 @@ where
 
 /// Predicate source for a [`ConditionOperation`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ConditionPredicate<T: Type + PartialEq = ArrayType> {
+pub enum ConditionPredicate<T: PartialEq + Type = ArrayType> {
     /// The first operation input is the predicate.
     RuntimeInput(T),
 
@@ -82,7 +82,7 @@ pub enum ConditionPredicate<T: Type + PartialEq = ArrayType> {
 #[derive(Clone, Debug)]
 pub struct ConditionOperation<V, O, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T>,
     O: Clone,
 {
@@ -101,7 +101,7 @@ where
 #[derive(Clone, Debug)]
 pub struct WhileOperation<V, O, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T>,
     O: Clone,
 {
@@ -149,7 +149,7 @@ fn ensure_data_scalar_bool_type(predicate_type: &DataType) -> Result<(), TypeErr
 }
 
 /// Validates that two flat type signatures are identical.
-fn ensure_types_match<T: Type + PartialEq>(context: &'static str, left: &[T], right: &[T]) -> Result<(), TypeError> {
+fn ensure_types_match<T: PartialEq + Type>(context: &'static str, left: &[T], right: &[T]) -> Result<(), TypeError> {
     if left != right {
         return Err(TypeError {
             message: format!(
@@ -226,7 +226,7 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> ConditionOperatio
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> ConditionOperation<V, O, T> {
+impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> ConditionOperation<V, O, T> {
     /// Creates a condition whose predicate is captured in the operation.
     pub fn with_captured_predicate(
         predicate: bool,
@@ -311,7 +311,7 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> ConditionOpe
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> Display for ConditionOperation<V, O, T>
+impl<T: PartialEq + Type, V: Traceable<T>, O: Clone> Display for ConditionOperation<V, O, T>
 where
     Self: Operation<T>,
 {
@@ -520,7 +520,7 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> WhileOperation<V,
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> WhileOperation<V, O, T> {
+impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> WhileOperation<V, O, T> {
     /// Returns the loop-carried state types.
     #[inline]
     pub fn state_types(&self) -> Vec<T> {
@@ -542,7 +542,7 @@ impl<T: Type + PartialEq, V: Traceable<T>, O: Clone + Operation<T>> WhileOperati
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T>, O: Clone> Display for WhileOperation<V, O, T>
+impl<T: PartialEq + Type, V: Traceable<T>, O: Clone> Display for WhileOperation<V, O, T>
 where
     Self: Operation<T>,
 {

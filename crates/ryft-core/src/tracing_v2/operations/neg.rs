@@ -57,14 +57,14 @@ impl<T: Type> Operation<T> for NegOperation {
     }
 }
 
-impl<V: Typed<ArrayType> + Clone + Neg<Output = V>> InterpretableOperation<ArrayType, V> for NegOperation {
+impl<V: Clone + Typed<ArrayType> + Neg<Output = V>> InterpretableOperation<ArrayType, V> for NegOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![-inputs[0].clone()])
     }
 }
 
-impl<V: Typed<DataType> + Clone + Neg<Output = V>> InterpretableOperation<DataType, V> for NegOperation {
+impl<V: Clone + Typed<DataType> + Neg<Output = V>> InterpretableOperation<DataType, V> for NegOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![-inputs[0].clone()])

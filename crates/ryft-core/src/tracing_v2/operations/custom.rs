@@ -28,7 +28,7 @@ pub enum CustomOperationError {
 /// closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this
 /// trait so that generic transform code can stage [`CustomPrimitive`] without knowing which carrier is in use.
 #[doc(hidden)]
-pub trait SupportsCustom<T: Type + PartialEq, V: Traceable<T> + Parameter> {
+pub trait SupportsCustom<T: PartialEq + Type, V: Traceable<T> + Parameter> {
     /// Constructs the carrier-specific representation of the custom-primitive [`Operation`].
     fn custom_operation(primitive: Arc<CustomPrimitive<T, V>>) -> Self;
 }
@@ -38,7 +38,7 @@ pub trait SupportsCustom<T: Type + PartialEq, V: Traceable<T> + Parameter> {
 /// example) implement this trait so that generic transform code can stage [`LinearCustomPrimitive`] without knowing
 /// which carrier is in use.
 #[doc(hidden)]
-pub trait SupportsLinearCustom<T: Type + PartialEq, V: Traceable<T> + Parameter>: Sized {
+pub trait SupportsLinearCustom<T: PartialEq + Type, V: Traceable<T> + Parameter>: Sized {
     /// Constructs the carrier-specific representation of the linear custom-primitive [`Operation`].
     fn custom_operation(primitive: CustomPrimitive<T, V>) -> Result<Self, TracingError>;
 
@@ -147,7 +147,7 @@ impl<Ty: Type, V: Traceable<Ty>, O: Operation<Ty> + InterpretableOperation<Ty, V
 /// - [`DifferentiableOperation<E>`] for forward-mode JVP under engine `E`,
 /// - [`CustomTracedLinearizationRule`] for JVPs whose primals are already staged tracers.
 #[derive(Clone)]
-pub struct CustomPrimitive<T: Type + PartialEq, V: Traceable<T> + Parameter> {
+pub struct CustomPrimitive<T: PartialEq + Type, V: Traceable<T> + Parameter> {
     /// Required base op providing abstract evaluation and eager interpretation.
     pub base: Arc<dyn CustomBaseOperation<T, V>>,
 
@@ -158,7 +158,7 @@ pub struct CustomPrimitive<T: Type + PartialEq, V: Traceable<T> + Parameter> {
     pub extensions: CustomPrimitiveExtensions<T, V>,
 }
 
-impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> CustomPrimitive<T, V> {
+impl<T: PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static> CustomPrimitive<T, V> {
     /// Creates one custom primitive from its required base operation.
     pub fn new<Base>(base: Base) -> Self
     where
@@ -285,19 +285,19 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T> + Parameter> Debug for CustomPrimitive<T, V> {
+impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Debug for CustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(self.base.as_ref(), formatter)
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T> + Parameter> Display for CustomPrimitive<T, V> {
+impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Display for CustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.base.name())
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T> + Parameter> Operation<T> for CustomPrimitive<T, V> {
+impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Operation<T> for CustomPrimitive<T, V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.base.name()
@@ -314,14 +314,14 @@ impl<T: Type + PartialEq, V: Traceable<T> + Parameter> Operation<T> for CustomPr
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T> + Parameter> InterpretableOperation<T, V> for CustomPrimitive<T, V> {
+impl<T: PartialEq + Type, V: Traceable<T> + Parameter> InterpretableOperation<T, V> for CustomPrimitive<T, V> {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         self.base.interpret(inputs)
     }
 }
 
-impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static>
+impl<T: PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static>
     LinearOperation<T, V, LinearArrayOperation<V, T>> for CustomPrimitive<T, V>
 where
     LinearArrayOperation<V, T>: Operation<T>,
@@ -375,12 +375,12 @@ where
 /// Linear programs cannot store an op unless reverse-mode transposition is known to exist. This
 /// wrapper is the proof object that a custom primitive has satisfied that requirement.
 #[derive(Clone)]
-pub struct LinearCustomPrimitive<T: Type + PartialEq, V: Traceable<T> + Parameter> {
+pub struct LinearCustomPrimitive<T: PartialEq + Type, V: Traceable<T> + Parameter> {
     /// Wrapped custom primitive known to provide a transpose rule.
     pub primitive: Arc<CustomPrimitive<T, V>>,
 }
 
-impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> LinearCustomPrimitive<T, V> {
+impl<T: PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static> LinearCustomPrimitive<T, V> {
     /// Creates one linear-only wrapper from a custom primitive that already provides a transpose rule.
     pub fn from_custom_primitive(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TracingError> {
         primitive
@@ -391,19 +391,19 @@ impl<T: Type + PartialEq + 'static, V: Traceable<T> + Parameter + 'static> Linea
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T> + Parameter> Debug for LinearCustomPrimitive<T, V> {
+impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Debug for LinearCustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(self.primitive.as_ref(), formatter)
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T> + Parameter> Display for LinearCustomPrimitive<T, V> {
+impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Display for LinearCustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(self.primitive.as_ref(), formatter)
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T> + Parameter> Operation<T> for LinearCustomPrimitive<T, V> {
+impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Operation<T> for LinearCustomPrimitive<T, V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.primitive.name()
@@ -420,14 +420,14 @@ impl<T: Type + PartialEq, V: Traceable<T> + Parameter> Operation<T> for LinearCu
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T> + Parameter> InterpretableOperation<T, V> for LinearCustomPrimitive<T, V> {
+impl<T: PartialEq + Type, V: Traceable<T> + Parameter> InterpretableOperation<T, V> for LinearCustomPrimitive<T, V> {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         self.primitive.interpret(inputs)
     }
 }
 
-impl<T: Type + PartialEq, V: Traceable<T> + Parameter> LinearOperation<T, V, LinearArrayOperation<V, T>>
+impl<T: PartialEq + Type, V: Traceable<T> + Parameter> LinearOperation<T, V, LinearArrayOperation<V, T>>
     for LinearCustomPrimitive<T, V>
 where
     LinearArrayOperation<V, T>: Operation<T>,

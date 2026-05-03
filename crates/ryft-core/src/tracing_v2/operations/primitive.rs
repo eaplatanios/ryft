@@ -48,7 +48,7 @@ use super::sin::SupportsSin;
 #[derive(Clone, Debug)]
 pub enum ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
@@ -121,7 +121,7 @@ where
 #[derive(Clone, Debug)]
 pub enum LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
@@ -177,7 +177,7 @@ where
 
 impl<T, V> LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq + 'static,
+    T: PartialEq + Type + 'static,
     V: Traceable<T> + Parameter + 'static,
 {
     /// Wraps one custom primitive in the linear-only operation universe after verifying transpose support.
@@ -495,7 +495,7 @@ where
 
 impl<T, V> SupportsAdd<T, V> for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -506,7 +506,7 @@ where
 
 impl<T, V> SupportsMul<T, V> for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -517,7 +517,7 @@ where
 
 impl<T, V> SupportsNeg<T, V> for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -528,7 +528,7 @@ where
 
 impl<T, V> SupportsSin<T, V> for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -539,7 +539,7 @@ where
 
 impl<T, V> SupportsCos<T, V> for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -550,7 +550,7 @@ where
 
 impl<T, V> SupportsZero<T, V> for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -569,7 +569,7 @@ where
 
 impl<T, V> SupportsOne<T, V> for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -580,7 +580,7 @@ where
 
 impl<T, V> SupportsZeroLike<T, V> for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -591,7 +591,7 @@ where
 
 impl<T, V> SupportsOneLike<T, V> for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -616,7 +616,7 @@ impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> 
 
 impl<T, V> SupportsScale<T, V> for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -650,7 +650,7 @@ impl<V: Traceable<ArrayType> + Parameter> SupportsRematerialize<ArrayType, V, Li
 
 impl<T, V> SupportsCustom<T, V> for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -661,7 +661,7 @@ where
 
 impl<T, V> SupportsAdd<T, V> for LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -672,7 +672,7 @@ where
 
 impl<T, V> SupportsZero<T, V> for LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -691,7 +691,7 @@ where
 
 impl<T, V> SupportsOne<T, V> for LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -702,7 +702,7 @@ where
 
 impl<T, V> SupportsZeroLike<T, V> for LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -713,7 +713,7 @@ where
 
 impl<T, V> SupportsOneLike<T, V> for LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -724,7 +724,7 @@ where
 
 impl<T, V> SupportsNeg<T, V> for LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -742,7 +742,7 @@ impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> 
 
 impl<T, V> SupportsScale<T, V> for LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -794,7 +794,7 @@ impl<V: Traceable<ArrayType> + Parameter> From<ConditionOperation<V, LinearArray
 
 impl<T, V> SupportsLinearCustom<T, V> for LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq + 'static,
+    T: PartialEq + Type + 'static,
     V: Traceable<T> + Parameter + 'static,
 {
     #[inline]
@@ -810,7 +810,7 @@ where
 
 impl<T, V> ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -839,7 +839,7 @@ where
 
 impl<T, V> LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -925,7 +925,7 @@ where
 
 impl<T, V> Display for ArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -938,7 +938,7 @@ where
 
 impl<T, V> Display for LinearArrayOperation<V, T>
 where
-    T: Type + PartialEq,
+    T: PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1787,12 +1787,12 @@ where
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearScalarOperation<V>: SupportsAdd<DataType, V>
+    LinearScalarOperation<V>: Clone
+        + SupportsAdd<DataType, V>
         + super::SupportsNeg<DataType, V>
         + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>
         + SupportsZeroLike<DataType, V>
-        + Clone
         + InterpretableOperation<DataType, V>
         + LinearOperation<DataType, V, LinearScalarOperation<V>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
@@ -1998,7 +1998,8 @@ where
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V, ArrayType>: SupportsAdd<ArrayType, V>
+    LinearArrayOperation<V, ArrayType>: Clone
+        + SupportsAdd<ArrayType, V>
         + super::SupportsNeg<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
@@ -2007,7 +2008,6 @@ where
         + super::SupportsReshape<ArrayType, V>
         + SupportsZero<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>
-        + Clone
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
@@ -2079,12 +2079,12 @@ where
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V, DataType>: SupportsAdd<DataType, V>
+    LinearArrayOperation<V, DataType>: Clone
+        + SupportsAdd<DataType, V>
         + super::SupportsNeg<DataType, V>
         + super::SupportsScale<DataType, V>
         + SupportsZero<DataType, V>
         + SupportsZeroLike<DataType, V>
-        + Clone
         + InterpretableOperation<DataType, V>
         + LinearOperation<DataType, V, LinearArrayOperation<V, DataType>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
