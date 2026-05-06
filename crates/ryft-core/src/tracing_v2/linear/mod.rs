@@ -24,9 +24,11 @@ mod replay;
 /// Public reverse-mode APIs built from traced programs and staged pullbacks.
 mod reverse;
 
-pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
+pub use dense::{CoordinateValue, DenseJacobian, jacrev};
+pub(crate) use dense::{Hessian, JacFwd};
+pub(crate) use reverse::Grad;
 pub use reverse::{
-    ConcreteValueAndGrad, TracedValueAndGrad, ValueAndGradDispatch, grad, grad_with_aux, linearize, value_and_grad,
+    ConcreteValueAndGrad, TracedValueAndGrad, ValueAndGradDispatch, grad_with_aux, linearize, value_and_grad,
     value_and_grad_with_aux, vjp,
 };
 

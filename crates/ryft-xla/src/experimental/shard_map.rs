@@ -1942,7 +1942,7 @@ mod tests {
 
     use ryft_core::operations::constants::OneLike;
     use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{Sin, grad};
+    use ryft_core::tracing_v2::{DifferentiableEngine, Sin};
     use ryft_core::types::data_types::DataType;
 
     use crate::mlir::ToMlir;
@@ -3266,25 +3266,25 @@ mod tests {
                 let mesh = device_mesh.logical_mesh.clone();
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
-                    grad(
-                        crate::experimental::engines::XlaEngine::token(),
-                        {
-                            let mesh = mesh.clone();
-                            let sharding = sharding.clone();
-                            move |y: ShardMapTracer| {
-                                shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
-                                    |local_x: ShardMapTracer| local_x.sin(),
-                                    y,
-                                    mesh.clone(),
-                                    sharding.clone(),
-                                    sharding.clone(),
-                                )
-                                .expect("shard_map inside grad should trace")
-                            }
-                        },
-                        x,
-                    )
-                    .expect("grad around shard_map should trace")
+                    crate::experimental::engines::XlaEngine::token()
+                        .grad(
+                            {
+                                let mesh = mesh.clone();
+                                let sharding = sharding.clone();
+                                move |y: ShardMapTracer| {
+                                    shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
+                                        |local_x: ShardMapTracer| local_x.sin(),
+                                        y,
+                                        mesh.clone(),
+                                        sharding.clone(),
+                                        sharding.clone(),
+                                    )
+                                    .expect("shard_map inside grad should trace")
+                                }
+                            },
+                            x,
+                        )
+                        .expect("grad around shard_map should trace")
                 }
             },
             global_input_type,

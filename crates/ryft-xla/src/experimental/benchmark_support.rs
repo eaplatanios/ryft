@@ -6,7 +6,7 @@ use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region, record,
     summarize_program,
 };
-use ryft_core::tracing_v2::{MatrixOps, Sin, grad};
+use ryft_core::tracing_v2::{DifferentiableEngine, MatrixOps, Sin};
 
 use crate::experimental::operations::{LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation};
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
@@ -263,29 +263,31 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
         {
             let mesh = mesh.clone();
             move |x: ShardMapTracer| {
-                grad(
-                    crate::experimental::engines::XlaEngine::token(),
-                    {
-                        let mesh = mesh.clone();
-                        let sharding = sharding.clone();
-                        move |y: ShardMapTracer| {
-                            shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
-                                |local_x: ShardMapTracer| local_x.sin(),
-                                y,
-                                mesh.clone(),
-                                sharding.clone(),
-                                sharding.clone(),
-                            )
-                            .unwrap_or_else(|error| {
-                                panic!("grad-around-shard-map IR benchmark should trace the inner shard_map: {error}")
-                            })
-                        }
-                    },
-                    x,
-                )
-                .unwrap_or_else(|error| {
-                    panic!("grad-around-shard-map IR benchmark should trace the outer gradient: {error}")
-                })
+                crate::experimental::engines::XlaEngine::token()
+                    .grad(
+                        {
+                            let mesh = mesh.clone();
+                            let sharding = sharding.clone();
+                            move |y: ShardMapTracer| {
+                                shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
+                                    |local_x: ShardMapTracer| local_x.sin(),
+                                    y,
+                                    mesh.clone(),
+                                    sharding.clone(),
+                                    sharding.clone(),
+                                )
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "grad-around-shard-map IR benchmark should trace the inner shard_map: {error}"
+                                    )
+                                })
+                            }
+                        },
+                        x,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("grad-around-shard-map IR benchmark should trace the outer gradient: {error}")
+                    })
             }
         },
         scalar_type(),
@@ -304,7 +306,8 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {
-                        grad(crate::experimental::engines::XlaEngine::token(), |y: ShardMapTracer| y.sin(), local_x)
+                        crate::experimental::engines::XlaEngine::token()
+                            .grad(|y: ShardMapTracer| y.sin(), local_x)
                             .unwrap_or_else(|error| {
                                 panic!("shard_map grad-inside IR benchmark should trace the inner gradient: {error}")
                             })

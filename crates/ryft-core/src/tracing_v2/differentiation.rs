@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
-use crate::operations::constants::{One, SupportsZero, Zero, ZeroLike};
+use crate::operations::constants::{One, SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
@@ -211,7 +211,7 @@ pub trait LinearizableEngine: Engine {
 /// Extension of [`LinearizableEngine`] for backends that support automatic differentiation.
 ///
 /// Engines that only need ordinary tracing implement [`TracingEngine`] without this extension. AD
-/// transforms such as [`grad`](crate::tracing_v2::grad), [`jvp`](crate::tracing_v2::jvp), and
+/// transforms such as [`DifferentiableEngine::grad`], [`jvp`](crate::tracing_v2::jvp), and
 /// [`vjp`](crate::tracing_v2::vjp) require this trait so non-differentiable backends do not need to
 /// define fake tangent carriers.
 ///
@@ -235,6 +235,126 @@ pub trait DifferentiableEngine: LinearizableEngine {
 
     /// Returns the linearizable engine used for tangent and cotangent programs.
     fn linear_engine(&self) -> &Self::LinearEngine;
+
+    /// Computes the reverse-mode gradient of a scalar-output function.
+    ///
+    /// This is the canonical user-facing reverse-mode entry point for differentiable engines. The function must return
+    /// exactly one rank-0 scalar array leaf.
+    #[allow(private_bounds, private_interfaces)]
+    fn grad<
+        'engine,
+        F,
+        Input: Parameterized<Leaf, ParameterStructure: std::fmt::Debug + PartialEq>,
+        Leaf: crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>,
+        Marker,
+    >(
+        &'engine self,
+        function: F,
+        primals: Input,
+    ) -> Result<<Leaf as crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>>::Gradient, TracingError>
+    where
+        F: FnOnce(
+            <Leaf as crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>>::FunctionInput<'engine>,
+        )
+            -> <Leaf as crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>>::FunctionOutput<
+            'engine,
+        >,
+    {
+        crate::tracing_v2::linear::Grad::new(function).evaluate(self, primals)
+    }
+
+    /// Materializes a dense Jacobian using forward-mode differentiation.
+    ///
+    /// The returned matrix preserves the input and output parameter structures in its metadata while storing entries in
+    /// row-major dense coordinate order.
+    #[allow(private_bounds)]
+    fn jacfwd<'engine, F, Input, Output, V>(
+        &'engine self,
+        function: F,
+        primals: Input,
+    ) -> Result<
+        crate::tracing_v2::linear::DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>,
+        TracingError,
+    >
+    where
+        Self: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
+        V: crate::tracing_v2::linear::CoordinateValue + Differentiable<ArrayType, Tangent = Self::Tangent>,
+        Self::Tangent: crate::tracing_v2::linear::CoordinateValue<Coordinate = V::Coordinate>,
+        Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
+        Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
+        Input::Family: ParameterizedFamily<Self::Tangent>
+            + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
+            + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>,
+        Output::Family: ParameterizedFamily<Self::Tangent>
+            + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
+            + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>,
+        Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>:
+            Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>, To<V> = Output>,
+        F: FnOnce(
+            Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>,
+        )
+            -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>, TracingError>,
+        <Self::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+            InterpretableOperation<ArrayType, Self::Tangent>,
+        Self::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<Self>>,
+    {
+        crate::tracing_v2::linear::JacFwd::new(function).evaluate::<Self, Input, Output, V>(self, primals)
+    }
+
+    /// Materializes a dense Hessian of a scalar-output function.
+    ///
+    /// Hessian evaluation is expressed internally as a forward-mode dense Jacobian over a reverse-mode gradient
+    /// transform.
+    #[allow(private_bounds)]
+    fn hessian<'engine, F, Input, V>(
+        &'engine self,
+        function: F,
+        primals: Input,
+    ) -> Result<
+        crate::tracing_v2::linear::DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>,
+        TracingError,
+    >
+    where
+        Self: DifferentiableEngine<Type = ArrayType, Value = V>
+            + DifferentiableTracingEngine<Type = ArrayType, Value = V>
+            + 'static,
+        V: crate::tracing_v2::linear::CoordinateValue + Differentiable<ArrayType, Tangent = Self::Tangent>,
+        Self::Tangent: crate::tracing_v2::linear::CoordinateValue<Coordinate = V::Coordinate>,
+        Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
+        Input::Family: ParameterizedFamily<Self::Tangent>
+            + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
+            + ParameterizedFamily<Tracer<'engine, Self>>
+            + ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<V>
+            + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>,
+        Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, Self>> = Input::To<Tracer<'engine, Self>>>,
+        Input::To<Tracer<'engine, Self>>:
+            Parameterized<Tracer<'engine, Self>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
+        <Input::To<Tracer<'engine, Self>> as Parameterized<Tracer<'engine, Self>>>::To<ArrayType>:
+            Parameterized<ArrayType, To<Tracer<'engine, Self>> = Input::To<Tracer<'engine, Self>>>,
+        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>:
+            Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>, To<V> = Input>,
+        F: FnOnce(Input::To<Tracer<'engine, Self>>) -> Tracer<'engine, Self>,
+        Self::OperationCarrier: Clone
+            + InterpretableOperation<ArrayType, V>
+            + DifferentiableOperation<TracingContext<'engine, Self>>
+            + DifferentiableOperation<Self>
+            + SupportsZeroLike<ArrayType, V>
+            + SupportsAdd<ArrayType, V>
+            + 'static,
+        <Self as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
+            + InterpretableOperation<ArrayType, Tracer<'engine, Self>>
+            + LinearOperation<
+                ArrayType,
+                Tracer<'engine, Self>,
+                <Self as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
+            > + SupportsZero<ArrayType, Tracer<'engine, Self>>,
+        <Self::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+            InterpretableOperation<ArrayType, Self::Tangent>,
+        AddOperation: InterpretableOperation<ArrayType, Tracer<'engine, Self>>,
+    {
+        crate::tracing_v2::linear::Hessian::new(function).evaluate(self, primals)
+    }
 }
 
 /// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
@@ -528,7 +648,7 @@ pub trait DifferentiableTracingEngine: TracingEngine {
 /// [`DifferentiableOperationTracingEngine::new`] reborrows an `E: DifferentiableEngine` as a
 /// [`TracingEngine`] without allocation or ownership. AD entry points construct this view at trace
 /// boundaries such as [`linearize`](crate::tracing_v2::linearize),
-/// [`vjp`](crate::tracing_v2::vjp), and [`grad`](crate::tracing_v2::grad), pass it immediately to
+/// [`vjp`](crate::tracing_v2::vjp), and [`DifferentiableEngine::grad`], pass it immediately to
 /// ordinary tracing helpers, and keep backend implementations centered on their real engine type.
 /// User-facing ordinary tracing should keep using the backend's own [`TracingEngine`]
 /// implementation; traced tangent and cotangent programs are selected separately through

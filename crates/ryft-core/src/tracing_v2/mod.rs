@@ -26,8 +26,8 @@ pub use differentiation::{
 };
 pub use forward::jvp;
 pub use linear::{
-    ConcreteValueAndGrad, CoordinateValue, DenseJacobian, TracedValueAndGrad, ValueAndGradDispatch, grad,
-    grad_with_aux, hessian, jacfwd, jacrev, linearize, value_and_grad, value_and_grad_with_aux, vjp,
+    ConcreteValueAndGrad, CoordinateValue, DenseJacobian, TracedValueAndGrad, ValueAndGradDispatch, grad_with_aux,
+    jacrev, linearize, value_and_grad, value_and_grad_with_aux, vjp,
 };
 pub use operations::matrix::{MatrixOps, MatrixValue};
 pub use operations::reshape::{ReshapeOps, ReshapeValue};

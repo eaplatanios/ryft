@@ -6,7 +6,9 @@ use crate::tracing::{Program, Traceable};
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::tracing_v2::{LinearScalarOperation, ScalarOperation, Sin, grad, jvp, linearize, value_and_grad, vjp};
+use crate::tracing_v2::{
+    DifferentiableEngine, LinearScalarOperation, ScalarOperation, Sin, jvp, linearize, value_and_grad, vjp,
+};
 use crate::types::{DataType, Type};
 
 /// Returns the tracing-only IR benchmark cases.
@@ -98,7 +100,9 @@ where
 }
 
 fn first_derivative_traced(x: Tracer<ScalarEngine<f64>>) -> Tracer<ScalarEngine<f64>> {
-    grad(&ScalarEngine::<f64>::new(), quartic_plus_sin, x).expect("scalar first traced derivative should succeed")
+    ScalarEngine::<f64>::new()
+        .grad(quartic_plus_sin, x)
+        .expect("scalar first traced derivative should succeed")
 }
 
 fn hessian_style_second_derivative_traced(x: Tracer<ScalarEngine<f64>>) -> Tracer<ScalarEngine<f64>> {
@@ -137,7 +141,7 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
     let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = ScalarEngine::<f64>::new()
         .interpret_and_trace(
             |x| {
-                let gradient: Tracer<ScalarEngine<f64>> = grad(&ScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
+                let gradient: Tracer<ScalarEngine<f64>> = ScalarEngine::<f64>::new().grad(quartic_plus_sin, x)?;
                 Ok(gradient)
             },
             2.0f64,

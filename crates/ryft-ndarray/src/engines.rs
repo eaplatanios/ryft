@@ -78,7 +78,7 @@ mod tests {
     use ryft_core::operations::arithmetic::ADD_OPERATION_NAME;
     use ryft_core::tracing::TracingError;
     use ryft_core::tracing::engines::{Engine, TracingEngine};
-    use ryft_core::tracing_v2::{DifferentiationError, MatrixOps, Sin, grad, jvp};
+    use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiationError, MatrixOps, Sin, jvp};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::Array;
@@ -152,7 +152,7 @@ mod tests {
         let engine = NdArrayEngine::<f64>::new();
         let input = Array::from_shape_vec([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
 
-        let result = grad(&engine, |input| input, input);
+        let result = engine.grad(|input| input, input);
 
         assert!(matches!(
             result,

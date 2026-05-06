@@ -293,10 +293,11 @@ mod tests {
     use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
     use crate::tracing::transposition::{LinearOperation, TranspositionContext};
     use crate::tracing::{AtomId, Program, ProgramBuilder};
+    use crate::tracing_v2::linear::{Grad, JacFwd};
     use crate::tracing_v2::operations::custom::CustomTracedLinearizationRule;
     use crate::tracing_v2::{
         ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, CustomOperationError, CustomPrimitive,
-        DifferentiableOperation, JvpContext, JvpTracer, grad, jacfwd, jacrev, jvp, vmap,
+        DifferentiableEngine, DifferentiableOperation, JvpContext, JvpTracer, jacrev, jvp, vmap,
     };
     use crate::types::TypeError;
 
@@ -411,12 +412,12 @@ mod tests {
 
     #[test]
     fn test_jacfwd_batches_basis_tangents() {
-        let jacobian = jacfwd::<TestArrayEngine, _, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
-            &TestArrayEngine,
-            |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
-            (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-        )
-        .unwrap();
+        let jacobian = TestArrayEngine
+            .jacfwd::<_, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
+                |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+            )
+            .unwrap();
 
         assert_eq!(jacobian.rows(), 2);
         assert_eq!(jacobian.cols(), 2);
@@ -441,6 +442,49 @@ mod tests {
         assert_close(jacobian.values()[1], 2.0);
         assert_close(jacobian.values()[2], 1.0);
         assert_close(jacobian.values()[3], 1.0);
+    }
+
+    #[test]
+    fn test_hessian_accepts_original_scalar_function() {
+        let hessian = TestArrayEngine
+            .hessian::<_, (TestArray, TestArray), TestArray>(
+                |(x, y)| x.clone() * y + x.sin(),
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+            )
+            .unwrap();
+
+        assert_eq!(hessian.rows(), 2);
+        assert_eq!(hessian.cols(), 2);
+        assert_close(hessian.values()[0], -2.0f64.sin());
+        assert_close(hessian.values()[1], 1.0);
+        assert_close(hessian.values()[2], 1.0);
+        assert_close(hessian.values()[3], 0.0);
+    }
+
+    fn traced_bilinear_sin<'engine>(
+        (x, y): (Tracer<'engine, TestArrayEngine>, Tracer<'engine, TestArrayEngine>),
+    ) -> Tracer<'engine, TestArrayEngine> {
+        x.clone() * y + x.sin()
+    }
+
+    #[test]
+    fn test_hessian_matches_composed_jacfwd_of_grad_transform() {
+        let direct = TestArrayEngine
+            .hessian::<_, (TestArray, TestArray), TestArray>(
+                |(x, y)| x.clone() * y + x.sin(),
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+            )
+            .unwrap();
+        let composed = JacFwd::new(Grad::new(traced_bilinear_sin))
+            .evaluate_gradient::<TestArrayEngine, (TestArray, TestArray), TestArray>(
+                &TestArrayEngine,
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+            )
+            .unwrap();
+
+        assert_eq!(direct.values(), composed.values());
+        assert_eq!(direct.input_coordinate_counts(), composed.input_coordinate_counts());
+        assert_eq!(direct.output_coordinate_counts(), composed.output_coordinate_counts());
     }
 
     fn scalar_scale_branch(
@@ -644,8 +688,7 @@ mod tests {
             .with_derivative_rule::<TestArrayEngine, _>(ShiftOp::new(2.0));
 
         assert_eq!(
-            grad(
-                &TestArrayEngine,
+            TestArrayEngine.grad(
                 {
                     let primitive = primitive.clone();
                     move |x| stage_custom_traced_unary(x, primitive.clone())

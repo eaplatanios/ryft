@@ -3089,10 +3089,7 @@ mod tests {
                 TestArray,
             >,
         ) = engine
-            .interpret_and_trace(
-                |x| Ok(ryft_core::tracing_v2::grad(&TestArrayEngine, scalar_quartic_plus_sin, x)?),
-                TestArray::scalar(2.0),
-            )
+            .interpret_and_trace(|x| Ok(TestArrayEngine.grad(scalar_quartic_plus_sin, x)?), TestArray::scalar(2.0))
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
@@ -3153,7 +3150,7 @@ mod tests {
             >,
         ) = engine
             .interpret_and_trace(
-                |inputs| Ok(ryft_core::tracing_v2::grad(&TestArrayEngine, scalar_bilinear_sin, inputs)?),
+                |inputs| Ok(TestArrayEngine.grad(scalar_bilinear_sin, inputs)?),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();

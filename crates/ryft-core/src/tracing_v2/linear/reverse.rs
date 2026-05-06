@@ -2,6 +2,47 @@ use super::*;
 use crate::parameters::Parameter;
 use crate::tracing_v2::DifferentiationError;
 
+/// Reverse-mode gradient transform.
+pub(crate) struct Grad<F> {
+    /// Function whose scalar output is differentiated.
+    function: F,
+}
+
+impl<F> Grad<F> {
+    /// Creates a gradient transform for `function`.
+    #[inline]
+    pub(crate) const fn new(function: F) -> Self {
+        Self { function }
+    }
+
+    /// Returns the wrapped function.
+    #[inline]
+    pub(crate) fn into_function(self) -> F {
+        self.function
+    }
+
+    /// Evaluates this gradient transform at `primals`.
+    #[allow(private_bounds, private_interfaces)]
+    pub(crate) fn evaluate<
+        'engine,
+        E: Engine,
+        Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
+        Leaf: ValueAndGradDispatch<E, Input, Marker>,
+        Marker,
+    >(
+        self,
+        engine: &'engine E,
+        primals: Input,
+    ) -> Result<<Leaf as ValueAndGradDispatch<E, Input, Marker>>::Gradient, TracingError>
+    where
+        F: FnOnce(
+            <Leaf as ValueAndGradDispatch<E, Input, Marker>>::FunctionInput<'engine>,
+        ) -> <Leaf as ValueAndGradDispatch<E, Input, Marker>>::FunctionOutput<'engine>,
+    {
+        grad_at(engine, self.function, primals)
+    }
+}
+
 /// Traces `function` once and returns both its primal output and a reusable pushforward program.
 ///
 /// [`linearize`] is the staged counterpart to [`crate::tracing_v2::jvp`]. Instead of immediately
@@ -180,12 +221,12 @@ pub struct ConcreteValueAndGrad;
 #[doc(hidden)]
 pub struct TracedValueAndGrad;
 
-/// Dispatch trait shared by [`grad`] and [`value_and_grad`] so they can operate both on concrete
+/// Dispatch trait shared by [`DifferentiableEngine::grad`] and [`value_and_grad`] so they can operate both on concrete
 /// values and on already traced values.
 ///
-/// The trait always produces `(value, gradient)`; [`grad`] is a thin wrapper that drops the primal
-/// value, while [`value_and_grad`] exposes the full pair. This keeps the public reverse-mode API
-/// compact while allowing concrete replay, traced replay, and batched replay to specialize
+/// The trait always produces `(value, gradient)`; [`DifferentiableEngine::grad`] is a thin wrapper that drops the
+/// primal value, while [`value_and_grad`] exposes the full pair. This keeps the public reverse-mode API compact while
+/// allowing concrete replay, traced replay, and batched replay to specialize
 /// independently.
 #[doc(hidden)]
 pub trait ValueAndGradDispatch<E: Engine, Input, Marker>: Parameter + Sized
@@ -458,12 +499,12 @@ where
 
 /// Computes the reverse-mode gradient of a scalar-output function.
 ///
-/// [`grad`] is just [`value_and_grad`] with the primal result discarded, but it is the most common
+/// [`DifferentiableEngine::grad`] is just [`value_and_grad`] with the primal result discarded, but it is the most common
 /// user-facing reverse-mode entry point and therefore gets its own dedicated wrapper. The function
 /// must return exactly one rank-0 scalar array leaf. Use [`vjp`] directly for vector-valued functions
 /// that need an explicit output cotangent.
 #[allow(private_bounds, private_interfaces)]
-pub fn grad<
+pub(crate) fn grad_at<
     'engine,
     E: Engine,
     F: FnOnce(
