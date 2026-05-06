@@ -12,6 +12,7 @@ use ryft_xla_sys::bindings::{
     mlirValueReplaceAllUsesOfWith, mlirValueSetType,
 };
 
+use crate::errors::Error;
 use crate::support::write_to_string_callback;
 use crate::{
     AsmState, AttributeRef, BlockRef, Context, Location, LocationRef, Operation, OperationPrintingFlags, OperationRef,
@@ -66,7 +67,7 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
 
     /// Up-casts this [`Value`] to an instance of [`ValueRef`] (i.e., the most generic value reference type).
     fn as_ref(&self) -> ValueRef<'v, 'c, 't> {
-        self.cast().unwrap()
+        ValueRef { handle: unsafe { self.to_c_api() }, context: self.context(), owner: PhantomData }
     }
 
     /// Returns the name of this [`Value`] (i.e., the ID that would be used to refer to it in MLIR when used as an
@@ -83,7 +84,9 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
             // It is not always safe to obtain the name of a value. We perform a few checks to ensure that we not get
             // unexpected crashes at runtime stemming from the underlying MLIR library.
             let handle = self.to_c_api();
-            let parent_operation = self.cast::<BlockArgumentRef>().and_then(|a| a.block().parent_operation());
+            let parent_operation = self
+                .cast::<BlockArgumentRef>()
+                .and_then(|argument| argument.block().ok().and_then(|block| block.parent_operation()));
             let operation_result = self.cast::<OperationResultRef>();
             if handle.ptr.is_null() || (operation_result.is_none() && parent_operation.is_none()) {
                 Ok(None)
@@ -111,21 +114,27 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
     }
 
     /// Returns the [`Location`] of this value.
-    fn location(&self) -> LocationRef<'c, 't> {
+    fn location(&self) -> Result<LocationRef<'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe { LocationRef::from_c_api(mlirValueGetLocation(self.to_c_api()), self.context()).unwrap() }
+        unsafe {
+            LocationRef::from_c_api(mlirValueGetLocation(self.to_c_api()), self.context())
+                .ok_or_else(|| Error::internal("expected non-null MLIR value location handle"))
+        }
     }
 
     /// Returns the [`Type`] of this value.
-    fn r#type(&self) -> TypeRef<'c, 't> {
+    fn r#type(&self) -> Result<TypeRef<'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe { TypeRef::from_c_api(mlirValueGetType(self.to_c_api()), self.context()).unwrap() }
+        unsafe {
+            TypeRef::from_c_api(mlirValueGetType(self.to_c_api()), self.context())
+                .ok_or_else(|| Error::internal("expected non-null MLIR value type handle"))
+        }
     }
 
     /// Sets the [`Type`] of this value to the provided [`Type`].
@@ -250,9 +259,12 @@ pub struct BlockArgumentRef<'b, 'c: 'b, 't: 'c> {
 
 impl<'b, 'c, 't> BlockArgumentRef<'b, 'c, 't> {
     /// Returns a reference to the [`Block`](crate::Block) in which this value is defined as an argument.
-    pub fn block(&self) -> BlockRef<'b, 'c, 't> {
+    pub fn block(&self) -> Result<BlockRef<'b, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe { BlockRef::from_c_api(mlirBlockArgumentGetOwner(self.handle), self.context).unwrap() }
+        unsafe {
+            BlockRef::from_c_api(mlirBlockArgumentGetOwner(self.handle), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR block argument owner handle"))
+        }
     }
 
     /// Returns the index of this value in the argument list of its owning [`Block`](crate::Block).
@@ -302,7 +314,7 @@ mlir_subtype_trait_impls!(BlockArgumentRef<'b, 'c, 't> as Value, mlir_type = Val
 
 impl<'o, 'c, 't> From<BlockArgumentRef<'o, 'c, 't>> for ValueRef<'o, 'c, 't> {
     fn from(value: BlockArgumentRef<'o, 'c, 't>) -> Self {
-        value.as_ref()
+        Self { handle: value.handle, context: value.context, owner: PhantomData }
     }
 }
 
@@ -325,9 +337,12 @@ pub struct OperationResultRef<'o, 'c: 'o, 't: 'c> {
 
 impl<'o, 'c, 't> OperationResultRef<'o, 'c, 't> {
     /// Returns a [`OperationRef`] referencing the [`Operation`] that produced this value as its result.
-    pub fn operation(&self) -> OperationRef<'o, 'c, 't> {
+    pub fn operation(&self) -> Result<OperationRef<'o, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe { OperationRef::from_c_api(mlirOpResultGetOwner(self.handle), self.context).unwrap() }
+        unsafe {
+            OperationRef::from_c_api(mlirOpResultGetOwner(self.handle), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR operation result owner handle"))
+        }
     }
 
     /// Returns the index of this value in the results of its owning [`Operation`].
@@ -359,7 +374,7 @@ mlir_subtype_trait_impls!(OperationResultRef<'o, 'c, 't> as Value, mlir_type = V
 
 impl<'o, 'c, 't> From<OperationResultRef<'o, 'c, 't>> for ValueRef<'o, 'c, 't> {
     fn from(value: OperationResultRef<'o, 'c, 't>) -> Self {
-        value.as_ref()
+        Self { handle: value.handle, context: value.context, owner: PhantomData }
     }
 }
 
@@ -409,15 +424,21 @@ impl<'o, 'c, 't> OperandRef<'o, 'c, 't> {
     }
 
     /// Returns a reference to the underlying [`Value`] of this [`OperandRef`].
-    pub fn value(&self) -> ValueRef<'o, 'c, 't> {
+    pub fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe { ValueRef::from_c_api(mlirOpOperandGetValue(self.to_c_api()), self.context).unwrap() }
+        unsafe {
+            ValueRef::from_c_api(mlirOpOperandGetValue(self.to_c_api()), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR operand value handle"))
+        }
     }
 
     /// Returns a reference to the [`Operation`] that takes this [`OperandRef`] as one of its inputs/operands.
-    pub fn operation(&self) -> OperationRef<'o, 'c, 't> {
+    pub fn operation(&self) -> Result<OperationRef<'o, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe { OperationRef::from_c_api(mlirOpOperandGetOwner(self.to_c_api()), self.context).unwrap() }
+        unsafe {
+            OperationRef::from_c_api(mlirOpOperandGetOwner(self.to_c_api()), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR operand owner handle"))
+        }
     }
 
     /// Returns the index of this [`OperandRef`] in the [`Operation`] where it is being used.
@@ -479,7 +500,7 @@ mod tests {
     #[test]
     fn test_value() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::arith());
+        context.load_dialect(DialectHandle::arith().unwrap()).unwrap();
         let location = context.unknown_location();
         let index_type = context.index_type();
 
@@ -487,7 +508,7 @@ mod tests {
         let block = context.block(&[(index_type, location)]);
         let block_argument = block.argument(0).unwrap();
         assert_eq!(block_argument.context(), &context);
-        assert_eq!(block_argument.block(), block);
+        assert_eq!(block_argument.block().unwrap(), block);
 
         // Test using an operation result.
         let op = OperationBuilder::new("arith.constant", location)
@@ -497,8 +518,8 @@ mod tests {
             .unwrap();
         let result = op.result(0).unwrap();
         assert_eq!(result.context(), &context);
-        assert_eq!(result.location(), location);
-        assert_eq!(result.r#type(), index_type);
+        assert_eq!(result.location().unwrap(), location);
+        assert_eq!(result.r#type().unwrap(), index_type);
         assert_eq!(format!("{}", result), "%c0 = arith.constant 0 : index\n");
         assert_eq!(format!("{:?}", result), "OperationResultRef[%c0 = arith.constant 0 : index\n]");
 
@@ -522,7 +543,7 @@ mod tests {
     #[test]
     fn test_value_replace_uses() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::arith());
+        context.load_dialect(DialectHandle::arith().unwrap()).unwrap();
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let index_type = context.index_type();
@@ -559,28 +580,28 @@ mod tests {
         let block = context.block(&[(index_type, location)]);
         let mut block_argument = block.argument(0).unwrap();
         assert_eq!(block_argument.context(), &context);
-        assert_eq!(block_argument.name(false, false).ok().flatten(), None);
-        assert_eq!(block_argument.name(true, false).ok().flatten(), None);
-        assert_eq!(block_argument.name(false, true).ok().flatten(), None);
-        assert_eq!(block_argument.name(true, true).ok().flatten(), None);
-        assert_eq!(block_argument.location(), location);
-        assert_eq!(block_argument.r#type(), index_type);
+        assert_eq!(block_argument.name(false, false).unwrap(), None);
+        assert_eq!(block_argument.name(true, false).unwrap(), None);
+        assert_eq!(block_argument.name(false, true).unwrap(), None);
+        assert_eq!(block_argument.name(true, true).unwrap(), None);
+        assert_eq!(block_argument.location().unwrap(), location);
+        assert_eq!(block_argument.r#type().unwrap(), index_type);
         assert_eq!(block_argument.argument_index(), 0);
         assert!(block_argument.is::<ValueRef>());
         assert!(block_argument.is::<BlockArgumentRef>());
         assert!(!block_argument.is::<OperationResultRef>());
-        assert_eq!(block_argument.block(), block);
+        assert_eq!(block_argument.block().unwrap(), block);
         block_argument.set_type(f64_type);
-        assert_eq!(block_argument.r#type(), f64_type);
+        assert_eq!(block_argument.r#type().unwrap(), f64_type);
         let new_location = context.file_location("foo.mlir", 2, 3);
         block_argument.set_location(new_location);
-        assert_eq!(block_argument.location(), new_location);
+        assert_eq!(block_argument.location().unwrap(), new_location);
     }
 
     #[test]
     fn test_operation_result() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::arith());
+        context.load_dialect(DialectHandle::arith().unwrap()).unwrap();
         let location = context.unknown_location();
         let index_type = context.index_type();
         let op = OperationBuilder::new("arith.constant", location)
@@ -590,13 +611,13 @@ mod tests {
             .unwrap();
         let result = op.result(0).unwrap();
         assert_eq!(result.context(), &context);
-        assert_eq!(result.name(false, false).ok().flatten(), Some("%c0".to_string()));
-        assert_eq!(result.name(true, false).ok().flatten(), Some("%c0".to_string()));
-        assert_eq!(result.name(false, true).ok().flatten(), Some("%c0".to_string()));
-        assert_eq!(result.name(true, true).ok().flatten(), Some("%c0".to_string()));
-        assert_eq!(result.location(), location);
-        assert_eq!(result.r#type(), index_type);
-        assert_eq!(result.operation(), op);
+        assert_eq!(result.name(false, false).unwrap(), Some("%c0".to_string()));
+        assert_eq!(result.name(true, false).unwrap(), Some("%c0".to_string()));
+        assert_eq!(result.name(false, true).unwrap(), Some("%c0".to_string()));
+        assert_eq!(result.name(true, true).unwrap(), Some("%c0".to_string()));
+        assert_eq!(result.location().unwrap(), location);
+        assert_eq!(result.r#type().unwrap(), index_type);
+        assert_eq!(result.operation().unwrap(), op);
         assert_eq!(result.result_index(), 0);
         assert!(result.is::<ValueRef>());
         assert!(!result.is::<BlockArgumentRef>());
@@ -608,7 +629,7 @@ mod tests {
     #[test]
     fn test_operand() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::arith());
+        context.load_dialect(DialectHandle::arith().unwrap()).unwrap();
         let location = context.unknown_location();
         let index_type = context.index_type();
         let block = context.block(&[(index_type, location)]);
@@ -619,19 +640,17 @@ mod tests {
             .add_attribute("value", context.parse_attribute("0 : index").unwrap())
             .build()
             .unwrap();
-        let operand = op.operand(0);
-        assert!(operand.is_some());
-        let operand = operand.unwrap();
+        let operand = op.operand(0).unwrap();
         let block_argument_uses = block_argument.uses().collect::<Vec<_>>();
         assert_eq!(block_argument_uses.len(), 1);
         let block_argument_use = block_argument_uses[0];
         assert_eq!(block_argument_use.context(), &context);
-        assert_eq!(block_argument_use.value(), block_argument);
+        assert_eq!(block_argument_use.value().unwrap(), block_argument);
         assert_eq!(operand.context(), &context);
-        assert_eq!(operand.value(), block_argument);
-        assert_eq!(block_argument_use.value(), operand.value());
-        assert_eq!(block_argument_use.operation(), op);
-        assert_eq!(operand.operation(), op);
+        assert_eq!(operand.value().unwrap(), block_argument);
+        assert_eq!(block_argument_use.value().unwrap(), operand.value().unwrap());
+        assert_eq!(block_argument_use.operation().unwrap(), op);
+        assert_eq!(operand.operation().unwrap(), op);
         assert_eq!(block_argument_use.operand_index(), 0);
         assert_eq!(operand.operand_index(), 0);
     }

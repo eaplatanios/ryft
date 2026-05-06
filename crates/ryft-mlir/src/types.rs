@@ -3,6 +3,7 @@ use std::fmt::{Debug, Display};
 
 use ryft_xla_sys::bindings::{MlirType, mlirTypeDump, mlirTypeGetDialect, mlirTypeGetTypeID, mlirTypeParseGet};
 
+use crate::errors::Error;
 use crate::{AttributeRef, Context, Dialect, StringRef, TypeId, mlir_subtype_trait_impls};
 
 /// Each value in MLIR has a [`Type`] defined by the MLIR type system. MLIR has an open type system (i.e., there is no
@@ -46,19 +47,25 @@ pub trait Type<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + De
 
     /// Up-casts this type to an instance of [`Type`].
     fn as_ref(&self) -> TypeRef<'c, 't> {
-        unsafe { TypeRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
+        TypeRef { handle: unsafe { self.to_c_api() }, context: self.context() }
     }
 
     /// Gets the [`TypeId`] of this type. Note that this function may return the same [`TypeId`] for different
     /// instances of the same type with potentially different attributes. That is because a [`TypeId`] is a unique
     /// identifier of the corresponding MLIR C++ type for [`Type`] and not for a specific instance of [`Type`].
-    fn type_id(&self) -> TypeId<'c> {
-        unsafe { TypeId::from_c_api(mlirTypeGetTypeID(self.to_c_api())).unwrap() }
+    fn type_id(&self) -> Result<TypeId<'c>, Error> {
+        unsafe {
+            TypeId::from_c_api(mlirTypeGetTypeID(self.to_c_api()))
+                .ok_or_else(|| Error::internal("expected non-null MLIR type ID handle"))
+        }
     }
 
     /// Returns the [`Dialect`] that this type belongs to.
-    fn dialect(&self) -> Dialect<'c, 't> {
-        unsafe { Dialect::from_c_api(mlirTypeGetDialect(self.to_c_api())).unwrap() }
+    fn dialect(&self) -> Result<Dialect<'c, 't>, Error> {
+        unsafe {
+            Dialect::from_c_api(mlirTypeGetDialect(self.to_c_api()))
+                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle for type"))
+        }
     }
 
     /// Dumps this type to the standard error stream.
@@ -94,15 +101,14 @@ impl<'c, 't> Type<'c, 't> for TypeRef<'c, 't> {
 mlir_subtype_trait_impls!(TypeRef<'c, 't> as Type, mlir_type = Type);
 
 impl<'t> Context<'t> {
-    /// Parses a [`Type`] from the provided string representation. Returns [`None`] if MLIR fails to parse
-    /// the provided string into a [`Type`] (this function will also emit diagnostics if that happens).
-    /// The resulting [`Type`] is owned by this [`Context`].
-    pub fn parse_type<'c, S: AsRef<str>>(&'c self, source: S) -> Option<TypeRef<'c, 't>> {
+    /// Parses a [`Type`] from the provided string representation. Returns an error if MLIR fails to parse the provided
+    /// string into a [`Type`] (this function will also emit diagnostics if that happens). The resulting [`Type`] is
+    /// owned by this [`Context`].
+    pub fn parse_type<'c, S: AsRef<str>>(&'c self, source: S) -> Result<TypeRef<'c, 't>, Error> {
+        let source = source.as_ref();
         unsafe {
-            TypeRef::from_c_api(
-                mlirTypeParseGet(*self.handle.borrow_mut(), StringRef::from(source.as_ref()).to_c_api()),
-                self,
-            )
+            TypeRef::from_c_api(mlirTypeParseGet(*self.handle.borrow_mut(), StringRef::from(source).to_c_api()), self)
+                .ok_or_else(|| Error::parsing_error(format!("failed to parse MLIR type `{source}`")))
         }
     }
 }
@@ -169,9 +175,9 @@ pub(crate) mod tests {
         let context = Context::new();
         let index_type = context.index_type();
         assert_eq!(index_type.context(), &context);
-        assert_eq!(index_type.type_id(), context.index_type().type_id());
-        assert_ne!(index_type.type_id(), context.signed_integer_type(32).type_id());
-        assert_eq!(index_type.clone().dialect().namespace().unwrap(), "builtin");
+        assert_eq!(index_type.type_id().unwrap(), context.index_type().type_id().unwrap());
+        assert_ne!(index_type.type_id().unwrap(), context.signed_integer_type(32).type_id().unwrap());
+        assert_eq!(index_type.clone().dialect().unwrap().namespace().unwrap(), "builtin");
         test_type_display_and_debug(index_type, "index");
         test_type_casting(index_type);
 
@@ -218,12 +224,12 @@ pub(crate) mod tests {
     fn test_type_parsing() {
         let context = Context::new();
         context.allow_unregistered_dialects();
-        assert_eq!(context.parse_type("index"), Some(context.index_type().as_ref()));
-        assert_eq!(context.parse_type("i32"), Some(context.signless_integer_type(32).as_ref()));
-        assert_eq!(context.parse_type("f64"), Some(context.float64_type().as_ref()));
-        assert!(context.parse_type("tensor<3x4xf32>").is_some());
-        assert!(context.parse_type("!llvm.ptr").is_some());
-        assert!(context.parse_type("invalid_type_xyz").is_none());
+        assert_eq!(context.parse_type("index").unwrap(), context.index_type().as_ref());
+        assert_eq!(context.parse_type("i32").unwrap(), context.signless_integer_type(32).as_ref());
+        assert_eq!(context.parse_type("f64").unwrap(), context.float64_type().as_ref());
+        assert!(context.parse_type("tensor<3x4xf32>").is_ok());
+        assert!(context.parse_type("!llvm.ptr").is_ok());
+        assert!(context.parse_type("invalid_type_xyz").is_err());
     }
 
     #[test]
