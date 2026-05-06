@@ -11,6 +11,7 @@ use ryft_xla_sys::bindings::{
     mlirBlockInsertOwnedOperationBefore, mlirBlockPrint, mlirOperationGetNextInBlock, mlirOperationRemoveFromParent,
 };
 
+use crate::errors::Error;
 use crate::support::write_to_formatter_callback;
 use crate::{
     BlockArgumentRef, Context, DetachedOp, DetachedOperation, Location, LocationRef, OpRef, Operation, OperationRef,
@@ -53,7 +54,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
 
     /// Returns a reference to this [`Block`].
     fn as_ref(&self) -> BlockRef<'b, 'c, 't> {
-        unsafe { BlockRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
+        BlockRef { handle: unsafe { self.to_c_api() }, context: self.context(), owner: PhantomData }
     }
 
     /// Returns the number of [`BlockArgumentRef`]s of this [`Block`].
@@ -150,9 +151,10 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`] because that
     /// would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn predecessors<'r>(&'r self) -> impl Iterator<Item = BlockRef<'b, 'c, 't>> {
+    fn predecessors<'r>(&'r self) -> impl Iterator<Item = Result<BlockRef<'b, 'c, 't>, Error>> {
         (0..self.predecessor_count()).map(|index| unsafe {
-            BlockRef::from_c_api(mlirBlockGetPredecessor(self.to_c_api(), index.cast_signed()), self.context()).unwrap()
+            BlockRef::from_c_api(mlirBlockGetPredecessor(self.to_c_api(), index.cast_signed()), self.context())
+                .ok_or_else(|| Error::internal("expected non-null MLIR block predecessor handle"))
         })
     }
 
@@ -195,9 +197,10 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`] because that
     /// would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn successors<'r>(&'r self) -> impl Iterator<Item = BlockRef<'b, 'c, 't>> {
+    fn successors<'r>(&'r self) -> impl Iterator<Item = Result<BlockRef<'b, 'c, 't>, Error>> {
         (0..self.successor_count()).map(|index| unsafe {
-            BlockRef::from_c_api(mlirBlockGetSuccessor(self.to_c_api(), index.cast_signed()), self.context()).unwrap()
+            BlockRef::from_c_api(mlirBlockGetSuccessor(self.to_c_api(), index.cast_signed()), self.context())
+                .ok_or_else(|| Error::internal("expected non-null MLIR block successor handle"))
         })
     }
 
@@ -221,7 +224,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
         &self,
         argument_type: T,
         argument_location: L,
-    ) -> BlockArgumentRef<'b, 'c, 't> {
+    ) -> Result<BlockArgumentRef<'b, 'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
@@ -231,7 +234,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
                 mlirBlockAddArgument(self.to_c_api(), argument_type.to_c_api(), argument_location.to_c_api()),
                 self.context(),
             )
-            .unwrap()
+            .ok_or_else(|| Error::internal("expected non-null MLIR block argument handle"))
         }
     }
 
@@ -242,7 +245,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
         index: usize,
         argument_type: T,
         argument_location: L,
-    ) -> BlockArgumentRef<'b, 'c, 't> {
+    ) -> Result<BlockArgumentRef<'b, 'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
@@ -257,7 +260,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
                 ),
                 self.context(),
             )
-            .unwrap()
+            .ok_or_else(|| Error::internal("expected non-null inserted MLIR block argument handle"))
         }
     }
 
@@ -272,7 +275,10 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
 
     /// Appends the provided [`Operation`] to the end of this [`Block`] and returns a reference
     /// to the appended [`Operation`].
-    fn append_operation<'o, O: DetachedOp<'o, 'c, 't>>(&mut self, operation: O) -> OperationRef<'b, 'c, 't>
+    fn append_operation<'o, O: DetachedOp<'o, 'c, 't>>(
+        &mut self,
+        operation: O,
+    ) -> Result<OperationRef<'b, 'c, 't>, Error>
     where
         'c: 'o,
     {
@@ -284,7 +290,8 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
             let handle = operation.to_c_api();
             std::mem::forget(operation);
             mlirBlockAppendOwnedOperation(self.to_c_api(), handle);
-            OperationRef::from_c_api(handle, self.context()).unwrap()
+            OperationRef::from_c_api(handle, self.context())
+                .ok_or_else(|| Error::internal("expected non-null appended MLIR operation handle"))
         }
     }
 
@@ -296,7 +303,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
         &mut self,
         operation: O,
         index: usize,
-    ) -> OperationRef<'b, 'c, 't>
+    ) -> Result<OperationRef<'b, 'c, 't>, Error>
     where
         'c: 'o,
     {
@@ -308,7 +315,8 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
             let handle = operation.to_c_api();
             std::mem::forget(operation);
             mlirBlockInsertOwnedOperation(self.to_c_api(), index.cast_signed(), handle);
-            OperationRef::from_c_api(handle, self.context()).unwrap()
+            OperationRef::from_c_api(handle, self.context())
+                .ok_or_else(|| Error::internal("expected non-null inserted MLIR operation handle"))
         }
     }
 
@@ -319,7 +327,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
         &mut self,
         operation: O,
         reference: Option<R>,
-    ) -> OperationRef<'b, 'c, 't>
+    ) -> Result<OperationRef<'b, 'c, 't>, Error>
     where
         'c: 'o,
     {
@@ -334,7 +342,8 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
             let handle = operation.to_c_api();
             std::mem::forget(operation);
             mlirBlockInsertOwnedOperationAfter(self.to_c_api(), reference, handle);
-            OperationRef::from_c_api(handle, self.context()).unwrap()
+            OperationRef::from_c_api(handle, self.context())
+                .ok_or_else(|| Error::internal("expected non-null inserted MLIR operation handle"))
         }
     }
 
@@ -345,7 +354,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
         &mut self,
         operation: O,
         reference: Option<R>,
-    ) -> OperationRef<'b, 'c, 't>
+    ) -> Result<OperationRef<'b, 'c, 't>, Error>
     where
         'c: 'o,
     {
@@ -360,7 +369,8 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
             let handle = operation.to_c_api();
             std::mem::forget(operation);
             mlirBlockInsertOwnedOperationBefore(self.to_c_api(), reference, handle);
-            OperationRef::from_c_api(handle, self.context()).unwrap()
+            OperationRef::from_c_api(handle, self.context())
+                .ok_or_else(|| Error::internal("expected non-null inserted MLIR operation handle"))
         }
     }
 
@@ -522,12 +532,15 @@ impl<'r, 'c, 't> BlockRef<'r, 'c, 't> {
 
     /// Returns a reference to the parent [`Region`](crate::Region) of the referenced [`Block`] (i.e., the closest
     /// surrounding [`Region`](crate::Region) that contains this block).
-    pub fn parent_region(&self) -> RegionRef<'r, 'c, 't> {
+    pub fn parent_region(&self) -> Result<RegionRef<'r, 'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe { RegionRef::from_c_api(mlirBlockGetParentRegion(self.to_c_api()), self.context()).unwrap() }
+        unsafe {
+            RegionRef::from_c_api(mlirBlockGetParentRegion(self.to_c_api()), self.context())
+                .ok_or_else(|| Error::internal("expected non-null MLIR block parent region handle"))
+        }
     }
 
     /// Returns a reference to the parent [`Operation`] of the referenced [`Block`] (i.e., the closest surrounding
@@ -604,9 +617,11 @@ impl<'r, 'c, 't> Debug for BlockRef<'r, 'c, 't> {
     }
 }
 
-impl<'b, 'c, 't> From<&'b DetachedBlock<'c, 't>> for BlockRef<'b, 'c, 't> {
-    fn from(value: &'b DetachedBlock<'c, 't>) -> Self {
-        value.as_ref()
+impl<'b, 'c, 't> TryFrom<&'b DetachedBlock<'c, 't>> for BlockRef<'b, 'c, 't> {
+    type Error = Error;
+
+    fn try_from(value: &'b DetachedBlock<'c, 't>) -> Result<Self, Self::Error> {
+        Ok(value.as_ref())
     }
 }
 
@@ -646,10 +661,9 @@ impl<'r, 'b: 'r, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>> Iterator for BlockArgumen
                     mlirBlockGetArgument(self.block.to_c_api(), self.current_argument_index.cast_signed()),
                     self.block.context(),
                 )
-                .unwrap()
             };
             self.current_argument_index += 1;
-            Some(current_argument)
+            current_argument
         }
     }
 }
@@ -702,10 +716,13 @@ mod tests {
         // Empty block with arguments.
         let block = context.block(&[(i32_type, location), (i64_type, location)]);
         assert_eq!(block.argument_count(), 2);
-        assert_eq!(block.argument(0).unwrap().r#type(), i32_type);
-        assert_eq!(block.argument(1).unwrap().r#type(), i64_type);
+        assert_eq!(block.argument(0).unwrap().r#type().unwrap(), i32_type);
+        assert_eq!(block.argument(1).unwrap().r#type().unwrap(), i64_type);
         assert!(block.argument(2).is_none());
-        assert_eq!(block.arguments().map(|argument| argument.r#type()).collect::<Vec<_>>(), vec![i32_type, i64_type]);
+        assert_eq!(
+            block.arguments().map(|argument| argument.r#type().unwrap()).collect::<Vec<_>>(),
+            vec![i32_type, i64_type],
+        );
     }
 
     #[test]
@@ -714,8 +731,8 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap());
-        let op_1 = block.append_operation(OperationBuilder::new("bar", location).build().unwrap());
+        let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
+        let op_1 = block.append_operation(OperationBuilder::new("bar", location).build().unwrap()).unwrap();
         assert_eq!(block.operations().collect::<Vec<_>>(), vec![op_0, op_1]);
     }
 
@@ -725,21 +742,21 @@ mod tests {
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
         assert_eq!(block.terminator(), None);
-        let op = block.append_operation(func::r#return::<ValueRef, _>(&[], location));
+        let op = block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
         assert_eq!(block.terminator(), Some(op));
     }
 
     #[test]
     fn test_block_successors_and_predecessors() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::cf());
+        context.load_dialect(DialectHandle::cf().unwrap()).unwrap();
         let location = context.unknown_location();
 
         // Create a region with three blocks that are initially all empty and not connected.
         let mut region = context.region();
-        let mut block_0 = region.append_block(context.block_with_no_arguments());
-        let block_1 = region.append_block(context.block_with_no_arguments());
-        let block_2 = region.append_block(context.block_with_no_arguments());
+        let mut block_0 = region.append_block(context.block_with_no_arguments()).unwrap();
+        let block_1 = region.append_block(context.block_with_no_arguments()).unwrap();
+        let block_2 = region.append_block(context.block_with_no_arguments()).unwrap();
         assert_eq!(block_0.successor_count(), 0);
         assert_eq!(block_0.predecessor_count(), 0);
         assert_eq!(block_1.predecessor_count(), 0);
@@ -747,31 +764,31 @@ mod tests {
 
         // Create a conditional branch from `block_0` to `block_1` and `block_2`.
         let i1_type = context.signless_integer_type(1);
-        let condition = block_0.append_argument(i1_type, location);
+        let condition = block_0.append_argument(i1_type, location).unwrap();
         let branch_op = OperationBuilder::new("cf.cond_br", location)
             .add_operands(&[condition])
             .add_successors(&[&block_1, &block_2])
             .build()
             .unwrap();
-        block_0.append_operation(branch_op);
+        block_0.append_operation(branch_op).unwrap();
 
         // Now `block_0 should have 2 successors and `block_1` and `block_2` should each have 1 predecessor.
         assert_eq!(block_0.successor_count(), 2);
         assert_eq!(block_0.successor(0), Some(block_1));
         assert_eq!(block_0.successor(1), Some(block_2));
         assert_eq!(block_0.successor(2), None);
-        assert_eq!(block_0.successors().collect::<Vec<_>>(), vec![block_1, block_2]);
+        assert_eq!(block_0.successors().collect::<Result<Vec<_>, _>>().unwrap(), vec![block_1, block_2]);
         assert_eq!(block_0.predecessor_count(), 0);
         assert_eq!(block_1.successor_count(), 0);
         assert_eq!(block_1.predecessor_count(), 1);
         assert_eq!(block_1.predecessor(0), Some(block_0));
         assert_eq!(block_1.predecessor(1), None);
-        assert_eq!(block_1.predecessors().collect::<Vec<_>>(), vec![block_0]);
+        assert_eq!(block_1.predecessors().collect::<Result<Vec<_>, _>>().unwrap(), vec![block_0]);
         assert_eq!(block_2.successor_count(), 0);
         assert_eq!(block_2.predecessor_count(), 1);
         assert_eq!(block_2.predecessor(0), Some(block_0));
         assert_eq!(block_2.predecessor(1), None);
-        assert_eq!(block_2.predecessors().collect::<Vec<_>>(), vec![block_0]);
+        assert_eq!(block_2.predecessors().collect::<Result<Vec<_>, _>>().unwrap(), vec![block_0]);
     }
 
     #[test]
@@ -782,9 +799,9 @@ mod tests {
         let block = context.block_with_no_arguments();
         assert_eq!(block.argument_count(), 0);
         assert!(block.is_empty());
-        let argument = block.append_argument(i32_type, location);
+        let argument = block.append_argument(i32_type, location).unwrap();
         assert_eq!(block.argument_count(), 1);
-        assert_eq!(argument.r#type(), i32_type);
+        assert_eq!(argument.r#type().unwrap(), i32_type);
     }
 
     #[test]
@@ -794,11 +811,11 @@ mod tests {
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
         let block = context.block(&[(i32_type, location)]);
-        let argument = block.insert_argument(0, i64_type, location);
-        assert_eq!(argument.r#type(), i64_type);
+        let argument = block.insert_argument(0, i64_type, location).unwrap();
+        assert_eq!(argument.r#type().unwrap(), i64_type);
         assert_eq!(block.argument_count(), 2);
-        assert_eq!(block.argument(0).unwrap().r#type(), i64_type);
-        assert_eq!(block.argument(1).unwrap().r#type(), i32_type);
+        assert_eq!(block.argument(0).unwrap().r#type().unwrap(), i64_type);
+        assert_eq!(block.argument(1).unwrap().r#type().unwrap(), i32_type);
         assert!(block.argument(2).is_none());
     }
 
@@ -812,7 +829,7 @@ mod tests {
         assert_eq!(block.argument_count(), 2);
         block.remove_argument(0);
         assert_eq!(block.argument_count(), 1);
-        assert_eq!(block.argument(0).unwrap().r#type(), i64_type);
+        assert_eq!(block.argument(0).unwrap().r#type().unwrap(), i64_type);
         assert!(block.argument(1).is_none());
     }
 
@@ -822,7 +839,7 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op = block.append_operation(OperationBuilder::new("foo", location).build().unwrap());
+        let op = block.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
         assert_eq!(block.operations().collect::<Vec<_>>(), vec![op]);
     }
 
@@ -832,8 +849,8 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap());
-        let op_1 = block.insert_operation(OperationBuilder::new("bar", location).build().unwrap(), 0);
+        let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
+        let op_1 = block.insert_operation(OperationBuilder::new("bar", location).build(), 0).unwrap();
         assert_eq!(block.operations().collect::<Vec<_>>(), vec![op_1, op_0]);
     }
 
@@ -843,10 +860,11 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap());
-        let op_1 = block.insert_operation_after(OperationBuilder::new("bar", location).build().unwrap(), Some(op_0));
-        let op_2 =
-            block.insert_operation_after(OperationBuilder::new("baz", location).build().unwrap(), None::<OperationRef>);
+        let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
+        let op_1 = block.insert_operation_after(OperationBuilder::new("bar", location).build(), Some(op_0)).unwrap();
+        let op_2 = block
+            .insert_operation_after(OperationBuilder::new("baz", location).build(), None::<OperationRef>)
+            .unwrap();
         assert_eq!(block.operations().collect::<Vec<_>>(), vec![op_2, op_0, op_1]);
     }
 
@@ -856,10 +874,11 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap());
-        let op_1 = block.insert_operation_before(OperationBuilder::new("bar", location).build().unwrap(), Some(op_0));
+        let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
+        let op_1 = block.insert_operation_before(OperationBuilder::new("bar", location).build(), Some(op_0)).unwrap();
         let op_2 = block
-            .insert_operation_before(OperationBuilder::new("baz", location).build().unwrap(), None::<OperationRef>);
+            .insert_operation_before(OperationBuilder::new("baz", location).build(), None::<OperationRef>)
+            .unwrap();
         assert_eq!(block.operations().collect::<Vec<_>>(), vec![op_1, op_0, op_2]);
     }
 
@@ -871,8 +890,8 @@ mod tests {
 
         // Create a block with two operations and remove one of them.
         let mut block_0 = context.block_with_no_arguments();
-        let op_0 = block_0.append_operation(OperationBuilder::new("foo", location).build().unwrap());
-        let op_1 = block_0.append_operation(OperationBuilder::new("bar", location).build().unwrap());
+        let op_0 = block_0.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
+        let op_1 = block_0.append_operation(OperationBuilder::new("bar", location).build().unwrap()).unwrap();
         assert_eq!(block_0.operations().collect::<Vec<_>>(), vec![op_0, op_1]);
         let (block, removed_op) = unsafe { block_0.remove_operation(op_0) };
         assert!(removed_op.is_some());
@@ -881,7 +900,7 @@ mod tests {
 
         // Create another block and try to remove an operation that is in that block from the previous one.
         let mut block_1 = context.block_with_no_arguments();
-        let op_2 = block_1.append_operation(OperationBuilder::new("foo", location).build().unwrap());
+        let op_2 = block_1.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
         let (block_0, removed_op) = unsafe { block.remove_operation(op_2) };
         assert!(removed_op.is_none());
 
@@ -896,22 +915,22 @@ mod tests {
         let context = Context::new();
         let mut region = context.region();
         let block = context.block_with_no_arguments();
-        let block = region.append_block(block);
-        assert_eq!(block.parent_region(), region);
+        let block = region.append_block(block).unwrap();
+        assert_eq!(block.parent_region().unwrap(), region);
     }
 
     #[test]
     fn test_block_ref_parent_operation() {
         let context = Context::new();
-        let module = context.module(context.unknown_location());
-        assert_eq!(module.body().parent_operation(), Some(module.as_operation().as_ref()));
+        let module = context.module(context.unknown_location()).unwrap();
+        assert_eq!(module.body().unwrap().parent_operation(), Some(module.as_operation().unwrap().as_ref()));
     }
 
     #[test]
     fn test_block_detach() {
         let context = Context::new();
         let mut region = context.region();
-        let block = region.append_block(context.block_with_no_arguments());
+        let block = region.append_block(context.block_with_no_arguments()).unwrap();
         let detached = block.detach();
         assert_eq!(detached.to_string(), "<<UNLINKED BLOCK>>\n");
     }
@@ -921,8 +940,8 @@ mod tests {
         let context = Context::new();
         let mut region = context.region();
         let block_0 = context.block_with_no_arguments();
-        let block_1 = region.append_block(context.block_with_no_arguments());
-        let block_2 = BlockRef::from(&block_0);
+        let block_1 = region.append_block(context.block_with_no_arguments()).unwrap();
+        let block_2 = block_0.as_ref();
         assert_eq!(block_0, block_0);
         assert_eq!(block_1, block_1);
         assert_eq!(block_2, block_2);
@@ -941,7 +960,7 @@ mod tests {
         assert_eq!(format!("{:?}", block.as_ref()), "BlockRef[<<UNLINKED BLOCK>>\n]");
 
         let mut region = context.region();
-        let block = region.append_block(context.block_with_no_arguments());
+        let block = region.append_block(context.block_with_no_arguments()).unwrap();
         assert_eq!(format!("{}", block), "<<UNLINKED BLOCK>>\n");
         assert_eq!(format!("{:?}", block), "BlockRef[<<UNLINKED BLOCK>>\n]");
     }

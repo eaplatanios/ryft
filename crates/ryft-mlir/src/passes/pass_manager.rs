@@ -10,6 +10,7 @@ use ryft_xla_sys::bindings::{
     mlirPassManagerGetAsOpPassManager, mlirPassManagerGetNestedUnder, mlirPassManagerRunOnOp, mlirPrintPassPipeline,
 };
 
+use crate::errors::Error;
 use crate::support::write_to_formatter_callback;
 use crate::{Context, LogicalResult, Operation, OperationPrintingFlags, StringRef};
 
@@ -100,9 +101,10 @@ impl<'c, 't: 'c> PassManager<'c, 't> {
     }
 
     /// Casts this [`PassManager`] to an [`OperationPassManager`].
-    pub fn as_operation_pass_manager<'p>(&'p self) -> OperationPassManager<'p, 'c, 't> {
+    pub fn as_operation_pass_manager<'p>(&'p self) -> Result<OperationPassManager<'p, 'c, 't>, Error> {
         unsafe {
-            OperationPassManager::from_c_api(mlirPassManagerGetAsOpPassManager(self.handle), self.context).unwrap()
+            OperationPassManager::from_c_api(mlirPassManagerGetAsOpPassManager(self.handle), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR operation pass-manager handle"))
         }
     }
 
@@ -178,13 +180,16 @@ impl<'c, 't: 'c> PassManager<'c, 't> {
 
     /// Nests an [`OperationPassManager`] under this top-level [`PassManager`] and returns it. The nested
     /// [`OperationPassManager`] will only run on [`Operation`]s matching the provided name.
-    pub fn nest<'p, 's, S: Into<StringRef<'s>>>(&self, operation_name: S) -> OperationPassManager<'p, 'c, 't> {
+    pub fn nest<'p, 's, S: Into<StringRef<'s>>>(
+        &self,
+        operation_name: S,
+    ) -> Result<OperationPassManager<'p, 'c, 't>, Error> {
         unsafe {
             OperationPassManager::from_c_api(
                 mlirPassManagerGetNestedUnder(self.handle, operation_name.into().to_c_api()),
                 self.context,
             )
-            .unwrap()
+            .ok_or_else(|| Error::internal("expected non-null nested MLIR operation pass-manager handle"))
         }
     }
 
@@ -219,7 +224,7 @@ impl Drop for PassManager<'_, '_> {
 
 impl<'t> Context<'t> {
     /// Creates a new top-level [`PassManager`] that is associated with this [`Context`], using the default anchor.
-    pub fn pass_manager<'c>(&'c self) -> PassManager<'c, 't> {
+    pub fn pass_manager<'c>(&'c self) -> Result<PassManager<'c, 't>, Error> {
         unsafe {
             PassManager::from_c_api(
                 mlirPassManagerCreate(
@@ -230,7 +235,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .ok_or_else(|| Error::internal("expected non-null MLIR pass-manager handle"))
         }
     }
 
@@ -239,7 +244,7 @@ impl<'t> Context<'t> {
     pub fn pass_manager_on_operation<'c, 's, S: Into<StringRef<'s>>>(
         &'c self,
         anchor_operation: S,
-    ) -> PassManager<'c, 't> {
+    ) -> Result<PassManager<'c, 't>, Error> {
         unsafe {
             PassManager::from_c_api(
                 mlirPassManagerCreateOnOperation(
@@ -251,7 +256,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .ok_or_else(|| Error::internal("expected non-null MLIR pass-manager handle"))
         }
     }
 }
@@ -304,13 +309,16 @@ impl<'p, 'c: 'p, 't: 'c> OperationPassManager<'p, 'c, 't> {
 
     /// Nests an [`OperationPassManager`] under this [`OperationPassManager`] and returns it. The nested
     /// [`OperationPassManager`] will only run on [`Operation`]s matching the provided name.
-    pub fn nest<'s, S: Into<StringRef<'s>>>(&self, operation_name: S) -> OperationPassManager<'p, 'c, 't> {
+    pub fn nest<'s, S: Into<StringRef<'s>>>(
+        &self,
+        operation_name: S,
+    ) -> Result<OperationPassManager<'p, 'c, 't>, Error> {
         unsafe {
             OperationPassManager::from_c_api(
                 mlirOpPassManagerGetNestedUnder(self.handle, operation_name.into().to_c_api()),
                 self.context,
             )
-            .unwrap()
+            .ok_or_else(|| Error::internal("expected non-null nested MLIR operation pass-manager handle"))
         }
     }
 
@@ -336,7 +344,7 @@ impl<'p, 'c: 'p, 't: 'c> OperationPassManager<'p, 'c, 't> {
             LogicalResult::from_c_api(mlirOpPassManagerAddPipeline(
                 self.handle,
                 pipeline_elements.into().to_c_api(),
-                Some(c_api_pass_pipeline_parse_error_callback),
+                Some(c_api_pass_pipeline_parsing_error_callback),
                 &mut error_message as *mut _ as *mut _,
             ))
         };
@@ -359,7 +367,7 @@ impl<'p, 'c: 'p, 't: 'c> OperationPassManager<'p, 'c, 't> {
             LogicalResult::from_c_api(mlirOpPassManagerAddPipeline(
                 self.handle,
                 pipeline.into().to_c_api(),
-                Some(c_api_pass_pipeline_parse_error_callback),
+                Some(c_api_pass_pipeline_parsing_error_callback),
                 &mut error_message as *mut _ as *mut _,
             ))
         };
@@ -388,7 +396,7 @@ impl Debug for OperationPassManager<'_, '_, '_> {
     }
 }
 
-unsafe extern "C" fn c_api_pass_pipeline_parse_error_callback(string: MlirStringRef, data: *mut std::ffi::c_void) {
+unsafe extern "C" fn c_api_pass_pipeline_parsing_error_callback(string: MlirStringRef, data: *mut std::ffi::c_void) {
     unsafe {
         let string = StringRef::from_c_api(string);
         let data = &mut *(data as *mut Option<String>);
@@ -418,20 +426,20 @@ mod tests {
         context.load_all_available_dialects();
         context.register_all_llvm_translations();
         let location = context.unknown_location();
-        let mut pass_manager = context.pass_manager_on_operation("builtin.module");
+        let mut pass_manager = context.pass_manager_on_operation("builtin.module").unwrap();
         pass_manager.enable_verification();
         pass_manager.disable_verification();
         pass_manager.enable_verification();
         pass_manager.enable_timing();
         pass_manager.enable_statistics(PassDisplayMode::Pipeline);
-        pass_manager.add_pass(builtin::create_conversion_func_to_llvm_pass());
+        pass_manager.add_pass(builtin::create_conversion_func_to_llvm_pass().unwrap());
         assert!(!pass_manager.enable_ir_printing(&PassIrPrintingOptions::default()));
         context.disable_multi_threading();
         assert!(pass_manager.enable_ir_printing(&PassIrPrintingOptions {
             path: Some(PathBuf::default()),
             ..PassIrPrintingOptions::default()
         }));
-        let mut op_pass_manager = pass_manager.as_operation_pass_manager();
+        let mut op_pass_manager = pass_manager.as_operation_pass_manager().unwrap();
         assert_eq!(
             format!("{}", op_pass_manager),
             "builtin.module(convert-func-to-llvm{index-bitwidth=0 use-bare-ptr-memref-call-conv=false})",
@@ -444,8 +452,8 @@ mod tests {
         assert!(op_pass_manager.add_pass_pipeline("func.func(").is_err());
 
         // Run on a top-level module.
-        let module = context.module(location);
-        assert!(pass_manager.run(&module.as_operation()).is_success());
+        let module = context.module(location).unwrap();
+        assert!(pass_manager.run(&module.as_operation().unwrap()).is_success());
 
         // Run on a nested function.
         let module = context
@@ -462,18 +470,20 @@ mod tests {
                     }
                 }"})
             .unwrap();
-        let pass_manager = context.pass_manager();
-        let mut nested_manager = pass_manager.nest("func.func");
-        nested_manager.add_pass(builtin::create_transforms_print_op_stats_pass());
+        let pass_manager = context.pass_manager().unwrap();
+        let mut nested_manager = pass_manager.nest("func.func").unwrap();
+        nested_manager.add_pass(builtin::create_transforms_print_op_stats_pass().unwrap());
         assert_eq!(format!("{}", nested_manager), "func.func(print-op-stats{json=false})");
         assert_eq!(format!("{:?}", nested_manager), "OperationPassManager[func.func(print-op-stats{json=false})]");
-        assert!(pass_manager.run(&module.as_operation()).is_success());
-        let pass_manager = context.pass_manager();
+        assert!(pass_manager.run(&module.as_operation().unwrap()).is_success());
+        let pass_manager = context.pass_manager().unwrap();
         pass_manager
             .nest("builtin.module")
+            .unwrap()
             .nest("func.func")
-            .add_pass(builtin::create_transforms_print_op_stats_pass());
-        assert!(pass_manager.run(&module.as_operation()).is_success());
+            .unwrap()
+            .add_pass(builtin::create_transforms_print_op_stats_pass().unwrap());
+        assert!(pass_manager.run(&module.as_operation().unwrap()).is_success());
 
         // Test a couple C API edge cases.
         let bad_pass_manager_handle = MlirPassManager { ptr: std::ptr::null_mut() };
@@ -488,8 +498,8 @@ mod tests {
         let context = Context::new();
 
         // Test using a good pipeline.
-        let pass_manager = context.pass_manager();
-        let mut op_pass_manager = pass_manager.as_operation_pass_manager();
+        let pass_manager = context.pass_manager().unwrap();
+        let mut op_pass_manager = pass_manager.as_operation_pass_manager().unwrap();
         assert!(
             op_pass_manager
                 .parse_pass_pipeline(
