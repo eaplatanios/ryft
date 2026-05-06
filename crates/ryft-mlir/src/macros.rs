@@ -225,7 +225,7 @@ macro_rules! mlir_enum_attribute {
                 #[doc = "Returns the"]
                 #[doc = $description]
                 #[doc = "that is stored in this [`Attribute`](crate::Attribute)."]
-                pub fn value(&self) -> $rust_name {
+                pub fn value(&self) -> Result<$rust_name, $crate::errors::Error> {
                     let value = unsafe {
                         $crate::StringRef::from_c_api(
                             ryft_xla_sys::bindings::[<$mlir_prefix $mlir_name AttrGetValue>](self.handle),
@@ -235,7 +235,7 @@ macro_rules! mlir_enum_attribute {
                         .as_str()
                         .ok()
                         .and_then(|value| $rust_name::try_from(value).ok())
-                        .unwrap()
+                        .ok_or_else(|| $crate::errors::Error::invalid_argument(concat!("invalid ", $description)))
                 }
             }
 
@@ -247,7 +247,10 @@ macro_rules! mlir_enum_attribute {
             );
 
             impl<'c, 't> $crate::FromWithContext<'c, 't, $rust_name> for [<$rust_name AttributeRef>]<'c, 't> {
-                fn from_with_context(value: $rust_name, context: &'c $crate::Context<'t>) -> Self {
+                fn from_with_context(
+                    value: $rust_name,
+                    context: &'c $crate::Context<'t>,
+                ) -> Result<Self, $crate::errors::Error> {
                     context.[<$($rust_prefix _)? $rust_name:snake>](value)
                 }
             }
@@ -259,10 +262,10 @@ macro_rules! mlir_enum_attribute {
                 pub fn [<$($rust_prefix _)? $rust_name:snake>]<'c>(
                     &'c self,
                     value: $rust_name,
-                ) -> [<$rust_name AttributeRef>]<'c, 't> {
+                ) -> Result<[<$rust_name AttributeRef>]<'c, 't>, $crate::errors::Error> {
                     $(
                         // Make sure that the right dialect is loaded into this context to avoid segmentation faults.
-                        self.load_dialect($crate::DialectHandle::$mlir_dialect_handle_constructor());
+                        self.load_dialect($crate::DialectHandle::$mlir_dialect_handle_constructor())?;
                     )?
                     // While this operation can mutate the context (in that it might add an entry to its corresponding
                     // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
@@ -278,7 +281,7 @@ macro_rules! mlir_enum_attribute {
                             ),
                             &self,
                         )
-                        .unwrap()
+                        .ok_or_else(|| $crate::errors::Error::invalid_argument(concat!("invalid arguments to `Context::", stringify!([<$($rust_prefix _)? $rust_name:snake>]), "`")))
                     }
                 }
             }
@@ -324,12 +327,13 @@ macro_rules! mlir_attribute_field {
     // We special-case `FloatTypeRef` because it requires a call to its constructor.
     ($rust_name:ident, $mlir_name:ident, FloatTypeRef, mlir_prefix = $mlir_prefix:ident $(,)*) => {
         paste::paste! {
-            pub fn $rust_name(&self) -> $crate::FloatTypeRef<'c, 't> {
+            pub fn $rust_name(&self) -> Result<$crate::FloatTypeRef<'c, 't>, $crate::errors::Error> {
                 unsafe {
-                    $crate::FloatTypeRef::from_c_api(
+                    <$crate::FloatTypeRef as $crate::Type>::from_c_api(
                         ryft_xla_sys::bindings::[<$mlir_prefix $mlir_name>](self.handle),
                         self.context,
-                    ).unwrap()
+                    )
+                    .ok_or_else(|| $crate::errors::Error::internal("expected non-null MLIR float type handle"))
                 }
             }
         }
@@ -392,13 +396,13 @@ macro_rules! mlir_attribute_field {
 /// // First, define a custom operation trait.
 /// pub trait AddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 ///     /// Returns the left-hand side input of this [`AddOperation`].
-///     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-///         self.operand_value(0).unwrap()
+///     fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+///         self.required_operand_value(0)
 ///     }
 ///
 ///     /// Returns the right-hand side input of this [`AddOperation`].
-///     fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-///         self.operand_value(1).unwrap()
+///     fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+///         self.required_operand_value(1)
 ///     }
 /// }
 ///
@@ -426,6 +430,12 @@ macro_rules! mlir_op {
             }
 
             impl<'o, 'c: 'o, 't: 'c> [<$name Operation>]<'o, 'c, 't> for [<Detached $name Operation>]<'c, 't> {}
+
+            #[cfg(test)]
+            impl<'o, 'c: 'o, 't: 'c> [<$name Operation>]<'o, 'c, 't>
+                for Result<[<Detached $name Operation>]<'c, 't>, $crate::errors::Error>
+            {
+            }
 
             impl<'o, 'c: 'o, 't: 'c> $crate::Operation<'o, 'c, 't> for [<Detached $name Operation>]<'c, 't> {
                 unsafe fn from_c_api(
@@ -600,18 +610,6 @@ macro_rules! mlir_op {
                 }
             }
 
-            impl<'r, 'o: 'r, 'c: 'o, 't: 'c> From<&'r [<Detached $name Operation>]<'c, 't>>
-                for [<$name OperationRef>]<'o, 'c, 't>
-            {
-                fn from(value: &'r [<Detached $name Operation>]<'c, 't>) -> Self {
-                    unsafe {
-                        <Self as $crate::Operation>::from_c_api(
-                            <[<Detached $name Operation>] as $crate::Operation>::to_c_api(&value),
-                            value.context,
-                        ).unwrap()
-                    }
-                }
-            }
         }
     };
 }
@@ -647,12 +645,22 @@ macro_rules! mlir_op_trait {
         paste::paste! {
             impl<'o, 'c: 'o, 't: 'c> $crate::$trait_name<'o, 'c, 't> for [<Detached $op_name Operation>]<'c, 't> {}
             impl<'o, 'c: 'o, 't: 'c> $crate::$trait_name<'o, 'c, 't> for [<$op_name OperationRef>]<'o, 'c, 't> {}
+            #[cfg(test)]
+            impl<'o, 'c: 'o, 't: 'c> $crate::$trait_name<'o, 'c, 't>
+                for Result<[<Detached $op_name Operation>]<'c, 't>, $crate::errors::Error>
+            {
+            }
         }
     };
     ($op_name:ident, @local $trait_name:ident) => {
         paste::paste! {
             impl<'o, 'c: 'o, 't: 'c> $trait_name<'o, 'c, 't> for [<Detached $op_name Operation>]<'c, 't> {}
             impl<'o, 'c: 'o, 't: 'c> $trait_name<'o, 'c, 't> for [<$op_name OperationRef>]<'o, 'c, 't> {}
+            #[cfg(test)]
+            impl<'o, 'c: 'o, 't: 'c> $trait_name<'o, 'c, 't>
+                for Result<[<Detached $op_name Operation>]<'c, 't>, $crate::errors::Error>
+            {
+            }
         }
     };
 }
@@ -697,7 +705,6 @@ macro_rules! mlir_generic_unary_op {
             $crate::mlir_op_trait!([<$op:camel>], OneResult);
 
             #[doc = "Constructs a new detached/owned [`" [<$op:camel Operation>] "`] at the specified [`Location`]."]
-            #[doc = "Note that if any of the inputs to this function are invalid, it will panic!"]
             pub fn $op<
                 'v,
                 'c: 'v,
@@ -709,16 +716,14 @@ macro_rules! mlir_generic_unary_op {
                 input: V,
                 output_type: T,
                 location: L,
-            ) -> [<Detached $op:camel Operation>]<'c, 't> {
+            ) -> Result<[<Detached $op:camel Operation>]<'c, 't>, $crate::errors::Error> {
                 let context = location.context();
-                context.load_dialect($crate::DialectHandle::$dialect());
+                context.load_dialect($crate::DialectHandle::$dialect())?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
                     .add_operands(&[input])
                     .add_result(output_type)
-                    .build()
-                    .and_then(|operation| unsafe { $crate::DetachedOp::cast(operation) })
-                    .expect(format!("invalid arguments to `{}::{}`", stringify!($dialect), stringify!($op)).as_str())
+                    .build_and_cast(format!("invalid arguments to `{}::{}`", stringify!($dialect), stringify!($op)))
             }
         }
     };
@@ -763,20 +768,17 @@ macro_rules! mlir_unary_op {
             $crate::mlir_op_trait!([<$op:camel>], OneResult);
 
             #[doc = "Constructs a new detached/owned [`" [<$op:camel Operation>] "`] at the specified [`Location`]."]
-            #[doc = "Note that if any of the inputs to this function are invalid, it will panic!"]
             pub fn $op<'v, 'c: 'v, 't: 'c, V: $crate::Value<'v, 'c, 't>, L: $crate::Location<'c, 't>>(
                 input: V,
                 location: L,
-            ) -> [<Detached $op:camel Operation>]<'c, 'c> {
+            ) -> Result<[<Detached $op:camel Operation>]<'c, 'c>, $crate::errors::Error> {
                 let context = location.context();
-                context.load_dialect($crate::DialectHandle::$dialect());
+                context.load_dialect($crate::DialectHandle::$dialect())?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
                     .add_operands(&[input])
                     .enable_result_type_inference()
-                    .build()
-                    .and_then(|operation| unsafe { $crate::DetachedOp::cast(operation) })
-                    .expect(format!("invalid arguments to `{}::{}`", stringify!($dialect), stringify!($op)).as_str())
+                    .build_and_cast(format!("invalid arguments to `{}::{}`", stringify!($dialect), stringify!($op)))
             }
         }
     };
@@ -817,14 +819,14 @@ macro_rules! mlir_binary_op {
             pub trait [<$op:camel Operation>]<'o, 'c: 'o, 't: 'c>: $crate::Operation<'o, 'c, 't> {
                 #[doc = "Returns the left-hand side input (i.e., first operand)"]
                 #[doc = "of this [`" [<$op:camel Operation>] "`]."]
-                fn lhs(&self) -> $crate::ValueRef<'o, 'c, 't> {
-                    self.operand_value(0).unwrap()
+                fn lhs(&self) -> Result<$crate::ValueRef<'o, 'c, 't>, $crate::errors::Error> {
+                    self.required_operand_value(0)
                 }
 
                 #[doc = "Returns the right-hand side input (i.e., second operand)"]
                 #[doc = "of this [`" [<$op:camel Operation>] "`]."]
-                fn rhs(&self) -> $crate::ValueRef<'o, 'c, 't> {
-                    self.operand_value(1).unwrap()
+                fn rhs(&self) -> Result<$crate::ValueRef<'o, 'c, 't>, $crate::errors::Error> {
+                    self.required_operand_value(1)
                 }
             }
 
@@ -832,7 +834,6 @@ macro_rules! mlir_binary_op {
             $crate::mlir_op_trait!([<$op:camel>], OneResult);
 
             #[doc = "Constructs a new detached/owned [`" [<$op:camel Operation>] "`] at the specified [`Location`]."]
-            #[doc = "Note that if any of the inputs to this function are invalid, it will panic!"]
             pub fn $op<
                 'lhs,
                 'rhs,
@@ -845,16 +846,14 @@ macro_rules! mlir_binary_op {
                 lhs: LHS,
                 rhs: RHS,
                 location: L,
-            ) -> [<Detached $op:camel Operation>]<'c, 't> {
+            ) -> Result<[<Detached $op:camel Operation>]<'c, 't>, $crate::errors::Error> {
                 let context = location.context();
-                context.load_dialect($crate::DialectHandle::$dialect());
+                context.load_dialect($crate::DialectHandle::$dialect())?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
                     .add_operands(&[lhs.as_ref(), rhs.as_ref()])
                     .enable_result_type_inference()
-                    .build()
-                    .and_then(|operation| unsafe { $crate::DetachedOp::cast(operation) })
-                    .expect(format!("invalid arguments to `{}::{}`", stringify!($dialect), stringify!($op)).as_str())
+                    .build_and_cast(format!("invalid arguments to `{}::{}`", stringify!($dialect), stringify!($op)))
             }
         }
     };
@@ -889,8 +888,15 @@ macro_rules! mlir_binary_op {
 macro_rules! mlir_pass {
     ($rust_name:ident, $mlir_name:ident) => {
         paste::paste! {
-            pub fn [<create_ $rust_name>]() -> $crate::Pass {
-                unsafe { $crate::Pass::from_c_api(ryft_xla_sys::bindings::[<mlirCreate $mlir_name>]()).unwrap() }
+            pub fn [<create_ $rust_name>]() -> Result<$crate::Pass, $crate::errors::Error> {
+                unsafe {
+                    $crate::Pass::from_c_api(ryft_xla_sys::bindings::[<mlirCreate $mlir_name>]())
+                        .ok_or_else(|| $crate::errors::Error::internal(concat!(
+                            "expected non-null MLIR pass handle from `mlirCreate",
+                            stringify!($mlir_name),
+                            "`",
+                        )))
+                }
             }
 
             pub fn [<register_ $rust_name>]() {

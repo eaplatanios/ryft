@@ -104,6 +104,6 @@ mod tests {
     fn test_register_all_passes() {
         // We intentionally try to register multiple times in parallel to ensure that the operation is idempotent.
         let threads = (0..100).map(|_| std::thread::spawn(|| register_all_passes())).collect::<Vec<_>>();
-        threads.into_iter().for_each(|thread| drop(thread.join()));
+        threads.into_iter().for_each(|thread| thread.join().unwrap());
     }
 }
