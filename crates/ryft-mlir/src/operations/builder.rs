@@ -206,8 +206,6 @@ impl Drop for OperationBuilder<'_, '_> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::errors::Error;
-
     use super::*;
 
     #[test]

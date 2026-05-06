@@ -21,10 +21,9 @@ use ryft_xla_sys::bindings::{
     mlirOperationWalk, mlirOperationWriteBytecode, mlirOperationWriteBytecodeWithConfig,
 };
 
-use crate::errors::Error;
 use crate::support::{write_to_formatter_callback, write_to_string_callback};
 use crate::{
-    Attribute, AttributeRef, Block, BlockRef, Context, Identifier, Location, LocationRef, LogicalResult,
+    Attribute, AttributeRef, Block, BlockRef, Context, Error, Identifier, Location, LocationRef, LogicalResult,
     NamedAttributeRef, OperandRef, OperationResultRef, RegionRef, StringRef, TypeId, TypeRef, Value, ValueRef,
     write_to_bytes_callback,
 };

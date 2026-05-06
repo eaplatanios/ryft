@@ -1,7 +1,6 @@
-use crate::{invoke_xla_ffi_api_error_fn, invoke_xla_ffi_api_void_fn};
-
 use crate::extensions::ffi::errors::FfiError;
 use crate::extensions::ffi::handlers::FfiApi;
+use crate::{invoke_xla_ffi_api_error_fn, invoke_xla_ffi_api_void_fn};
 
 /// [`FfiFuture`]s provide a mechanism to signal the completion of asynchronous computations
 /// in XLA FFI handlers back to the XLA runtime.

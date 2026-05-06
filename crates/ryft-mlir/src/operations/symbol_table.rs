@@ -5,7 +5,7 @@ use ryft_xla_sys::bindings::{
     MlirSymbolTable, mlirSymbolTableDestroy, mlirSymbolTableErase, mlirSymbolTableInsert, mlirSymbolTableLookup,
 };
 
-use crate::{Attribute, StringAttributeRef, StringRef, Error};
+use crate::{Attribute, Error, StringAttributeRef, StringRef};
 
 use super::{Operation, OperationRef};
 

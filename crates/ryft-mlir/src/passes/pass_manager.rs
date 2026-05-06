@@ -10,9 +10,8 @@ use ryft_xla_sys::bindings::{
     mlirPassManagerGetAsOpPassManager, mlirPassManagerGetNestedUnder, mlirPassManagerRunOnOp, mlirPrintPassPipeline,
 };
 
-use crate::errors::Error;
 use crate::support::write_to_formatter_callback;
-use crate::{Context, LogicalResult, Operation, OperationPrintingFlags, StringRef};
+use crate::{Context, Error, LogicalResult, Operation, OperationPrintingFlags, StringRef};
 
 use super::Pass;
 

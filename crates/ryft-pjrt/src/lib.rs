@@ -367,10 +367,9 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
-    use crate::errors::Error;
     use crate::{
-        Api, Client, ClientOptions, CpuClientOptions, NamedValue, Plugin, VERSION, Value, Version, hash_map_from_c_api,
-        load_cpu_plugin, str_from_c_api,
+        Api, Client, ClientOptions, CpuClientOptions, Error, NamedValue, Plugin, VERSION, Value, Version,
+        hash_map_from_c_api, load_cpu_plugin, str_from_c_api,
     };
 
     /// Platform identifier used by [`test_for_each_platform`] to signal which backend is being tested.

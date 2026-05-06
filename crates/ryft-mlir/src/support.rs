@@ -9,7 +9,7 @@ use ryft_xla_sys::bindings::{
     mlirTypeIDAllocatorCreate, mlirTypeIDAllocatorDestroy, mlirTypeIDCreate, mlirTypeIDEqual, mlirTypeIDHashValue,
 };
 
-use crate::errors::Error;
+use crate::Error;
 
 /// Pointer to a sized fragment of a string that is not necessarily null-terminated. Note that [`StringRef`] does not
 /// own the underlying string and that is why it has a lifetime parameter that is tied to the owner of that string.

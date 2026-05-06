@@ -12,11 +12,10 @@ use ryft_xla_sys::bindings::{
     mlirValueReplaceAllUsesOfWith, mlirValueSetType,
 };
 
-use crate::errors::Error;
 use crate::support::write_to_string_callback;
 use crate::{
-    AsmState, AttributeRef, BlockRef, Context, Location, LocationRef, Operation, OperationPrintingFlags, OperationRef,
-    StringRef, Type, TypeRef, mlir_subtype_trait_impls,
+    AsmState, AttributeRef, BlockRef, Context, Error, Location, LocationRef, Operation, OperationPrintingFlags,
+    OperationRef, StringRef, Type, TypeRef, mlir_subtype_trait_impls,
 };
 
 /// [`Value`]s represent the arguments of [`Block`](crate::Block)s and the results and operands of [`Operation`]s.

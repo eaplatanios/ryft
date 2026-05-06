@@ -3,8 +3,7 @@ use std::fmt::{Debug, Display};
 
 use ryft_xla_sys::bindings::{MlirType, mlirTypeDump, mlirTypeGetDialect, mlirTypeGetTypeID, mlirTypeParseGet};
 
-use crate::errors::Error;
-use crate::{AttributeRef, Context, Dialect, StringRef, TypeId, mlir_subtype_trait_impls};
+use crate::{AttributeRef, Context, Dialect, Error, StringRef, TypeId, mlir_subtype_trait_impls};
 
 /// Each value in MLIR has a [`Type`] defined by the MLIR type system. MLIR has an open type system (i.e., there is no
 /// fixed set of types), and types may have application-specific semantics.MLIR dialects may define any number of

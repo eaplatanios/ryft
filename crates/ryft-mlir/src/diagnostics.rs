@@ -9,9 +9,8 @@ use ryft_xla_sys::bindings::{
     mlirDiagnosticGetSeverity, mlirDiagnosticPrint,
 };
 
-use crate::errors::Error;
 use crate::support::write_to_formatter_callback;
-use crate::{Context, Location, LocationRef, LogicalResult};
+use crate::{Context, Error, Location, LocationRef, LogicalResult};
 
 /// Severity level of a [`Diagnostic`]. Note that if the underlying native library returns a severity level that
 /// is not recognized by this library (e.g., due to a version incompatibility), then that severity level will be

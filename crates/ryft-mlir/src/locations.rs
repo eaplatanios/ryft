@@ -2,8 +2,7 @@ use std::fmt::{Debug, Display};
 
 use ryft_xla_sys::bindings::{MlirLocation, mlirEmitError};
 
-use crate::errors::Error;
-use crate::{Context, mlir_subtype_trait_impls};
+use crate::{Context, Error, mlir_subtype_trait_impls};
 
 /// MLIR location that is used for describing where some operation, identifier, etc., is defined in the source code.
 /// In MLIR, locations are effectively metadata that indicate where an operation or value originated from (e.g., a

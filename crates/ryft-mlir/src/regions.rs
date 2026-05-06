@@ -6,8 +6,7 @@ use ryft_xla_sys::bindings::{
     mlirRegionInsertOwnedBlockBefore, mlirRegionTakeBody,
 };
 
-use crate::errors::Error;
-use crate::{Block, BlockRef, Context, DetachedBlock, TryFromWithContext};
+use crate::{Block, BlockRef, Context, DetachedBlock, Error, TryFromWithContext};
 
 /// [`Region`]s are one of the main building blocks of MLIR programs. MLIR is fundamentally based on a graph-like
 /// data structure of nodes, called [`Operation`](crate::Operation)s, and edges, called [`Value`](crate::Value)s.

@@ -5,8 +5,7 @@ use ryft_xla_sys::bindings::{
     mlirCreateExternalPass, mlirExternalPassSignalFailure, mlirTypeIDCreate,
 };
 
-use crate::errors::Error;
-use crate::{Context, ContextRef, DialectHandle, LogicalResult, Operation, OperationRef, StringRef, TypeId};
+use crate::{Context, ContextRef, DialectHandle, Error, LogicalResult, Operation, OperationRef, StringRef, TypeId};
 
 /// MLIR passes represent the basic infrastructure for transformation and optimization. Refer to the documentation of
 /// [`PassManager`](crate::PassManager) and to the [MLIR documentation](https://mlir.llvm.org/docs/PassManagement) for
@@ -273,7 +272,7 @@ mod tests {
                     func::FuncAttributes::default(),
                     {
                         let mut block = context.block_with_no_arguments();
-                        block.append_operation(func::r#return::<ValueRef, _>(&[], location)).unwrap();
+                        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
                         block.try_into().unwrap()
                     },
                     location,

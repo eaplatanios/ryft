@@ -10,8 +10,7 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::dialects::builtin::{DetachedModuleOperation, ModuleOperationRef};
-use crate::errors::Error;
-use crate::{BlockRef, Context, Location, Operation, StringRef};
+use crate::{BlockRef, Context, Error, Location, Operation, StringRef};
 
 /// [`Module`]s in MLIR represent top-level [`Operation`]s (i.e., they are instances of a built-in operation type).
 /// A [`Module`] contains a single [`Region`](crate::Region) which itself contains a single [`Block`](crate::Block).

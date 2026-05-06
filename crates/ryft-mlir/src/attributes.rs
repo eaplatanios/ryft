@@ -5,8 +5,7 @@ use ryft_xla_sys::bindings::{
     mlirAttributeGetType, mlirAttributeGetTypeID, mlirAttributeParseGet, mlirNamedAttributeGet,
 };
 
-use crate::errors::Error;
-use crate::{Context, Dialect, Identifier, StringRef, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
+use crate::{Context, Dialect, Error, Identifier, StringRef, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
 
 /// MLIR attributes are the mechanism for specifying constant data on operations in places where a variable is never
 /// allowed (e.g., the comparison predicate of a `arith.cmpi` operation). Each operation has an attribute dictionary,

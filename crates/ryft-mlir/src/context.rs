@@ -9,8 +9,7 @@ use ryft_xla_sys::bindings::{
     mlirContextSetThreadPool,
 };
 
-use crate::ThreadPoolRef;
-use crate::errors::Error;
+use crate::{Error, ThreadPoolRef};
 
 /// Thread pool being used by a [`Context`]. This enum allows us to use safe abstractions for both [`Context`]s that
 /// own an underlying [`ThreadPoolRef`] and for [`Context`]s that use a shared one.
