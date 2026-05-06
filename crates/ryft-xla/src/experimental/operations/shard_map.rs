@@ -280,6 +280,7 @@ impl ShardMapOperation<ShardMapTracer> {
         E: DifferentiableEngine<
                 Type = ArrayType,
                 Value = ShardMapTracer,
+                LinearEngine = E,
                 LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
             >,
     {
@@ -350,6 +351,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
         E: DifferentiableEngine<
                 Type = ArrayType,
                 Value = ShardMapTracer,
+                LinearEngine = E,
                 LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
             >,
     {
@@ -577,78 +579,6 @@ where
     output
 }
 
-impl<E> DifferentiableOperation<E> for ShardMapOperation<ShardMapTensor>
-where
-    E: DifferentiableEngine<
-            Type = ArrayType,
-            Value = ShardMapTensor,
-            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor, ArrayType>,
-        >,
-    ShardMapTensor: Differentiable<ArrayType, Tangent = ShardMapTensor>,
-{
-    fn jvp(
-        &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<ShardMapTensor, AtomId>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_outputs = InterpretableOperation::interpret(self, primal_inputs.as_slice())?;
-        check_count!("output", primal_outputs, self.output_types.len(), TracingError);
-        let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
-        if tangent_inputs.is_empty() && !self.output_types.is_empty() {
-            return Err(missing_linear_shard_map_staging_context());
-        }
-        let tangent_outputs = context.stage(
-            LinearArrayOperation::Custom(Arc::new(
-                make_linear_tensor_shard_map(&self.body)
-                    .map_err(trace_error_from_shard_map)?
-                    .to_tensor_linear_custom_primitive(),
-            )),
-            tangent_inputs.as_slice(),
-        )?;
-        check_count!("output", tangent_outputs, self.output_types.len(), TracingError);
-        Ok(primal_outputs
-            .into_iter()
-            .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent })
-            .collect::<Vec<_>>())
-    }
-}
-
-impl<E> DifferentiableOperation<E> for LinearShardMapOperation<ShardMapTensor>
-where
-    E: DifferentiableEngine<
-            Type = ArrayType,
-            Value = ShardMapTensor,
-            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor, ArrayType>,
-        >,
-    ShardMapTensor: Differentiable<ArrayType, Tangent = ShardMapTensor>,
-{
-    fn jvp(
-        &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<ShardMapTensor, AtomId>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_outputs = InterpretableOperation::interpret(self, primal_inputs.as_slice())?;
-        check_count!("output", primal_outputs, self.output_types.len(), TracingError);
-        let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
-        if tangent_inputs.is_empty() && !self.output_types.is_empty() {
-            return Err(missing_linear_shard_map_staging_context());
-        }
-        let tangent_outputs = context.stage(
-            LinearArrayOperation::Custom(Arc::new(self.to_tensor_linear_custom_primitive())),
-            tangent_inputs.as_slice(),
-        )?;
-        check_count!("output", tangent_outputs, self.output_types.len(), TracingError);
-        Ok(primal_outputs
-            .into_iter()
-            .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent })
-            .collect::<Vec<_>>())
-    }
-}
-
 impl Operation<ArrayType> for ShardMapOperation<ShardMapTracer> {
     #[inline]
     fn name(&self) -> &'static str {
@@ -741,6 +671,7 @@ where
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTracer,
+            LinearEngine = E,
             LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
         >,
     ShardMapTracer: Differentiable<ArrayType, Tangent = ShardMapTracer>,
@@ -1221,9 +1152,10 @@ fn factorize_transpose_shard_map_body(
 
 /// Builds one linear shard-map op over abstract tensor leaves.
 ///
-/// Tensor-leaf linear shard-map ops do not read `captured_global_primals` during interpretation or MLIR lowering â€”
-/// the bodies themselves already encode everything the downstream consumers need â€” so the capture vector is left
+/// Tensor-leaf linear shard-map ops do not read `captured_global_primals` during interpretation or MLIR lowering; the
+/// bodies themselves already encode everything the downstream consumers need, so the capture vector is left
 /// empty here.
+#[cfg(test)]
 fn make_linear_tensor_shard_map(
     body: &FlatTracedShardMap,
 ) -> Result<LinearShardMapOperation<ShardMapTensor>, ShardMapTraceError> {
@@ -1596,6 +1528,7 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::convert::Infallible;
     use std::rc::Rc;
 
     use ryft_core::parameters::Placeholder;
@@ -1603,7 +1536,7 @@ mod tests {
     use ryft_core::tracing::transposition::TranspositionContext;
     use ryft_core::tracing::{Atom, AtomId, ProgramBuilder, Traceable};
     use ryft_core::tracing_v2::differentiation::JvpTracer;
-    use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext, LinearArrayOperation};
+    use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext, LinearArrayOperation, TangentValue};
     use ryft_core::types::{ArrayType, DataType, Typed};
 
     use crate::experimental::ops::XlaOperation;
@@ -1819,19 +1752,19 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_tensor_shard_map_jvp_stages_linear_shard_map() {
+    fn test_linear_tensor_shard_map_jvp_stages_zero_tangent() {
         let body = simple_traced_shard_map_body();
         let operation = make_linear_tensor_shard_map(&body).expect("linear tensor shard_map should be buildable");
         let tangent_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
-            ShardMapTensor,
-            LinearArrayOperation<ShardMapTensor, ArrayType>,
+            TangentValue<ArrayType, Infallible>,
+            LinearArrayOperation<TangentValue<ArrayType, Infallible>, ArrayType>,
         >::new()));
         let tangent_atom = tangent_builder.borrow_mut().add_input(test_array_type());
         let engine = crate::experimental::engines::XlaEngine::token();
         let mut context = JvpContext::new(engine, tangent_builder.clone());
 
-        let outputs = operation
+        let outputs = XlaOperation::LinearShardMap(Box::new(operation))
             .jvp(&mut context, &[JvpTracer { primal: ShardMapTensor::new(test_array_type()), tangent: tangent_atom }])
             .expect("linear tensor shard_map jvp should succeed");
 
@@ -1844,11 +1777,15 @@ mod tests {
             .expect("traced shard_map jvp should not leak linear terms")
             .into_inner();
         let tangent_program = tangent_builder
-            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(output_atoms, vec![Placeholder], vec![Placeholder])
+            .build::<Vec<TangentValue<ArrayType, Infallible>>, Vec<TangentValue<ArrayType, Infallible>>>(
+                output_atoms,
+                vec![Placeholder],
+                vec![Placeholder],
+            )
             .unwrap();
         assert!(
-            tangent_program.to_string().contains("linear_shard_map"),
-            "expected linear tensor shard_map jvp to stage a linear_shard_map op: {}",
+            tangent_program.to_string().contains("zero"),
+            "expected linear tensor shard_map jvp to stage a zero tangent op: {}",
             tangent_program
         );
     }

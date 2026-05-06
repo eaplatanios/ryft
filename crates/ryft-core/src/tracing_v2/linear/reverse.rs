@@ -26,19 +26,43 @@ pub fn linearize<
                 To<V> = Output,
             >,
         >,
-    V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
+    V: Differentiable<E::Type, Tangent = E::Tangent>,
 >(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(Output, Program<E::Type, V, E::LinearOperationCarrier, Input, Output>), TracingError> {
+) -> Result<
+    (
+        Output,
+        Program<
+            E::Type,
+            E::Tangent,
+            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+            Input::To<E::Tangent>,
+            Output::To<E::Tangent>,
+        >,
+    ),
+    TracingError,
+>
+where
+    Input::Family: ParameterizedFamily<E::Tangent>,
+    Output::Family: ParameterizedFamily<E::Tangent>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+{
     let input_structure = primals.parameter_structure();
     let input_primals: Vec<V> = primals.into_parameters().collect();
     let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
     let differentiable_tracing_engine = DifferentiableOperationTracingEngine::new(engine);
-    let (primal_output, program) =
+    let (primal_output, program): (Output, Program<E::Type, V, E::DifferentiableOperationCarrier, Input, Output>) =
         differentiable_tracing_engine.interpret_and_trace(function, reconstructed_primals)?;
-    Ok((primal_output, program.linearize(engine, input_primals)?))
+    Ok((
+        primal_output,
+        Program::linearize::<DifferentiableOperationTracingEngine<E>>(
+            &program,
+            differentiable_tracing_engine,
+            input_primals,
+        )?,
+    ))
 }
 
 /// Returns the primal output together with a pullback produced by transposing the staged pushforward.
@@ -49,13 +73,7 @@ pub fn linearize<
 #[allow(private_bounds)]
 pub fn vjp<
     'engine,
-    E: DifferentiableEngine<
-            Value = V,
-            LinearOperationCarrier: Clone
-                                        + InterpretableOperation<E::Type, V>
-                                        + LinearOperation<E::Type, V, E::LinearOperationCarrier>
-                                        + SupportsZero<E::Type, V>,
-        > + 'static,
+    E: DifferentiableEngine<Value = V> + 'static,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
@@ -72,14 +90,39 @@ pub fn vjp<
                 To<V> = Output,
             >,
         >,
-    V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
+    V: Differentiable<E::Type, Tangent = E::Tangent>,
 >(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(Output, Program<E::Type, V, E::LinearOperationCarrier, Output, Input>), TracingError> {
+) -> Result<
+    (
+        Output,
+        Program<
+            E::Type,
+            E::Tangent,
+            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+            Output::To<E::Tangent>,
+            Input::To<E::Tangent>,
+        >,
+    ),
+    TracingError,
+>
+where
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Clone
+        + InterpretableOperation<E::Type, E::Tangent>
+        + LinearOperation<
+            E::Type,
+            E::Tangent,
+            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+        > + SupportsZero<E::Type, E::Tangent>
+        + SupportsAdd<E::Type, E::Tangent>,
+    Input::Family: ParameterizedFamily<E::Tangent>,
+    Output::Family: ParameterizedFamily<E::Tangent>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+{
     let (output, pushforward) = linearize::<E, F, Input, Output, V>(engine, function, primals)?;
-    let output_examples = output.parameters().cloned().collect::<Vec<_>>();
+    let output_examples = output.parameters().map(Differentiable::tangent_type).collect::<Result<Vec<_>, _>>()?;
     let pullback = pushforward.transpose(output_examples.as_slice())?;
     Ok((output, pullback))
 }
@@ -97,7 +140,7 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
         traced_primals: Vec<Tracer<'engine, E>>,
     ) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
     where
-        V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
+        V: Traceable<E::Type> + Differentiable<E::Type> + One<E::Type>,
         Input: Parameterized<V>,
         Output: Parameterized<V>,
         E: DifferentiableTracingEngine<Value = V> + 'static,
@@ -145,14 +188,15 @@ pub struct TracedValueAndGrad;
 /// compact while allowing concrete replay, traced replay, and batched replay to specialize
 /// independently.
 #[doc(hidden)]
-pub(crate) trait ValueAndGradDispatch<
-    E: Engine,
+pub trait ValueAndGradDispatch<E: Engine, Input, Marker>: Parameter + Sized
+where
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
-    Mode,
->: Parameter + Sized
 {
     /// Primal scalar output value produced for the corresponding input regime.
     type Value;
+
+    /// Gradient value produced for the corresponding input regime.
+    type Gradient;
 
     /// Traced input type expected by the user-provided function.
     type FunctionInput<'engine>
@@ -169,23 +213,15 @@ pub(crate) trait ValueAndGradDispatch<
         engine: &'engine E,
         function: F,
         primals: Input,
-    ) -> Result<(Self::Value, Input), TracingError>;
+    ) -> Result<(Self::Value, Self::Gradient), TracingError>;
 }
 
 /// Concrete-value dispatch for [`value_and_grad`]: evaluates the user function via [`vjp`], checks
 /// that the output is a scalar, and pulls back a unit seed to obtain both the primal output and gradient.
 impl<
-    E: DifferentiableEngine<
-            Value = V,
-            LinearOperationCarrier: Clone
-                                        + InterpretableOperation<E::Type, V>
-                                        + LinearOperation<E::Type, V, E::LinearOperationCarrier>
-                                        + SupportsZero<E::Type, V>,
-        > + 'static,
+    E: DifferentiableEngine<Value = V> + 'static,
     V: Value<E::Type>
-        + Differentiable<E::Type, Tangent = V>
-        + Zero<E::Type>
-        + One<E::Type>
+        + Differentiable<E::Type, Tangent = E::Tangent>
         + for<'engine> Parameterized<
             V,
             Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
@@ -193,16 +229,32 @@ impl<
                 'engine,
                 DifferentiableOperationTracingEngine<E>,
             >,
+            To<V> = V,
             ParameterStructure: Debug + PartialEq,
         >,
     Input: Parameterized<
             V,
             Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            To<V> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
 > ValueAndGradDispatch<E, Input, ConcreteValueAndGrad> for V
+where
+    E::Tangent: One<E::Type>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Clone
+        + InterpretableOperation<E::Type, E::Tangent>
+        + LinearOperation<
+            E::Type,
+            E::Tangent,
+            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+        > + SupportsZero<E::Type, E::Tangent>
+        + SupportsAdd<E::Type, E::Tangent>,
+    V::Family: ParameterizedFamily<E::Tangent>,
+    Input::Family: ParameterizedFamily<E::Tangent>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
 {
     type Value = V;
+    type Gradient = Input::To<E::Tangent>;
 
     type FunctionInput<'engine>
         = Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>
@@ -217,10 +269,22 @@ impl<
         engine: &'engine E,
         function: F,
         primals: Input,
-    ) -> Result<(Self::Value, Input), TracingError> {
-        let (output, pullback): (V, Program<E::Type, V, E::LinearOperationCarrier, V, Input>) =
-            vjp(engine, |input| Ok(function(input)), primals)?;
-        let gradient = pullback.interpret(<V as One<E::Type>>::one(output.r#type().as_ref())?)?;
+    ) -> Result<(Self::Value, Self::Gradient), TracingError> {
+        let (output, pullback): (
+            V,
+            Program<
+                E::Type,
+                E::Tangent,
+                <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+                V::To<E::Tangent>,
+                Self::Gradient,
+            >,
+        ) = vjp(engine, |input| Ok(function(input)), primals)?;
+        let seed = V::To::<E::Tangent>::from_parameters(
+            output.parameter_structure(),
+            [<E::Tangent as One<E::Type>>::one(output.r#type().as_ref())?],
+        )?;
+        let gradient = pullback.interpret(seed)?;
         Ok((output, gradient))
     }
 }
@@ -230,7 +294,7 @@ impl<
 impl<
     'engine,
     E: DifferentiableTracingEngine<Value = V> + 'static,
-    V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + One<E::Type>,
+    V: Traceable<E::Type> + Differentiable<E::Type> + One<E::Type>,
     Input,
 > ValueAndGradDispatch<E, Input, TracedValueAndGrad> for Tracer<'engine, E>
 where
@@ -253,6 +317,7 @@ where
     AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
     type Value = Tracer<'engine, E>;
+    type Gradient = Input;
 
     type FunctionInput<'call>
         = Input
@@ -267,7 +332,7 @@ where
         _engine: &'call E,
         function: F,
         primals: Input,
-    ) -> Result<(Self::Value, Input), TracingError> {
+    ) -> Result<(Self::Value, Self::Gradient), TracingError> {
         let input_structure = primals.parameter_structure();
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
         let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
@@ -294,16 +359,22 @@ pub fn value_and_grad<
     'engine,
     E: Engine,
     F: FnOnce(
-        <Leaf as ValueAndGradDispatch<E, Input, Mode>>::FunctionInput<'engine>,
-    ) -> <Leaf as ValueAndGradDispatch<E, Input, Mode>>::FunctionOutput<'engine>,
+        <Leaf as ValueAndGradDispatch<E, Input, Marker>>::FunctionInput<'engine>,
+    ) -> <Leaf as ValueAndGradDispatch<E, Input, Marker>>::FunctionOutput<'engine>,
     Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
-    Leaf: ValueAndGradDispatch<E, Input, Mode>,
-    Mode,
+    Leaf: ValueAndGradDispatch<E, Input, Marker>,
+    Marker,
 >(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(<Leaf as ValueAndGradDispatch<E, Input, Mode>>::Value, Input), TracingError> {
+) -> Result<
+    (
+        <Leaf as ValueAndGradDispatch<E, Input, Marker>>::Value,
+        <Leaf as ValueAndGradDispatch<E, Input, Marker>>::Gradient,
+    ),
+    TracingError,
+> {
     Leaf::invoke(engine, function, primals)
 }
 
@@ -318,13 +389,7 @@ pub fn value_and_grad<
 #[allow(private_bounds)]
 pub fn value_and_grad_with_aux<
     'engine,
-    E: DifferentiableEngine<
-            Value = V,
-            LinearOperationCarrier: Clone
-                                        + InterpretableOperation<E::Type, V>
-                                        + LinearOperation<E::Type, V, E::LinearOperationCarrier>
-                                        + SupportsZero<E::Type, V>,
-        > + 'static,
+    E: DifferentiableEngine<Value = V> + 'static,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> (
@@ -334,6 +399,7 @@ pub fn value_and_grad_with_aux<
     Input: Parameterized<
             V,
             Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            To<V> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     Aux: Parameterized<
@@ -345,9 +411,7 @@ pub fn value_and_grad_with_aux<
             ParameterStructure: Debug + PartialEq,
         >,
     V: Traceable<E::Type>
-        + Differentiable<E::Type, Tangent = V>
-        + Zero<E::Type>
-        + One<E::Type>
+        + Differentiable<E::Type, Tangent = E::Tangent>
         + Parameterized<
             V,
             Family: ParameterizedFamily<
@@ -364,13 +428,31 @@ pub fn value_and_grad_with_aux<
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<((V, Aux), Input), TracingError> {
+) -> Result<((V, Aux), Input::To<E::Tangent>), TracingError>
+where
+    E::Tangent: One<E::Type>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Clone
+        + InterpretableOperation<E::Type, E::Tangent>
+        + LinearOperation<
+            E::Type,
+            E::Tangent,
+            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+        > + SupportsZero<E::Type, E::Tangent>
+        + SupportsAdd<E::Type, E::Tangent>,
+    V::Family: ParameterizedFamily<E::Tangent>,
+    Input::Family: ParameterizedFamily<E::Tangent>,
+    Aux::Family: ParameterizedFamily<E::Tangent>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+{
     let ((output, aux), pullback) = vjp(engine, |input| Ok(function(input)), primals)?;
-    let aux_zeros = Aux::from_parameters(
-        aux.parameter_structure(),
-        aux.parameters().map(|value| V::zero(value.r#type().as_ref())).collect::<Result<Vec<_>, _>>()?,
+    let output_cotangent_structure = (output.parameter_structure(), aux.parameter_structure());
+    let seed = <E::Tangent as One<E::Type>>::one(output.r#type().as_ref())?;
+    let aux_zeros = aux.parameters().map(Differentiable::tangent_type).collect::<Result<Vec<_>, _>>()?;
+    let output_cotangent = <(V, Aux) as Parameterized<V>>::To::<E::Tangent>::from_parameters(
+        output_cotangent_structure,
+        std::iter::once(seed).chain(aux_zeros.into_iter()),
     )?;
-    let gradient = pullback.interpret((V::one(output.r#type().as_ref())?, aux_zeros))?;
+    let gradient = pullback.interpret(output_cotangent)?;
     Ok(((output, aux), gradient))
 }
 
@@ -385,16 +467,16 @@ pub fn grad<
     'engine,
     E: Engine,
     F: FnOnce(
-        <Leaf as ValueAndGradDispatch<E, Input, Mode>>::FunctionInput<'engine>,
-    ) -> <Leaf as ValueAndGradDispatch<E, Input, Mode>>::FunctionOutput<'engine>,
+        <Leaf as ValueAndGradDispatch<E, Input, Marker>>::FunctionInput<'engine>,
+    ) -> <Leaf as ValueAndGradDispatch<E, Input, Marker>>::FunctionOutput<'engine>,
     Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
-    Leaf: ValueAndGradDispatch<E, Input, Mode>,
-    Mode,
+    Leaf: ValueAndGradDispatch<E, Input, Marker>,
+    Marker,
 >(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<Input, TracingError> {
+) -> Result<<Leaf as ValueAndGradDispatch<E, Input, Marker>>::Gradient, TracingError> {
     Leaf::invoke(engine, function, primals).map(|(_, gradient)| gradient)
 }
 
@@ -406,13 +488,7 @@ pub fn grad<
 #[allow(private_bounds)]
 pub fn grad_with_aux<
     'engine,
-    E: DifferentiableEngine<
-            Value = V,
-            LinearOperationCarrier: Clone
-                                        + InterpretableOperation<E::Type, V>
-                                        + LinearOperation<E::Type, V, E::LinearOperationCarrier>
-                                        + SupportsZero<E::Type, V>,
-        > + 'static,
+    E: DifferentiableEngine<Value = V> + 'static,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> (
@@ -422,6 +498,7 @@ pub fn grad_with_aux<
     Input: Parameterized<
             V,
             Family: ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            To<V> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     Aux: Parameterized<
@@ -433,9 +510,7 @@ pub fn grad_with_aux<
             ParameterStructure: Debug + PartialEq,
         >,
     V: Traceable<E::Type>
-        + Differentiable<E::Type, Tangent = V>
-        + Zero<E::Type>
-        + One<E::Type>
+        + Differentiable<E::Type, Tangent = E::Tangent>
         + Parameterized<
             V,
             Family: ParameterizedFamily<
@@ -452,7 +527,22 @@ pub fn grad_with_aux<
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(Input, Aux), TracingError> {
+) -> Result<(Input::To<E::Tangent>, Aux), TracingError>
+where
+    E::Tangent: One<E::Type>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Clone
+        + InterpretableOperation<E::Type, E::Tangent>
+        + LinearOperation<
+            E::Type,
+            E::Tangent,
+            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+        > + SupportsZero<E::Type, E::Tangent>
+        + SupportsAdd<E::Type, E::Tangent>,
+    V::Family: ParameterizedFamily<E::Tangent>,
+    Input::Family: ParameterizedFamily<E::Tangent>,
+    Aux::Family: ParameterizedFamily<E::Tangent>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+{
     value_and_grad_with_aux(engine, function, primals).map(|((_, aux), gradient)| (gradient, aux))
 }
 
@@ -554,6 +644,10 @@ mod tests {
 
     impl Differentiable<TestType> for TestValue {
         type Tangent = Self;
+
+        fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+            Ok(Self(0.0))
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -701,13 +795,22 @@ mod tests {
     }
 
     impl DifferentiableEngine for TestEngine {
+        type Tangent = TestValue;
+        type LinearEngine = Self;
         type DifferentiableOperationCarrier = AddOperation;
+
+        fn linear_engine(&self) -> &Self::LinearEngine {
+            self
+        }
     }
 
     #[test]
     fn test_linearize_supports_non_array_type_metadata() {
         let engine = TestEngine;
-        let (output, pushforward) = linearize(
+        let (output, pushforward): (
+            TestValue,
+            Program<TestType, TestValue, TestLinearOperation, TestValue, TestValue>,
+        ) = linearize(
             &engine,
             |x: Tracer<'_, DifferentiableOperationTracingEngine<TestEngine>>| Ok(x.clone() + x),
             TestValue(3.0),

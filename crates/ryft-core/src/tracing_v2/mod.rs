@@ -22,15 +22,14 @@ pub(crate) mod test_util;
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
     Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
-    DifferentiableTracingEngine, DifferentiationError, JvpContext, JvpTracer, LinearizableEngine,
+    DifferentiableTracingEngine, DifferentiationError, JvpContext, JvpTracer, LinearizableEngine, TangentValue,
 };
 pub use forward::jvp;
 pub use linear::{
-    CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad,
+    ConcreteValueAndGrad, CoordinateValue, DenseJacobian, TracedValueAndGrad, ValueAndGradDispatch, grad,
     grad_with_aux, hessian, jacfwd, jacrev, linearize, value_and_grad, value_and_grad_with_aux, vjp,
 };
 pub use operations::matrix::{MatrixOps, MatrixValue};
-pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::{
     ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, Cos,

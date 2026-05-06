@@ -5,7 +5,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, Type, TypeError};
 
 use super::LinearArrayOperation;
@@ -76,9 +76,10 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, Array
 
 impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
 where
-    E: LinearizableEngine<Type = ArrayType>,
-    E::Value: MatrixValue + Differentiable<ArrayType, Tangent = E::Value>,
-    E::LinearOperationCarrier: SupportsMatrixTranspose<ArrayType, E::Value>,
+    E: DifferentiableEngine<Type = ArrayType>,
+    E::Value: MatrixValue + Differentiable<ArrayType>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsMatrixTranspose<ArrayType, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -88,7 +89,10 @@ where
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().transpose_matrix();
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsMatrixTranspose<ArrayType, E::Value>>::matrix_transpose_operation(),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsMatrixTranspose<
+                ArrayType,
+                E::Tangent,
+            >>::matrix_transpose_operation(),
             &[inputs[0].tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

@@ -4,7 +4,7 @@ use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, Type, TypeError};
 
 use super::left_matmul::SupportsLeftMatMul;
@@ -56,11 +56,11 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
 
 impl<E> DifferentiableOperation<E> for MatMulOperation
 where
-    E: LinearizableEngine<Type = ArrayType>,
-    E::Value: MatrixValue + Differentiable<ArrayType, Tangent = E::Value>,
-    E::LinearOperationCarrier: SupportsAdd<ArrayType, E::Value>
-        + SupportsLeftMatMul<ArrayType, E::Value>
-        + SupportsRightMatMul<ArrayType, E::Value>,
+    E: DifferentiableEngine<Type = ArrayType>,
+    E::Value: MatrixValue + Differentiable<ArrayType>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: SupportsAdd<ArrayType, E::Tangent>
+        + SupportsLeftMatMul<ArrayType, E::Tangent, E::Value>
+        + SupportsRightMatMul<ArrayType, E::Tangent, E::Value>,
 {
     fn jvp(
         &self,
@@ -72,21 +72,32 @@ where
         let right = &inputs[1];
         let primal = left.primal.clone().matmul(right.primal.clone());
         let left_term_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsRightMatMul<ArrayType, E::Value>>::right_matmul_operation(
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsRightMatMul<
+                ArrayType,
+                E::Tangent,
+                E::Value,
+            >>::right_matmul_operation(
                 right.primal.clone(),
             ),
             &[left.tangent],
         )?;
         check_count!("output", left_term_outputs, 1, TracingError);
         let right_term_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsLeftMatMul<ArrayType, E::Value>>::left_matmul_operation(
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsLeftMatMul<
+                ArrayType,
+                E::Tangent,
+                E::Value,
+            >>::left_matmul_operation(
                 left.primal.clone(),
             ),
             &[right.tangent],
         )?;
         check_count!("output", right_term_outputs, 1, TracingError);
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsAdd<ArrayType, E::Value>>::add_operation(),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsAdd<
+                ArrayType,
+                E::Tangent,
+            >>::add_operation(),
             &[left_term_outputs[0], right_term_outputs[0]],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

@@ -49,7 +49,14 @@ impl<T: NdArrayElement> LinearizableEngine for NdArrayEngine<T> {
 }
 
 impl<T: NdArrayElement> DifferentiableEngine for NdArrayEngine<T> {
+    type Tangent = Array<T>;
+    type LinearEngine = Self;
     type DifferentiableOperationCarrier = NdarrayOperation<Array<T>>;
+
+    #[inline]
+    fn linear_engine(&self) -> &Self::LinearEngine {
+        self
+    }
 }
 
 impl<T: NdArrayElement> DifferentiableTracingEngine for NdArrayEngine<T> {
@@ -71,7 +78,7 @@ mod tests {
     use ryft_core::operations::arithmetic::ADD_OPERATION_NAME;
     use ryft_core::tracing::TracingError;
     use ryft_core::tracing::engines::{Engine, TracingEngine};
-    use ryft_core::tracing_v2::{DifferentiationError, MatrixOps, Sin, compile_grad, grad, jvp};
+    use ryft_core::tracing_v2::{DifferentiationError, MatrixOps, Sin, grad, jvp};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::Array;
@@ -146,20 +153,6 @@ mod tests {
         let input = Array::from_shape_vec([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
 
         let result = grad(&engine, |input| input, input);
-
-        assert!(matches!(
-            result,
-            Err(TracingError::Differentiation(DifferentiationError::NonScalarGradientOutput { output_type }))
-                if output_type.rank() == 2
-        ));
-    }
-
-    #[test]
-    fn test_compile_grad_rejects_non_scalar_array_output() {
-        let engine = NdArrayEngine::<f64>::new();
-        let input = Array::from_shape_vec([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-
-        let result = compile_grad(&engine, |input| input, input);
 
         assert!(matches!(
             result,

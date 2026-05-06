@@ -8,7 +8,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::sin::Sin;
@@ -101,10 +101,11 @@ impl<V: Clone + Typed<DataType> + Cos> InterpretableOperation<DataType, V> for C
 
 impl<E> DifferentiableOperation<E> for CosOperation
 where
-    E: LinearizableEngine,
+    E: DifferentiableEngine,
     CosOperation: Operation<E::Type>,
-    E::Value: Cos + Sin + Neg<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperationCarrier: SupportsNeg<E::Type, E::Value> + SupportsScale<E::Type, E::Value>,
+    E::Value: Cos + Sin + Neg<Output = E::Value> + Differentiable<E::Type>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsNeg<E::Type, E::Tangent> + SupportsScale<E::Type, E::Tangent, E::Value>,
 {
     fn jvp(
         &self,
@@ -114,14 +115,19 @@ where
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let scaled_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(
-                input.primal.clone().sin(),
-            ),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsScale<
+                E::Type,
+                E::Tangent,
+                E::Value,
+            >>::scale_operation(input.primal.clone().sin()),
             &[input.tangent],
         )?;
         check_count!("output", scaled_outputs, 1, TracingError);
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsNeg<E::Type, E::Value>>::neg_operation(),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsNeg<
+                E::Type,
+                E::Tangent,
+            >>::neg_operation(),
             &[scaled_outputs[0]],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

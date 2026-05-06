@@ -746,7 +746,8 @@ fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
             addressable_buffers.push(source_buffer.bitcast(ryft_pjrt::BufferSpecification {
                 element_type: source_buffer.element_type()?,
                 dimensions: source_buffer.dimensions()?,
-                layout: None,
+                #[allow(deprecated)]
+                layout: source_buffer.layout()?,
             })?);
         } else {
             addressable_buffers.push(source_buffer.copy_to_device(destination_device.clone())?);

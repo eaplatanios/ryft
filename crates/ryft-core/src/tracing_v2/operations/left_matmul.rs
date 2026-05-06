@@ -7,7 +7,7 @@ use crate::tracing::engines::Tracer;
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiableTracingEngine, LinearizableEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
@@ -18,9 +18,9 @@ use crate::operations::arithmetic::SupportsAdd;
 /// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
 /// so that generic transform code can stage [`LeftMatMulOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
-pub trait SupportsLeftMatMul<T: Type, V: Traceable<T>> {
+pub trait SupportsLeftMatMul<T: Type, V: Traceable<T>, F: Traceable<T> = V> {
     /// Constructs the carrier-specific representation of the left matrix multiplication [`Operation`].
-    fn left_matmul_operation(factor: V) -> Self;
+    fn left_matmul_operation(factor: F) -> Self;
 }
 
 /// Linear map `tangent -> factor @ tangent`.
@@ -106,9 +106,10 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, Array
 
 impl<V, E> DifferentiableOperation<E> for LeftMatMulOperation<V>
 where
-    V: MatrixValue + ZeroLike + Differentiable<ArrayType, Tangent = V>,
-    E: LinearizableEngine<Type = ArrayType, Value = V>,
-    E::LinearOperationCarrier: SupportsLeftMatMul<ArrayType, V>,
+    V: MatrixValue + ZeroLike + Differentiable<ArrayType>,
+    E: DifferentiableEngine<Type = ArrayType, Value = V>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsLeftMatMul<ArrayType, E::Tangent, V>,
 {
     fn jvp(
         &self,
@@ -118,7 +119,9 @@ where
         check_count!("input", inputs, 1, TracingError);
         let primal = self.factor.clone().matmul(inputs[0].primal.clone());
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsLeftMatMul<ArrayType, V>>::left_matmul_operation(self.factor.clone()),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsLeftMatMul<ArrayType, E::Tangent, V>>::left_matmul_operation(
+                self.factor.clone(),
+            ),
             &[inputs[0].tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -131,7 +134,7 @@ where
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
     for LeftMatMulOperation<V>
 where
-    V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
+    V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V>,
     EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
     EInner::LinearOperationCarrier<'engine>: SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>,

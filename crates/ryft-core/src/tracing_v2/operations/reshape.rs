@@ -7,7 +7,7 @@ use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearizableEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearArrayOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Trait that represents [`Operation`] carrier types that support/include [`ReshapeOperation`]. Backend-owned closed
@@ -296,9 +296,10 @@ impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, Arra
 
 impl<E> DifferentiableOperation<E> for ReshapeOperation
 where
-    E: LinearizableEngine<Type = ArrayType>,
-    E::Value: ReshapeValue + Differentiable<ArrayType, Tangent = E::Value>,
-    E::LinearOperationCarrier: SupportsReshape<ArrayType, E::Value>,
+    E: DifferentiableEngine<Type = ArrayType>,
+    E::Value: ReshapeValue + Differentiable<ArrayType>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsReshape<ArrayType, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -308,10 +309,10 @@ where
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().reshape(self.output_shape.clone())?;
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsReshape<ArrayType, E::Value>>::reshape_operation(
-                self.input_shape.clone(),
-                self.output_shape.clone(),
-            ),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsReshape<
+                ArrayType,
+                E::Tangent,
+            >>::reshape_operation(self.input_shape.clone(), self.output_shape.clone()),
             &[inputs[0].tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

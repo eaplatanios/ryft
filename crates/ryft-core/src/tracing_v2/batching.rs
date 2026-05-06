@@ -314,7 +314,7 @@ impl<
         + ControlFlowValue,
 > BatchableOperation<V> for ArrayOperation<V, ArrayType>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         match self {
@@ -348,7 +348,7 @@ where
                 &crate::tracing_v2::operations::ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                 inputs,
             ),
-            Self::Custom(_) | Self::Rematerialize(_) | Self::Condition(_) | Self::While(_) => {
+            Self::Custom(_) | Self::Condition(_) | Self::While(_) => {
                 Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
             }
         }
@@ -370,11 +370,11 @@ impl<
         + ControlFlowValue,
 > BatchableOperation<V> for LinearArrayOperation<V, ArrayType>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         match self {
-            Self::Custom(_) | Self::Rematerialize(_) | Self::Condition(_) | Self::While(_) => {
+            Self::Custom(_) | Self::Condition(_) | Self::While(_) => {
                 Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
             }
             _ => batch_by_interpreting_physical_operation(self, inputs),

@@ -301,6 +301,11 @@ impl<T: NdArrayElement> One<ArrayType> for Array<T> {
 
 impl<T: NdArrayElement> Differentiable<ArrayType> for Array<T> {
     type Tangent = Self;
+
+    #[inline]
+    fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+        Self::zero(self.r#type().as_ref())
+    }
 }
 
 impl<T: NdArrayElement> CoordinateValue for Array<T> {

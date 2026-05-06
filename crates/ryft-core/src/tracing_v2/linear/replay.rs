@@ -1,5 +1,6 @@
 use crate::macros::check_count;
 use crate::tracing::engines::TracingContext;
+use crate::tracing::{Atom, AtomId};
 use crate::tracing_v2::JvpContext;
 use crate::types::Type;
 
@@ -22,7 +23,7 @@ impl<'engine, E: DifferentiableTracingEngine> TracingContext<'engine, E> {
         T: Type,
         Input: Parameterized<V>,
         Output: Parameterized<V>,
-        V: Traceable<T> + Differentiable<T, Tangent = V>,
+        V: Traceable<T> + Differentiable<T>,
         O: DifferentiableOperation<TracingContext<'engine, E>> + Operation<T>,
     >(
         &self,
@@ -64,13 +65,13 @@ impl<'engine, E: DifferentiableTracingEngine> TracingContext<'engine, E> {
             T: Type,
             V: Traceable<T>,
             E: DifferentiableTracingEngine<Type = T, Value = V>,
-            E::OperationCarrier: SupportsZeroLike<T, V>,
+            Tracer<'engine, E>: Differentiable<T, Tangent = Tracer<'engine, E>>,
         {
             if let Some(atom) = tangents[atom_id.index] {
                 return Ok(atom);
             }
             let primal = primal_values[atom_id.index].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-            let atom = builder.borrow_mut().add_constant(primal.zero_like());
+            let atom = builder.borrow_mut().add_constant(primal.tangent_type()?);
             tangents[atom_id.index] = Some(atom);
             Ok(atom)
         }

@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::Arc;
@@ -16,8 +17,10 @@ use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::engines::Tracer;
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::operations::control_flow::{ConditionOperation, ControlFlowValue, WhileOperation};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, TangentValue};
+use crate::tracing_v2::operations::control_flow::{
+    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
+};
 use crate::tracing_v2::operations::left_matmul::left_matmul_abstract_eval;
 use crate::tracing_v2::operations::right_matmul::right_matmul_abstract_eval;
 use crate::tracing_v2::operations::{
@@ -25,7 +28,7 @@ use crate::tracing_v2::operations::{
     RightMatMulOperation, ScaleOperation, SinOperation,
 };
 use crate::tracing_v2::{
-    Cos, DifferentiableOperation, DifferentiableTracingEngine, LinearizableEngine, MatrixOps, Sin,
+    Cos, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, MatrixOps, Sin,
 };
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
@@ -35,11 +38,13 @@ use super::left_matmul::SupportsLeftMatMul;
 use super::matmul::SupportsMatMul;
 use super::matrix_transpose::SupportsMatrixTranspose;
 use super::neg::SupportsNeg;
-use super::rematerialize::{SupportsLinearRematerialize, SupportsRematerialize};
 use super::reshape::SupportsReshape;
 use super::right_matmul::SupportsRightMatMul;
 use super::scale::SupportsScale;
 use super::sin::SupportsSin;
+
+type ZeroScalarTangent = TangentValue<DataType, Infallible>;
+type ZeroArrayTangent = TangentValue<ArrayType, Infallible>;
 
 /// Default closed carrier for ordinary staged programs.
 ///
@@ -97,18 +102,6 @@ where
 
     /// Reshape from one shape to another.
     Reshape { input_shape: Shape, output_shape: Shape },
-
-    /// Higher-order rematerialization boundary carrying a compiled body and optional transpose body.
-    Rematerialize(
-        Box<
-            crate::tracing_v2::operations::RematerializeOperation<
-                T,
-                V,
-                ArrayOperation<V, T>,
-                LinearArrayOperation<V, T>,
-            >,
-        >,
-    ),
 
     /// Higher-order conditional carrying true and false branch programs.
     Condition(Box<ConditionOperation<V, ArrayOperation<V, T>, T>>),
@@ -172,9 +165,6 @@ where
 
     /// Reshape from one shape to another.
     Reshape { input_shape: Shape, output_shape: Shape },
-
-    /// Higher-order rematerialization boundary restricted to linear bodies and transpose bodies.
-    Rematerialize(Box<crate::tracing_v2::operations::LinearRematerializeOperation<T, V, LinearArrayOperation<V, T>>>),
 
     /// Higher-order conditional restricted to linear branch programs.
     Condition(Box<ConditionOperation<V, LinearArrayOperation<V, T>, T>>),
@@ -704,22 +694,6 @@ impl<V: Traceable<ArrayType> + Parameter> SupportsReshape<ArrayType, V> for Arra
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsRematerialize<ArrayType, V, LinearArrayOperation<V, ArrayType>>
-    for ArrayOperation<V, ArrayType>
-{
-    #[inline]
-    fn rematerialize_operation(
-        op: crate::tracing_v2::operations::RematerializeOperation<
-            ArrayType,
-            V,
-            Self,
-            LinearArrayOperation<V, ArrayType>,
-        >,
-    ) -> Self {
-        ArrayOperation::Rematerialize(Box::new(op))
-    }
-}
-
 impl<T, V> SupportsCustom<T, V> for ArrayOperation<V, T>
 where
     T: PartialEq + Type,
@@ -855,17 +829,6 @@ impl<V: Traceable<ArrayType> + Parameter> SupportsReshape<ArrayType, V> for Line
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter> SupportsLinearRematerialize<ArrayType, V>
-    for LinearArrayOperation<V, ArrayType>
-{
-    #[inline]
-    fn rematerialize_operation(
-        op: crate::tracing_v2::operations::LinearRematerializeOperation<ArrayType, V, Self>,
-    ) -> Self {
-        LinearArrayOperation::Rematerialize(Box::new(op))
-    }
-}
-
 impl<V: Traceable<ArrayType> + Parameter> From<ConditionOperation<V, LinearArrayOperation<V, ArrayType>, ArrayType>>
     for LinearArrayOperation<V, ArrayType>
 {
@@ -914,7 +877,6 @@ where
             Self::Transpose => "matrix_transpose",
             Self::Scale { .. } => "scale",
             Self::Reshape { .. } => "reshape",
-            Self::Rematerialize(_) => "rematerialize",
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
             Self::Custom(op) => op.name(),
@@ -942,7 +904,6 @@ where
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
-            Self::Rematerialize(_) => "rematerialize",
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
             Self::Custom(op) => op.name(),
@@ -1042,6 +1003,276 @@ fn unsupported_scalar_metadata_operation(operation_name: &'static str) -> TypeEr
     TypeError { message: format!("{operation_name} is not supported for scalar data type metadata") }
 }
 
+fn unsupported_symbolic_zero_custom_interpretation(operation_name: &'static str) -> TypeError {
+    TypeError { message: format!("symbolic-zero custom interpretation is not implemented for {operation_name}") }
+}
+
+fn unsupported_tangent_value_custom_interpretation(operation_name: &'static str) -> TypeError {
+    TypeError { message: format!("mixed symbolic-zero custom interpretation is not implemented for {operation_name}") }
+}
+
+fn symbolic_zero_one_error<T: Type>(r#type: &T) -> TypeError {
+    TypeError { message: format!("zero tangent space has no one value for {type}", type = r#type) }
+}
+
+fn infer_zero_only_tangent_output_types<T, O>(
+    operation: &O,
+    inputs: &[TangentValue<T, Infallible>],
+) -> Result<Vec<T>, TracingError>
+where
+    T: Type,
+    O: Operation<T>,
+{
+    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+    Ok(operation.infer_output_types(input_types.as_slice())?)
+}
+
+fn interpret_zero_only_tangent_operation<T, O>(
+    operation: &O,
+    inputs: &[TangentValue<T, Infallible>],
+) -> Result<Vec<TangentValue<T, Infallible>>, TracingError>
+where
+    T: Type,
+    O: Operation<T>,
+{
+    Ok(infer_zero_only_tangent_output_types(operation, inputs)?
+        .into_iter()
+        .map(TangentValue::zero)
+        .collect())
+}
+
+fn reject_zero_only_tangent_one_operation<T, O>(
+    operation: &O,
+    inputs: &[TangentValue<T, Infallible>],
+) -> Result<Vec<TangentValue<T, Infallible>>, TracingError>
+where
+    T: Type,
+    O: Operation<T>,
+{
+    let output_types = infer_zero_only_tangent_output_types(operation, inputs)?;
+    check_count!("output", output_types, 1, TracingError);
+    Err(symbolic_zero_one_error(&output_types[0]).into())
+}
+
+fn infer_tangent_value_output_types<T, V, O>(
+    operation: &O,
+    inputs: &[TangentValue<T, V>],
+) -> Result<Vec<T>, TracingError>
+where
+    T: Type,
+    V: Traceable<T>,
+    O: Operation<T>,
+{
+    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+    Ok(operation.infer_output_types(input_types.as_slice())?)
+}
+
+fn symbolic_zero_tangent_value_outputs<T, V>(output_types: Vec<T>) -> Vec<TangentValue<T, V>>
+where
+    T: Type,
+    V: Traceable<T>,
+{
+    output_types.into_iter().map(TangentValue::Zero).collect()
+}
+
+fn materialize_tangent_value<T, V>(value: &TangentValue<T, V>) -> Result<V, TracingError>
+where
+    T: Type,
+    V: Traceable<T> + Zero<T>,
+{
+    match value {
+        TangentValue::Zero(r#type) => V::zero(r#type),
+        TangentValue::NonZero(value) => Ok(value.clone()),
+    }
+}
+
+fn materialize_tangent_value_inputs<T, V>(inputs: &[TangentValue<T, V>]) -> Result<Vec<V>, TracingError>
+where
+    T: Type,
+    V: Traceable<T> + Zero<T>,
+{
+    inputs.iter().map(materialize_tangent_value).collect()
+}
+
+fn interpret_materialized_tangent_value_operation<T, V, O>(
+    operation: &O,
+    inputs: &[TangentValue<T, V>],
+) -> Result<Vec<TangentValue<T, V>>, TracingError>
+where
+    T: Type,
+    V: Traceable<T> + Zero<T>,
+    O: InterpretableOperation<T, V>,
+{
+    Ok(operation
+        .interpret(materialize_tangent_value_inputs(inputs)?.as_slice())?
+        .into_iter()
+        .map(TangentValue::NonZero)
+        .collect())
+}
+
+fn tangent_value_non_zero_type_matches<T, V>(value: &V, output_type: &T) -> bool
+where
+    T: PartialEq + Type,
+    V: Traceable<T>,
+{
+    value.r#type().as_ref() == output_type
+}
+
+fn interpret_tangent_value_add<T, V>(inputs: &[TangentValue<T, V>]) -> Result<Vec<TangentValue<T, V>>, TracingError>
+where
+    T: PartialEq + Type,
+    V: Traceable<T> + Add<Output = V> + Zero<T>,
+    AddOperation: Operation<T> + InterpretableOperation<T, V>,
+{
+    let output_types = infer_tangent_value_output_types(&AddOperation, inputs)?;
+    check_count!("output", output_types, 1, TracingError);
+    if inputs.iter().all(TangentValue::is_zero) {
+        return Ok(symbolic_zero_tangent_value_outputs(output_types));
+    }
+    let output_type = &output_types[0];
+    match inputs {
+        [TangentValue::NonZero(value), TangentValue::Zero(_)]
+            if tangent_value_non_zero_type_matches(value, output_type) =>
+        {
+            Ok(vec![TangentValue::NonZero(value.clone())])
+        }
+        [TangentValue::Zero(_), TangentValue::NonZero(value)]
+            if tangent_value_non_zero_type_matches(value, output_type) =>
+        {
+            Ok(vec![TangentValue::NonZero(value.clone())])
+        }
+        _ => interpret_materialized_tangent_value_operation(&AddOperation, inputs),
+    }
+}
+
+fn interpret_tangent_value_sub<T, V>(inputs: &[TangentValue<T, V>]) -> Result<Vec<TangentValue<T, V>>, TracingError>
+where
+    T: PartialEq + Type,
+    V: Traceable<T> + Neg<Output = V> + Sub<Output = V> + Zero<T>,
+    SubOperation: Operation<T> + InterpretableOperation<T, V>,
+{
+    let output_types = infer_tangent_value_output_types(&SubOperation, inputs)?;
+    check_count!("output", output_types, 1, TracingError);
+    if inputs.iter().all(TangentValue::is_zero) {
+        return Ok(symbolic_zero_tangent_value_outputs(output_types));
+    }
+    let output_type = &output_types[0];
+    match inputs {
+        [TangentValue::NonZero(value), TangentValue::Zero(_)]
+            if tangent_value_non_zero_type_matches(value, output_type) =>
+        {
+            Ok(vec![TangentValue::NonZero(value.clone())])
+        }
+        [TangentValue::Zero(_), TangentValue::NonZero(value)]
+            if tangent_value_non_zero_type_matches(value, output_type) =>
+        {
+            Ok(vec![TangentValue::NonZero(-value.clone())])
+        }
+        _ => interpret_materialized_tangent_value_operation(&SubOperation, inputs),
+    }
+}
+
+fn interpret_tangent_value_neg<T, V>(inputs: &[TangentValue<T, V>]) -> Result<Vec<TangentValue<T, V>>, TracingError>
+where
+    T: Type,
+    V: Traceable<T> + Neg<Output = V>,
+    NegOperation: Operation<T> + InterpretableOperation<T, V>,
+{
+    let output_types = infer_tangent_value_output_types(&NegOperation, inputs)?;
+    check_count!("output", output_types, 1, TracingError);
+    match inputs {
+        [TangentValue::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
+        [TangentValue::NonZero(value)] => Ok(NegOperation
+            .interpret(std::slice::from_ref(value))?
+            .into_iter()
+            .map(TangentValue::NonZero)
+            .collect()),
+        _ => unreachable!("neg output type inference validates the input count"),
+    }
+}
+
+fn interpret_tangent_value_zero_like<T, V, O>(
+    operation: &O,
+    inputs: &[TangentValue<T, V>],
+) -> Result<Vec<TangentValue<T, V>>, TracingError>
+where
+    T: Type,
+    V: Traceable<T>,
+    O: Operation<T>,
+{
+    Ok(symbolic_zero_tangent_value_outputs(infer_tangent_value_output_types(operation, inputs)?))
+}
+
+fn interpret_tangent_value_one_like<T, V>(
+    inputs: &[TangentValue<T, V>],
+) -> Result<Vec<TangentValue<T, V>>, TracingError>
+where
+    T: Type,
+    V: Traceable<T> + OneLike,
+    OneLikeOperation: Operation<T>,
+{
+    let output_types = infer_tangent_value_output_types(&OneLikeOperation, inputs)?;
+    check_count!("output", output_types, 1, TracingError);
+    match inputs {
+        [TangentValue::Zero(r#type)] => Err(symbolic_zero_one_error(r#type).into()),
+        [TangentValue::NonZero(value)] => Ok(vec![TangentValue::NonZero(value.one_like())]),
+        _ => unreachable!("one_like output type inference validates the input count"),
+    }
+}
+
+fn interpret_tangent_value_scale<T, V, O>(
+    operation: &O,
+    factor: &TangentValue<T, V>,
+    inputs: &[TangentValue<T, V>],
+) -> Result<Vec<TangentValue<T, V>>, TracingError>
+where
+    T: Type,
+    V: Traceable<T> + Mul<Output = V>,
+    O: Operation<T>,
+    ScaleOperation<T, V>: InterpretableOperation<T, V>,
+{
+    let output_types = infer_tangent_value_output_types(operation, inputs)?;
+    check_count!("output", output_types, 1, TracingError);
+    match inputs {
+        [input] if factor.is_zero() || input.is_zero() => Ok(symbolic_zero_tangent_value_outputs(output_types)),
+        [TangentValue::NonZero(input)] => {
+            let TangentValue::NonZero(factor) = factor else {
+                unreachable!("zero factors are handled before concrete scale interpretation")
+            };
+            Ok(ScaleOperation::new(factor.clone())
+                .interpret(std::slice::from_ref(input))?
+                .into_iter()
+                .map(TangentValue::NonZero)
+                .collect())
+        }
+        _ => unreachable!("scale output type inference validates the input count"),
+    }
+}
+
+fn interpret_tangent_value_unary_non_zero_or_zero<T, V, MetadataOperation, ConcreteOperation>(
+    metadata_operation: &MetadataOperation,
+    concrete_operation: &ConcreteOperation,
+    inputs: &[TangentValue<T, V>],
+) -> Result<Vec<TangentValue<T, V>>, TracingError>
+where
+    T: Type,
+    V: Traceable<T>,
+    MetadataOperation: Operation<T>,
+    ConcreteOperation: InterpretableOperation<T, V>,
+{
+    let output_types = infer_tangent_value_output_types(metadata_operation, inputs)?;
+    check_count!("output", output_types, 1, TracingError);
+    match inputs {
+        [TangentValue::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
+        [TangentValue::NonZero(input)] => Ok(concrete_operation
+            .interpret(std::slice::from_ref(input))?
+            .into_iter()
+            .map(TangentValue::NonZero)
+            .collect()),
+        _ => unreachable!("unary output type inference validates the input count"),
+    }
+}
+
 impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ScalarOperation<V> {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1135,7 +1366,6 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for ArrayOperatio
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
             }
-            Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
@@ -1151,7 +1381,6 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for ArrayOperatio
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            Self::Rematerialize(remat) => remat.render(formatter, indentation),
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Custom(op) => op.render(formatter, indentation),
@@ -1181,12 +1410,9 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ArrayOperation<
             Self::Cos => CosOperation.infer_output_types(input_types),
             Self::Scale { .. } => ScaleOperation::<DataType, V>::abstract_eval_static(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
-            Self::MatrixMultiply
-            | Self::Transpose
-            | Self::Reshape { .. }
-            | Self::Rematerialize(_)
-            | Self::Condition(_)
-            | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
+            Self::MatrixMultiply | Self::Transpose | Self::Reshape { .. } | Self::Condition(_) | Self::While(_) => {
+                Err(unsupported_scalar_metadata_operation(self.operation_name()))
+            }
         }
     }
 
@@ -1199,7 +1425,6 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ArrayOperation<
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            Self::Rematerialize(remat) => remat.render(formatter, indentation),
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Custom(op) => op.render(formatter, indentation),
@@ -1236,7 +1461,6 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for LinearArrayOp
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
             }
-            Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
@@ -1256,7 +1480,6 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for LinearArrayOp
                 OperationFormatter::new(formatter, indentation, self.operation_name())?
                     .bracketed(|operation| operation.field("factor", factor))
             }
-            Self::Rematerialize(remat) => remat.render(formatter, indentation),
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Custom(op) => op.render(formatter, indentation),
@@ -1286,7 +1509,6 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearArrayOper
             | Self::LeftMatMul { .. }
             | Self::RightMatMul { .. }
             | Self::Reshape { .. }
-            | Self::Rematerialize(_)
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
         }
@@ -1305,7 +1527,6 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearArrayOper
                 OperationFormatter::new(formatter, indentation, self.operation_name())?
                     .bracketed(|operation| operation.field("factor", factor))
             }
-            Self::Rematerialize(remat) => remat.render(formatter, indentation),
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Custom(op) => op.render(formatter, indentation),
@@ -1328,7 +1549,12 @@ where
         + One<DataType>
         + ZeroLike
         + OneLike,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<
+            V,
+            Family: crate::parameters::ParameterizedFamily<V>,
+            To<V> = Vec<V>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
@@ -1349,6 +1575,43 @@ where
     }
 }
 
+impl InterpretableOperation<DataType, ZeroScalarTangent> for LinearScalarOperation<ZeroScalarTangent> {
+    fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, TracingError> {
+        match self {
+            Self::One(_) | Self::OneLike => reject_zero_only_tangent_one_operation(self, inputs),
+            Self::Custom(op) => Err(unsupported_symbolic_zero_custom_interpretation(op.name()).into()),
+            _ => interpret_zero_only_tangent_operation(self, inputs),
+        }
+    }
+}
+
+impl<V: Traceable<DataType>> InterpretableOperation<DataType, TangentValue<DataType, V>>
+    for LinearScalarOperation<TangentValue<DataType, V>>
+where
+    V: Parameter
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
+        + Zero<DataType>
+        + One<DataType>
+        + OneLike,
+{
+    fn interpret(&self, inputs: &[TangentValue<DataType, V>]) -> Result<Vec<TangentValue<DataType, V>>, TracingError> {
+        match self {
+            Self::Zero(zero) => Ok(vec![TangentValue::Zero(zero.r#type)]),
+            Self::One(one) => Ok(vec![TangentValue::NonZero(V::one(&one.r#type)?)]),
+            Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
+            Self::OneLike => interpret_tangent_value_one_like(inputs),
+            Self::Add => interpret_tangent_value_add(inputs),
+            Self::Sub => interpret_tangent_value_sub(inputs),
+            Self::Neg => interpret_tangent_value_neg(inputs),
+            Self::Scale { factor } => interpret_tangent_value_scale(self, factor, inputs),
+            Self::Custom(op) => Err(unsupported_tangent_value_custom_interpretation(op.name()).into()),
+        }
+    }
+}
+
 impl<V: Traceable<DataType>> InterpretableOperation<DataType, V> for LinearScalarOperation<V>
 where
     V: Parameter
@@ -1360,7 +1623,7 @@ where
         + One<DataType>
         + ZeroLike
         + OneLike,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
@@ -1444,7 +1707,7 @@ where
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
@@ -1465,7 +1728,6 @@ where
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
-            Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
@@ -1487,7 +1749,7 @@ where
         + One<DataType>
         + ZeroLike
         + OneLike,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
@@ -1504,12 +1766,176 @@ where
             Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
-            Self::MatrixMultiply
-            | Self::Transpose
-            | Self::Reshape { .. }
-            | Self::Rematerialize(_)
-            | Self::Condition(_)
-            | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
+            Self::MatrixMultiply | Self::Transpose | Self::Reshape { .. } | Self::Condition(_) | Self::While(_) => {
+                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
+            }
+        }
+    }
+}
+
+impl InterpretableOperation<ArrayType, ZeroArrayTangent> for LinearArrayOperation<ZeroArrayTangent, ArrayType> {
+    fn interpret(&self, inputs: &[ZeroArrayTangent]) -> Result<Vec<ZeroArrayTangent>, TracingError> {
+        match self {
+            Self::One(_) | Self::OneLike => reject_zero_only_tangent_one_operation(self, inputs),
+            Self::Condition(condition) => {
+                let output_types = infer_zero_only_tangent_output_types(self, inputs)?;
+                let branch = match condition.predicate {
+                    ConditionPredicate::Captured(predicate) => {
+                        if predicate {
+                            &condition.true_branch
+                        } else {
+                            &condition.false_branch
+                        }
+                    }
+                    ConditionPredicate::RuntimeInput(_) => {
+                        return Err(ControlFlowError::MissingTransformRule {
+                            transform: "runtime-predicate symbolic-zero condition interpretation",
+                        }
+                        .into());
+                    }
+                };
+                let outputs = branch.interpret(inputs.to_vec())?;
+                check_count!("output", outputs, output_types.len(), TracingError);
+                Ok(outputs)
+            }
+            Self::While(while_operation) => {
+                let output_types = infer_zero_only_tangent_output_types(self, inputs)?;
+                let condition_outputs = while_operation.condition.interpret(inputs.to_vec())?;
+                check_count!("output", condition_outputs, 1, TracingError);
+                let outputs = while_operation.body.interpret(inputs.to_vec())?;
+                check_count!("output", outputs, output_types.len(), TracingError);
+                Ok(outputs)
+            }
+            Self::Custom(op) => Err(unsupported_symbolic_zero_custom_interpretation(op.name()).into()),
+            _ => interpret_zero_only_tangent_operation(self, inputs),
+        }
+    }
+}
+
+impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, TangentValue<ArrayType, V>>
+    for LinearArrayOperation<TangentValue<ArrayType, V>, ArrayType>
+where
+    V: Parameter
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
+        + Zero<ArrayType>
+        + One<ArrayType>
+        + OneLike
+        + MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps
+        + ControlFlowValue,
+{
+    fn interpret(
+        &self,
+        inputs: &[TangentValue<ArrayType, V>],
+    ) -> Result<Vec<TangentValue<ArrayType, V>>, TracingError> {
+        match self {
+            Self::Zero(zero) => Ok(vec![TangentValue::Zero(zero.r#type.clone())]),
+            Self::One(one) => Ok(vec![TangentValue::NonZero(V::one(&one.r#type)?)]),
+            Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
+            Self::OneLike => interpret_tangent_value_one_like(inputs),
+            Self::Add => interpret_tangent_value_add(inputs),
+            Self::Sub => interpret_tangent_value_sub(inputs),
+            Self::Neg => interpret_tangent_value_neg(inputs),
+            Self::Transpose => interpret_tangent_value_unary_non_zero_or_zero(
+                &MatrixTransposeOperation,
+                &MatrixTransposeOperation,
+                inputs,
+            ),
+            Self::Scale { factor } => interpret_tangent_value_scale(self, factor, inputs),
+            Self::LeftMatMul { factor } => {
+                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                check_count!("output", output_types, 1, TracingError);
+                match inputs {
+                    [input] if factor.is_zero() || input.is_zero() => {
+                        Ok(symbolic_zero_tangent_value_outputs(output_types))
+                    }
+                    [TangentValue::NonZero(input)] => {
+                        let TangentValue::NonZero(factor) = factor else {
+                            unreachable!("zero factors are handled before concrete left_matmul interpretation")
+                        };
+                        Ok(LeftMatMulOperation::new(factor.clone())
+                            .interpret(std::slice::from_ref(input))?
+                            .into_iter()
+                            .map(TangentValue::NonZero)
+                            .collect())
+                    }
+                    _ => unreachable!("left_matmul output type inference validates the input count"),
+                }
+            }
+            Self::RightMatMul { factor } => {
+                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                check_count!("output", output_types, 1, TracingError);
+                match inputs {
+                    [input] if factor.is_zero() || input.is_zero() => {
+                        Ok(symbolic_zero_tangent_value_outputs(output_types))
+                    }
+                    [TangentValue::NonZero(input)] => {
+                        let TangentValue::NonZero(factor) = factor else {
+                            unreachable!("zero factors are handled before concrete right_matmul interpretation")
+                        };
+                        Ok(RightMatMulOperation::new(factor.clone())
+                            .interpret(std::slice::from_ref(input))?
+                            .into_iter()
+                            .map(TangentValue::NonZero)
+                            .collect())
+                    }
+                    _ => unreachable!("right_matmul output type inference validates the input count"),
+                }
+            }
+            Self::Reshape { input_shape, output_shape } => interpret_tangent_value_unary_non_zero_or_zero(
+                &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
+                &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
+                inputs,
+            ),
+            Self::Condition(condition) => {
+                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                let (predicate, operands) = match condition.predicate {
+                    ConditionPredicate::RuntimeInput(_) => {
+                        let predicate = match &inputs[0] {
+                            TangentValue::Zero(_) => {
+                                return Err(ControlFlowError::MissingTransformRule {
+                                    transform: "runtime-predicate mixed symbolic-zero condition interpretation",
+                                }
+                                .into());
+                            }
+                            TangentValue::NonZero(predicate) => predicate.control_flow_predicate()?,
+                        };
+                        (predicate, &inputs[1..])
+                    }
+                    ConditionPredicate::Captured(predicate) => (predicate, inputs),
+                };
+                let branch = if predicate { &condition.true_branch } else { &condition.false_branch };
+                let outputs = branch.interpret(operands.to_vec())?;
+                check_count!("output", outputs, output_types.len(), TracingError);
+                Ok(outputs)
+            }
+            Self::While(while_operation) => {
+                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                let mut state = inputs.to_vec();
+                loop {
+                    let condition_outputs = while_operation.condition.interpret(state.clone())?;
+                    check_count!("output", condition_outputs, 1, TracingError);
+                    let predicate = match &condition_outputs[0] {
+                        TangentValue::Zero(_) => {
+                            return Err(ControlFlowError::MissingTransformRule {
+                                transform: "mixed symbolic-zero while predicate interpretation",
+                            }
+                            .into());
+                        }
+                        TangentValue::NonZero(predicate) => predicate.control_flow_predicate()?,
+                    };
+                    if !predicate {
+                        check_count!("output", state, output_types.len(), TracingError);
+                        return Ok(state);
+                    }
+                    state = while_operation.body.interpret(state)?;
+                    check_count!("output", state, while_operation.state_types().len(), TracingError);
+                }
+            }
+            Self::Custom(op) => Err(unsupported_tangent_value_custom_interpretation(op.name()).into()),
         }
     }
 }
@@ -1528,7 +1954,7 @@ where
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
@@ -1546,10 +1972,52 @@ where
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
-            Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
+        }
+    }
+}
+
+impl InterpretableOperation<DataType, ZeroScalarTangent> for LinearArrayOperation<ZeroScalarTangent, DataType> {
+    fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, TracingError> {
+        match self {
+            Self::One(_) | Self::OneLike => reject_zero_only_tangent_one_operation(self, inputs),
+            Self::Custom(op) => Err(unsupported_symbolic_zero_custom_interpretation(op.name()).into()),
+            _ => interpret_zero_only_tangent_operation(self, inputs),
+        }
+    }
+}
+
+impl<V: Traceable<DataType>> InterpretableOperation<DataType, TangentValue<DataType, V>>
+    for LinearArrayOperation<TangentValue<DataType, V>, DataType>
+where
+    V: Parameter
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
+        + Zero<DataType>
+        + One<DataType>
+        + OneLike,
+{
+    fn interpret(&self, inputs: &[TangentValue<DataType, V>]) -> Result<Vec<TangentValue<DataType, V>>, TracingError> {
+        match self {
+            Self::Zero(zero) => Ok(vec![TangentValue::Zero(zero.r#type)]),
+            Self::One(one) => Ok(vec![TangentValue::NonZero(V::one(&one.r#type)?)]),
+            Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
+            Self::OneLike => interpret_tangent_value_one_like(inputs),
+            Self::Add => interpret_tangent_value_add(inputs),
+            Self::Sub => interpret_tangent_value_sub(inputs),
+            Self::Neg => interpret_tangent_value_neg(inputs),
+            Self::Scale { factor } => interpret_tangent_value_scale(self, factor, inputs),
+            Self::Custom(op) => Err(unsupported_tangent_value_custom_interpretation(op.name()).into()),
+            Self::Transpose
+            | Self::LeftMatMul { .. }
+            | Self::RightMatMul { .. }
+            | Self::Reshape { .. }
+            | Self::Condition(_)
+            | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
         }
     }
 }
@@ -1565,7 +2033,7 @@ where
         + One<DataType>
         + ZeroLike
         + OneLike,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
@@ -1582,7 +2050,6 @@ where
             | Self::LeftMatMul { .. }
             | Self::RightMatMul { .. }
             | Self::Reshape { .. }
-            | Self::Rematerialize(_)
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
         }
@@ -1602,7 +2069,11 @@ where
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-    Vec<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<Tracer<'engine, E>>: Parameterized<
+            Tracer<'engine, E>,
+            To<Tracer<'engine, E>> = Vec<Tracer<'engine, E>>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         match self {
@@ -1641,7 +2112,6 @@ where
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
-            Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
@@ -1694,7 +2164,316 @@ where
             | Self::LeftMatMul { .. }
             | Self::RightMatMul { .. }
             | Self::Reshape { .. }
-            | Self::Rematerialize(_)
+            | Self::Condition(_)
+            | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
+        }
+    }
+}
+
+fn transpose_array_type_metadata(r#type: &ArrayType) -> Result<ArrayType, TracingError> {
+    let output_types = MatrixTransposeOperation.infer_output_types(&[r#type.clone()])?;
+    check_count!("output", output_types, 1, TracingError);
+    Ok(output_types[0].clone())
+}
+
+fn transpose_zero_only_tangent_array_metadata(factor: &ZeroArrayTangent) -> Result<ZeroArrayTangent, TracingError> {
+    let factor_type = factor.r#type();
+    Ok(TangentValue::zero(transpose_array_type_metadata(factor_type.as_ref())?))
+}
+
+fn transpose_tangent_value_array_factor<V>(
+    factor: &TangentValue<ArrayType, V>,
+) -> Result<TangentValue<ArrayType, V>, TracingError>
+where
+    V: Traceable<ArrayType> + MatrixOps,
+{
+    match factor {
+        TangentValue::Zero(r#type) => Ok(TangentValue::Zero(transpose_array_type_metadata(r#type)?)),
+        TangentValue::NonZero(value) => Ok(TangentValue::NonZero(value.clone().transpose_matrix())),
+    }
+}
+
+impl<V: Traceable<DataType>>
+    LinearOperation<DataType, TangentValue<DataType, V>, LinearScalarOperation<TangentValue<DataType, V>>>
+    for LinearScalarOperation<TangentValue<DataType, V>>
+{
+    fn transpose(
+        &self,
+        context: &mut crate::tracing::transposition::TranspositionContext<
+            DataType,
+            TangentValue<DataType, V>,
+            LinearScalarOperation<TangentValue<DataType, V>>,
+        >,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        match self {
+            Self::Zero(zero) => zero.transpose(context, output_cotangents),
+            Self::One(one) => one.transpose(context, output_cotangents),
+            Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
+            Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+            Self::Add => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                Ok(vec![output_cotangents[0], output_cotangents[0]])
+            }
+            Self::Sub => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let negated_outputs = context.stage(Self::Neg, &[atom])?;
+                        check_count!("output", negated_outputs, 1, TracingError);
+                        Ok(vec![Some(atom), Some(negated_outputs[0])])
+                    }
+                    None => Ok(vec![None, None]),
+                }
+            }
+            Self::Neg | Self::Scale { .. } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(self.clone(), &[atom])?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::Custom(_) => Err(TypeError {
+                message: "custom scalar linear transpose requires a carrier-specific transpose rule".to_string(),
+            }
+            .into()),
+        }
+    }
+}
+
+impl LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType>>
+    for LinearArrayOperation<ZeroArrayTangent, ArrayType>
+{
+    fn transpose(
+        &self,
+        context: &mut crate::tracing::transposition::TranspositionContext<
+            ArrayType,
+            ZeroArrayTangent,
+            LinearArrayOperation<ZeroArrayTangent, ArrayType>,
+        >,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        match self {
+            Self::Zero(zero) => zero.transpose(context, output_cotangents),
+            Self::One(one) => one.transpose(context, output_cotangents),
+            Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
+            Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+            Self::Add | Self::Sub => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                Ok(vec![output_cotangents[0], output_cotangents[0]])
+            }
+            Self::Neg | Self::Scale { .. } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                Ok(vec![output_cotangents[0]])
+            }
+            Self::Transpose => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(Self::Transpose, &[atom])?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::LeftMatMul { factor } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(
+                            Self::LeftMatMul { factor: transpose_zero_only_tangent_array_metadata(factor)? },
+                            &[atom],
+                        )?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::RightMatMul { factor } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(
+                            Self::RightMatMul { factor: transpose_zero_only_tangent_array_metadata(factor)? },
+                            &[atom],
+                        )?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::Reshape { input_shape, output_shape } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(
+                            Self::Reshape { input_shape: output_shape.clone(), output_shape: input_shape.clone() },
+                            &[atom],
+                        )?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::Condition(condition) => condition.transpose(context, output_cotangents),
+            Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
+            Self::Custom(op) => op.transpose(context, output_cotangents),
+        }
+    }
+}
+
+impl<V: Traceable<ArrayType>>
+    LinearOperation<ArrayType, TangentValue<ArrayType, V>, LinearArrayOperation<TangentValue<ArrayType, V>, ArrayType>>
+    for LinearArrayOperation<TangentValue<ArrayType, V>, ArrayType>
+where
+    V: MatrixOps,
+{
+    fn transpose(
+        &self,
+        context: &mut crate::tracing::transposition::TranspositionContext<
+            ArrayType,
+            TangentValue<ArrayType, V>,
+            LinearArrayOperation<TangentValue<ArrayType, V>, ArrayType>,
+        >,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        match self {
+            Self::Zero(zero) => zero.transpose(context, output_cotangents),
+            Self::One(one) => one.transpose(context, output_cotangents),
+            Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
+            Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+            Self::Add => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                Ok(vec![output_cotangents[0], output_cotangents[0]])
+            }
+            Self::Sub => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let negated_outputs = context.stage(Self::Neg, &[atom])?;
+                        check_count!("output", negated_outputs, 1, TracingError);
+                        Ok(vec![Some(atom), Some(negated_outputs[0])])
+                    }
+                    None => Ok(vec![None, None]),
+                }
+            }
+            Self::Neg | Self::Transpose | Self::Scale { .. } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(self.clone(), &[atom])?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::LeftMatMul { factor } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(
+                            Self::LeftMatMul { factor: transpose_tangent_value_array_factor(factor)? },
+                            &[atom],
+                        )?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::RightMatMul { factor } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(
+                            Self::RightMatMul { factor: transpose_tangent_value_array_factor(factor)? },
+                            &[atom],
+                        )?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::Reshape { input_shape, output_shape } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(
+                            Self::Reshape { input_shape: output_shape.clone(), output_shape: input_shape.clone() },
+                            &[atom],
+                        )?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::Condition(condition) => condition.transpose(context, output_cotangents),
+            Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
+            Self::Custom(op) => op.transpose(context, output_cotangents),
+        }
+    }
+}
+
+impl<V: Traceable<DataType>>
+    LinearOperation<DataType, TangentValue<DataType, V>, LinearArrayOperation<TangentValue<DataType, V>, DataType>>
+    for LinearArrayOperation<TangentValue<DataType, V>, DataType>
+{
+    fn transpose(
+        &self,
+        context: &mut crate::tracing::transposition::TranspositionContext<
+            DataType,
+            TangentValue<DataType, V>,
+            LinearArrayOperation<TangentValue<DataType, V>, DataType>,
+        >,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        match self {
+            Self::Zero(zero) => zero.transpose(context, output_cotangents),
+            Self::One(one) => one.transpose(context, output_cotangents),
+            Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
+            Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+            Self::Add => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                Ok(vec![output_cotangents[0], output_cotangents[0]])
+            }
+            Self::Sub => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let negated_outputs = context.stage(Self::Neg, &[atom])?;
+                        check_count!("output", negated_outputs, 1, TracingError);
+                        Ok(vec![Some(atom), Some(negated_outputs[0])])
+                    }
+                    None => Ok(vec![None, None]),
+                }
+            }
+            Self::Neg | Self::Scale { .. } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match output_cotangents[0] {
+                    Some(atom) => {
+                        let outputs = context.stage(self.clone(), &[atom])?;
+                        check_count!("output", outputs, 1, TracingError);
+                        Ok(vec![Some(outputs[0])])
+                    }
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::Custom(op) => op.transpose(context, output_cotangents),
+            Self::Transpose
+            | Self::LeftMatMul { .. }
+            | Self::RightMatMul { .. }
+            | Self::Reshape { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
         }
@@ -1793,7 +2572,6 @@ where
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).transpose(context, output_cotangents)
             }
-            Self::Rematerialize(remat) => remat.transpose(context, output_cotangents),
             Self::Condition(condition) => condition.transpose(context, output_cotangents),
             Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
             Self::Custom(op) => op.transpose(context, output_cotangents),
@@ -1830,7 +2608,6 @@ where
             | Self::LeftMatMul { .. }
             | Self::RightMatMul { .. }
             | Self::Reshape { .. }
-            | Self::Rematerialize(_)
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
         }
@@ -1851,17 +2628,17 @@ where
         + Zero<DataType>
         + One<DataType>
         + Parameterized<V>
-        + Differentiable<DataType, Tangent = V>
+        + Differentiable<DataType, Tangent = E::Tangent>
         + 'static,
-    E: LinearizableEngine<Type = DataType, Value = V, LinearOperationCarrier = LinearScalarOperation<V>> + 'static,
+    E: DifferentiableEngine<Type = DataType, Value = V> + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearScalarOperation<V>: SupportsZero<DataType, V>
-        + SupportsZeroLike<DataType, V>
-        + super::SupportsNeg<DataType, V>
-        + SupportsAdd<DataType, V>
-        + SupportsSub<DataType, V>
-        + super::SupportsScale<DataType, V>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: SupportsZero<DataType, E::Tangent>
+        + SupportsZeroLike<DataType, E::Tangent>
+        + super::SupportsNeg<DataType, E::Tangent>
+        + SupportsAdd<DataType, E::Tangent>
+        + SupportsSub<DataType, E::Tangent>
+        + super::SupportsScale<DataType, E::Tangent, V>,
 {
     fn jvp(
         &self,
@@ -1905,7 +2682,7 @@ where
         + Zero<DataType>
         + One<DataType>
         + Parameterized<V>
-        + Differentiable<DataType, Tangent = V>
+        + Differentiable<DataType>
         + 'static,
     EInner: DifferentiableTracingEngine<Type = DataType, Value = V, OperationCarrier = ScalarOperation<V>> + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
@@ -1993,22 +2770,26 @@ where
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue
-        + Differentiable<ArrayType, Tangent = V>
+        + Differentiable<ArrayType, Tangent = E::Tangent>
         + 'static,
-    E: LinearizableEngine<Type = ArrayType, Value = V, LinearOperationCarrier = LinearArrayOperation<V, ArrayType>>
-        + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V, ArrayType>: SupportsZero<ArrayType, V>
-        + SupportsZeroLike<ArrayType, V>
-        + super::SupportsNeg<ArrayType, V>
-        + SupportsAdd<ArrayType, V>
-        + SupportsSub<ArrayType, V>
-        + super::SupportsScale<ArrayType, V>
-        + super::SupportsLeftMatMul<ArrayType, V>
-        + super::SupportsRightMatMul<ArrayType, V>
-        + super::SupportsMatrixTranspose<ArrayType, V>
-        + super::SupportsReshape<ArrayType, V>,
+    Vec<V>: Parameterized<
+            V,
+            Family: crate::parameters::ParameterizedFamily<E::Tangent>,
+            To<E::Tangent> = Vec<E::Tangent>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: SupportsZero<ArrayType, E::Tangent>
+        + SupportsZeroLike<ArrayType, E::Tangent>
+        + super::SupportsNeg<ArrayType, E::Tangent>
+        + SupportsAdd<ArrayType, E::Tangent>
+        + SupportsSub<ArrayType, E::Tangent>
+        + super::SupportsScale<ArrayType, E::Tangent, V>
+        + super::SupportsLeftMatMul<ArrayType, E::Tangent, V>
+        + super::SupportsRightMatMul<ArrayType, E::Tangent, V>
+        + super::SupportsMatrixTranspose<ArrayType, E::Tangent>
+        + super::SupportsReshape<ArrayType, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -2033,9 +2814,10 @@ where
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
             }
-            Self::Rematerialize(remat) => remat.as_ref().jvp(context, inputs),
-            Self::Condition(condition) => condition.as_ref().jvp(context, inputs),
-            Self::While(while_operation) => while_operation.as_ref().jvp(context, inputs),
+            Self::Condition(_) | Self::While(_) => {
+                Err(TypeError { message: format!("{} does not support generic array jvp dispatch", self.name()) }
+                    .into())
+            }
             Self::Custom(op) => op.jvp(context, inputs),
         }
     }
@@ -2055,18 +2837,17 @@ where
         + Zero<DataType>
         + One<DataType>
         + Parameterized<V>
-        + Differentiable<DataType, Tangent = V>
+        + Differentiable<DataType, Tangent = E::Tangent>
         + 'static,
-    E: LinearizableEngine<Type = DataType, Value = V, LinearOperationCarrier = LinearArrayOperation<V, DataType>>
-        + 'static,
+    E: DifferentiableEngine<Type = DataType, Value = V> + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearArrayOperation<V, DataType>: SupportsZero<DataType, V>
-        + SupportsZeroLike<DataType, V>
-        + super::SupportsNeg<DataType, V>
-        + SupportsAdd<DataType, V>
-        + SupportsSub<DataType, V>
-        + super::SupportsScale<DataType, V>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: SupportsZero<DataType, E::Tangent>
+        + SupportsZeroLike<DataType, E::Tangent>
+        + super::SupportsNeg<DataType, E::Tangent>
+        + SupportsAdd<DataType, E::Tangent>
+        + SupportsSub<DataType, E::Tangent>
+        + super::SupportsScale<DataType, E::Tangent, V>,
 {
     fn jvp(
         &self,
@@ -2089,7 +2870,6 @@ where
             Self::MatrixMultiply
             | Self::Transpose
             | Self::Reshape { .. }
-            | Self::Rematerialize(_)
             | Self::Condition(_)
             | Self::While(_)
             | Self::Custom(_) => {
@@ -2104,11 +2884,9 @@ where
 ///
 /// Forwards each variant to the per-op JVP rule, picking up the
 /// [`TracingContext`](crate::tracing::engines::TracingContext)-keyed impl for captured
-/// [`Scale`](Self::Scale), the [`Rematerialize`](Self::Rematerialize) impl that recurses via
-/// [`TracingContext::linearize`](crate::tracing::engines::TracingContext::linearize), the
-/// [`Condition`](Self::Condition) / [`While`](Self::While) stub impls (predicate extraction does
-/// not work at trace time), and the [`Custom`](Self::Custom) bridge to the registered traced
-/// linearization rule.
+/// [`Scale`](Self::Scale), the [`Condition`](Self::Condition) / [`While`](Self::While) stub impls
+/// (predicate extraction does not work at trace time), and the [`Custom`](Self::Custom) bridge to
+/// the registered traced linearization rule.
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
     for ArrayOperation<V, ArrayType>
 where
@@ -2128,7 +2906,7 @@ where
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue
-        + Differentiable<ArrayType, Tangent = V>
+        + Differentiable<ArrayType>
         + 'static,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
         + 'static,
@@ -2168,8 +2946,7 @@ where
         + SupportsRightMatMul<ArrayType, Tracer<'engine, EInner>>
         + SupportsMatrixTranspose<ArrayType, Tracer<'engine, EInner>>
         + SupportsScale<ArrayType, Tracer<'engine, EInner>>
-        + SupportsReshape<ArrayType, Tracer<'engine, EInner>>
-        + SupportsLinearRematerialize<ArrayType, Tracer<'engine, EInner>>,
+        + SupportsReshape<ArrayType, Tracer<'engine, EInner>>,
 {
     fn jvp(
         &self,
@@ -2194,7 +2971,6 @@ where
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
             }
-            Self::Rematerialize(remat) => remat.as_ref().jvp(context, inputs),
             Self::Condition(condition) => condition.as_ref().jvp(context, inputs),
             Self::While(while_operation) => while_operation.as_ref().jvp(context, inputs),
             Self::Custom(op) => op.jvp(context, inputs),
@@ -2218,7 +2994,7 @@ where
         + Zero<DataType>
         + One<DataType>
         + Parameterized<V>
-        + Differentiable<DataType, Tangent = V>
+        + Differentiable<DataType>
         + 'static,
     EInner: DifferentiableTracingEngine<Type = DataType, Value = V, OperationCarrier = ArrayOperation<V, DataType>>
         + 'static,
@@ -2285,7 +3061,6 @@ where
             Self::MatrixMultiply
             | Self::Transpose
             | Self::Reshape { .. }
-            | Self::Rematerialize(_)
             | Self::Condition(_)
             | Self::While(_)
             | Self::Custom(_) => {
@@ -2298,5 +3073,350 @@ where
 
 #[cfg(test)]
 mod tests {
-    // Primitive-operation behavior is exercised through the per-operation modules and transform tests.
+    use pretty_assertions::assert_eq;
+
+    use crate::operations::InterpretableOperation as _;
+    use crate::parameters::Placeholder;
+    use crate::tracing::transposition::{LinearOperation, TranspositionContext};
+    use crate::tracing::{Program, ProgramBuilder};
+    use crate::tracing_v2::test_util::TestArray;
+    use crate::types::Size;
+
+    use super::*;
+
+    type ZeroArrayOperation = LinearArrayOperation<ZeroArrayTangent, ArrayType>;
+    type ZeroArrayProgram =
+        Program<ArrayType, ZeroArrayTangent, ZeroArrayOperation, Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>;
+    type MixedScalar = TangentValue<DataType, f64>;
+    type MixedScalarOperation = LinearScalarOperation<MixedScalar>;
+    type MixedArray = TangentValue<ArrayType, TestArray>;
+    type MixedArrayOperation = LinearArrayOperation<MixedArray, ArrayType>;
+
+    fn array_type(dimensions: &[usize]) -> ArrayType {
+        ArrayType::new(DataType::F32, Shape::new(dimensions.iter().copied().map(Size::Static).collect()), None, None)
+            .unwrap()
+    }
+
+    fn f64_array_type(dimensions: &[usize]) -> ArrayType {
+        ArrayType::new(DataType::F64, Shape::new(dimensions.iter().copied().map(Size::Static).collect()), None, None)
+            .unwrap()
+    }
+
+    fn identity_zero_array_program(input_type: ArrayType) -> ZeroArrayProgram {
+        let mut builder = ProgramBuilder::<ArrayType, ZeroArrayTangent, ZeroArrayOperation>::new();
+        let input = builder.add_input(input_type);
+        builder
+            .build::<Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+    }
+
+    fn one_zero_array_program(input_type: ArrayType, output_type: ArrayType) -> ZeroArrayProgram {
+        let mut builder = ProgramBuilder::<ArrayType, ZeroArrayTangent, ZeroArrayOperation>::new();
+        builder.add_input(input_type);
+        let output =
+            builder.add_instruction(ZeroArrayOperation::One(OneOperation::new(output_type)), vec![]).unwrap()[0];
+        builder
+            .build::<Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+    }
+
+    fn zero_bool_condition_program(state_type: ArrayType) -> ZeroArrayProgram {
+        let mut builder = ProgramBuilder::<ArrayType, ZeroArrayTangent, ZeroArrayOperation>::new();
+        builder.add_input(state_type);
+        let output = builder
+            .add_instruction(ZeroArrayOperation::Zero(ZeroOperation::new(ArrayType::scalar(DataType::Boolean))), vec![])
+            .unwrap()[0];
+        builder
+            .build::<Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+    }
+
+    #[test]
+    fn test_linear_scalar_zero_only_tangent_interpretation_uses_inferred_metadata() {
+        let tangent = TangentValue::zero(DataType::F32);
+        let add = LinearScalarOperation::<ZeroScalarTangent>::Add;
+        let neg = LinearScalarOperation::<ZeroScalarTangent>::Neg;
+        let zero = LinearScalarOperation::<ZeroScalarTangent>::Zero(ZeroOperation::new(DataType::F32));
+        let one = LinearScalarOperation::<ZeroScalarTangent>::One(OneOperation::new(DataType::F32));
+        let one_like = LinearScalarOperation::<ZeroScalarTangent>::OneLike;
+
+        assert_eq!(add.interpret(&[tangent.clone(), tangent.clone()]), Ok(vec![tangent.clone()]));
+        assert_eq!(neg.interpret(std::slice::from_ref(&tangent)), Ok(vec![tangent.clone()]));
+        assert_eq!(zero.interpret(&[]), Ok(vec![tangent.clone()]));
+        assert_eq!(one.interpret(&[]).unwrap_err().to_string(), "zero tangent space has no one value for f32");
+        assert_eq!(
+            one_like.interpret(std::slice::from_ref(&tangent)).unwrap_err().to_string(),
+            "zero tangent space has no one value for f32"
+        );
+    }
+
+    #[test]
+    fn test_linear_array_zero_only_tangent_program_propagates_metadata() {
+        let input_type = array_type(&[2, 3]);
+        let reshaped_type = array_type(&[3, 2]);
+        let mut builder = ProgramBuilder::<ArrayType, ZeroArrayTangent, ZeroArrayOperation>::new();
+        let input = builder.add_input(input_type.clone());
+        let reshaped = builder
+            .add_instruction(
+                ZeroArrayOperation::Reshape {
+                    input_shape: input_type.shape.clone(),
+                    output_shape: reshaped_type.shape.clone(),
+                },
+                vec![input],
+            )
+            .unwrap()[0];
+        let transposed = builder.add_instruction(ZeroArrayOperation::Transpose, vec![reshaped]).unwrap()[0];
+        let negated = builder.add_instruction(ZeroArrayOperation::Neg, vec![transposed]).unwrap()[0];
+        let output = builder.add_instruction(ZeroArrayOperation::Add, vec![negated, input]).unwrap()[0];
+        let program = builder
+            .build::<Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        assert_eq!(
+            program.interpret(vec![TangentValue::zero(input_type.clone())]),
+            Ok(vec![TangentValue::zero(input_type)])
+        );
+    }
+
+    #[test]
+    fn test_linear_array_zero_only_tangent_matmul_metadata() {
+        let input_type = array_type(&[2, 3]);
+        let right_factor_type = array_type(&[3, 4]);
+        let right_matmul = ZeroArrayOperation::RightMatMul { factor: TangentValue::zero(right_factor_type) };
+
+        assert_eq!(
+            right_matmul.interpret(&[TangentValue::zero(input_type.clone())]),
+            Ok(vec![TangentValue::zero(array_type(&[2, 4]))])
+        );
+
+        let left_factor_type = array_type(&[4, 2]);
+        let left_matmul = ZeroArrayOperation::LeftMatMul { factor: TangentValue::zero(left_factor_type) };
+
+        assert_eq!(
+            left_matmul.interpret(&[TangentValue::zero(input_type)]),
+            Ok(vec![TangentValue::zero(array_type(&[4, 3]))])
+        );
+    }
+
+    #[test]
+    fn test_linear_array_zero_only_tangent_control_flow_interprets_nested_programs() {
+        let state_type = array_type(&[2, 3]);
+        let true_branch = identity_zero_array_program(state_type.clone());
+        let false_branch = one_zero_array_program(state_type.clone(), state_type.clone());
+        let condition = ZeroArrayOperation::Condition(Box::new(
+            ConditionOperation::with_captured_predicate(true, true_branch.clone(), false_branch.clone()).unwrap(),
+        ));
+
+        assert_eq!(
+            condition.interpret(&[TangentValue::zero(state_type.clone())]),
+            Ok(vec![TangentValue::zero(state_type.clone())])
+        );
+
+        let condition = ZeroArrayOperation::Condition(Box::new(
+            ConditionOperation::with_captured_predicate(false, true_branch, false_branch).unwrap(),
+        ));
+        assert_eq!(
+            condition.interpret(&[TangentValue::zero(state_type.clone())]).unwrap_err().to_string(),
+            format!("zero tangent space has no one value for {state_type}")
+        );
+
+        let while_operation = ZeroArrayOperation::While(Box::new(
+            WhileOperation::new(
+                zero_bool_condition_program(state_type.clone()),
+                identity_zero_array_program(state_type.clone()),
+            )
+            .unwrap(),
+        ));
+
+        assert_eq!(
+            while_operation.interpret(&[TangentValue::zero(state_type.clone())]),
+            Ok(vec![TangentValue::zero(state_type)])
+        );
+    }
+
+    #[test]
+    fn test_linear_scalar_tangent_value_interpretation_mixes_non_zero_and_zero() {
+        let non_zero = MixedScalar::non_zero(3.0);
+        let zero = MixedScalar::zero(DataType::F64);
+
+        assert_eq!(MixedScalarOperation::Add.interpret(&[non_zero.clone(), zero.clone()]), Ok(vec![non_zero.clone()]));
+        assert_eq!(MixedScalarOperation::Add.interpret(&[zero.clone(), non_zero.clone()]), Ok(vec![non_zero.clone()]));
+        assert_eq!(
+            MixedScalarOperation::Sub.interpret(&[zero.clone(), non_zero.clone()]),
+            Ok(vec![MixedScalar::non_zero(-3.0)])
+        );
+        assert_eq!(
+            (MixedScalarOperation::Scale { factor: MixedScalar::zero(DataType::F64) })
+                .interpret(std::slice::from_ref(&non_zero)),
+            Ok(vec![zero.clone()])
+        );
+        assert_eq!(
+            (MixedScalarOperation::Scale { factor: MixedScalar::non_zero(2.0) }).interpret(std::slice::from_ref(&zero)),
+            Ok(vec![zero.clone()])
+        );
+        assert_eq!(
+            (MixedScalarOperation::Scale { factor: MixedScalar::non_zero(2.0) })
+                .interpret(std::slice::from_ref(&non_zero)),
+            Ok(vec![MixedScalar::non_zero(6.0)])
+        );
+        assert_eq!(MixedScalarOperation::ZeroLike.interpret(std::slice::from_ref(&non_zero)), Ok(vec![zero.clone()]));
+        assert_eq!(
+            MixedScalarOperation::One(OneOperation::new(DataType::F64)).interpret(&[]),
+            Ok(vec![MixedScalar::non_zero(1.0)])
+        );
+        assert_eq!(
+            MixedScalarOperation::OneLike.interpret(std::slice::from_ref(&zero)).unwrap_err().to_string(),
+            "zero tangent space has no one value for f64"
+        );
+    }
+
+    #[test]
+    fn test_linear_array_tangent_value_interpretation_preserves_symbolic_zero_metadata() {
+        let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input_zero = MixedArray::zero(input.r#type.clone());
+
+        assert_eq!(
+            MixedArrayOperation::Add.interpret(&[MixedArray::non_zero(input.clone()), input_zero.clone()]),
+            Ok(vec![MixedArray::non_zero(input.clone())])
+        );
+        assert_eq!(MixedArrayOperation::Neg.interpret(std::slice::from_ref(&input_zero)), Ok(vec![input_zero.clone()]));
+
+        let reshaped_type = f64_array_type(&[3, 2]);
+        assert_eq!(
+            (MixedArrayOperation::Reshape {
+                input_shape: input.r#type.shape.clone(),
+                output_shape: reshaped_type.shape.clone(),
+            })
+            .interpret(std::slice::from_ref(&input_zero)),
+            Ok(vec![MixedArray::zero(reshaped_type.clone())])
+        );
+
+        let left_factor_type = f64_array_type(&[4, 2]);
+        assert_eq!(
+            (MixedArrayOperation::LeftMatMul { factor: MixedArray::zero(left_factor_type) })
+                .interpret(&[MixedArray::non_zero(input.clone())]),
+            Ok(vec![MixedArray::zero(f64_array_type(&[4, 3]))])
+        );
+
+        let right_factor = TestArray::matrix(3, 4, vec![0.0; 12]);
+        assert_eq!(
+            (MixedArrayOperation::RightMatMul { factor: MixedArray::non_zero(right_factor) })
+                .interpret(std::slice::from_ref(&input_zero)),
+            Ok(vec![MixedArray::zero(f64_array_type(&[2, 4]))])
+        );
+    }
+
+    #[test]
+    fn test_linear_scalar_tangent_value_program_supports_nested_structured_parameters() {
+        let mut builder = ProgramBuilder::<DataType, MixedScalar, MixedScalarOperation>::new();
+        let left = builder.add_input(DataType::F64);
+        let right = builder.add_input(DataType::F64);
+        let sum = builder.add_instruction(MixedScalarOperation::Add, vec![left, right]).unwrap()[0];
+        let difference = builder.add_instruction(MixedScalarOperation::Sub, vec![right, left]).unwrap()[0];
+        let scaled = builder
+            .add_instruction(MixedScalarOperation::Scale { factor: MixedScalar::zero(DataType::F64) }, vec![sum])
+            .unwrap()[0];
+        let program = builder
+            .build::<(MixedScalar, MixedScalar), (MixedScalar, (MixedScalar, MixedScalar))>(
+                vec![sum, difference, scaled],
+                (Placeholder, Placeholder),
+                (Placeholder, (Placeholder, Placeholder)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            program.interpret((MixedScalar::non_zero(2.0), MixedScalar::zero(DataType::F64))),
+            Ok((MixedScalar::non_zero(2.0), (MixedScalar::non_zero(-2.0), MixedScalar::zero(DataType::F64))))
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestCustomOperation;
+
+    impl Operation<DataType> for TestCustomOperation {
+        fn name(&self) -> &'static str {
+            "test_custom_zero"
+        }
+
+        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+            check_count!("input", input_types, 0, TypeError);
+            Ok(vec![DataType::F32])
+        }
+    }
+
+    impl InterpretableOperation<DataType, ZeroScalarTangent> for TestCustomOperation {
+        fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, TracingError> {
+            interpret_zero_only_tangent_operation(self, inputs)
+        }
+    }
+
+    impl InterpretableOperation<DataType, TangentValue<DataType, f32>> for TestCustomOperation {
+        fn interpret(
+            &self,
+            inputs: &[TangentValue<DataType, f32>],
+        ) -> Result<Vec<TangentValue<DataType, f32>>, TracingError> {
+            Ok(symbolic_zero_tangent_value_outputs(infer_tangent_value_output_types(self, inputs)?))
+        }
+    }
+
+    impl
+        LinearOperation<
+            DataType,
+            TangentValue<DataType, f32>,
+            LinearArrayOperation<TangentValue<DataType, f32>, DataType>,
+        > for TestCustomOperation
+    {
+        fn transpose(
+            &self,
+            _context: &mut TranspositionContext<
+                DataType,
+                TangentValue<DataType, f32>,
+                LinearArrayOperation<TangentValue<DataType, f32>, DataType>,
+            >,
+            _output_cotangents: &[Option<AtomId>],
+        ) -> Result<Vec<Option<AtomId>>, TracingError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl LinearOperation<DataType, ZeroScalarTangent, LinearArrayOperation<ZeroScalarTangent, DataType>>
+        for TestCustomOperation
+    {
+        fn transpose(
+            &self,
+            _context: &mut TranspositionContext<
+                DataType,
+                ZeroScalarTangent,
+                LinearArrayOperation<ZeroScalarTangent, DataType>,
+            >,
+            _output_cotangents: &[Option<AtomId>],
+        ) -> Result<Vec<Option<AtomId>>, TracingError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn test_linear_scalar_zero_only_tangent_custom_interpretation_is_explicitly_unsupported() {
+        let custom = LinearScalarOperation::<ZeroScalarTangent>::custom(
+            CustomPrimitive::new(TestCustomOperation).with_transpose_rule(TestCustomOperation),
+        )
+        .unwrap();
+
+        assert_eq!(
+            custom.interpret(&[]).unwrap_err().to_string(),
+            "symbolic-zero custom interpretation is not implemented for test_custom_zero"
+        );
+    }
+
+    #[test]
+    fn test_linear_scalar_tangent_value_custom_interpretation_is_explicitly_unsupported() {
+        let primitive: CustomPrimitive<DataType, TangentValue<DataType, f32>> =
+            CustomPrimitive::new(TestCustomOperation).with_transpose_rule(TestCustomOperation);
+        let custom = LinearScalarOperation::<TangentValue<DataType, f32>>::custom(primitive).unwrap();
+
+        assert_eq!(
+            custom.interpret(&[]).unwrap_err().to_string(),
+            "mixed symbolic-zero custom interpretation is not implemented for test_custom_zero"
+        );
+    }
 }

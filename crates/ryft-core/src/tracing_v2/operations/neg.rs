@@ -8,7 +8,7 @@ use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearArrayOperation, LinearizableEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearArrayOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Trait that represents [`Operation`] carrier types that support/include [`NegOperation`]. Backend-owned closed
@@ -121,10 +121,11 @@ impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + Z
 
 impl<E> DifferentiableOperation<E> for NegOperation
 where
-    E: LinearizableEngine,
+    E: DifferentiableEngine,
     NegOperation: Operation<E::Type>,
-    E::Value: Neg<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperationCarrier: SupportsNeg<E::Type, E::Value>,
+    E::Value: Neg<Output = E::Value> + Differentiable<E::Type>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsNeg<E::Type, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -133,7 +134,10 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsNeg<E::Type, E::Value>>::neg_operation(),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsNeg<
+                E::Type,
+                E::Tangent,
+            >>::neg_operation(),
             &[inputs[0].tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

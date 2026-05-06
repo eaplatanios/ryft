@@ -7,7 +7,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::SupportsScale;
@@ -101,10 +101,11 @@ impl<V: Clone + Typed<DataType> + Sin> InterpretableOperation<DataType, V> for S
 
 impl<E> DifferentiableOperation<E> for SinOperation
 where
-    E: LinearizableEngine,
+    E: DifferentiableEngine,
     SinOperation: Operation<E::Type>,
-    E::Value: Sin + Cos + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperationCarrier: SupportsScale<E::Type, E::Value>,
+    E::Value: Sin + Cos + Differentiable<E::Type>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsScale<E::Type, E::Tangent, E::Value>,
 {
     fn jvp(
         &self,
@@ -114,9 +115,11 @@ where
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsScale<E::Type, E::Value>>::scale_operation(
-                input.primal.clone().cos(),
-            ),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsScale<
+                E::Type,
+                E::Tangent,
+                E::Value,
+            >>::scale_operation(input.primal.clone().cos()),
             &[input.tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

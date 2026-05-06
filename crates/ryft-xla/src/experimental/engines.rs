@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
@@ -9,7 +10,7 @@ use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
-use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearizableEngine};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearizableEngine, TangentValue};
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::arrays::{Array, ArrayError};
@@ -147,8 +148,47 @@ impl<'c> LinearizableEngine for XlaEngine<'c> {
     type LinearOperationCarrier = LinearXlaOperation<ShardMapTensor>;
 }
 
+/// Stateless linear engine used by XLA AD paths when tangents are represented as symbolic zeros.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct XlaSymbolicZeroEngine;
+
+impl XlaSymbolicZeroEngine {
+    /// Returns the singleton symbolic-zero linear engine.
+    #[inline]
+    pub fn token() -> &'static Self {
+        static TOKEN: XlaSymbolicZeroEngine = XlaSymbolicZeroEngine;
+        &TOKEN
+    }
+}
+
+impl Engine for XlaSymbolicZeroEngine {
+    type Type = ArrayType;
+    type Value = TangentValue<ArrayType, Infallible>;
+
+    #[inline]
+    fn zero(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
+        Ok(TangentValue::zero(array_type.clone()))
+    }
+
+    #[inline]
+    fn one(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
+        Err(TypeError { message: format!("zero tangent space has no one value for {array_type}") }.into())
+    }
+}
+
+impl LinearizableEngine for XlaSymbolicZeroEngine {
+    type LinearOperationCarrier = LinearXlaOperation<TangentValue<ArrayType, Infallible>>;
+}
+
 impl<'c> DifferentiableEngine for XlaEngine<'c> {
+    type Tangent = TangentValue<ArrayType, Infallible>;
+    type LinearEngine = XlaSymbolicZeroEngine;
     type DifferentiableOperationCarrier = XlaOperation;
+
+    #[inline]
+    fn linear_engine(&self) -> &Self::LinearEngine {
+        XlaSymbolicZeroEngine::token()
+    }
 }
 
 impl<'c> DifferentiableTracingEngine for XlaEngine<'c> {

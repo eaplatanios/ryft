@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use half::{bf16, f16};
 
 use crate::macros::check_count;
@@ -7,8 +9,8 @@ use crate::operations::constants::{
 };
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, TangentValue};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{DataType, Type};
 
 impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
@@ -26,10 +28,11 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for ZeroOperation<E::Type>
 where
-    E: LinearizableEngine,
+    E: DifferentiableEngine,
     ZeroOperation<E::Type>: Operation<E::Type>,
-    E::Value: Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperationCarrier: SupportsZero<E::Type, E::Value>,
+    E::Value: Differentiable<E::Type>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsZero<E::Type, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -38,7 +41,10 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 0, TracingError);
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(self.r#type.clone()),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZero<
+                E::Type,
+                E::Tangent,
+            >>::zero_operation(self.r#type.clone()),
             &[],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -61,10 +67,11 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for OneOperation<E::Type>
 where
-    E: LinearizableEngine,
+    E: DifferentiableEngine,
     OneOperation<E::Type>: Operation<E::Type>,
-    E::Value: Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperationCarrier: SupportsZero<E::Type, E::Value>,
+    E::Value: Differentiable<E::Type>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsZero<E::Type, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -73,7 +80,10 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 0, TracingError);
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsZero<E::Type, E::Value>>::zero_operation(self.r#type.clone()),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZero<
+                E::Type,
+                E::Tangent,
+            >>::zero_operation(self.r#type.clone()),
             &[],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -96,10 +106,11 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for ZeroLikeOperation
 where
-    E: LinearizableEngine,
+    E: DifferentiableEngine,
     ZeroLikeOperation: Operation<E::Type>,
-    E::Value: ZeroLike + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperationCarrier: SupportsZeroLike<E::Type, E::Value>,
+    E::Value: ZeroLike + Differentiable<E::Type>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsZeroLike<E::Type, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -108,7 +119,10 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZeroLike<
+                E::Type,
+                E::Tangent,
+            >>::zero_like_operation(),
             &[inputs[0].tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -131,10 +145,11 @@ impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperat
 
 impl<E> DifferentiableOperation<E> for OneLikeOperation
 where
-    E: LinearizableEngine,
+    E: DifferentiableEngine,
     OneLikeOperation: Operation<E::Type>,
-    E::Value: OneLike + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperationCarrier: SupportsZeroLike<E::Type, E::Value>,
+    E::Value: OneLike + Differentiable<E::Type>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsZeroLike<E::Type, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -143,7 +158,10 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsZeroLike<E::Type, E::Value>>::zero_like_operation(),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZeroLike<
+                E::Type,
+                E::Tangent,
+            >>::zero_like_operation(),
             &[inputs[0].tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -151,53 +169,104 @@ where
     }
 }
 
-macro_rules! impl_scalar_differentiable {
-    ($ty:ty) => {
+macro_rules! impl_nondifferentiable_scalar {
+    ($ty:ty, $data_type:path) => {
         impl crate::tracing_v2::differentiation::Differentiable<DataType> for $ty {
-            type Tangent = Self;
+            type Tangent = TangentValue<DataType, Infallible>;
+
+            #[inline]
+            fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+                Ok(TangentValue::zero($data_type))
+            }
         }
     };
 }
 
-impl_scalar_differentiable!(bool);
-impl_scalar_differentiable!(i8);
-impl_scalar_differentiable!(i16);
-impl_scalar_differentiable!(i32);
-impl_scalar_differentiable!(i64);
-impl_scalar_differentiable!(u8);
-impl_scalar_differentiable!(u16);
-impl_scalar_differentiable!(u32);
-impl_scalar_differentiable!(u64);
-impl_scalar_differentiable!(bf16);
-impl_scalar_differentiable!(f16);
-impl_scalar_differentiable!(f32);
-impl_scalar_differentiable!(f64);
+macro_rules! impl_floating_scalar_differentiable {
+    ($ty:ty, $zero:expr) => {
+        impl crate::tracing_v2::differentiation::Differentiable<DataType> for $ty {
+            type Tangent = Self;
+
+            #[inline]
+            fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+                Ok($zero)
+            }
+        }
+    };
+}
+
+impl_nondifferentiable_scalar!(bool, DataType::Boolean);
+impl_nondifferentiable_scalar!(i8, DataType::I8);
+impl_nondifferentiable_scalar!(i16, DataType::I16);
+impl_nondifferentiable_scalar!(i32, DataType::I32);
+impl_nondifferentiable_scalar!(i64, DataType::I64);
+impl_nondifferentiable_scalar!(u8, DataType::U8);
+impl_nondifferentiable_scalar!(u16, DataType::U16);
+impl_nondifferentiable_scalar!(u32, DataType::U32);
+impl_nondifferentiable_scalar!(u64, DataType::U64);
+impl_floating_scalar_differentiable!(bf16, bf16::ZERO);
+impl_floating_scalar_differentiable!(f16, f16::ZERO);
+impl_floating_scalar_differentiable!(f32, 0.0);
+impl_floating_scalar_differentiable!(f64, 0.0);
 
 #[cfg(test)]
 mod tests {
+    use std::any::TypeId;
+    use std::convert::Infallible;
+
     use half::{bf16, f16};
     use indoc::indoc;
 
     use crate::tracing::Program;
     use crate::tracing::engines::{ScalarEngine, TracingEngine};
-    use crate::tracing_v2::{Cos, Differentiable, ScalarOperation, Sin};
+    use crate::tracing_v2::{Cos, Differentiable, ScalarOperation, Sin, TangentValue};
     use crate::types::DataType;
 
     #[test]
     fn test_scalar_types_are_differentiable() {
-        let _: Option<<bool as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<i8 as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<i16 as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<i32 as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<i64 as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<u8 as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<u16 as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<u32 as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<u64 as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<bf16 as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<f16 as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<f32 as Differentiable<DataType>>::Tangent> = None;
-        let _: Option<<f64 as Differentiable<DataType>>::Tangent> = None;
+        assert_eq!(
+            TypeId::of::<<bool as Differentiable<DataType>>::Tangent>(),
+            TypeId::of::<TangentValue<DataType, Infallible>>()
+        );
+        assert_eq!(
+            TypeId::of::<<i8 as Differentiable<DataType>>::Tangent>(),
+            TypeId::of::<TangentValue<DataType, Infallible>>()
+        );
+        assert_eq!(
+            TypeId::of::<<i16 as Differentiable<DataType>>::Tangent>(),
+            TypeId::of::<TangentValue<DataType, Infallible>>()
+        );
+        assert_eq!(
+            TypeId::of::<<i32 as Differentiable<DataType>>::Tangent>(),
+            TypeId::of::<TangentValue<DataType, Infallible>>()
+        );
+        assert_eq!(
+            TypeId::of::<<i64 as Differentiable<DataType>>::Tangent>(),
+            TypeId::of::<TangentValue<DataType, Infallible>>()
+        );
+        assert_eq!(
+            TypeId::of::<<u8 as Differentiable<DataType>>::Tangent>(),
+            TypeId::of::<TangentValue<DataType, Infallible>>()
+        );
+        assert_eq!(
+            TypeId::of::<<u16 as Differentiable<DataType>>::Tangent>(),
+            TypeId::of::<TangentValue<DataType, Infallible>>()
+        );
+        assert_eq!(
+            TypeId::of::<<u32 as Differentiable<DataType>>::Tangent>(),
+            TypeId::of::<TangentValue<DataType, Infallible>>()
+        );
+        assert_eq!(
+            TypeId::of::<<u64 as Differentiable<DataType>>::Tangent>(),
+            TypeId::of::<TangentValue<DataType, Infallible>>()
+        );
+        assert_eq!(TypeId::of::<<bf16 as Differentiable<DataType>>::Tangent>(), TypeId::of::<bf16>());
+        assert_eq!(TypeId::of::<<f16 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f16>());
+        assert_eq!(TypeId::of::<<f32 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f32>());
+        assert_eq!(TypeId::of::<<f64 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f64>());
+        assert_eq!(false.tangent_type().unwrap(), TangentValue::zero(DataType::Boolean));
+        assert_eq!(3i32.tangent_type().unwrap(), TangentValue::zero(DataType::I32));
+        assert_eq!(2.0f64.tangent_type().unwrap(), 0.0);
     }
 
     #[test]

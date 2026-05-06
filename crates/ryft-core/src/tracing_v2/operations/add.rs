@@ -7,7 +7,7 @@ use crate::tracing::TranspositionContext;
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableOperation, LinearizableEngine};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::Type;
 
 impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> LinearOperation<T, V, O> for AddOperation
@@ -25,10 +25,11 @@ where
     }
 }
 
-impl<E: LinearizableEngine> DifferentiableOperation<E> for AddOperation
+impl<E: DifferentiableEngine> DifferentiableOperation<E> for AddOperation
 where
-    E::Value: Add<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperationCarrier: SupportsAdd<E::Type, E::Value>,
+    E::Value: Add<Output = E::Value> + Differentiable<E::Type>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsAdd<E::Type, E::Tangent>,
     AddOperation: Operation<E::Type>,
 {
     #[inline]
@@ -39,7 +40,13 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
         let tangent_inputs = &[inputs[0].tangent, inputs[1].tangent];
-        let tangent_outputs = context.stage(E::LinearOperationCarrier::add_operation(), tangent_inputs)?;
+        let tangent_outputs = context.stage(
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsAdd<
+                E::Type,
+                E::Tangent,
+            >>::add_operation(),
+            tangent_inputs,
+        )?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: inputs[0].primal.clone() + inputs[1].primal.clone(), tangent: tangent_outputs[0] }])
     }

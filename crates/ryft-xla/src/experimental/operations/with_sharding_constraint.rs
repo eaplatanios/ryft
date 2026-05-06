@@ -8,8 +8,7 @@ use ryft_core::tracing::transposition::LinearOperation;
 use ryft_core::tracing::{AtomId, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearArrayOperation,
-    LinearCustomPrimitive,
+    CustomPrimitive, DifferentiableOperation, JvpContext, LinearArrayOperation, LinearCustomPrimitive,
 };
 use ryft_core::types::{ArrayType, TypeError};
 use ryft_mlir::{Block, Operation as MlirOperation, Value};
@@ -128,24 +127,14 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
     }
 }
 
-impl<E> DifferentiableOperation<E> for WithShardingConstraintOperation
-where
-    E: DifferentiableEngine<
-            Type = ArrayType,
-            Value = ShardMapTensor,
-            LinearOperationCarrier = LinearArrayOperation<ShardMapTensor, ArrayType>,
-        >,
-{
+impl<'c> DifferentiableOperation<crate::experimental::engines::XlaEngine<'c>> for WithShardingConstraintOperation {
     fn jvp(
         &self,
-        context: &mut JvpContext<'_, E>,
+        _context: &mut JvpContext<'_, crate::experimental::engines::XlaEngine<'c>>,
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
-        let tangent_outputs =
-            context.stage(LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, &[inputs[0].tangent])?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: inputs[0].primal.clone(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal: inputs[0].primal.clone(), tangent: inputs[0].tangent }])
     }
 }
 

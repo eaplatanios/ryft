@@ -3,7 +3,6 @@ use std::fmt::Debug;
 use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
 use crate::operations::constants::SupportsZeroLike;
-use crate::operations::constants::Zero;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::{Program, Traceable, TracingError, Value};
@@ -46,10 +45,12 @@ where
 }
 
 /// Marker selecting concrete-value [`jvp`] dispatch.
-pub(crate) struct JvpDispatchValueMarker;
+#[doc(hidden)]
+pub struct JvpDispatchValueMarker;
 
 /// Marker selecting already-traced [`jvp`] dispatch.
-pub(crate) struct JvpDispatchTracerMarker;
+#[doc(hidden)]
+pub struct JvpDispatchTracerMarker;
 
 /// Dispatch trait used by [`jvp`] so it can operate both on concrete values and on already traced values.
 ///
@@ -82,17 +83,8 @@ where
 /// pushforward via [`linearize`] and evaluates it at the supplied tangents.
 impl<
     'engine,
-    E: DifferentiableEngine<
-            Value = V,
-            LinearOperationCarrier: InterpretableOperation<E::Type, V>
-                                        + SupportsNeg<E::Type, V>
-                                        + SupportsAdd<E::Type, V>
-                                        + SupportsScale<E::Type, V>,
-        > + 'static,
-    V: Value<E::Type>
-        + Differentiable<E::Type, Tangent = V>
-        + Zero<E::Type>
-        + Parameterized<V, ParameterStructure: PartialEq>,
+    E: DifferentiableEngine<Value = V> + 'static,
+    V: Value<E::Type> + Differentiable<E::Type, Tangent = E::Tangent> + Parameterized<V, ParameterStructure: PartialEq>,
     Input: Parameterized<
             V,
             Family: for<'call> ParameterizedFamily<Tracer<'call, DifferentiableOperationTracingEngine<E>>>,
@@ -109,6 +101,14 @@ impl<
             To<V> = Output,
         >,
 > JvpDispatch<'engine, E, Input, Output, JvpDispatchValueMarker> for V
+where
+    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: InterpretableOperation<E::Type, E::Tangent>
+        + SupportsNeg<E::Type, E::Tangent>
+        + SupportsAdd<E::Type, E::Tangent>
+        + SupportsScale<E::Type, E::Tangent>,
+    Input::Family: ParameterizedFamily<E::Tangent>,
+    Output::Family: ParameterizedFamily<E::Tangent>,
 {
     type FunctionInput = Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>;
     type FunctionOutput = Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>;
@@ -129,8 +129,16 @@ impl<
             .into());
         }
 
-        let (primal_output, tangent_program): (Output, Program<E::Type, V, E::LinearOperationCarrier, Input, Output>) =
-            linearize(engine, |input| Ok(function(input)), primals)?;
+        let (primal_output, tangent_program): (
+            Output,
+            Program<
+                E::Type,
+                E::Tangent,
+                <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+                Input::To<E::Tangent>,
+                Output::To<E::Tangent>,
+            >,
+        ) = linearize(engine, |input| Ok(function(input)), primals)?;
         let tangent_output = tangent_program.interpret(tangents)?;
         Ok((primal_output, tangent_output))
     }
@@ -142,7 +150,7 @@ impl<
 impl<
     'engine,
     E: DifferentiableTracingEngine<Value = V> + TracingEngine + 'static,
-    V: Traceable<E::Type> + Differentiable<E::Type, Tangent = V> + Parameterized<V, ParameterStructure = Placeholder>,
+    V: Traceable<E::Type> + Differentiable<E::Type> + Parameterized<V, ParameterStructure = Placeholder>,
     Input,
     Output,
 > JvpDispatch<'engine, E, Input, Output, JvpDispatchTracerMarker> for Tracer<'engine, E>
@@ -201,20 +209,475 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::cell::RefCell;
+    use std::fmt::Display;
+    use std::ops::{Add, Div, Mul, Neg, Sub};
     use std::rc::Rc;
 
     use indoc::indoc;
+    use pretty_assertions::assert_eq;
+    use ryft_macros::Parameter;
 
+    use crate::macros::check_count;
+    use crate::operations::Operation;
+    use crate::operations::arithmetic::{
+        AddOperation, MulOperation, SubOperation, SupportsAdd, SupportsMul, SupportsSub,
+    };
+    use crate::operations::constants::{
+        One, OneLike, OneOperation, SupportsOne, SupportsZero, Zero, ZeroLike, ZeroOperation,
+    };
     use crate::parameters::{ParameterError, Parameterized};
-    use crate::tracing::engines::{ScalarEngine, TracingContext};
-    use crate::tracing::{Program, ProgramBuilder};
-    use crate::tracing_v2::DifferentiableOperation;
+    use crate::tracing::TranspositionContext;
+    use crate::tracing::engines::{Engine, ScalarEngine, TracingContext, TracingEngine};
+    use crate::tracing::transposition::LinearOperation;
+    use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+    use crate::tracing_v2::operations::{NegOperation, SupportsNeg, SupportsScale};
+    use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearizableEngine};
     use crate::tracing_v2::{LinearScalarOperation, ScalarOperation, Sin};
-    use crate::types::DataType;
+    use crate::types::{DataType, Typed};
 
     use super::*;
+
+    #[derive(Copy, Clone, Debug, PartialEq, Parameter)]
+    struct DistinctPrimal(f64);
+
+    impl Display for DistinctPrimal {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Display::fmt(&self.0, formatter)
+        }
+    }
+
+    impl Typed<DataType> for DistinctPrimal {
+        fn r#type(&self) -> Cow<'_, DataType> {
+            Cow::Owned(DataType::F64)
+        }
+    }
+
+    impl Traceable<DataType> for DistinctPrimal {}
+    impl Value<DataType> for DistinctPrimal {}
+    impl Differentiable<DataType> for DistinctPrimal {
+        type Tangent = DistinctTangent;
+
+        fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+            Ok(DistinctTangent(0.0))
+        }
+    }
+
+    impl Add for DistinctPrimal {
+        type Output = Self;
+
+        fn add(self, rhs: Self) -> Self::Output {
+            Self(self.0 + rhs.0)
+        }
+    }
+
+    impl Sub for DistinctPrimal {
+        type Output = Self;
+
+        fn sub(self, rhs: Self) -> Self::Output {
+            Self(self.0 - rhs.0)
+        }
+    }
+
+    impl Mul for DistinctPrimal {
+        type Output = Self;
+
+        fn mul(self, rhs: Self) -> Self::Output {
+            Self(self.0 * rhs.0)
+        }
+    }
+
+    impl Div for DistinctPrimal {
+        type Output = Self;
+
+        fn div(self, rhs: Self) -> Self::Output {
+            Self(self.0 / rhs.0)
+        }
+    }
+
+    impl Neg for DistinctPrimal {
+        type Output = Self;
+
+        fn neg(self) -> Self::Output {
+            Self(-self.0)
+        }
+    }
+
+    impl Zero<DataType> for DistinctPrimal {
+        fn zero(r#type: &DataType) -> Result<Self, TracingError> {
+            assert_eq!(r#type, &DataType::F64);
+            Ok(Self(0.0))
+        }
+    }
+
+    impl One<DataType> for DistinctPrimal {
+        fn one(r#type: &DataType) -> Result<Self, TracingError> {
+            assert_eq!(r#type, &DataType::F64);
+            Ok(Self(1.0))
+        }
+    }
+
+    impl ZeroLike for DistinctPrimal {
+        fn zero_like(&self) -> Self {
+            Self(0.0)
+        }
+    }
+
+    impl OneLike for DistinctPrimal {
+        fn one_like(&self) -> Self {
+            Self(1.0)
+        }
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Parameter)]
+    struct DistinctTangent(f64);
+
+    impl Display for DistinctTangent {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Display::fmt(&self.0, formatter)
+        }
+    }
+
+    impl Typed<DataType> for DistinctTangent {
+        fn r#type(&self) -> Cow<'_, DataType> {
+            Cow::Owned(DataType::F64)
+        }
+    }
+
+    impl Traceable<DataType> for DistinctTangent {}
+
+    impl Add for DistinctTangent {
+        type Output = Self;
+
+        fn add(self, rhs: Self) -> Self::Output {
+            Self(self.0 + rhs.0)
+        }
+    }
+
+    impl Sub for DistinctTangent {
+        type Output = Self;
+
+        fn sub(self, rhs: Self) -> Self::Output {
+            Self(self.0 - rhs.0)
+        }
+    }
+
+    impl Mul for DistinctTangent {
+        type Output = Self;
+
+        fn mul(self, rhs: Self) -> Self::Output {
+            Self(self.0 * rhs.0)
+        }
+    }
+
+    impl Neg for DistinctTangent {
+        type Output = Self;
+
+        fn neg(self) -> Self::Output {
+            Self(-self.0)
+        }
+    }
+
+    impl Zero<DataType> for DistinctTangent {
+        fn zero(r#type: &DataType) -> Result<Self, TracingError> {
+            assert_eq!(r#type, &DataType::F64);
+            Ok(Self(0.0))
+        }
+    }
+
+    impl One<DataType> for DistinctTangent {
+        fn one(r#type: &DataType) -> Result<Self, TracingError> {
+            assert_eq!(r#type, &DataType::F64);
+            Ok(Self(1.0))
+        }
+    }
+
+    impl ZeroLike for DistinctTangent {
+        fn zero_like(&self) -> Self {
+            Self(0.0)
+        }
+    }
+
+    impl OneLike for DistinctTangent {
+        fn one_like(&self) -> Self {
+            Self(1.0)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum DistinctLinearOperation {
+        Zero(ZeroOperation<DataType>),
+        One(OneOperation<DataType>),
+        Neg,
+        Add,
+        Sub,
+        ScaleByTangent { factor: DistinctTangent },
+        ScaleByPrimal { factor: DistinctPrimal },
+    }
+
+    impl Operation<DataType> for DistinctLinearOperation {
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Zero(operation) => operation.name(),
+                Self::One(operation) => operation.name(),
+                Self::Neg => Operation::<DataType>::name(&NegOperation),
+                Self::Add => Operation::<DataType>::name(&AddOperation),
+                Self::Sub => Operation::<DataType>::name(&SubOperation),
+                Self::ScaleByTangent { .. } | Self::ScaleByPrimal { .. } => "scale",
+            }
+        }
+
+        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, crate::types::TypeError> {
+            match self {
+                Self::Zero(operation) => operation.infer_output_types(input_types),
+                Self::One(operation) => operation.infer_output_types(input_types),
+                Self::Neg => NegOperation.infer_output_types(input_types),
+                Self::Add => Operation::<DataType>::infer_output_types(&AddOperation, input_types),
+                Self::Sub => Operation::<DataType>::infer_output_types(&SubOperation, input_types),
+                Self::ScaleByTangent { .. } | Self::ScaleByPrimal { .. } => {
+                    check_count!("input", input_types, 1, TypeError);
+                    Ok(vec![input_types[0]])
+                }
+            }
+        }
+    }
+
+    impl InterpretableOperation<DataType, DistinctTangent> for DistinctLinearOperation {
+        fn interpret(&self, inputs: &[DistinctTangent]) -> Result<Vec<DistinctTangent>, TracingError> {
+            match self {
+                Self::Zero(operation) => operation.interpret(inputs),
+                Self::One(operation) => operation.interpret(inputs),
+                Self::Neg => NegOperation.interpret(inputs),
+                Self::Add => AddOperation.interpret(inputs),
+                Self::Sub => SubOperation.interpret(inputs),
+                Self::ScaleByTangent { factor } => {
+                    check_count!("input", inputs, 1, TracingError);
+                    Ok(vec![DistinctTangent(factor.0 * inputs[0].0)])
+                }
+                Self::ScaleByPrimal { factor } => {
+                    check_count!("input", inputs, 1, TracingError);
+                    Ok(vec![DistinctTangent(factor.0 * inputs[0].0)])
+                }
+            }
+        }
+    }
+
+    impl SupportsZero<DataType, DistinctTangent> for DistinctLinearOperation {
+        fn zero_operation(r#type: DataType) -> Self {
+            Self::Zero(ZeroOperation::new(r#type))
+        }
+
+        fn as_zero_operation(&self) -> Option<&ZeroOperation<DataType>> {
+            match self {
+                Self::Zero(operation) => Some(operation),
+                _ => None,
+            }
+        }
+    }
+
+    impl SupportsOne<DataType, DistinctTangent> for DistinctLinearOperation {
+        fn one_operation(r#type: DataType) -> Self {
+            Self::One(OneOperation::new(r#type))
+        }
+    }
+
+    impl SupportsNeg<DataType, DistinctTangent> for DistinctLinearOperation {
+        fn neg_operation() -> Self {
+            Self::Neg
+        }
+    }
+
+    impl SupportsAdd<DataType, DistinctTangent> for DistinctLinearOperation {
+        fn add_operation() -> Self {
+            Self::Add
+        }
+    }
+
+    impl SupportsSub<DataType, DistinctTangent> for DistinctLinearOperation {
+        fn sub_operation() -> Self {
+            Self::Sub
+        }
+    }
+
+    impl SupportsScale<DataType, DistinctTangent> for DistinctLinearOperation {
+        fn scale_operation(factor: DistinctTangent) -> Self {
+            Self::ScaleByTangent { factor }
+        }
+    }
+
+    impl SupportsScale<DataType, DistinctTangent, DistinctPrimal> for DistinctLinearOperation {
+        fn scale_operation(factor: DistinctPrimal) -> Self {
+            Self::ScaleByPrimal { factor }
+        }
+    }
+
+    impl LinearOperation<DataType, DistinctTangent, DistinctLinearOperation> for DistinctLinearOperation {
+        fn transpose(
+            &self,
+            context: &mut TranspositionContext<DataType, DistinctTangent, DistinctLinearOperation>,
+            output_cotangents: &[Option<AtomId>],
+        ) -> Result<Vec<Option<AtomId>>, TracingError> {
+            check_count!("output", output_cotangents, 1, TracingError);
+            let Some(output_cotangent) = output_cotangents[0] else {
+                return Ok(match self {
+                    Self::Zero(_) | Self::One(_) => vec![],
+                    Self::Neg | Self::ScaleByTangent { .. } | Self::ScaleByPrimal { .. } => vec![None],
+                    Self::Add | Self::Sub => vec![None, None],
+                });
+            };
+            match self {
+                Self::Zero(_) | Self::One(_) => Ok(vec![]),
+                Self::Neg => {
+                    let inputs = context.stage(Self::Neg, &[output_cotangent])?;
+                    check_count!("output", inputs, 1, TracingError);
+                    Ok(vec![Some(inputs[0])])
+                }
+                Self::Add => Ok(vec![Some(output_cotangent), Some(output_cotangent)]),
+                Self::Sub => {
+                    let right_inputs = context.stage(Self::Neg, &[output_cotangent])?;
+                    check_count!("output", right_inputs, 1, TracingError);
+                    Ok(vec![Some(output_cotangent), Some(right_inputs[0])])
+                }
+                Self::ScaleByTangent { factor } => {
+                    let inputs = context.stage(Self::ScaleByTangent { factor: *factor }, &[output_cotangent])?;
+                    check_count!("output", inputs, 1, TracingError);
+                    Ok(vec![Some(inputs[0])])
+                }
+                Self::ScaleByPrimal { factor } => {
+                    let inputs = context.stage(Self::ScaleByPrimal { factor: *factor }, &[output_cotangent])?;
+                    check_count!("output", inputs, 1, TracingError);
+                    Ok(vec![Some(inputs[0])])
+                }
+            }
+        }
+    }
+
+    #[derive(Copy, Clone, Debug)]
+    struct DistinctTangentEngine;
+
+    impl Engine for DistinctTangentEngine {
+        type Type = DataType;
+        type Value = DistinctTangent;
+
+        fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
+            DistinctTangent::zero(r#type)
+        }
+
+        fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
+            DistinctTangent::one(r#type)
+        }
+    }
+
+    impl LinearizableEngine for DistinctTangentEngine {
+        type LinearOperationCarrier = DistinctLinearOperation;
+    }
+
+    #[derive(Clone, Debug)]
+    enum DistinctPrimalOperation {
+        Add,
+        Mul,
+    }
+
+    impl Operation<DataType> for DistinctPrimalOperation {
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Add => Operation::<DataType>::name(&AddOperation),
+                Self::Mul => Operation::<DataType>::name(&MulOperation),
+            }
+        }
+
+        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, crate::types::TypeError> {
+            match self {
+                Self::Add => Operation::<DataType>::infer_output_types(&AddOperation, input_types),
+                Self::Mul => Operation::<DataType>::infer_output_types(&MulOperation, input_types),
+            }
+        }
+    }
+
+    impl InterpretableOperation<DataType, DistinctPrimal> for DistinctPrimalOperation {
+        fn interpret(&self, inputs: &[DistinctPrimal]) -> Result<Vec<DistinctPrimal>, TracingError> {
+            match self {
+                Self::Add => AddOperation.interpret(inputs),
+                Self::Mul => MulOperation.interpret(inputs),
+            }
+        }
+    }
+
+    impl SupportsAdd<DataType, DistinctPrimal> for DistinctPrimalOperation {
+        fn add_operation() -> Self {
+            Self::Add
+        }
+    }
+
+    impl SupportsMul<DataType, DistinctPrimal> for DistinctPrimalOperation {
+        fn mul_operation() -> Self {
+            Self::Mul
+        }
+    }
+
+    impl<E: DifferentiableEngine<Type = DataType, Value = DistinctPrimal>> DifferentiableOperation<E>
+        for DistinctPrimalOperation
+    where
+        <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+            SupportsAdd<DataType, E::Tangent>,
+        <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+            SupportsScale<DataType, E::Tangent, DistinctPrimal>,
+    {
+        fn jvp(
+            &self,
+            context: &mut JvpContext<'_, E>,
+            inputs: &[JvpTracer<DistinctPrimal, AtomId>],
+        ) -> Result<Vec<JvpTracer<DistinctPrimal, AtomId>>, TracingError> {
+            match self {
+                Self::Add => AddOperation.jvp(context, inputs),
+                Self::Mul => MulOperation.jvp(context, inputs),
+            }
+        }
+    }
+
+    #[derive(Copy, Clone, Debug)]
+    struct DistinctPrimalEngine {
+        linear_engine: DistinctTangentEngine,
+    }
+
+    impl DistinctPrimalEngine {
+        fn new() -> Self {
+            Self { linear_engine: DistinctTangentEngine }
+        }
+    }
+
+    impl Engine for DistinctPrimalEngine {
+        type Type = DataType;
+        type Value = DistinctPrimal;
+
+        fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
+            DistinctPrimal::zero(r#type)
+        }
+
+        fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
+            DistinctPrimal::one(r#type)
+        }
+    }
+
+    impl TracingEngine for DistinctPrimalEngine {
+        type OperationCarrier = DistinctPrimalOperation;
+    }
+
+    impl LinearizableEngine for DistinctPrimalEngine {
+        type LinearOperationCarrier = LinearScalarOperation<DistinctPrimal>;
+    }
+
+    impl DifferentiableEngine for DistinctPrimalEngine {
+        type Tangent = DistinctTangent;
+        type LinearEngine = DistinctTangentEngine;
+        type DifferentiableOperationCarrier = DistinctPrimalOperation;
+
+        fn linear_engine(&self) -> &Self::LinearEngine {
+            &self.linear_engine
+        }
+    }
 
     /// Validates that [`TracingContext`] can host a JVP rule like [`AddOperation`] when its
     /// `Value` is `Tracer<E>`: the rule stages its primal effect through the underlying engine and
@@ -251,6 +714,64 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(linear_builder.borrow().instructions.len(), 1);
         assert_eq!(outer_builder.borrow().instructions.len(), 1);
+    }
+
+    #[test]
+    fn concrete_jvp_supports_distinct_primal_and_tangent_types() {
+        let engine = DistinctPrimalEngine::new();
+
+        let (primal, tangent): (DistinctPrimal, DistinctTangent) = jvp(
+            &engine,
+            |(left, right)| left + right,
+            (DistinctPrimal(2.0), DistinctPrimal(5.0)),
+            (DistinctTangent(3.0), DistinctTangent(7.0)),
+        )
+        .unwrap();
+
+        assert_eq!(primal, DistinctPrimal(7.0));
+        assert_eq!(tangent, DistinctTangent(10.0));
+
+        let (_, pushforward): (
+            DistinctPrimal,
+            Program<DataType, DistinctTangent, DistinctLinearOperation, DistinctTangent, DistinctTangent>,
+        ) = linearize(&engine, |input| Ok(input.clone() + input), DistinctPrimal(2.0)).unwrap();
+
+        assert_eq!(
+            pushforward.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = add %0 %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        let (output, pullback): (
+            DistinctPrimal,
+            Program<DataType, DistinctTangent, DistinctLinearOperation, DistinctTangent, DistinctTangent>,
+        ) = crate::tracing_v2::linear::vjp(&engine, |input| Ok(input.clone() + input), DistinctPrimal(2.0)).unwrap();
+        assert_eq!(output, DistinctPrimal(4.0));
+        assert_eq!(pullback.interpret(DistinctTangent(4.0)).unwrap(), DistinctTangent(8.0));
+
+        let (product_primal, product_tangent): (DistinctPrimal, DistinctTangent) = jvp(
+            &engine,
+            |(left, right)| left * right,
+            (DistinctPrimal(2.0), DistinctPrimal(5.0)),
+            (DistinctTangent(3.0), DistinctTangent(7.0)),
+        )
+        .unwrap();
+        assert_eq!(product_primal, DistinctPrimal(10.0));
+        assert_eq!(product_tangent, DistinctTangent(29.0));
+
+        let (reverse_primal, reverse_gradient): (DistinctPrimal, (DistinctTangent, DistinctTangent)) =
+            crate::tracing_v2::value_and_grad(
+                &engine,
+                |(left, right)| left * right,
+                (DistinctPrimal(2.0), DistinctPrimal(5.0)),
+            )
+            .unwrap();
+        assert_eq!(reverse_primal, DistinctPrimal(10.0));
+        assert_eq!(reverse_gradient, (DistinctTangent(5.0), DistinctTangent(2.0)));
     }
 
     #[test]

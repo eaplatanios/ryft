@@ -37,9 +37,6 @@ pub mod neg;
 /// Closed default carriers for the built-in operation set.
 pub mod primitive;
 
-/// Traced rematerialization boundary.
-pub mod rematerialize;
-
 /// Reshaping primitive.
 pub mod reshape;
 
@@ -69,10 +66,6 @@ pub use matmul::{MatMulOperation, SupportsMatMul};
 pub use matrix_transpose::{MatrixTransposeOperation, SupportsMatrixTranspose};
 pub use neg::{NegOperation, SupportsNeg};
 pub use primitive::{ArrayOperation, LinearArrayOperation, LinearScalarOperation, ScalarOperation};
-pub use rematerialize::{
-    FlatTracedRematerialize, LinearRematerializeOperation, RematerializeOperation, SupportsLinearRematerialize,
-    SupportsRematerialize,
-};
 pub use reshape::{ReshapeOperation, SupportsReshape};
 pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
 pub use scale::{ScaleOperation, SupportsScale};

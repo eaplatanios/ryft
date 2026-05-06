@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::convert::Infallible;
 use std::fmt::Display;
 use std::rc::Rc;
 
@@ -9,9 +10,9 @@ use thiserror::Error;
 
 use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
-use crate::operations::constants::{SupportsZero, Zero};
+use crate::operations::constants::{One, SupportsZero, Zero, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
-use crate::parameters::{Parameter, Parameterized};
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
@@ -38,20 +39,6 @@ pub enum DifferentiationError {
     #[error("traced reverse-mode requires at least one input leaf to recover the tracing context")]
     MissingTracedReverseModeInputLeaves,
 
-    /// Traced rematerialization was invoked without any staged input leaves.
-    #[error("traced rematerialize requires at least one input leaf to recover the tracing context")]
-    MissingTracedRematerializeInputLeaves,
-
-    /// Linear rematerialization replay was invoked without any tangent leaves.
-    #[error("linear rematerialize replay requires at least one tangent leaf to recover the tracing context")]
-    MissingLinearRematerializeReplayTangentLeaves,
-
-    /// Linear rematerialization transpose was invoked without any output cotangent leaves.
-    #[error(
-        "linear rematerialize transpose requires at least one output cotangent leaf to recover the tracing context"
-    )]
-    MissingLinearRematerializeTransposeCotangentLeaves,
-
     /// Dense Jacobian materialization produced an unexpected number of rows.
     #[error("invalid Jacobian row count; expected {expected} but got {got}")]
     InvalidJacobianRowCount { expected: usize, got: usize },
@@ -69,17 +56,123 @@ pub enum DifferentiationError {
     InvalidJacobianColumnHeight { expected: usize, got: usize },
 }
 
+// `TangentValue<T, Infallible>` is the zero-only tangent representation described in the
+// `TangentValue` docs: `NonZero(Infallible)` cannot be constructed, but the generic enum still
+// requires its payload type to satisfy the ordinary trace leaf contracts. These impls are vacuous
+// because there is no `Infallible` value to inspect or print.
+impl<T: Type> Typed<T> for Infallible {
+    #[inline]
+    fn r#type(&self) -> Cow<'_, T> {
+        match *self {}
+    }
+}
+
+impl Parameter for Infallible {}
+
+impl<T: Type> Traceable<T> for Infallible {}
+
+/// Tangent leaf that can represent either a concrete tangent payload or a symbolic zero.
+///
+/// Engines that need tangent programs containing both concrete tangent leaves and symbolic zero leaves can use this as
+/// their tangent value type. Fully zero tangent spaces use `TangentValue<T, Infallible>`, where
+/// [`TangentValue::NonZero`] is statically unconstructible. `NonZero` means "not the symbolic zero branch"; its payload
+/// may still be a concrete value whose numeric contents are all zero. Operation semantics stay centralized in the
+/// linear operation interpreters: the enum itself only stores the representation and deliberately does not implement
+/// arithmetic or array operation traits.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TangentValue<T: Type, V: Traceable<T>> {
+    /// Symbolic zero with abstract type metadata and no concrete payload.
+    Zero(T),
+
+    /// Concrete tangent payload that is not represented by the symbolic zero branch.
+    NonZero(V),
+}
+
+impl<T: Type, V: Traceable<T>> TangentValue<T, V> {
+    /// Creates a symbolic zero tangent carrying the provided abstract type metadata.
+    #[inline]
+    pub fn zero(r#type: T) -> Self {
+        Self::Zero(r#type)
+    }
+
+    /// Wraps a concrete tangent payload in the non-symbolic-zero branch.
+    #[inline]
+    pub fn non_zero(value: V) -> Self {
+        Self::NonZero(value)
+    }
+
+    /// Returns `true` when this tangent is represented as a symbolic zero.
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        matches!(self, Self::Zero(_))
+    }
+
+    /// Returns the concrete tangent payload when this tangent is in the non-symbolic-zero branch.
+    #[inline]
+    pub fn as_non_zero(&self) -> Option<&V> {
+        match self {
+            Self::Zero(_) => None,
+            Self::NonZero(value) => Some(value),
+        }
+    }
+}
+
+impl<T: Type, V: Traceable<T>> Display for TangentValue<T, V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero(r#type) => write!(formatter, "zero_tangent[{type}]", type = r#type),
+            Self::NonZero(value) => Display::fmt(value, formatter),
+        }
+    }
+}
+
+impl<T: Type, V: Traceable<T>> Typed<T> for TangentValue<T, V> {
+    #[inline]
+    fn r#type(&self) -> Cow<'_, T> {
+        match self {
+            Self::Zero(r#type) => Cow::Borrowed(r#type),
+            Self::NonZero(value) => value.r#type(),
+        }
+    }
+}
+
+impl<T: Parameter + Type, V: Traceable<T>> Parameter for TangentValue<T, V> {}
+
+impl<T: Parameter + Type, V: Traceable<T>> Traceable<T> for TangentValue<T, V> {}
+
+impl<T: Type, V: Traceable<T>> Zero<T> for TangentValue<T, V> {
+    #[inline]
+    fn zero(r#type: &T) -> Result<Self, TracingError> {
+        Ok(Self::Zero(r#type.clone()))
+    }
+}
+
+impl<T: Type, V: Traceable<T> + One<T>> One<T> for TangentValue<T, V> {
+    #[inline]
+    fn one(r#type: &T) -> Result<Self, TracingError> {
+        Ok(Self::NonZero(V::one(r#type)?))
+    }
+}
+
+impl<T: Type, V: Traceable<T>> ZeroLike for TangentValue<T, V> {
+    #[inline]
+    fn zero_like(&self) -> Self {
+        Self::Zero(self.r#type().into_owned())
+    }
+}
+
 /// Value-level contract for leaves that participate in automatic differentiation over `T`.
 ///
-/// The associated [`Tangent`](Self::Tangent) type makes the tangent representation explicit even
-/// though today's staged linear-program IR still requires `Tangent = Self` at the transform
-/// boundary. Code paths that need to synthesize zero tangents or unit gradient seeds from abstract
-/// type metadata add [`Zero`](crate::operations::constants::Zero) and
-/// [`One`](crate::operations::constants::One) bounds at those synthesis sites instead
-/// of requiring every tangent representation to support metadata-only construction.
+/// The associated [`Tangent`](Self::Tangent) type makes the tangent representation explicit. [`tangent_type`] returns
+/// the canonical zero tangent/exemplar for this concrete primal value, carrying whatever metadata the tangent
+/// representation needs. Transform code uses this hook when it must synthesize disconnected tangents from primal
+/// values instead of guessing from abstract [`Type`] metadata alone.
 pub trait Differentiable<T: Type>: Traceable<T> {
     /// Tangent and cotangent leaf type associated with this primal leaf.
     type Tangent: Traceable<T>;
+
+    /// Returns the canonical zero tangent/exemplar associated with this primal value.
+    fn tangent_type(&self) -> Result<Self::Tangent, TracingError>;
 }
 
 impl<'engine, E> Differentiable<E::Type> for Tracer<'engine, E>
@@ -88,6 +181,11 @@ where
     E::Value: Differentiable<E::Type>,
 {
     type Tangent = Self;
+
+    #[inline]
+    fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+        self.context.zero(self.r#type().as_ref())
+    }
 }
 
 /// Extension of [`Engine`] for backends that can stage linear tangent and cotangent programs.
@@ -122,14 +220,21 @@ pub trait LinearizableEngine: Engine {
 /// ordinary tracing free to use a wider operation carrier while making differentiation reject
 /// unsupported operations at type-check time when the differentiation carrier omits them.
 pub trait DifferentiableEngine: LinearizableEngine {
+    /// Tangent and cotangent leaf type selected by this differentiable engine.
+    type Tangent: Traceable<Self::Type>;
+
+    /// Linearizable engine selected by this differentiable engine for tangent and cotangent programs.
+    type LinearEngine: LinearizableEngine<Type = Self::Type, Value = Self::Tangent>;
+
     /// Operation carrier selected by this engine for tracing differentiable primal programs.
     ///
     /// This carrier may be narrower than the ordinary [`TracingEngine::OperationCarrier`]. Every
     /// operation it stores must be interpretable for primal execution and must provide a
     /// [`DifferentiableOperation`] rule for linearization.
-    type DifferentiableOperationCarrier: Clone
-        + InterpretableOperation<Self::Type, Self::Value>
-        + DifferentiableOperation<Self>;
+    type DifferentiableOperationCarrier: Clone + InterpretableOperation<Self::Type, Self::Value>;
+
+    /// Returns the linearizable engine used for tangent and cotangent programs.
+    fn linear_engine(&self) -> &Self::LinearEngine;
 }
 
 /// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
@@ -142,7 +247,7 @@ pub trait DifferentiableEngine: LinearizableEngine {
 /// Primitive rules usually stage tangent operations through [`JvpContext::apply_operation`].
 /// Higher-order rules use [`JvpContext::engine`] to recurse into nested programs with the same
 /// engine.
-pub trait DifferentiableOperation<E: LinearizableEngine>: Operation<E::Type> {
+pub trait DifferentiableOperation<E: DifferentiableEngine>: Operation<E::Type> {
     /// Applies this operation's forward-mode Jacobian-Vector Product (JVP) rule.
     ///
     /// The returned vector must be aligned with this operation's outputs and must carry both the
@@ -167,27 +272,47 @@ pub trait DifferentiableOperation<E: LinearizableEngine>: Operation<E::Type> {
 /// [`TranspositionContext`](crate::tracing::transposition::TranspositionContext): JVP rules call
 /// [`apply_operation`](Self::apply_operation) to stage tangent ops on the active builder.
 #[doc(hidden)]
-pub struct JvpContext<'a, E: LinearizableEngine> {
-    /// [`LinearizableEngine`] borrowed by this [`JvpContext`] for type-driven value synthesis and operation selection.
+pub struct JvpContext<'a, E: DifferentiableEngine> {
+    /// Differentiable engine borrowed by this [`JvpContext`] for primal semantics and linear-engine selection.
     pub engine: &'a E,
 
     /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::tracing::Program) that is currently being
     /// traced.
-    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::LinearOperationCarrier>>>,
+    pub builder: Rc<
+        RefCell<
+            ProgramBuilder<
+                E::Type,
+                E::Tangent,
+                <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+            >,
+        >,
+    >,
 }
 
-impl<'a, E: LinearizableEngine> JvpContext<'a, E> {
+impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
     /// Creates a JVP context that stages into `builder`.
     #[doc(hidden)]
     pub fn new(
         engine: &'a E,
-        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::LinearOperationCarrier>>>,
+        builder: Rc<
+            RefCell<
+                ProgramBuilder<
+                    E::Type,
+                    E::Tangent,
+                    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+                >,
+            >,
+        >,
     ) -> Self {
         Self { engine, builder }
     }
 
     /// Stages one operation in the currently active linear program.
-    pub fn stage(&self, operation: E::LinearOperationCarrier, inputs: &[AtomId]) -> Result<Vec<AtomId>, TracingError> {
+    pub fn stage(
+        &self,
+        operation: <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+        inputs: &[AtomId],
+    ) -> Result<Vec<AtomId>, TracingError> {
         let mut builder_borrow = self.builder.borrow_mut();
         let input_types =
             inputs.iter().map(|atom| builder_borrow.atoms[atom.index].r#type().into_owned()).collect::<Vec<_>>();
@@ -200,7 +325,7 @@ impl<'a, E: LinearizableEngine> JvpContext<'a, E> {
     }
 
     /// Stages a constant tangent on the active linear builder.
-    pub fn add_constant(&self, value: E::Value) -> AtomId {
+    pub fn add_constant(&self, value: E::Tangent) -> AtomId {
         self.builder.borrow_mut().add_constant(value)
     }
 }
@@ -254,37 +379,52 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     ///   - `engine`: Linearizing engine that supplies the linear operation carrier and primitive
     ///     JVP rules.
     ///   - `input_primals`: Concrete primal values aligned with this program's input atoms.
-    pub fn linearize<E: LinearizableEngine<Type = T, Value = V>>(
+    pub fn linearize<E: DifferentiableEngine<Type = T, Value = V>>(
         &self,
         engine: &E,
         input_primals: Vec<V>,
-    ) -> Result<Program<T, V, E::LinearOperationCarrier, Input, Output>, TracingError>
+    ) -> Result<
+        Program<
+            T,
+            E::Tangent,
+            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+            Input::To<E::Tangent>,
+            Output::To<E::Tangent>,
+        >,
+        TracingError,
+    >
     where
-        V: Differentiable<T, Tangent = V> + Zero<T>,
+        V: Differentiable<T, Tangent = E::Tangent>,
+        Input::Family: ParameterizedFamily<E::Tangent>,
+        Output::Family: ParameterizedFamily<E::Tangent>,
         O: DifferentiableOperation<E>,
     {
         fn tangent_for_atom<T, V, LinearOperationCarrier>(
             primal_values: &[Option<V>],
-            builder: &Rc<RefCell<ProgramBuilder<T, V, LinearOperationCarrier>>>,
+            builder: &Rc<RefCell<ProgramBuilder<T, V::Tangent, LinearOperationCarrier>>>,
             tangents: &mut [Option<AtomId>],
             atom_id: AtomId,
         ) -> Result<AtomId, TracingError>
         where
             T: Type,
-            V: Differentiable<T, Tangent = V> + Zero<T>,
+            V: Differentiable<T>,
             LinearOperationCarrier: Clone + Operation<T>,
         {
             if let Some(atom) = tangents[atom_id.index] {
                 return Ok(atom);
             }
             let primal = primal_values[atom_id.index].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-            let atom = builder.borrow_mut().add_constant(<V as Zero<T>>::zero(primal.r#type().as_ref())?);
+            let atom = builder.borrow_mut().add_constant(primal.tangent_type()?);
             tangents[atom_id.index] = Some(atom);
             Ok(atom)
         }
 
         check_count!("input", input_primals, self.input_ids.len(), TracingError);
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, E::LinearOperationCarrier>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<
+            T,
+            E::Tangent,
+            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+        >::new()));
         let mut primals: Vec<Option<V>> = vec![None; self.atoms.len()];
         let mut tangents: Vec<Option<AtomId>> = vec![None; self.atoms.len()];
         for (input_atom, input_primal) in self.input_ids.iter().copied().zip(input_primals.into_iter()) {
@@ -310,11 +450,12 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                         primal: primals[input_atom.index]
                             .clone()
                             .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
-                        tangent: tangent_for_atom::<T, V, E::LinearOperationCarrier>(
-                            primals.as_slice(),
-                            &builder,
-                            tangents.as_mut_slice(),
-                            input_atom,
+                        tangent: tangent_for_atom::<
+                            T,
+                            V,
+                            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+                        >(
+                            primals.as_slice(), &builder, tangents.as_mut_slice(), input_atom
                         )?,
                     })
                 })
@@ -332,12 +473,11 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             .iter()
             .copied()
             .map(|output_atom| {
-                tangent_for_atom::<T, V, E::LinearOperationCarrier>(
-                    primals.as_slice(),
-                    &builder,
-                    tangents.as_mut_slice(),
-                    output_atom,
-                )
+                tangent_for_atom::<
+                    T,
+                    V,
+                    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+                >(primals.as_slice(), &builder, tangents.as_mut_slice(), output_atom)
             })
             .collect::<Result<Vec<_>, _>>()?;
         drop(context);
@@ -450,13 +590,15 @@ impl<E: DifferentiableEngine> LinearizableEngine for DifferentiableOperationTrac
     type LinearOperationCarrier = E::LinearOperationCarrier;
 }
 
-impl<
-    E: DifferentiableEngine<
-        DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
-    >,
-> DifferentiableEngine for DifferentiableOperationTracingEngine<E>
-{
+impl<E: DifferentiableEngine> DifferentiableEngine for DifferentiableOperationTracingEngine<E> {
+    type Tangent = E::Tangent;
+    type LinearEngine = E::LinearEngine;
     type DifferentiableOperationCarrier = E::DifferentiableOperationCarrier;
+
+    #[inline]
+    fn linear_engine(&self) -> &Self::LinearEngine {
+        self.inner().linear_engine()
+    }
 }
 
 impl<'engine, E> LinearizableEngine for TracingContext<'engine, E>
@@ -469,11 +611,18 @@ where
 impl<'engine, E> DifferentiableEngine for TracingContext<'engine, E>
 where
     E: DifferentiableTracingEngine,
-    E::Value: Differentiable<E::Type, Tangent = E::Value>,
+    E::Value: Differentiable<E::Type>,
     E::OperationCarrier: SupportsAdd<E::Type, E::Value>,
     AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
 {
+    type Tangent = Tracer<'engine, E>;
+    type LinearEngine = Self;
     type DifferentiableOperationCarrier = AddOperation;
+
+    #[inline]
+    fn linear_engine(&self) -> &Self::LinearEngine {
+        self
+    }
 }
 
 macro_rules! impl_differentiable_engine_for_scalar {
@@ -483,7 +632,14 @@ macro_rules! impl_differentiable_engine_for_scalar {
         }
 
         impl DifferentiableEngine for ScalarEngine<$ty> {
+            type Tangent = $ty;
+            type LinearEngine = Self;
             type DifferentiableOperationCarrier = ScalarOperation<$ty>;
+
+            #[inline]
+            fn linear_engine(&self) -> &Self::LinearEngine {
+                self
+            }
         }
 
         impl DifferentiableTracingEngine for ScalarEngine<$ty> {
@@ -502,13 +658,47 @@ impl_differentiable_engine_for_scalar!(f64);
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
+    use crate::operations::constants::{One, Zero, ZeroLike};
     use crate::tracing::engines::ScalarEngine;
     use crate::tracing_v2::jvp;
+    use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
-    use super::DifferentiableEngine;
+    use super::{DifferentiableEngine, TangentValue};
+
+    #[test]
+    fn test_tangent_value_carries_symbolic_zero_or_non_zero_tangent() {
+        let zero = TangentValue::<DataType, f64>::zero(DataType::F64);
+        let non_zero = TangentValue::<DataType, f64>::non_zero(2.5);
+
+        assert!(zero.is_zero());
+        assert_eq!(zero.as_non_zero(), None);
+        assert_eq!(zero.r#type().into_owned(), DataType::F64);
+        assert_eq!(zero.to_string(), "zero_tangent[f64]");
+        assert_eq!(<TangentValue<DataType, f64> as Zero<DataType>>::zero(&DataType::F64), Ok(zero.clone()));
+        assert_eq!(non_zero.as_non_zero(), Some(&2.5));
+        assert_eq!(non_zero.r#type().into_owned(), DataType::F64);
+        assert_eq!(non_zero.to_string(), "2.5");
+        assert_eq!(
+            <TangentValue<DataType, f64> as One<DataType>>::one(&DataType::F64),
+            Ok(TangentValue::non_zero(1.0))
+        );
+        assert_eq!(non_zero.zero_like(), zero);
+
+        let zero_only = TangentValue::<DataType, Infallible>::zero(DataType::I32);
+        assert_eq!(zero_only.r#type().into_owned(), DataType::I32);
+        assert_eq!(zero_only.to_string(), "zero_tangent[i32]");
+        assert_eq!(<TangentValue<DataType, Infallible> as Zero<DataType>>::zero(&DataType::I32), Ok(zero_only.clone()));
+        assert_eq!(zero_only.zero_like(), zero_only);
+
+        let array_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
+        let array_tangent = TangentValue::<ArrayType, Infallible>::zero(array_type.clone());
+        assert_eq!(array_tangent.r#type().into_owned(), array_type);
+    }
 
     #[test]
     fn test_scalar_engine_half_and_float_engines_are_differentiable() {

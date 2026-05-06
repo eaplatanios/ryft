@@ -138,6 +138,10 @@ impl OneLike for TestArray {
 
 impl Differentiable<ArrayType> for TestArray {
     type Tangent = Self;
+
+    fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+        Ok(self.zero_like())
+    }
 }
 
 impl CoordinateValue for TestArray {
@@ -258,7 +262,13 @@ impl LinearizableEngine for TestArrayEngine {
 }
 
 impl DifferentiableEngine for TestArrayEngine {
+    type Tangent = TestArray;
+    type LinearEngine = Self;
     type DifferentiableOperationCarrier = ArrayOperation<TestArray, ArrayType>;
+
+    fn linear_engine(&self) -> &Self::LinearEngine {
+        self
+    }
 }
 
 impl DifferentiableTracingEngine for TestArrayEngine {
@@ -284,11 +294,9 @@ mod tests {
     use crate::tracing::transposition::{LinearOperation, TranspositionContext};
     use crate::tracing::{AtomId, Program, ProgramBuilder};
     use crate::tracing_v2::operations::custom::CustomTracedLinearizationRule;
-    use crate::tracing_v2::operations::rematerialize::{FlatTracedRematerialize, RematerializeOperation};
     use crate::tracing_v2::{
         ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, CustomOperationError, CustomPrimitive,
-        DifferentiableOperation, DifferentiationError, JvpContext, JvpTracer, RematerializationPolicy, compile_grad,
-        compile_grad_with_policy, grad, jacfwd, jacrev, jvp, rematerialize, vmap,
+        DifferentiableOperation, JvpContext, JvpTracer, grad, jacfwd, jacrev, jvp, vmap,
     };
     use crate::types::TypeError;
 
@@ -479,56 +487,6 @@ mod tests {
         let tangent_program =
             builder.build::<TestArray, TestArray>(vec![tangent_output], Placeholder, Placeholder).unwrap();
         assert_eq!(tangent_program.interpret(TestArray::scalar(10.0)).map(|output| output.values[0]), Ok(20.0));
-    }
-
-    fn empty_traced_body() -> FlatTracedRematerialize<ArrayType, TestArray> {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>>::new();
-        let output = builder.add_constant(TestArray::scalar(0.0));
-        let program = builder.build(vec![output], Vec::<Placeholder>::new(), vec![Placeholder]).unwrap();
-        FlatTracedRematerialize::from_parts(vec![], vec![ArrayType::scalar(DataType::F64)], program)
-    }
-
-    #[test]
-    fn test_linear_rematerialize_jvp_requires_tangent_leaves() {
-        let operation = RematerializeOperation::<ArrayType, TestArray>::new(empty_traced_body());
-        let builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
-            ));
-        let mut context = JvpContext::new(&TestArrayEngine, builder);
-
-        assert!(matches!(
-            operation.jvp(&mut context, &[]),
-            Err(TracingError::Differentiation(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves)),
-        ));
-    }
-
-    #[test]
-    fn test_rematerialize_compile_grad_produces_reusable_gradient() {
-        let compiled =
-            compile_grad(&TestArrayEngine, |x| rematerialize(|y| y.sin(), x).unwrap(), TestArray::scalar(2.0)).unwrap();
-
-        assert_close(compiled.interpret(TestArray::scalar(2.0)).unwrap().values[0], 2.0f64.cos());
-        assert_close(compiled.interpret(TestArray::scalar(0.5)).unwrap().values[0], 0.5f64.cos());
-    }
-
-    #[test]
-    fn test_compile_grad_checkpoint_matches_compile_grad() {
-        let compiled_plain =
-            compile_grad(&TestArrayEngine, |x| x.clone() * x.clone() + x.sin(), TestArray::scalar(2.0)).unwrap();
-        let compiled_checkpoint = compile_grad_with_policy(
-            &TestArrayEngine,
-            |x| x.clone() * x.clone() + x.sin(),
-            TestArray::scalar(2.0),
-            RematerializationPolicy::Checkpoint { segment_size: 2 },
-        )
-        .unwrap();
-
-        for x in [0.0, 0.5, 1.0, 2.0] {
-            let grad_plain = compiled_plain.interpret(TestArray::scalar(x)).unwrap();
-            let grad_checkpoint = compiled_checkpoint.interpret(TestArray::scalar(x)).unwrap();
-            assert_close(grad_plain.values[0], grad_checkpoint.values[0]);
-        }
     }
 
     #[derive(Clone, Debug)]

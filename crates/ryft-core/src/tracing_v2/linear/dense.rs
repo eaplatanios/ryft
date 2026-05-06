@@ -9,9 +9,7 @@ use crate::tracing_v2::{BatchingError, DifferentiationError};
 /// explicit basis. [`CoordinateValue`] is the bridge from the generic tracing world into that
 /// coordinate-based view: it teaches the dense helpers how many coordinates a leaf contributes,
 /// what basis vectors to probe with, and how to flatten outputs back into numeric entries.
-pub trait CoordinateValue:
-    Traceable<ArrayType> + ZeroLike + OneLike + Zero<ArrayType> + One<ArrayType> + Differentiable<ArrayType, Tangent = Self>
-{
+pub trait CoordinateValue: Traceable<ArrayType> + ZeroLike + OneLike + Zero<ArrayType> + One<ArrayType> {
     /// Scalar-like coordinate type used by dense Jacobians and Hessians.
     type Coordinate: Clone + Debug + PartialEq + 'static;
 
@@ -237,24 +235,34 @@ pub fn jacfwd<'engine, E, F, Input, Output, V>(
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    V: CoordinateValue,
-    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Output: Parameterized<V, ParameterStructure: PartialEq>,
-    Input::Family: ParameterizedFamily<ReferenceBatch<V>>
+    V: CoordinateValue + Differentiable<ArrayType, Tangent = E::Tangent>,
+    E::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+    Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
+    Input::Family: ParameterizedFamily<E::Tangent>
+        + ParameterizedFamily<ReferenceBatch<E::Tangent>>
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Output::Family: ParameterizedFamily<ReferenceBatch<V>>
+    Output::Family: ParameterizedFamily<E::Tangent>
+        + ParameterizedFamily<ReferenceBatch<E::Tangent>>
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
         Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    E::LinearOperationCarrier: InterpretableOperation<ArrayType, V>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        InterpretableOperation<ArrayType, E::Tangent>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
-    let basis_inputs = standard_basis::<Input, V>(&input_structure, input_parameters.as_slice())?;
+    let tangent_parameters = input_parameters
+        .iter()
+        .map(|parameter| E::Tangent::zero(parameter.r#type().as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let basis_inputs =
+        standard_basis::<Input::To<E::Tangent>, E::Tangent>(&input_structure, tangent_parameters.as_slice())?;
     let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
     let (output, pushforward) = linearize::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_structure = output.parameter_structure();
@@ -265,9 +273,9 @@ where
         Vec::new()
     } else {
         let lane_count = basis_inputs.len();
-        let batched_tangents = reference_stack::<V, Input>(basis_inputs)?;
+        let batched_tangents = reference_stack::<E::Tangent, Input::To<E::Tangent>>(basis_inputs)?;
         let batched_outputs = interpret_reference_batched_program(&pushforward, batched_tangents)?;
-        flatten_batched_coordinates::<Output, V>(batched_outputs, lane_count)?
+        flatten_batched_coordinates::<Output::To<E::Tangent>, E::Tangent>(batched_outputs, lane_count)?
     };
 
     DenseJacobian::from_columns(
@@ -291,22 +299,30 @@ pub fn jacrev<'engine, E, F, Input, Output, V>(
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    V: CoordinateValue,
-    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Output: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ReferenceBatch<V>>
+    V: CoordinateValue + Differentiable<ArrayType, Tangent = E::Tangent>,
+    E::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+    Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Output: Parameterized<V, To<V> = Output, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Input::Family: ParameterizedFamily<E::Tangent>
+        + ParameterizedFamily<ReferenceBatch<E::Tangent>>
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Output::Family: ParameterizedFamily<ReferenceBatch<V>>
+    Output::Family: ParameterizedFamily<E::Tangent>
+        + ParameterizedFamily<ReferenceBatch<E::Tangent>>
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
         Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    E::LinearOperationCarrier: Clone
-        + InterpretableOperation<ArrayType, V>
-        + LinearOperation<ArrayType, V, E::LinearOperationCarrier>
-        + crate::operations::constants::SupportsZero<ArrayType, V>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        Clone
+            + InterpretableOperation<ArrayType, E::Tangent>
+            + LinearOperation<
+                ArrayType,
+                E::Tangent,
+                <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+            > + crate::operations::constants::SupportsZero<ArrayType, E::Tangent>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -316,15 +332,20 @@ where
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
-    let basis_outputs = standard_basis::<Output, V>(&output_structure, output_parameters.as_slice())?;
+    let cotangent_parameters = output_parameters
+        .iter()
+        .map(|parameter| E::Tangent::zero(parameter.r#type().as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let basis_outputs =
+        standard_basis::<Output::To<E::Tangent>, E::Tangent>(&output_structure, cotangent_parameters.as_slice())?;
 
     let rows = if basis_outputs.is_empty() {
         Vec::new()
     } else {
         let lane_count = basis_outputs.len();
-        let batched_cotangents = reference_stack::<V, Output>(basis_outputs)?;
+        let batched_cotangents = reference_stack::<E::Tangent, Output::To<E::Tangent>>(basis_outputs)?;
         let batched_inputs = interpret_reference_batched_program(&pullback, batched_cotangents)?;
-        flatten_batched_coordinates::<Input, V>(batched_inputs, lane_count)?
+        flatten_batched_coordinates::<Input::To<E::Tangent>, E::Tangent>(batched_inputs, lane_count)?
     };
 
     DenseJacobian::from_rows(rows, input_structure, output_structure, input_coordinate_counts, output_coordinate_counts)
@@ -342,16 +363,20 @@ pub fn hessian<'engine, E, F, Input, V>(
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    V: CoordinateValue,
-    Input: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ReferenceBatch<V>>
+    V: CoordinateValue + Differentiable<ArrayType, Tangent = E::Tangent>,
+    E::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+    Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Input::Family: ParameterizedFamily<E::Tangent>
+        + ParameterizedFamily<ReferenceBatch<E::Tangent>>
         + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
         Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Input>,
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    E::LinearOperationCarrier: InterpretableOperation<ArrayType, V>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        InterpretableOperation<ArrayType, E::Tangent>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
 {
     jacfwd::<E, F, Input, Input, V>(engine, gradient_function, primals)
 }

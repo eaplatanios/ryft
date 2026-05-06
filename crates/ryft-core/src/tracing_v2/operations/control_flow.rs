@@ -3,17 +3,15 @@ use std::fmt::{Debug, Display};
 use thiserror::Error;
 
 use crate::macros::check_count;
-use crate::operations::constants::Zero;
-use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::parameters::Parameterized;
+use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::tracing::engines::Tracer;
 use crate::tracing::engines::TracingEngine;
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{Instruction, Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiableTracingEngine, JvpContext, JvpTracer, LinearizableEngine,
+    DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, JvpContext, JvpTracer,
 };
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -172,9 +170,15 @@ fn ensure_input_count(expected: usize, got: usize, operation: &'static str) -> R
 
 /// Replays one staged linear program by inlining its instructions into an existing linear builder
 /// owned by a [`JvpContext`].
-fn replay_linear_program_on_atoms<E: LinearizableEngine<Type = ArrayType>>(
+fn replay_linear_program_on_atoms<E: DifferentiableEngine<Type = ArrayType>>(
     context: &JvpContext<'_, E>,
-    program: &FlatProgram<E::Value, E::LinearOperationCarrier>,
+    program: &Program<
+        ArrayType,
+        E::Tangent,
+        <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+        Vec<E::Tangent>,
+        Vec<E::Tangent>,
+    >,
     inputs: &[crate::tracing::AtomId],
 ) -> Result<Vec<crate::tracing::AtomId>, TracingError> {
     check_count!("input", inputs, program.input_ids.len(), TracingError);
@@ -444,11 +448,16 @@ where
 
 impl<V, E, O> DifferentiableOperation<E> for ConditionOperation<V, O, ArrayType>
 where
-    V: ControlFlowValue + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType>,
-    E: LinearizableEngine<Type = ArrayType, Value = V>,
+    V: ControlFlowValue + Differentiable<ArrayType, Tangent = E::Tangent>,
+    E: DifferentiableEngine<Type = ArrayType, Value = V>,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
-    <E as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Operation<ArrayType>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Operation<ArrayType>,
+    Vec<V>: Parameterized<
+            V,
+            Family: ParameterizedFamily<E::Tangent>,
+            To<E::Tangent> = Vec<E::Tangent>,
+            ParameterStructure: Debug + PartialEq,
+        >,
 {
     fn jvp(
         &self,
@@ -466,8 +475,11 @@ where
         let tangent_operands = operands.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let branch = self.selected_branch(predicate);
         let primal_outputs = branch.interpret(primal_operands.clone())?;
-        let pushforward = branch.linearize(context.engine, primal_operands)?;
-        let tangent_outputs = replay_linear_program_on_atoms(context, &pushforward, tangent_operands.as_slice())?;
+        let pushforward: FlatProgram<
+            E::Tangent,
+            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+        > = branch.linearize(context.engine, primal_operands)?;
+        let tangent_outputs = replay_linear_program_on_atoms::<E>(context, &pushforward, tangent_operands.as_slice())?;
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
@@ -485,7 +497,7 @@ where
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
     for ConditionOperation<V, EInner::OperationCarrier, ArrayType>
 where
-    V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
+    V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + 'static,
     EInner::OperationCarrier: Clone + SupportsAdd<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
@@ -625,7 +637,7 @@ where
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
     for WhileOperation<V, EInner::OperationCarrier, ArrayType>
 where
-    V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
+    V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + 'static,
     EInner::OperationCarrier: Clone + SupportsAdd<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
@@ -642,11 +654,16 @@ where
 
 impl<V, E, O> DifferentiableOperation<E> for WhileOperation<V, O, ArrayType>
 where
-    V: ControlFlowValue + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType>,
-    E: LinearizableEngine<Type = ArrayType, Value = V>,
+    V: ControlFlowValue + Differentiable<ArrayType, Tangent = E::Tangent>,
+    E: DifferentiableEngine<Type = ArrayType, Value = V>,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
-    <E as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Operation<ArrayType>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Operation<ArrayType>,
+    Vec<V>: Parameterized<
+            V,
+            Family: ParameterizedFamily<E::Tangent>,
+            To<E::Tangent> = Vec<E::Tangent>,
+            ParameterStructure: Debug + PartialEq,
+        >,
 {
     fn jvp(
         &self,
@@ -669,9 +686,12 @@ where
                     .collect());
             }
 
-            let pushforward = &self.body.linearize(context.engine, state_primals.clone())?;
+            let pushforward: FlatProgram<
+                E::Tangent,
+                <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+            > = self.body.linearize(context.engine, state_primals.clone())?;
             let next_primals = self.body.interpret(state_primals)?;
-            let next_tangents = replay_linear_program_on_atoms(context, &pushforward, state_tangents.as_slice())?;
+            let next_tangents = replay_linear_program_on_atoms::<E>(context, &pushforward, state_tangents.as_slice())?;
             check_count!("output", next_primals, state_count, TracingError);
             check_count!("output", next_tangents, state_count, TracingError);
             state_primals = next_primals;
@@ -693,7 +713,7 @@ mod tests {
 
     use crate::operations::arithmetic::{ADD_OPERATION_NAME, SUB_OPERATION_NAME, SupportsAdd};
     use crate::operations::constants::OneLike;
-    use crate::operations::constants::{One, Zero};
+    use crate::operations::constants::{One, Zero, ZeroLike};
     use crate::parameters::{Parameter, Placeholder};
     use crate::tracing::engines::Engine;
     use crate::tracing::{ProgramBuilder, Traceable, Value};
@@ -784,6 +804,10 @@ mod tests {
 
     impl Differentiable<ArrayType> for TestValue {
         type Tangent = Self;
+
+        fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+            Ok(self.zero_like())
+        }
     }
 
     impl ControlFlowValue for TestValue {
@@ -1096,7 +1120,13 @@ mod tests {
     }
 
     impl crate::tracing_v2::DifferentiableEngine for TestEngine {
+        type Tangent = TestValue;
+        type LinearEngine = Self;
         type DifferentiableOperationCarrier = TestDifferentiableOperation;
+
+        fn linear_engine(&self) -> &Self::LinearEngine {
+            self
+        }
     }
 
     fn test_transposition_context(

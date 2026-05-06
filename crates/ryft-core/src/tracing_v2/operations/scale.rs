@@ -12,7 +12,7 @@ use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiableTracingEngine, LinearArrayOperation, LinearizableEngine,
+    DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, LinearArrayOperation,
 };
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -22,9 +22,9 @@ use crate::operations::arithmetic::SupportsAdd;
 /// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
 /// so that generic transform code can stage [`ScaleOperation`] without knowing which carrier is in use.
 #[doc(hidden)]
-pub trait SupportsScale<T: Type, V: Traceable<T>> {
+pub trait SupportsScale<T: Type, V: Traceable<T>, F: Traceable<T> = V> {
     /// Constructs the carrier-specific representation of the scaling [`Operation`].
-    fn scale_operation(factor: V) -> Self;
+    fn scale_operation(factor: F) -> Self;
 }
 
 /// Unary linear operation that multiplies its input by a captured factor.
@@ -115,9 +115,10 @@ where
 
 impl<V, E> DifferentiableOperation<E> for ScaleOperation<ArrayType, V>
 where
-    V: Differentiable<ArrayType, Tangent = V> + Mul<Output = V>,
-    E: LinearizableEngine<Type = ArrayType, Value = V>,
-    E::LinearOperationCarrier: SupportsScale<ArrayType, V>,
+    V: Differentiable<ArrayType> + Mul<Output = V>,
+    E: DifferentiableEngine<Type = ArrayType, Value = V>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsScale<ArrayType, E::Tangent, V>,
 {
     fn jvp(
         &self,
@@ -127,7 +128,11 @@ where
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsScale<ArrayType, V>>::scale_operation(self.factor.clone()),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsScale<
+                ArrayType,
+                E::Tangent,
+                V,
+            >>::scale_operation(self.factor.clone()),
             &[input.tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -137,9 +142,10 @@ where
 
 impl<V, E> DifferentiableOperation<E> for ScaleOperation<DataType, V>
 where
-    V: Differentiable<DataType, Tangent = V> + Mul<Output = V>,
-    E: LinearizableEngine<Type = DataType, Value = V>,
-    E::LinearOperationCarrier: SupportsScale<DataType, V>,
+    V: Differentiable<DataType> + Mul<Output = V>,
+    E: DifferentiableEngine<Type = DataType, Value = V>,
+    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        SupportsScale<DataType, E::Tangent, V>,
 {
     fn jvp(
         &self,
@@ -149,7 +155,11 @@ where
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let tangent_outputs = context.stage(
-            <E::LinearOperationCarrier as SupportsScale<DataType, V>>::scale_operation(self.factor.clone()),
+            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsScale<
+                DataType,
+                E::Tangent,
+                V,
+            >>::scale_operation(self.factor.clone()),
             &[input.tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -168,7 +178,7 @@ where
 impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
     for ScaleOperation<ArrayType, V>
 where
-    V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
+    V: Value<ArrayType> + Differentiable<ArrayType>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V>,
     EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
     Tracer<'engine, EInner>: Mul<Output = Tracer<'engine, EInner>>,

@@ -17,8 +17,8 @@ use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing::{AtomId, Instruction, Program, Traceable, TracingError};
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use ryft_core::tracing_v2::operations::{
-    CosOperation, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation,
-    NegOperation, RematerializeOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
+    CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, NegOperation, ReshapeOperation,
+    RightMatMulOperation, ScaleOperation, SinOperation,
 };
 use ryft_core::tracing_v2::{ArrayOperation, CustomPrimitive, LinearArrayOperation, MatrixOps};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
@@ -126,20 +126,6 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         value: &V,
     ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
         lower_literal_value(value, &mut self.block, self.context, self.location)
-    }
-
-    /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current block
-    /// and placing an optimization barrier on the boundary outputs.
-    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O, L>(
-        &mut self,
-        remat_op: &RematerializeOperation<ArrayType, V, O, L>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        O: Clone + LowerableXlaOperation<V>,
-        L: Clone,
-    {
-        lower_rematerialize_inline(&remat_op.body.program, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested condition operation inside this lowering context.
@@ -634,7 +620,6 @@ impl LowerableXlaOperation<ShardMapTensor> for XlaOperation {
                     lowerer,
                 )
             }
-            Self::Rematerialize(remat) => lowerer.lower_rematerialize(remat.as_ref(), input_values),
             Self::Condition(condition) => lowerer.lower_condition(condition.as_ref(), input_values),
             Self::While(while_operation) => lowerer.lower_while(while_operation.as_ref(), input_values),
             Self::ShardMap(shard_map_op) => {
@@ -679,27 +664,6 @@ impl LowerableXlaOperation<ShardMapTensor> for XlaOperation {
                     .lower_to_mlir(custom_op.as_ref(), input_values, output_types, &mut shard_map_lowerer)
             }
         }
-    }
-}
-
-impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for LinearRematerializeOperation<ArrayType, V, O>
-where
-    O: Clone + LowerableXlaOperation<V>,
-{
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_rematerialize_inline(
-            &self.body.program,
-            input_values,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )
     }
 }
 
@@ -866,7 +830,6 @@ where
                     lowerer,
                 )
             }
-            ArrayOperation::Rematerialize(remat) => lowerer.lower_rematerialize(remat, input_values),
             ArrayOperation::Condition(condition) => condition.lower_to_mlir(input_values, output_types, mode, lowerer),
             ArrayOperation::While(while_operation) => {
                 while_operation.lower_to_mlir(input_values, output_types, mode, lowerer)
@@ -989,15 +952,6 @@ impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for LinearArray
                     lowerer,
                 )
             }
-            LinearArrayOperation::Rematerialize(remat) => {
-                <LinearRematerializeOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    remat,
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
             LinearArrayOperation::Condition(condition) => {
                 condition.lower_to_mlir(input_values, output_types, mode, lowerer)
             }
@@ -1037,20 +991,6 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         array_type: &ArrayType,
     ) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, LoweringError> {
         lower_tensor_type(array_type, self.context, self.location)
-    }
-
-    /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current block
-    /// and placing an optimization barrier on the boundary outputs.
-    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O, L>(
-        &mut self,
-        remat_op: &RematerializeOperation<ArrayType, V, O, L>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        O: Clone + LowerableXlaOperation<V>,
-        L: Clone,
-    {
-        lower_rematerialize_inline(&remat_op.body.program, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested condition operation inside this lowering context.
@@ -1801,21 +1741,6 @@ where
     )
 }
 
-/// Inlines a rematerialize body's sub-program and places an optimization barrier on its boundary outputs.
-fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
-    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    V: MlirLowerableValue,
-    O: Clone + LowerableXlaOperation<V>,
-{
-    lower_nested_program_inline(program, input_values, block, context, location, true)
-}
-
 /// Lowers one plain traced program to values inside a block.
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
@@ -2247,7 +2172,6 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
-        XlaOperation::Rematerialize(remat_op) => lowerer.lower_rematerialize(remat_op.as_ref(), input_values),
         XlaOperation::Condition(condition_op) => lowerer.lower_condition(condition_op.as_ref(), input_values),
         XlaOperation::While(while_op) => lowerer.lower_while(while_op.as_ref(), input_values),
         XlaOperation::ShardMap(shard_map_op) => {
@@ -2691,6 +2615,10 @@ mod tests {
 
     impl Differentiable<ArrayType> for TestArray {
         type Tangent = Self;
+
+        fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+            Ok(self.zero_like())
+        }
     }
 
     impl CoordinateValue for TestArray {
@@ -3097,7 +3025,13 @@ mod tests {
     }
 
     impl DifferentiableEngine for TestArrayEngine {
+        type Tangent = TestArray;
+        type LinearEngine = Self;
         type DifferentiableOperationCarrier = ArrayOperation<TestArray, ArrayType>;
+
+        fn linear_engine(&self) -> &Self::LinearEngine {
+            self
+        }
     }
 
     impl DifferentiableTracingEngine for TestArrayEngine {
@@ -3136,39 +3070,6 @@ mod tests {
                     %1 = stablehlo.sine %arg0 : tensor<f64>
                     %2 = stablehlo.add %0, %1 : tensor<f64>
                     return %2 : tensor<f64>
-                  }
-                }
-            "#}
-        );
-    }
-
-    #[test]
-    fn test_plain_rematerialize_lowers_optimization_barrier() {
-        let engine = TestArrayEngine;
-        let (_, compiled): (
-            TestArray,
-            ryft_core::tracing::Program<
-                ArrayType,
-                TestArray,
-                ryft_core::tracing_v2::ArrayOperation<TestArray, ArrayType>,
-                TestArray,
-                TestArray,
-            >,
-        ) = engine
-            .interpret_and_trace(
-                |x| Ok(ryft_core::tracing_v2::rematerialize(|y| y.sin(), x).unwrap()),
-                TestArray::scalar(2.0),
-            )
-            .unwrap();
-
-        assert_eq!(
-            to_mlir_module_for_plain_program(&compiled, "main").unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
-                    %0 = stablehlo.sine %arg0 : tensor<f64>
-                    %1 = stablehlo.optimization_barrier %0 : tensor<f64>
-                    return %1 : tensor<f64>
                   }
                 }
             "#}

@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
@@ -13,19 +14,16 @@ use ryft_core::operations::constants::{
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{AtomId, TracingError};
-use ryft_core::tracing_v2::differentiation::JvpTracer;
+use ryft_core::tracing_v2::differentiation::{JvpTracer, TangentValue};
 use ryft_core::tracing_v2::operations::{
-    ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation, FlatTracedRematerialize,
-    LinearRematerializeOperation, MatMulOperation, MatrixTransposeOperation, NegOperation, RematerializeOperation,
-    ReshapeOperation, ScaleOperation, SinOperation, SupportsCos, SupportsCustom, SupportsMatMul,
-    SupportsMatrixTranspose, SupportsNeg, SupportsRematerialize, SupportsReshape, SupportsScale, SupportsSin,
-    WhileOperation,
+    ConditionOperation, CosOperation, MatMulOperation, MatrixTransposeOperation, NegOperation, ReshapeOperation,
+    ScaleOperation, SinOperation, SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsNeg,
+    SupportsReshape, SupportsScale, SupportsSin, WhileOperation,
 };
 use ryft_core::tracing_v2::{
-    CustomOperationError, CustomPrimitive, DifferentiableEngine, DifferentiableOperation, DifferentiationError,
-    JvpContext, LinearArrayOperation,
+    CustomOperationError, CustomPrimitive, DifferentiableOperation, JvpContext, LinearArrayOperation,
 };
-use ryft_core::types::{ArrayType, Shape, TypeError};
+use ryft_core::types::{ArrayType, Shape, TypeError, Typed};
 
 use crate::experimental::engines::XlaEngine;
 use crate::experimental::operations::{
@@ -36,30 +34,6 @@ use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 
 /// Linear staged operation carrier used by the XLA backend.
 pub type LinearXlaOperation<V> = LinearArrayOperation<V, ArrayType>;
-
-fn make_linear_xla_rematerialize<
-    E: DifferentiableEngine<
-            Type = ArrayType,
-            Value = ShardMapTensor,
-            LinearOperationCarrier = LinearXlaOperation<ShardMapTensor>,
-        >,
->(
-    engine: &E,
-    body: &FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaOperation>,
-    input_primals: Vec<ShardMapTensor>,
-) -> Result<LinearRematerializeOperation<ArrayType, ShardMapTensor>, TracingError>
-where
-    XlaOperation: DifferentiableOperation<E>,
-{
-    let body_program = &body.program;
-    let output_primals = body_program.interpret(input_primals.clone())?;
-    let pushforward = body_program.linearize(engine, input_primals)?;
-    let pullback = pushforward.transpose(output_primals.as_slice())?;
-    Ok(LinearRematerializeOperation::new(
-        FlatTracedRematerialize::from_parts(body.input_types.clone(), body.output_types.clone(), pushforward),
-        FlatTracedRematerialize::from_parts(body.output_types.clone(), body.input_types.clone(), pullback),
-    ))
-}
 
 #[cfg(test)]
 fn replay_xla_program_with_tracers(
@@ -102,46 +76,6 @@ fn replay_xla_program_with_tracers(
         .iter()
         .map(|output| values[output.index].clone().ok_or(TracingError::UnboundAtomId { id: *output }))
         .collect()
-}
-
-fn interpret_xla_condition_jvp<
-    E: DifferentiableEngine<
-            Type = ArrayType,
-            Value = ShardMapTensor,
-            LinearOperationCarrier = LinearXlaOperation<ShardMapTensor>,
-        >,
->(
-    condition: &ConditionOperation<ShardMapTensor, XlaOperation, ArrayType>,
-    context: &mut JvpContext<'_, E>,
-    inputs: &[JvpTracer<ShardMapTensor, AtomId>],
-) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError>
-where
-    XlaOperation: DifferentiableOperation<E>,
-{
-    let ConditionPredicate::Captured(predicate) = &condition.predicate else {
-        return Err(ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition jvp" }.into());
-    };
-    let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-    let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
-    if tangent_inputs.is_empty() && !condition.output_types().is_empty() {
-        return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
-    }
-
-    let selected_branch = if *predicate { &condition.true_branch } else { &condition.false_branch };
-    let primal_outputs = selected_branch.interpret(primal_inputs.clone())?;
-    check_count!("output", primal_outputs, condition.output_types().len(), TracingError);
-    let true_pushforward = condition.true_branch.linearize(context.engine, primal_inputs.clone())?;
-    let false_pushforward = condition.false_branch.linearize(context.engine, primal_inputs)?;
-    let linear_condition = ConditionOperation::with_captured_predicate(*predicate, true_pushforward, false_pushforward)
-        .map_err(TracingError::from)?;
-    let tangent_outputs =
-        context.stage(LinearArrayOperation::Condition(Box::new(linear_condition)), tangent_inputs.as_slice())?;
-    check_count!("output", tangent_outputs, condition.output_types().len(), TracingError);
-    Ok(primal_outputs
-        .into_iter()
-        .zip(tangent_outputs)
-        .map(|(primal, tangent)| JvpTracer { primal, tangent })
-        .collect())
 }
 
 /// Closed ordinary staged-op universe owned by the XLA backend.
@@ -193,11 +127,6 @@ pub enum XlaOperation {
     /// Reshape from one shape to another.
     Reshape { input_shape: Shape, output_shape: Shape },
 
-    /// Higher-order rematerialization.
-    Rematerialize(
-        Box<RematerializeOperation<ArrayType, ShardMapTensor, XlaOperation, LinearXlaOperation<ShardMapTensor>>>,
-    ),
-
     /// Higher-order conditional.
     Condition(Box<ConditionOperation<ShardMapTensor, XlaOperation, ArrayType>>),
 
@@ -245,7 +174,6 @@ impl Operation<ArrayType> for XlaOperation {
             Self::Transpose => "matrix_transpose",
             Self::Scale { .. } => "scale",
             Self::Reshape { .. } => "reshape",
-            Self::Rematerialize(remat) => remat.name(),
             Self::Condition(condition) => condition.name(),
             Self::While(while_operation) => while_operation.name(),
             Self::ShardMap(op) => op.name(),
@@ -274,7 +202,6 @@ impl Operation<ArrayType> for XlaOperation {
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
             }
-            Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::ShardMap(op) => op.infer_output_types(input_types),
@@ -305,7 +232,6 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaOperation {
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
-            Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::ShardMap(op) => op.interpret(inputs),
@@ -351,7 +277,6 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
-            Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 let input_refs = inputs.iter().collect::<Vec<_>>();
@@ -395,56 +320,26 @@ impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
         context: &mut JvpContext<'_, XlaEngine<'c>>,
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
-        match self {
-            Self::Zero(zero) => zero.jvp(context, inputs),
-            Self::One(one) => one.jvp(context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(context, inputs),
-            Self::Add => AddOperation.jvp(context, inputs),
-            Self::Sub => SubOperation.jvp(context, inputs),
-            Self::Mul => MulOperation.jvp(context, inputs),
-            Self::Div => DivOperation.jvp(context, inputs),
-            Self::Neg => NegOperation.jvp(context, inputs),
-            Self::Sin => SinOperation.jvp(context, inputs),
-            Self::Cos => CosOperation.jvp(context, inputs),
-            Self::MatrixMultiply => MatMulOperation.jvp(context, inputs),
-            Self::Transpose => MatrixTransposeOperation.jvp(context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
-            }
-            Self::Rematerialize(remat) => {
-                let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-                let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
-                let primal_outputs = remat.interpret(primal_inputs.as_slice())?;
-                check_count!("output", primal_outputs, remat.body.output_types.as_slice().len(), TracingError);
-                if tangent_inputs.is_empty() && !remat.body.output_types.as_slice().is_empty() {
-                    return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
-                }
-                let tangent_outputs = context.stage(
-                    LinearArrayOperation::Rematerialize(Box::new(make_linear_xla_rematerialize(
-                        context.engine,
-                        &remat.body,
-                        primal_inputs,
-                    )?)),
-                    tangent_inputs.as_slice(),
+        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_outputs = self.interpret(primal_inputs.as_slice())?;
+        let tangent_outputs = primal_outputs
+            .iter()
+            .map(|output| {
+                let outputs = context.stage(
+                    LinearArrayOperation::<TangentValue<ArrayType, Infallible>, ArrayType>::Zero(ZeroOperation::new(
+                        output.r#type().into_owned(),
+                    )),
+                    &[],
                 )?;
-                check_count!("output", tangent_outputs, remat.body.output_types.as_slice().len(), TracingError);
-                Ok(primal_outputs
-                    .into_iter()
-                    .zip(tangent_outputs)
-                    .map(|(primal, tangent)| JvpTracer { primal, tangent })
-                    .collect::<Vec<_>>())
-            }
-            Self::Condition(condition) => interpret_xla_condition_jvp(condition, context, inputs),
-            Self::While(_) => Err(ControlFlowError::MissingTransformRule { transform: "while jvp" }.into()),
-            Self::ShardMap(op) => op.jvp(context, inputs),
-            Self::LinearShardMap(op) => op.jvp(context, inputs),
-            Self::WithShardingConstraint(op) => op.jvp(context, inputs),
-            Self::Custom(op) => {
-                Err(ryft_core::tracing_v2::CustomOperationError::MissingRule { op: op.name(), transform: "jvp" }.into())
-            }
-        }
+                check_count!("output", outputs, 1, TracingError);
+                Ok(outputs[0])
+            })
+            .collect::<Result<Vec<_>, TracingError>>()?;
+        Ok(primal_outputs
+            .into_iter()
+            .zip(tangent_outputs)
+            .map(|(primal, tangent)| JvpTracer { primal, tangent })
+            .collect())
     }
 }
 
@@ -472,7 +367,6 @@ impl DifferentiableOperation<TracingContext<'static, XlaEngine<'static>>> for Xl
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
             }
-            Self::Rematerialize(remat) => remat.jvp(context, inputs),
             Self::Condition(condition) => condition.jvp(context, inputs),
             Self::While(while_operation) => while_operation.jvp(context, inputs),
             Self::ShardMap(op) => {
@@ -591,14 +485,6 @@ impl SupportsCustom<ArrayType, ShardMapTensor> for XlaOperation {
     }
 }
 
-impl SupportsRematerialize<ArrayType, ShardMapTensor, LinearXlaOperation<ShardMapTensor>> for XlaOperation {
-    fn rematerialize_operation(
-        op: RematerializeOperation<ArrayType, ShardMapTensor, XlaOperation, LinearXlaOperation<ShardMapTensor>>,
-    ) -> Self {
-        XlaOperation::Rematerialize(Box::new(op))
-    }
-}
-
 impl SupportsScale<ArrayType, ShardMapTensor> for XlaOperation {
     fn scale_operation(factor: ShardMapTensor) -> Self {
         XlaOperation::Scale { factor }
@@ -634,53 +520,6 @@ mod tests {
 
     fn test_mesh() -> LogicalMesh {
         LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap()
-    }
-
-    fn unary_rematerialize_body() -> FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaOperation> {
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
-        let input = builder.add_input(scalar_type());
-        let output = builder
-            .add_instruction(XlaOperation::Sin, vec![input])
-            .expect("rematerialize body should stage one sine op")
-            .into_iter()
-            .copied()
-            .next()
-            .expect("sine should produce one output");
-        let program = builder
-            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        FlatTracedRematerialize::from_parts(vec![scalar_type()], vec![scalar_type()], program)
-    }
-
-    #[test]
-    fn test_xla_rematerialize_jvp_stages_a_linear_rematerialize() {
-        let operation = XlaOperation::Rematerialize(Box::new(RematerializeOperation::new(unary_rematerialize_body())));
-        let tangent_builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTensor, LinearXlaOperation<ShardMapTensor>>::new(),
-            ));
-        let tangent_atom = tangent_builder.borrow_mut().add_input(scalar_type());
-        let engine = crate::experimental::engines::XlaEngine::token();
-        let mut context = JvpContext::new(engine, tangent_builder.clone());
-        let outputs = operation
-            .jvp(&mut context, &[JvpTracer { primal: ShardMapTensor::new(scalar_type()), tangent: tangent_atom }])
-            .expect("xla rematerialize jvp should succeed");
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal.r#type().into_owned(), scalar_type());
-
-        let output_atoms = outputs.into_iter().map(|output| output.tangent).collect::<Vec<_>>();
-        drop(context);
-        let tangent_builder = Rc::try_unwrap(tangent_builder)
-            .expect("rematerialize jvp builder should not have outstanding linear terms")
-            .into_inner();
-        let tangent_program = tangent_builder
-            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(output_atoms, vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert!(
-            tangent_program.to_string().contains("rematerialize"),
-            "expected xla rematerialize jvp to stage a linear rematerialize op: {}",
-            tangent_program
-        );
     }
 
     #[test]
