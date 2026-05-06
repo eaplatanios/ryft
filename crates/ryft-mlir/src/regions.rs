@@ -7,7 +7,7 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::errors::Error;
-use crate::{Block, BlockRef, Context, DetachedBlock, FromWithContext};
+use crate::{Block, BlockRef, Context, DetachedBlock, TryFromWithContext};
 
 /// [`Region`]s are one of the main building blocks of MLIR programs. MLIR is fundamentally based on a graph-like
 /// data structure of nodes, called [`Operation`](crate::Operation)s, and edges, called [`Value`](crate::Value)s.
@@ -215,8 +215,8 @@ impl<'c, 't> TryFrom<DetachedBlock<'c, 't>> for DetachedRegion<'c, 't> {
     }
 }
 
-impl<'c, 't> FromWithContext<'c, 't, Vec<DetachedBlock<'c, 't>>> for DetachedRegion<'c, 't> {
-    fn from_with_context(value: Vec<DetachedBlock<'c, 't>>, context: &'c Context<'t>) -> Result<Self, Error> {
+impl<'c, 't> TryFromWithContext<'c, 't, Vec<DetachedBlock<'c, 't>>> for DetachedRegion<'c, 't> {
+    fn try_from_with_context(value: Vec<DetachedBlock<'c, 't>>, context: &'c Context<'t>) -> Result<Self, Error> {
         let mut region = context.region();
         for block in value {
             region.append_block(block)?;
@@ -399,14 +399,14 @@ mod tests {
     fn test_region_from_blocks() {
         let context = Context::new();
         let blocks = vec![];
-        let region = DetachedRegion::from_with_context(blocks, &context).unwrap();
+        let region = DetachedRegion::try_from_with_context(blocks, &context).unwrap();
         assert_eq!(region.blocks().count(), 0);
         let blocks = vec![
             context.block_with_no_arguments(),
             context.block_with_no_arguments(),
             context.block_with_no_arguments(),
         ];
-        let region = DetachedRegion::from_with_context(blocks, &context).unwrap();
+        let region = DetachedRegion::try_from_with_context(blocks, &context).unwrap();
         assert_eq!(region.blocks().count(), 3);
     }
 }

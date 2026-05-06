@@ -9,6 +9,7 @@ use ryft_xla_sys::bindings::{
     mlirDiagnosticGetSeverity, mlirDiagnosticPrint,
 };
 
+use crate::errors::Error;
 use crate::support::write_to_formatter_callback;
 use crate::{Context, Location, LocationRef, LogicalResult};
 
@@ -81,8 +82,11 @@ impl<'o, 'c, 't> Diagnostic<'o, 'c, 't> {
     }
 
     /// Returns the [`Location`] at which this [`Diagnostic`] was reported.
-    pub fn location(&self) -> LocationRef<'c, 't> {
-        unsafe { LocationRef::from_c_api(mlirDiagnosticGetLocation(self.handle), self.context).unwrap() }
+    pub fn location(&self) -> Result<LocationRef<'c, 't>, Error> {
+        unsafe {
+            LocationRef::from_c_api(mlirDiagnosticGetLocation(self.handle), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR diagnostic location handle"))
+        }
     }
 
     /// Returns the number of notes attached to this [`Diagnostic`].
@@ -91,8 +95,11 @@ impl<'o, 'c, 't> Diagnostic<'o, 'c, 't> {
     }
 
     /// Returns the notes attached to this [`Diagnostic`].
-    pub fn notes(&self) -> impl Iterator<Item = Self> {
-        (0..self.note_count()).map(|index| self.note(index).unwrap())
+    pub fn notes(&self) -> impl Iterator<Item = Result<Self, Error>> {
+        (0..self.note_count()).map(|index| unsafe {
+            Self::from_c_api(mlirDiagnosticGetNote(self.handle, index.cast_signed()), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR diagnostic note handle"))
+        })
     }
 
     /// Returns the `index`-th note attached to this [`Diagnostic`]. If `index` is larger than
@@ -150,8 +157,13 @@ impl<'t> Context<'t> {
         ) -> MlirLogicalResult {
             unsafe {
                 let user_data = user_data as *mut (F, &'c Context<'t>);
-                let (ref mut handler, context) = *user_data;
-                LogicalResult::from((*handler)(Diagnostic::from_c_api(diagnostic, context).unwrap())).to_c_api()
+                if let Some((handler, context)) = user_data.as_mut() {
+                    Diagnostic::from_c_api(diagnostic, context)
+                        .map(|diagnostic| LogicalResult::from((*handler)(diagnostic)).to_c_api())
+                        .unwrap_or_else(|| LogicalResult::failure().to_c_api())
+                } else {
+                    LogicalResult::failure().to_c_api()
+                }
             }
         }
 
@@ -219,7 +231,7 @@ mod tests {
     #[test]
     fn test_diagnostics_handler() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
 
         // Create a diagnostics handler that collects a bunch of information to check all accessors.
         let message = Rc::new(RefCell::new(None));
@@ -236,8 +248,8 @@ mod tests {
             let _ = diagnostic.context();
             *message_clone.borrow_mut() = Some(diagnostic.to_string());
             *severity_clone.borrow_mut() = Some(diagnostic.severity());
-            *location_clone.borrow_mut() = Some(diagnostic.location().to_string());
-            *notes_clone.borrow_mut() = diagnostic.notes().map(|note| note.to_string()).collect();
+            *location_clone.borrow_mut() = Some(diagnostic.location().unwrap().to_string());
+            *notes_clone.borrow_mut() = diagnostic.notes().map(|note| note.unwrap().to_string()).collect();
             assert!(diagnostic.note_count() > 0);
             assert_eq!(
                 diagnostic.note(0).unwrap().to_string(),
@@ -255,16 +267,20 @@ mod tests {
             true
         });
 
-        // Create a func.func operation with mismatched function signature that will fail verification and
-        // produce diagnostics with notes.
-        context.parse_module(
-            r#"
-            module {
-                func.func @test(%arg0: i32) -> i64 {
-                    func.return %arg0 : i32
-                }
-            }
-            "#,
+        // Create a `func.func` operation with mismatched function signature that will fail verification
+        // and produce diagnostics with notes.
+        assert!(
+            context
+                .parse_module(
+                    r#"
+                    module {
+                        func.func @test(%arg0: i32) -> i64 {
+                            func.return %arg0 : i32
+                        }
+                    }
+                    "#,
+                )
+                .is_err(),
         );
 
         // Check that we captured diagnostic information.
@@ -272,7 +288,7 @@ mod tests {
             message.borrow().as_ref().unwrap(),
             "type of return operand 0 ('i32') doesn't match function result type ('i64') in function @test",
         );
-        assert_eq!(severity.borrow().unwrap(), DiagnosticSeverity::Error);
+        assert_eq!(severity.borrow().as_ref().unwrap(), &DiagnosticSeverity::Error);
         assert!(location.borrow().is_some());
         assert_eq!(
             notes.borrow().as_slice(),
@@ -281,7 +297,7 @@ mod tests {
 
         // Verify that we can detach the handler.
         context.detach_diagnostics_handler(diagnostics_handler_id);
-        context.parse_module("foo");
+        assert!(context.parse_module("foo").is_err());
         assert_eq!(
             message.borrow().as_ref().unwrap(),
             "type of return operand 0 ('i32') doesn't match function result type ('i64') in function @test",
@@ -304,7 +320,7 @@ mod tests {
             false // Do not consume the diagnostic.
         });
 
-        context.parse_module("foo");
+        assert!(context.parse_module("foo").is_err());
         assert_eq!(
             messages.borrow().as_slice(),
             &[
@@ -333,8 +349,8 @@ mod tests {
             diagnostic.to_string().contains("foo") // Consume the diagnostic if it contains "foo".
         });
 
-        context.parse_module("foo");
-        context.parse_module("bar");
+        assert!(context.parse_module("foo").is_err());
+        assert!(context.parse_module("bar").is_err());
         assert_eq!(
             messages.borrow().as_slice(),
             &[

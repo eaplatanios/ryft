@@ -2,6 +2,7 @@ use std::fmt::{Debug, Display};
 
 use ryft_xla_sys::bindings::{MlirLocation, mlirEmitError};
 
+use crate::errors::Error;
 use crate::{Context, mlir_subtype_trait_impls};
 
 /// MLIR location that is used for describing where some operation, identifier, etc., is defined in the source code.
@@ -59,16 +60,18 @@ pub trait Location<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display 
 
     /// Up-casts this [`Location`] to an instance of [`LocationRef`].
     fn as_ref(&self) -> LocationRef<'c, 't> {
-        unsafe { LocationRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
+        LocationRef { handle: unsafe { self.to_c_api() }, context: self.context() }
     }
 
     /// Emits an error message at this [`Location`] through the diagnostics engine.
     /// This function is mainly used for testing purposes.
-    fn emit_error<Message: AsRef<str>>(&self, message: Message) {
+    fn emit_error<Message: AsRef<str>>(&self, message: Message) -> Result<(), Error> {
         unsafe {
-            let message = std::ffi::CString::new(message.as_ref()).unwrap();
+            let message = std::ffi::CString::new(message.as_ref())
+                .map_err(|_| Error::invalid_argument("diagnostic message cannot contain nul bytes"))?;
             mlirEmitError(self.to_c_api(), message.as_c_str().as_ptr());
         }
+        Ok(())
     }
 }
 
@@ -151,6 +154,10 @@ pub(crate) mod tests {
         assert_ne!(location_1.as_ref(), location_2);
         assert_eq!(format!("{location_0}").as_str(), "loc(unknown)");
         assert_eq!(format!("{location_0:?}").as_str(), "UnknownLocationRef[loc(unknown)]");
-        location_0.emit_error("dummy error");
+        assert!(location_0.emit_error("dummy error").is_ok());
+        assert!(matches!(
+            location_0.emit_error("dummy\0error"),
+            Err(Error::InvalidArgument { message, .. }) if message == "diagnostic message cannot contain nul bytes",
+        ));
     }
 }

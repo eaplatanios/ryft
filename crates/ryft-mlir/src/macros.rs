@@ -246,8 +246,8 @@ macro_rules! mlir_enum_attribute {
                 mlir_prefix = $mlir_prefix,
             );
 
-            impl<'c, 't> $crate::FromWithContext<'c, 't, $rust_name> for [<$rust_name AttributeRef>]<'c, 't> {
-                fn from_with_context(
+            impl<'c, 't> $crate::TryFromWithContext<'c, 't, $rust_name> for [<$rust_name AttributeRef>]<'c, 't> {
+                fn try_from_with_context(
                     value: $rust_name,
                     context: &'c $crate::Context<'t>,
                 ) -> Result<Self, $crate::errors::Error> {

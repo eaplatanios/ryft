@@ -5,6 +5,7 @@ use ryft_xla_sys::bindings::{
     mlirAttributeGetType, mlirAttributeGetTypeID, mlirAttributeParseGet, mlirNamedAttributeGet,
 };
 
+use crate::errors::Error;
 use crate::{Context, Dialect, Identifier, StringRef, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
 
 /// MLIR attributes are the mechanism for specifying constant data on operations in places where a variable is never
@@ -69,25 +70,31 @@ pub trait Attribute<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display
 
     /// Up-casts this attribute to an instance of [`Attribute`].
     fn as_ref(&self) -> AttributeRef<'c, 't> {
-        unsafe { AttributeRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
+        AttributeRef { handle: unsafe { self.to_c_api() }, context: self.context() }
     }
 
     /// Gets the [`TypeId`] of this attribute. Note that this function may return the same [`TypeId`] for different
     /// instances of the same attribute with potentially different properties and nested attributes. That is because
     /// a [`TypeId`] is a unique identifier of the corresponding MLIR C++ type for [`Attribute`] and not for a specific
     /// instance of [`Attribute`].
-    fn type_id(&self) -> TypeId<'c> {
-        unsafe { TypeId::from_c_api(mlirAttributeGetTypeID(self.to_c_api())).unwrap() }
+    fn type_id(&self) -> Result<TypeId<'c>, Error> {
+        unsafe { TypeId::from_c_api(mlirAttributeGetTypeID(self.to_c_api())) }
     }
 
     /// Returns the [`Type`] of this attribute.
-    fn r#type(&self) -> TypeRef<'c, 't> {
-        unsafe { TypeRef::from_c_api(mlirAttributeGetType(self.to_c_api()), self.context()).unwrap() }
+    fn r#type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        unsafe {
+            TypeRef::from_c_api(mlirAttributeGetType(self.to_c_api()), self.context())
+                .ok_or_else(|| Error::internal("expected non-null MLIR attribute type handle"))
+        }
     }
 
     /// Returns the [`Dialect`] that this attribute belongs to.
-    fn dialect(&self) -> Dialect<'c, 't> {
-        unsafe { Dialect::from_c_api(mlirAttributeGetDialect(self.to_c_api())).unwrap() }
+    fn dialect(&self) -> Result<Dialect<'c, 't>, Error> {
+        unsafe {
+            Dialect::from_c_api(mlirAttributeGetDialect(self.to_c_api()))
+                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle for attribute"))
+        }
     }
 
     /// Dumps this attribute to the standard error stream.
@@ -128,12 +135,13 @@ impl<'t> Context<'t> {
         AttributeRef { handle: unsafe { mlirAttributeGetNull() }, context: self }
     }
 
-    /// Parses an [`Attribute`] from the provided string representation. Returns [`None`] if MLIR fails to parse
-    /// the provided string into an [`Attribute`]. The resulting [`Attribute`] is owned by this [`Context`].
-    pub fn parse_attribute<'c>(&'c self, source: &str) -> Option<AttributeRef<'c, 't>> {
+    /// Parses an [`Attribute`] from the provided string representation. Returns an error if MLIR fails to parse the
+    /// provided string into an [`Attribute`]. The resulting [`Attribute`] is owned by this [`Context`].
+    pub fn parse_attribute<'c>(&'c self, source: &str) -> Result<AttributeRef<'c, 't>, Error> {
         unsafe {
             let handle = mlirAttributeParseGet(*self.handle.borrow_mut(), StringRef::from(source).to_c_api());
-            if handle.ptr.is_null() { None } else { AttributeRef::from_c_api(handle, self) }
+            AttributeRef::from_c_api(handle, self)
+                .ok_or_else(|| Error::parsing_error(format!("failed to parse MLIR attribute `{source}`")))
         }
     }
 }
@@ -182,14 +190,17 @@ impl<'c, 't> NamedAttributeRef<'c, 't> {
     }
 
     /// Returns the underlying [`Attribute`] of this [`NamedAttributeRef`].
-    pub fn attribute(&self) -> AttributeRef<'c, 't> {
-        unsafe { AttributeRef::from_c_api(self.handle.attribute, self.context).unwrap() }
+    pub fn attribute(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        unsafe {
+            AttributeRef::from_c_api(self.handle.attribute, self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR named attribute value handle"))
+        }
     }
 }
 
 impl PartialEq for NamedAttributeRef<'_, '_> {
     fn eq(&self, other: &Self) -> bool {
-        self.name() == other.name() && self.attribute() == other.attribute()
+        self.name() == other.name() && self.attribute().ok() == other.attribute().ok()
     }
 }
 
@@ -197,7 +208,7 @@ impl Eq for NamedAttributeRef<'_, '_> {}
 
 impl Display for NamedAttributeRef<'_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}: {}", self.name(), self.attribute())
+        write!(formatter, "{}: {}", self.name(), self.attribute().map_err(|_| std::fmt::Error)?)
     }
 }
 
@@ -268,7 +279,7 @@ pub(crate) mod tests {
         let context = Context::new();
         let unit_attribute_1 = context.unit_attribute();
         let unit_attribute_2 = context.unit_attribute();
-        assert_eq!(unit_attribute_1.type_id(), unit_attribute_2.type_id());
+        assert_eq!(unit_attribute_1.type_id().unwrap(), unit_attribute_2.type_id().unwrap());
     }
 
     #[test]
@@ -276,8 +287,8 @@ pub(crate) mod tests {
         let context = Context::new();
         let attribute = context.unit_attribute();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.r#type(), context.none_type());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "builtin");
+        assert_eq!(attribute.r#type().unwrap(), context.none_type());
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "builtin");
     }
 
     #[test]
@@ -353,7 +364,7 @@ pub(crate) mod tests {
         let attribute = context.parse_attribute("[]").unwrap();
         assert_eq!(attribute, context.array_attribute::<AttributeRef>(&[]));
 
-        assert!(context.parse_attribute("invalid_attribute_syntax!@#").is_none());
+        assert!(context.parse_attribute("invalid_attribute_syntax!@#").is_err());
     }
 
     #[test]
@@ -363,7 +374,7 @@ pub(crate) mod tests {
         let attribute = context.unit_attribute();
         let named_attribute = context.named_attribute(name, attribute);
         assert_eq!(named_attribute.name(), name);
-        assert_eq!(named_attribute.attribute(), attribute);
+        assert_eq!(named_attribute.attribute().unwrap(), attribute);
         assert_eq!(format!("{}", named_attribute), "test_name: unit");
         assert_eq!(format!("{:?}", named_attribute), "NamedAttributeRef[test_name: unit]");
     }
@@ -398,7 +409,7 @@ pub(crate) mod tests {
         let attribute = context.integer_attribute(context.signless_integer_type(64), 42);
         let named_attribute = context.named_attribute(name, attribute);
         assert_eq!(named_attribute.name(), name);
-        assert_eq!(named_attribute.attribute(), attribute);
+        assert_eq!(named_attribute.attribute().unwrap(), attribute);
     }
 
     #[test]
@@ -408,7 +419,7 @@ pub(crate) mod tests {
         let attribute = context.string_attribute("hello world");
         let named_attribute = context.named_attribute(name, attribute);
         assert_eq!(named_attribute.name(), name);
-        assert_eq!(named_attribute.attribute(), attribute);
-        assert_eq!(named_attribute.attribute().to_string(), "\"hello world\"");
+        assert_eq!(named_attribute.attribute().unwrap(), attribute);
+        assert_eq!(named_attribute.attribute().unwrap().to_string(), "\"hello world\"");
     }
 }

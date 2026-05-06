@@ -69,6 +69,7 @@ pub enum OptimizationLevel {
 /// the use of an external LLVM function to show how you can register an implementation for it:
 ///
 /// ```rust
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use ryft_mlir::dialects::builtin;
 /// use ryft_mlir::{Context, DialectRegistry, ExecutionEngine, OptimizationLevel};
 ///
@@ -91,7 +92,7 @@ pub enum OptimizationLevel {
 ///             }
 ///         }
 ///         "#,
-///     ).unwrap();
+///     )?;
 ///
 /// // Convert the MLIR into LLVM IR to prevent undefined behavior when we invoke [`ExecutionEngine::initialize`].
 /// let mut pass_manager = context.pass_manager();
@@ -129,20 +130,30 @@ pub enum OptimizationLevel {
 ///     // Obtain function pointers in Rust and invoke them manually. Note that the type signatures in the `transmute`
 ///     // invocations must match exactly the underlying LLVM function type signatures. Mismatched type signatures
 ///     // result in undefined behavior.
-///     let example_fn = std::mem::transmute::<_, extern "C" fn(i32) -> i32>(engine.get_function("example").unwrap());
+///     let example_fn = std::mem::transmute::<_, extern "C" fn(i32) -> i32>(
+///         engine.get_function("example").ok_or_else(|| {
+///             std::io::Error::new(std::io::ErrorKind::NotFound, "missing example function")
+///         })?,
+///     );
 ///     assert_eq!(example_fn(42), 253);
 ///
 ///     // You can also obtain function pointers to registered external functions.
-///     let callback_fn = std::mem::transmute::<_, extern "C" fn(i32) -> i32>(engine.get_function("callback").unwrap());
+///     let callback_fn = std::mem::transmute::<_, extern "C" fn(i32) -> i32>(
+///         engine.get_function("callback").ok_or_else(|| {
+///             std::io::Error::new(std::io::ErrorKind::NotFound, "missing callback function")
+///         })?,
+///     );
 ///     assert_eq!(callback_fn(42), 211);
 ///
 ///     // Dump the compiled object into a file.
-///     let object_file = tempfile::NamedTempFile::new().unwrap();
+///     let object_file = tempfile::NamedTempFile::new()?;
 ///     let object_file_path = object_file.path();
 ///     engine.dump_to_object_file(&object_file_path);
 ///     assert!(object_file_path.exists());
-///     assert!(std::fs::metadata(object_file_path).unwrap().len() > 0);
+///     assert!(std::fs::metadata(object_file_path)?.len() > 0);
 /// }
+/// # Ok(())
+/// # }
 /// ```
 pub struct ExecutionEngine {
     /// Handle that represents this [`ExecutionEngine`] in the MLIR C API.
@@ -359,9 +370,9 @@ mod tests {
             .unwrap();
 
         // Convert to LLVM-compatible MLIR so that the resulting [`Module`] is supposed by [`ExecutionEngine`]s.
-        let mut pass_manager = context.pass_manager();
-        pass_manager.add_pass(builtin::passes::create_conversion_to_llvm_pass());
-        assert!(pass_manager.run(&module.as_operation()).is_success());
+        let mut pass_manager = context.pass_manager().unwrap();
+        pass_manager.add_pass(builtin::passes::create_conversion_to_llvm_pass().unwrap());
+        assert!(pass_manager.run(&module.as_operation().unwrap()).is_success());
 
         module
     }
