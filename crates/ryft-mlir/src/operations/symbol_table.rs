@@ -5,7 +5,7 @@ use ryft_xla_sys::bindings::{
     MlirSymbolTable, mlirSymbolTableDestroy, mlirSymbolTableErase, mlirSymbolTableInsert, mlirSymbolTableLookup,
 };
 
-use crate::{Attribute, StringAttributeRef, StringRef};
+use crate::{Attribute, StringAttributeRef, StringRef, Error};
 
 use super::{Operation, OperationRef};
 
@@ -127,7 +127,7 @@ impl<'o, 'c, 't: 'c> SymbolTable<'o, 'c, 't> {
     /// Returns the name of the symbol after insertion, if successful. Note that this does not move the operation
     /// itself into the [`Block`](crate::Block) of the operation that this [`SymbolTable`] is associated with;
     /// this should be done separately.
-    pub fn insert<'p, O: Operation<'p, 'c, 't>>(&self, operation: &O) -> StringRef<'c>
+    pub fn insert<'p, O: Operation<'p, 'c, 't>>(&self, operation: &O) -> Result<StringRef<'c>, Error>
     where
         'c: 'p,
     {
@@ -140,8 +140,8 @@ impl<'o, 'c, 't: 'c> SymbolTable<'o, 'c, 't> {
                 mlirSymbolTableInsert(*self.handle.borrow_mut(), operation.to_c_api()),
                 self.operation.context(),
             )
-            .unwrap()
-            .string()
+            .map(|attribute| attribute.string())
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to symbol table insertion"))
         }
     }
 
@@ -227,20 +227,25 @@ mod tests {
     #[test]
     fn test_symbol_table() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
 
         // Create a module that contains a function named `test_function`.
         let location = context.unknown_location();
-        let module = context.module(location);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-            func::func("test_function", func::FuncAttributes::default(), block.into(), location)
-        });
-        let module = module.as_operation();
+        let module = context.module(location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func::func("test_function", func::FuncAttributes::default(), block.try_into().unwrap(), location)
+                    .unwrap()
+            })
+            .unwrap();
+        let module = module.as_operation().unwrap();
 
         // Look up a symbol that exists in the test module.
-        let symbol_table = module.new_symbol_table();
+        let symbol_table = module.new_symbol_table().unwrap();
         let function = symbol_table.lookup("test_function");
         assert!(function.is_some());
         assert_eq!(function.unwrap().name().as_str().unwrap(), "func.func");
@@ -251,8 +256,9 @@ mod tests {
 
         // Attempt to insert a symbol with the same name as the function that is already there.
         let block = context.block_with_no_arguments();
-        let op = func::func("test_function", func::FuncAttributes::default(), block.into(), location);
-        let name = symbol_table.insert(&op);
+        let op =
+            func::func("test_function", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
+        let name = symbol_table.insert(&op).unwrap();
         assert_eq!(name.as_str().unwrap(), "test_function_0");
         let function = symbol_table.lookup("test_function_0");
         assert!(function.is_some());
@@ -268,8 +274,8 @@ mod tests {
     fn test_symbol_table_c_api() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let symbol_table = module.as_operation().new_symbol_table();
+        let module = context.module(location).unwrap();
+        let symbol_table = module.as_operation().unwrap().new_symbol_table().unwrap();
         let symbol_table = ManuallyDrop::new(symbol_table);
         let handle = unsafe { *symbol_table.to_c_api().borrow() };
         let symbol_table = unsafe { super::SymbolTable::from_c_api(handle, &symbol_table.operation) };

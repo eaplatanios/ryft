@@ -397,12 +397,12 @@ macro_rules! mlir_attribute_field {
 /// pub trait AddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 ///     /// Returns the left-hand side input of this [`AddOperation`].
 ///     fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
-///         self.required_operand_value(0)
+///         self.operand_value(0).ok_or_else(|| Error::invalid_argument("missing left-hand side input"))
 ///     }
 ///
 ///     /// Returns the right-hand side input of this [`AddOperation`].
 ///     fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
-///         self.required_operand_value(1)
+///         self.operand_value(1).ok_or_else(|| Error::invalid_argument("missing right-hand side input"))
 ///     }
 /// }
 ///
@@ -430,12 +430,6 @@ macro_rules! mlir_op {
             }
 
             impl<'o, 'c: 'o, 't: 'c> [<$name Operation>]<'o, 'c, 't> for [<Detached $name Operation>]<'c, 't> {}
-
-            #[cfg(test)]
-            impl<'o, 'c: 'o, 't: 'c> [<$name Operation>]<'o, 'c, 't>
-                for Result<[<Detached $name Operation>]<'c, 't>, $crate::errors::Error>
-            {
-            }
 
             impl<'o, 'c: 'o, 't: 'c> $crate::Operation<'o, 'c, 't> for [<Detached $name Operation>]<'c, 't> {
                 unsafe fn from_c_api(
@@ -645,22 +639,12 @@ macro_rules! mlir_op_trait {
         paste::paste! {
             impl<'o, 'c: 'o, 't: 'c> $crate::$trait_name<'o, 'c, 't> for [<Detached $op_name Operation>]<'c, 't> {}
             impl<'o, 'c: 'o, 't: 'c> $crate::$trait_name<'o, 'c, 't> for [<$op_name OperationRef>]<'o, 'c, 't> {}
-            #[cfg(test)]
-            impl<'o, 'c: 'o, 't: 'c> $crate::$trait_name<'o, 'c, 't>
-                for Result<[<Detached $op_name Operation>]<'c, 't>, $crate::errors::Error>
-            {
-            }
         }
     };
     ($op_name:ident, @local $trait_name:ident) => {
         paste::paste! {
             impl<'o, 'c: 'o, 't: 'c> $trait_name<'o, 'c, 't> for [<Detached $op_name Operation>]<'c, 't> {}
             impl<'o, 'c: 'o, 't: 'c> $trait_name<'o, 'c, 't> for [<$op_name OperationRef>]<'o, 'c, 't> {}
-            #[cfg(test)]
-            impl<'o, 'c: 'o, 't: 'c> $trait_name<'o, 'c, 't>
-                for Result<[<Detached $op_name Operation>]<'c, 't>, $crate::errors::Error>
-            {
-            }
         }
     };
 }
@@ -723,7 +707,16 @@ macro_rules! mlir_generic_unary_op {
                 $crate::OperationBuilder::new(name.as_str(), location)
                     .add_operands(&[input])
                     .add_result(output_type)
-                    .build_and_cast(format!("invalid arguments to `{}::{}`", stringify!($dialect), stringify!($op)))
+                    .build()
+                    .and_then(|operation| unsafe {
+                        $crate::DetachedOp::cast(operation).ok_or_else(|| {
+                            $crate::errors::Error::invalid_argument(format!(
+                                "invalid arguments to `{}::{}`",
+                                stringify!($dialect),
+                                stringify!($op),
+                            ))
+                        })
+                    })
             }
         }
     };
@@ -778,7 +771,16 @@ macro_rules! mlir_unary_op {
                 $crate::OperationBuilder::new(name.as_str(), location)
                     .add_operands(&[input])
                     .enable_result_type_inference()
-                    .build_and_cast(format!("invalid arguments to `{}::{}`", stringify!($dialect), stringify!($op)))
+                    .build()
+                    .and_then(|operation| unsafe {
+                        $crate::DetachedOp::cast(operation).ok_or_else(|| {
+                            $crate::errors::Error::invalid_argument(format!(
+                                "invalid arguments to `{}::{}`",
+                                stringify!($dialect),
+                                stringify!($op),
+                            ))
+                        })
+                    })
             }
         }
     };
@@ -820,13 +822,23 @@ macro_rules! mlir_binary_op {
                 #[doc = "Returns the left-hand side input (i.e., first operand)"]
                 #[doc = "of this [`" [<$op:camel Operation>] "`]."]
                 fn lhs(&self) -> Result<$crate::ValueRef<'o, 'c, 't>, $crate::errors::Error> {
-                    self.required_operand_value(0)
+                    $crate::Operation::operand_value(self, 0).ok_or_else(|| {
+                        $crate::errors::Error::invalid_argument(format!(
+                            "missing operand in `{}`",
+                            $crate::Operation::name(self).as_str().unwrap_or("<unknown>"),
+                        ))
+                    })
                 }
 
                 #[doc = "Returns the right-hand side input (i.e., second operand)"]
                 #[doc = "of this [`" [<$op:camel Operation>] "`]."]
                 fn rhs(&self) -> Result<$crate::ValueRef<'o, 'c, 't>, $crate::errors::Error> {
-                    self.required_operand_value(1)
+                    $crate::Operation::operand_value(self, 1).ok_or_else(|| {
+                        $crate::errors::Error::invalid_argument(format!(
+                            "missing operand in `{}`",
+                            $crate::Operation::name(self).as_str().unwrap_or("<unknown>"),
+                        ))
+                    })
                 }
             }
 
@@ -853,7 +865,16 @@ macro_rules! mlir_binary_op {
                 $crate::OperationBuilder::new(name.as_str(), location)
                     .add_operands(&[lhs.as_ref(), rhs.as_ref()])
                     .enable_result_type_inference()
-                    .build_and_cast(format!("invalid arguments to `{}::{}`", stringify!($dialect), stringify!($op)))
+                    .build()
+                    .and_then(|operation| unsafe {
+                        $crate::DetachedOp::cast(operation).ok_or_else(|| {
+                            $crate::errors::Error::invalid_argument(format!(
+                                "invalid arguments to `{}::{}`",
+                                stringify!($dialect),
+                                stringify!($op),
+                            ))
+                        })
+                    })
             }
         }
     };

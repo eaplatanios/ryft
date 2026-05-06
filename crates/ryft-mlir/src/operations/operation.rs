@@ -21,6 +21,7 @@ use ryft_xla_sys::bindings::{
     mlirOperationWalk, mlirOperationWriteBytecode, mlirOperationWriteBytecodeWithConfig,
 };
 
+use crate::errors::Error;
 use crate::support::{write_to_formatter_callback, write_to_string_callback};
 use crate::{
     Attribute, AttributeRef, Block, BlockRef, Context, Identifier, Location, LocationRef, LogicalResult,
@@ -71,7 +72,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
 
     /// Returns an [`OperationRef`] that references this [`Operation`].
     fn as_ref(&self) -> OperationRef<'o, 'c, 't> {
-        unsafe { OperationRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
+        OperationRef { handle: unsafe { self.to_c_api() }, context: self.context(), owner: PhantomData }
     }
 
     /// Gets the [`TypeId`] of this [`Operation`]. Note that this function may return the same [`TypeId`] for different
@@ -79,13 +80,19 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// identifier of the corresponding MLIR C++ type for the operation and not for a specific instance of this
     /// operation type. Also, note that if the operation does not have a registered description, then this function
     /// will return [`None`].
-    fn type_id(&self) -> Option<TypeId<'c>> {
-        unsafe { TypeId::from_c_api(mlirOperationGetTypeID(self.to_c_api())) }
+    fn type_id(&self) -> Result<Option<TypeId<'c>>, Error> {
+        unsafe {
+            let handle = mlirOperationGetTypeID(self.to_c_api());
+            if handle.ptr.is_null() { Ok(None) } else { TypeId::from_c_api(handle).map(Some) }
+        }
     }
 
     /// Returns the [`Location`] of this [`Operation`].
-    fn location(&self) -> LocationRef<'c, 't> {
-        unsafe { LocationRef::from_c_api(mlirOperationGetLocation(self.to_c_api()), self.context()).unwrap() }
+    fn location(&self) -> Result<LocationRef<'c, 't>, Error> {
+        unsafe {
+            LocationRef::from_c_api(mlirOperationGetLocation(self.to_c_api()), self.context())
+                .ok_or_else(|| Error::internal("expected non-null MLIR operation location handle"))
+        }
     }
 
     /// Sets the [`Location`] of this [`Operation`].
@@ -419,8 +426,13 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn operands<'r>(&'r self) -> impl Iterator<Item = OperandRef<'o, 'c, 't>> {
-        (0..self.operand_count()).map(|index| self.operand(index).unwrap())
+    fn operands(&self) -> impl Iterator<Item = Result<OperandRef<'o, 'c, 't>, Error>> {
+        let operand_count = self.operand_count();
+        (0..operand_count).map(|index| {
+            self.operand(index).ok_or_else(|| {
+                Error::internal(format!("expected non-null MLIR operation operand handle at index {index}"))
+            })
+        })
     }
 
     /// Returns the operand at the `index`-pth position in the operands list of this [`Operation`],
@@ -444,8 +456,13 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn operand_values<'r>(&'r self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
-        self.operands().map(|operand| operand.value())
+    fn operand_values(&self) -> impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>> {
+        let operand_count = self.operand_count();
+        (0..operand_count).map(|index| {
+            self.operand_value(index).ok_or_else(|| {
+                Error::internal(format!("expected non-null MLIR operation operand value handle at index {index}"))
+            })
+        })
     }
 
     /// Returns the operand [`Value`](crate::Value) at the `index`-pth position in the operands list of this
@@ -469,14 +486,14 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn operand_types<'r>(&'r self) -> impl Iterator<Item = TypeRef<'c, 't>> {
-        self.operand_values().map(|operand| operand.r#type())
+    fn operand_types(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
+        self.operand_values().map(|operand| operand.and_then(|operand| operand.r#type()))
     }
 
     /// Returns the [`Type`](crate::Type) of the operand at the `index`-pth position in the operands list of this
     /// [`Operation`], and [`None`] if `index` is out of bounds.
-    fn operand_type(&self, index: usize) -> Option<TypeRef<'c, 't>> {
-        self.operand_value(index).map(|operand| operand.r#type())
+    fn operand_type(&self, index: usize) -> Result<Option<TypeRef<'c, 't>>, Error> {
+        self.operand_value(index).map(|operand| operand.r#type()).transpose()
     }
 
     /// Replaces the operand at the `index`-pth position in the operands list of this [`Operation`], with the provided
@@ -555,10 +572,13 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn results<'r>(&'r self) -> impl Iterator<Item = OperationResultRef<'o, 'c, 't>> {
-        (0..self.result_count()).map(|index| unsafe {
+    fn results(&self) -> impl Iterator<Item = Result<OperationResultRef<'o, 'c, 't>, Error>> {
+        let result_count = self.result_count();
+        (0..result_count).map(|index| unsafe {
             OperationResultRef::from_c_api(mlirOperationGetResult(self.to_c_api(), index.cast_signed()), self.context())
-                .unwrap()
+                .ok_or_else(|| {
+                    Error::internal(format!("expected non-null MLIR operation result handle at index {index}"))
+                })
         })
     }
 
@@ -586,14 +606,14 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn result_types<'r>(&'r self) -> impl Iterator<Item = TypeRef<'c, 't>> {
-        self.results().map(|result| result.r#type())
+    fn result_types(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
+        self.results().map(|result| result.and_then(|result| result.r#type()))
     }
 
     /// Returns the [`Type`](crate::Type) of the result at the `index`-pth position in the results list of this
     /// [`Operation`], and [`None`] if `index` is out of bounds.
-    fn result_type(&self, index: usize) -> Option<TypeRef<'c, 't>> {
-        self.result(index).map(|result| result.r#type())
+    fn result_type(&self, index: usize) -> Result<Option<TypeRef<'c, 't>>, Error> {
+        self.result(index).map(|result| result.r#type()).transpose()
     }
 
     /// Returns `true` if this [`Operation`] is empty (i.e., if it contains no [`Region`](crate::Region)s).
@@ -615,9 +635,13 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'o, 'c, 't>> {
-        (0..self.region_count()).map(|index| unsafe {
-            RegionRef::from_c_api(mlirOperationGetRegion(self.to_c_api(), index.cast_signed()), self.context()).unwrap()
+    fn regions(&self) -> impl Iterator<Item = Result<RegionRef<'o, 'c, 't>, Error>> {
+        let region_count = self.region_count();
+        (0..region_count).map(|index| unsafe {
+            RegionRef::from_c_api(mlirOperationGetRegion(self.to_c_api(), index.cast_signed()), self.context())
+                .ok_or_else(|| {
+                    Error::internal(format!("expected non-null MLIR operation region handle at index {index}"))
+                })
         })
     }
 
@@ -653,10 +677,13 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn successors<'r>(&'r self) -> impl Iterator<Item = BlockRef<'o, 'c, 't>> {
-        (0..self.successor_count()).map(|index| unsafe {
+    fn successors(&self) -> impl Iterator<Item = Result<BlockRef<'o, 'c, 't>, Error>> {
+        let successor_count = self.successor_count();
+        (0..successor_count).map(|index| unsafe {
             BlockRef::from_c_api(mlirOperationGetSuccessor(self.to_c_api(), index.cast_signed()), self.context())
-                .unwrap()
+                .ok_or_else(|| {
+                    Error::internal(format!("expected non-null MLIR operation successor handle at index {index}"))
+                })
         })
     }
 
@@ -754,7 +781,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
             if !handle.ptr.is_null() {
                 std::mem::forget(self);
             }
-            OperationRef::from_c_api(handle, context).unwrap()
+            OperationRef { handle, context, owner: PhantomData }
         }
     }
 
@@ -781,7 +808,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
             if !handle.ptr.is_null() {
                 std::mem::forget(self);
             }
-            OperationRef::from_c_api(handle, context).unwrap()
+            OperationRef { handle, context, owner: PhantomData }
         }
     }
 
@@ -805,8 +832,9 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
             unsafe {
                 let data = data as *mut (&mut F, &'c Context<'t>);
                 let (ref mut callback, context) = *data;
-                let operation = OperationRef::from_c_api(operation, context).unwrap();
-                (callback)(operation).to_c_api()
+                OperationRef::from_c_api(operation, context)
+                    .map(|operation| (callback)(operation).to_c_api())
+                    .unwrap_or(MlirWalkResult_MlirWalkResultInterrupt)
             }
         }
 
@@ -1141,12 +1169,6 @@ impl Debug for OperationRef<'_, '_, '_> {
     }
 }
 
-impl<'r, 'o: 'r, 'c: 'o, 't: 'c, O: DetachedOp<'r, 'c, 't>> From<&'r O> for OperationRef<'o, 'c, 't> {
-    fn from(value: &'r O) -> Self {
-        unsafe { Self::from_c_api(value.to_c_api(), value.context()).unwrap() }
-    }
-}
-
 /// Traversal order when performing a walk over [`Operation`]s.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WalkOrder {
@@ -1221,24 +1243,24 @@ mod tests {
     #[test]
     fn test_operation_construction() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
 
         // Test using a simple unregistered operation that has no type ID.
         let mut op = OperationBuilder::new("foo", location).build().unwrap();
-        assert_eq!(op, OperationRef::from(&op));
-        assert!(op.type_id().is_none());
-        assert_eq!(op.location(), location);
+        assert_eq!(op, op.as_ref());
+        assert!(op.type_id().unwrap().is_none());
+        assert_eq!(op.location().unwrap(), location);
         op.set_location(context.file_location("test.mlir", 4, 2));
-        assert_eq!(op.location(), context.file_location("test.mlir", 4, 2));
+        assert_eq!(op.location().unwrap(), context.file_location("test.mlir", 4, 2));
         assert_eq!(op.name(), context.identifier("foo"));
 
         // Check that registered operations have type IDs.
         let mut block = context.block_with_no_arguments();
-        block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-        let op = func::func("test_func", func::FuncAttributes::default(), block.into(), location);
-        assert!(op.type_id().is_some());
+        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+        let op = func::func("test_func", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
+        assert!(op.type_id().unwrap().is_some());
 
         // Test a C API-related edge case.
         let op = DetachedOperation { handle: MlirOperation { ptr: std::ptr::null_mut() }, context: &context };
@@ -1248,11 +1270,12 @@ mod tests {
     #[test]
     fn test_operation_inherent_attributes() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-        let mut op = func::func("test_func", func::FuncAttributes::default(), block.into(), location);
+        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+        let mut op =
+            func::func("test_func", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         assert!(op.inherent_attribute_count() > 0);
         assert!(op.has_inherent_attribute("sym_name"));
         assert_eq!(op.inherent_attribute("sym_name"), Some(context.string_attribute("test_func").as_ref()));
@@ -1311,7 +1334,7 @@ mod tests {
         assert_eq!(op.attribute("foo").map(|a| a.to_string()), Some("\"foo\"".into()));
         let attribute = op.attributes().next().unwrap();
         assert_eq!(attribute.name(), context.identifier("foo"));
-        assert_eq!(attribute.attribute(), context.string_attribute("foo"));
+        assert_eq!(attribute.attribute().unwrap(), context.string_attribute("foo"));
     }
 
     #[test]
@@ -1323,7 +1346,7 @@ mod tests {
 
         // Operation with no operands.
         let op = OperationBuilder::new("foo", location).build().unwrap();
-        assert_eq!(op.operands().count(), 0);
+        assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
 
         // Operation with three operands.
         let block = context.block(&[(index_type, location)]);
@@ -1334,9 +1357,9 @@ mod tests {
             .add_operand(argument_0)
             .build()
             .unwrap();
-        assert_eq!(op.operand(0).map(|operand| operand.value()), Some(argument_0));
-        assert_eq!(op.operand(1).map(|operand| operand.value()), Some(argument_0));
-        assert_eq!(op.operand(2).map(|operand| operand.value()), Some(argument_0));
+        assert_eq!(op.operand(0).map(|operand| operand.value().unwrap()), Some(argument_0));
+        assert_eq!(op.operand(1).map(|operand| operand.value().unwrap()), Some(argument_0));
+        assert_eq!(op.operand(2).map(|operand| operand.value().unwrap()), Some(argument_0));
         assert_eq!(op.operand(0).map(|operand| operand.operand_index()), Some(0));
         assert_eq!(op.operand(1).map(|operand| operand.operand_index()), Some(1));
         assert_eq!(op.operand(2).map(|operand| operand.operand_index()), Some(2));
@@ -1345,28 +1368,34 @@ mod tests {
         assert_eq!(op.operand_value(1), Some(argument_0));
         assert_eq!(op.operand_value(2), Some(argument_0));
         assert!(op.operand_value(3).is_none());
-        assert_eq!(op.operand_values().skip(1).collect::<Vec<_>>(), vec![argument_0.clone(), argument_0]);
-        assert_eq!(op.operand_type(0), Some(index_type));
-        assert_eq!(op.operand_type(1), Some(index_type));
-        assert_eq!(op.operand_type(2), Some(index_type));
-        assert!(op.operand_type(3).is_none());
-        assert_eq!(op.operand_types().collect::<Vec<_>>(), vec![index_type, index_type, index_type]);
+        assert_eq!(
+            op.operand_values().collect::<Result<Vec<_>, _>>().unwrap().into_iter().skip(1).collect::<Vec<_>>(),
+            vec![argument_0.clone(), argument_0]
+        );
+        assert_eq!(op.operand_type(0).unwrap(), Some(index_type));
+        assert_eq!(op.operand_type(1).unwrap(), Some(index_type));
+        assert_eq!(op.operand_type(2).unwrap(), Some(index_type));
+        assert!(op.operand_type(3).unwrap().is_none());
+        assert_eq!(
+            op.operand_types().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![index_type, index_type, index_type]
+        );
 
         // Try replacing an operand of an operation.
         let i32_type = context.signless_integer_type(32).as_ref();
         let i64_type = context.signless_integer_type(64).as_ref();
         let mut block = context.block(&[(i32_type, location), (i64_type, location)]);
-        let mut op = block.append_operation(op);
+        let mut op = block.append_operation(op).unwrap();
         let argument_1 = block.argument(0).unwrap().as_ref();
         assert!(unsafe { op.replace_operand(0, argument_1) });
-        assert_eq!(op.operand(0).unwrap().value(), argument_1);
+        assert_eq!(op.operand(0).unwrap().value().unwrap(), argument_1);
         assert!(unsafe { !op.replace_operand(10, argument_0) });
 
         // Try replacing all operands of an operation.
         let argument_2 = block.argument(1).unwrap().as_ref();
         assert!(unsafe { op.replace_operands(&[argument_1, argument_2, argument_0]) });
-        assert_eq!(op.operand(0).map(|operand| operand.value()), Some(argument_1));
-        assert_eq!(op.operand(1).map(|operand| operand.value()), Some(argument_2));
+        assert_eq!(op.operand(0).map(|operand| operand.value().unwrap()), Some(argument_1));
+        assert_eq!(op.operand(1).map(|operand| operand.value().unwrap()), Some(argument_2));
         assert!(unsafe { !op.replace_operands(&[argument_2]) });
 
         // Try replacing all uses of one value inside an operation.
@@ -1377,9 +1406,9 @@ mod tests {
             .build()
             .unwrap();
         unsafe { op.replace_uses_of_with(argument_0, argument_2) };
-        assert_eq!(op.operand(0).map(|operand| operand.value()), Some(argument_2));
-        assert_eq!(op.operand(1).map(|operand| operand.value()), Some(argument_2));
-        assert_eq!(op.operand(2).map(|operand| operand.value()), Some(argument_2));
+        assert_eq!(op.operand(0).map(|operand| operand.value().unwrap()), Some(argument_2));
+        assert_eq!(op.operand(1).map(|operand| operand.value().unwrap()), Some(argument_2));
+        assert_eq!(op.operand(2).map(|operand| operand.value().unwrap()), Some(argument_2));
     }
 
     #[test]
@@ -1400,11 +1429,14 @@ mod tests {
         assert!(op.result(0).is_some());
         assert!(op.result(1).is_some());
         assert!(op.result(2).is_none());
-        assert_eq!(op.result_type(0).unwrap(), i32_type);
-        assert_eq!(op.result_type(1).unwrap(), i64_type);
-        assert!(op.result_type(2).is_none());
-        assert_eq!(op.results().collect::<Vec<_>>().len(), 2);
-        assert_eq!(op.result_types().collect::<Vec<_>>(), vec![i32_type, i64_type]);
+        assert_eq!(op.result_type(0).unwrap().unwrap(), i32_type);
+        assert_eq!(op.result_type(1).unwrap().unwrap(), i64_type);
+        assert!(op.result_type(2).unwrap().is_none());
+        assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(), 2);
+        assert_eq!(
+            op.result_types().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![i32_type, i64_type]
+        );
     }
 
     #[test]
@@ -1433,7 +1465,7 @@ mod tests {
         assert!(op.region(1).is_some());
         assert!(op.region(2).is_some());
         assert!(op.region(3).is_none());
-        assert_eq!(op.regions().collect::<Vec<_>>().len(), 3);
+        assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(), 3);
     }
 
     #[test]
@@ -1449,9 +1481,9 @@ mod tests {
         assert!(op.successor(0).is_some());
         assert!(op.successor(1).is_some());
         assert!(op.successor(2).is_none());
-        assert_eq!(op.successors().collect::<Vec<_>>().len(), 2);
+        assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(), 2);
         let mut block_3 = context.block_with_no_arguments();
-        let mut op = block_3.append_operation(op);
+        let mut op = block_3.append_operation(op).unwrap();
         assert!(op.replace_successor(0, &block_2));
         assert!(!op.replace_successor(10, &block_2));
     }
@@ -1464,7 +1496,7 @@ mod tests {
         let op = OperationBuilder::new("foo", location).build().unwrap();
         assert!(op.parent_block().is_none());
         let mut block = context.block_with_no_arguments();
-        let op = block.append_operation(op);
+        let op = block.append_operation(op).unwrap();
         assert_eq!(op.parent_block(), Some(block.as_ref()));
     }
 
@@ -1478,15 +1510,15 @@ mod tests {
             .add_results(&[context.index_type()])
             .add_region({
                 let mut block = context.block_with_no_arguments();
-                block.append_operation(OperationBuilder::new("bar", location).build().unwrap());
-                block.into()
+                block.append_operation(OperationBuilder::new("bar", location).build().unwrap()).unwrap();
+                block.try_into().unwrap()
             })
             .build()
             .unwrap();
-        let op = block.append_operation(op);
+        let op = block.append_operation(op).unwrap();
         assert_eq!(op.parent_operation(), None);
         assert_eq!(
-            &op.region(0)
+            op.region(0)
                 .unwrap()
                 .blocks()
                 .next()
@@ -1496,7 +1528,7 @@ mod tests {
                 .unwrap()
                 .parent_operation()
                 .unwrap(),
-            &op
+            op
         );
     }
 
@@ -1506,9 +1538,9 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op_0 = block.append_operation(OperationBuilder::new("op_0", location).build().unwrap());
-        let op_1 = block.append_operation(OperationBuilder::new("op_1", location).build().unwrap());
-        let op_2 = block.append_operation(OperationBuilder::new("op_2", location).build().unwrap());
+        let op_0 = block.append_operation(OperationBuilder::new("op_0", location).build().unwrap()).unwrap();
+        let op_1 = block.append_operation(OperationBuilder::new("op_1", location).build().unwrap()).unwrap();
+        let op_2 = block.append_operation(OperationBuilder::new("op_2", location).build().unwrap()).unwrap();
         assert!(op_0.is_before_in_block(&op_1));
         assert!(op_0.is_before_in_block(&op_2));
         assert!(op_1.is_before_in_block(&op_2));
@@ -1523,9 +1555,9 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op_0 = block.append_operation(OperationBuilder::new("op_0", location).build().unwrap());
-        let op_1 = block.append_operation(OperationBuilder::new("op_1", location).build().unwrap());
-        let op_2 = block.append_operation(OperationBuilder::new("op_2", location).build().unwrap());
+        let op_0 = block.append_operation(OperationBuilder::new("op_0", location).build().unwrap()).unwrap();
+        let op_1 = block.append_operation(OperationBuilder::new("op_1", location).build().unwrap()).unwrap();
+        let op_2 = block.append_operation(OperationBuilder::new("op_2", location).build().unwrap()).unwrap();
         unsafe { op_1.move_after(&op_2) };
         assert_eq!(
             block.operations().map(|op| op.name().as_str().unwrap().to_string()).collect::<Vec<_>>(),
@@ -1544,18 +1576,20 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op = block.append_operation(
-            OperationBuilder::new("parent", location)
-                .add_results(&[context.index_type()])
-                .add_region({
-                    let mut block = context.block_with_no_arguments();
-                    block.append_operation(OperationBuilder::new("child_0", location).build().unwrap());
-                    block.append_operation(OperationBuilder::new("child_1", location).build().unwrap());
-                    block.into()
-                })
-                .build()
-                .unwrap(),
-        );
+        let op = block
+            .append_operation(
+                OperationBuilder::new("parent", location)
+                    .add_results(&[context.index_type()])
+                    .add_region({
+                        let mut block = context.block_with_no_arguments();
+                        block.append_operation(OperationBuilder::new("child_0", location).build().unwrap()).unwrap();
+                        block.append_operation(OperationBuilder::new("child_1", location).build().unwrap()).unwrap();
+                        block.try_into().unwrap()
+                    })
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
 
         // Test with [`WalkResult::Advance`].
         let mut result: Vec<String> = Vec::new();
@@ -1592,25 +1626,31 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op = block.append_operation(
-            OperationBuilder::new("grandparent", location)
-                .add_region({
-                    let mut block = context.block_with_no_arguments();
-                    block.append_operation(
-                        OperationBuilder::new("parent", location)
-                            .add_region({
-                                let mut block = context.block_with_no_arguments();
-                                block.append_operation(OperationBuilder::new("child", location).build().unwrap());
-                                block.into()
-                            })
-                            .build()
-                            .unwrap(),
-                    );
-                    block.into()
-                })
-                .build()
-                .unwrap(),
-        );
+        let op = block
+            .append_operation(
+                OperationBuilder::new("grandparent", location)
+                    .add_region({
+                        let mut block = context.block_with_no_arguments();
+                        block
+                            .append_operation(
+                                OperationBuilder::new("parent", location)
+                                    .add_region({
+                                        let mut block = context.block_with_no_arguments();
+                                        block
+                                            .append_operation(OperationBuilder::new("child", location).build().unwrap())
+                                            .unwrap();
+                                        block.try_into().unwrap()
+                                    })
+                                    .build()
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                        block.try_into().unwrap()
+                    })
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
 
         // Test with [`WalkResult::Advance`].
         let mut result: Vec<String> = Vec::new();
@@ -1645,11 +1685,11 @@ mod tests {
     #[test]
     fn test_operation_bytecode() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-        let op = func::func("test_func", func::FuncAttributes::default(), block.into(), location);
+        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+        let op = func::func("test_func", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         let bytecode = op.bytecode();
         assert!(bytecode.len() > 0);
         let bytecode = op.bytecode_with_configuration(&BytecodeWriterConfiguration { version: Some(0) });
@@ -1673,8 +1713,9 @@ mod tests {
                 use_generic_op_form: true,
                 use_local_scope: true,
                 ..Default::default()
-            }),
-            Ok("\"foo\"() : () -> () [unknown]".to_string())
+            })
+            .unwrap(),
+            "\"foo\"() : () -> () [unknown]"
         );
     }
 
@@ -1685,21 +1726,21 @@ mod tests {
         let location = context.unknown_location();
         let op = OperationBuilder::new("test.op", location).build().unwrap();
         assert_eq!(
-            op.to_string_with_state(AsmState::for_operation(&op, OperationPrintingFlags::default())),
-            Ok("\"test.op\"() : () -> ()\n".to_string())
+            op.to_string_with_state(AsmState::for_operation(&op, OperationPrintingFlags::default())).unwrap(),
+            "\"test.op\"() : () -> ()\n"
         );
     }
 
     #[test]
     fn test_operation_verify() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let location = context.unknown_location();
 
         // Valid operation.
         let mut block = context.block_with_no_arguments();
-        block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-        let op = func::func("valid", func::FuncAttributes::default(), block.into(), location);
+        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+        let op = func::func("valid", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         assert!(op.verify());
 
         // Invalid operation.
@@ -1738,7 +1779,7 @@ mod tests {
 
         // Cloned operations should have the same name, attributes, etc.
         assert_eq!(op_0.name(), op_1.name());
-        assert_eq!(op_0.attribute("key"), op_1.attribute("key"));
+        assert_eq!(op_0.attribute("key").unwrap(), op_1.attribute("key").unwrap());
     }
 
     #[test]
@@ -1755,16 +1796,16 @@ mod tests {
 
         // Test hashing of detached operations.
         let mut map = HashMap::new();
-        map.insert(&op_0, "op_0");
-        map.insert(&op_1, "op_1");
+        assert_eq!(map.insert(&op_0, "op_0"), None);
+        assert_eq!(map.insert(&op_1, "op_1"), None);
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&op_0), Some(&"op_0"));
         assert_eq!(map.get(&op_1), Some(&"op_1"));
 
         // Test hashing of operation references.
         let mut map = HashMap::new();
-        map.insert(&op_0_ref, "op_0");
-        map.insert(&op_1_ref, "op_1");
+        assert_eq!(map.insert(&op_0_ref, "op_0"), None);
+        assert_eq!(map.insert(&op_1_ref, "op_1"), None);
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&op_0_ref), Some(&"op_0"));
         assert_eq!(map.get(&op_1_ref), Some(&"op_1"));
@@ -1785,11 +1826,11 @@ mod tests {
     #[test]
     fn test_operation_casting() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-        let op = func::func("test_func", func::FuncAttributes::default(), block.into(), location);
+        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+        let op = func::func("test_func", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         let op = unsafe { op.cast::<DetachedOperation>() };
         assert!(op.is_some());
         let op = op.unwrap();
@@ -1801,7 +1842,7 @@ mod tests {
     #[test]
     fn test_operation_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
 
         // Parse a good operation.
         let op = context.parse_operation("func.func @test() {\n  func.return\n}", "test.mlir");

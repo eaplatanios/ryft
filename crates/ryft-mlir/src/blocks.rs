@@ -11,11 +11,10 @@ use ryft_xla_sys::bindings::{
     mlirBlockInsertOwnedOperationBefore, mlirBlockPrint, mlirOperationGetNextInBlock, mlirOperationRemoveFromParent,
 };
 
-use crate::errors::Error;
 use crate::support::write_to_formatter_callback;
 use crate::{
-    BlockArgumentRef, Context, DetachedOp, DetachedOperation, Location, LocationRef, OpRef, Operation, OperationRef,
-    RegionRef, Type, TypeRef, Value,
+    BlockArgumentRef, Context, DetachedOp, DetachedOperation, Error, Location, LocationRef, OpRef, Operation,
+    OperationRef, RegionRef, Type, TypeRef, Value,
 };
 
 /// [`Block`]s are one of the main building blocks of MLIR programs. MLIR is fundamentally based on a graph-like
@@ -850,7 +849,7 @@ mod tests {
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
         let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
-        let op_1 = block.insert_operation(OperationBuilder::new("bar", location).build(), 0).unwrap();
+        let op_1 = block.insert_operation(OperationBuilder::new("bar", location).build().unwrap(), 0).unwrap();
         assert_eq!(block.operations().collect::<Vec<_>>(), vec![op_1, op_0]);
     }
 
@@ -861,9 +860,11 @@ mod tests {
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
         let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
-        let op_1 = block.insert_operation_after(OperationBuilder::new("bar", location).build(), Some(op_0)).unwrap();
+        let op_1 = block
+            .insert_operation_after(OperationBuilder::new("bar", location).build().unwrap(), Some(op_0))
+            .unwrap();
         let op_2 = block
-            .insert_operation_after(OperationBuilder::new("baz", location).build(), None::<OperationRef>)
+            .insert_operation_after(OperationBuilder::new("baz", location).build().unwrap(), None::<OperationRef>)
             .unwrap();
         assert_eq!(block.operations().collect::<Vec<_>>(), vec![op_2, op_0, op_1]);
     }
@@ -875,9 +876,11 @@ mod tests {
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
         let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
-        let op_1 = block.insert_operation_before(OperationBuilder::new("bar", location).build(), Some(op_0)).unwrap();
+        let op_1 = block
+            .insert_operation_before(OperationBuilder::new("bar", location).build().unwrap(), Some(op_0))
+            .unwrap();
         let op_2 = block
-            .insert_operation_before(OperationBuilder::new("baz", location).build(), None::<OperationRef>)
+            .insert_operation_before(OperationBuilder::new("baz", location).build().unwrap(), None::<OperationRef>)
             .unwrap();
         assert_eq!(block.operations().collect::<Vec<_>>(), vec![op_1, op_0, op_2]);
     }
