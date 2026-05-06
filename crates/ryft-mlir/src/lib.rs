@@ -9,6 +9,7 @@ pub mod blocks;
 pub mod context;
 pub mod diagnostics;
 pub mod dialects;
+pub mod errors;
 pub mod execution_engine;
 pub mod identifier;
 pub mod locations;
@@ -52,6 +53,7 @@ pub use self::dialects::builtin::{
     UnrealizedConversionCastOperationRef, VectorTypeDimension, VectorTypeRef,
 };
 pub use self::dialects::{Dialect, DialectHandle, DialectRegistry};
+pub use self::errors::*;
 pub use self::execution_engine::*;
 pub use self::identifier::*;
 pub use self::locations::*;
