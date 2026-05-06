@@ -1,16 +1,15 @@
-use std::backtrace::Backtrace;
 use std::fmt::{Debug, Display};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::marker::PhantomData;
 use std::path::Path;
-
-use thiserror::Error;
 
 use ryft_xla_sys::bindings::{
     MlirLlvmThreadPool, MlirLogicalResult, MlirStringRef, MlirTypeID, MlirTypeIDAllocator, mlirLlvmThreadPoolCreate,
     mlirLlvmThreadPoolDestroy, mlirStringRefCreateFromCString, mlirStringRefEqual, mlirTypeIDAllocatorAllocateTypeID,
     mlirTypeIDAllocatorCreate, mlirTypeIDAllocatorDestroy, mlirTypeIDCreate, mlirTypeIDEqual, mlirTypeIDHashValue,
 };
+
+use crate::errors::Error;
 
 /// Pointer to a sized fragment of a string that is not necessarily null-terminated. Note that [`StringRef`] does not
 /// own the underlying string and that is why it has a lifetime parameter that is tied to the owner of that string.
@@ -351,12 +350,6 @@ impl<'o> From<&'o ThreadPool> for ThreadPoolRef<'o> {
     }
 }
 
-#[derive(Error, Debug)]
-pub enum TypeIdError {
-    #[error("type ID reference data must be 8-byte aligned")]
-    AlignmentError { backtrace: String },
-}
-
 /// [`TypeId`]s provide efficient and unique identifiers for specific C++ types (not to be conflated with MLIR
 /// [`Type`](crate::Type)s; e.g., multiple non-equal instances of MLIR [`Type`](crate::Type)s might have the same
 /// [`TypeId`]). This allows for a C++ type to be compared, hashed, and stored in an opaque context.
@@ -376,8 +369,12 @@ impl TypeId<'_> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirTypeID) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, owner: PhantomData }) }
+    pub unsafe fn from_c_api(handle: MlirTypeID) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR type ID handle"))
+        } else {
+            Ok(Self { handle, owner: PhantomData })
+        }
     }
 
     /// Returns the [`MlirTypeID`] that corresponds to this [`TypeId`]
@@ -392,14 +389,14 @@ impl TypeId<'_> {
     }
 
     /// Creates a new [`TypeId`] using the provided reference data. Note that the reference data must be
-    /// 8-byte aligned. If it is not, then this function will return a [`TypeIdError`].
-    pub fn create<T>(reference: &T) -> Result<Self, TypeIdError> {
+    /// 8-byte aligned. If it is not, then this function will return an [`Error`].
+    pub fn create<T>(reference: &T) -> Result<Self, Error> {
         let reference = reference as *const _ as *const u8;
         if reference.align_offset(8) != 0 {
-            Err(TypeIdError::AlignmentError { backtrace: Backtrace::capture().to_string() })
+            Err(Error::invalid_argument("type ID reference data must be 8-byte aligned"))
         } else {
             let reference = reference as *const _ as *const std::ffi::c_void;
-            Ok(unsafe { Self::from_c_api(mlirTypeIDCreate(reference)).unwrap() })
+            unsafe { Self::from_c_api(mlirTypeIDCreate(reference)) }
         }
     }
 }
@@ -440,8 +437,8 @@ impl TypeIdAllocator {
     }
 
     /// Allocates a new [`TypeId`] that is ensured to be unique for the lifetime of this [`TypeIdAllocator`].
-    pub fn allocate(&self) -> TypeId<'_> {
-        unsafe { TypeId::from_c_api(mlirTypeIDAllocatorAllocateTypeID(self.handle)).unwrap() }
+    pub fn allocate(&self) -> Result<TypeId<'_>, Error> {
+        unsafe { TypeId::from_c_api(mlirTypeIDAllocatorAllocateTypeID(self.handle)) }
     }
 }
 
@@ -499,8 +496,8 @@ mod tests {
         let string_ref_1 = StringRef::from("test");
         let string_ref_2 = StringRef::from("other");
         let mut map = HashMap::new();
-        map.insert(string_ref_0, 1);
-        map.insert(string_ref_1, 2);
+        assert_eq!(map.insert(string_ref_0, 1), None);
+        assert_eq!(map.insert(string_ref_1, 2), Some(1));
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&string_ref_0), Some(&2));
         assert_eq!(map.get(&string_ref_2), None);
@@ -586,30 +583,30 @@ mod tests {
         let type_id_0 = TypeId::create(&data_0).unwrap();
         let type_id_1 = TypeId::create(&data_1).unwrap();
         let mut map = HashMap::new();
-        map.insert(unsafe { TypeId::from_c_api(type_id_0.to_c_api()).unwrap() }, "first");
-        map.insert(TypeId::create(&data_0).unwrap(), "second");
-        map.insert(type_id_1, "third");
+        assert_eq!(map.insert(unsafe { TypeId::from_c_api(type_id_0.to_c_api()).unwrap() }, "first"), None);
+        assert_eq!(map.insert(TypeId::create(&data_0).unwrap(), "second"), Some("first"));
+        assert_eq!(map.insert(type_id_1, "third"), None);
         assert_eq!(map.len(), 2);
 
         // Test with misaligned data.
         let bytes = [0_u8; 16];
         let type_id = TypeId::create(&bytes[1]);
-        assert!(matches!(type_id, Err(TypeIdError::AlignmentError { .. })));
+        assert!(type_id.is_err());
 
         // Test null pointer edge case.
         let bad_handle = MlirTypeID { ptr: std::ptr::null_mut() };
         let type_id = unsafe { TypeId::from_c_api(bad_handle) };
-        assert!(type_id.is_none());
+        assert!(type_id.is_err());
     }
 
     #[test]
     fn test_type_id_allocator() {
         let allocator_0 = TypeIdAllocator::default();
         let allocator_1 = TypeIdAllocator::default();
-        let type_id_0 = allocator_0.allocate();
-        let type_id_1 = allocator_0.allocate();
-        let type_id_2 = allocator_0.allocate();
-        let type_id_3 = allocator_1.allocate();
+        let type_id_0 = allocator_0.allocate().unwrap();
+        let type_id_1 = allocator_0.allocate().unwrap();
+        let type_id_2 = allocator_0.allocate().unwrap();
+        let type_id_3 = allocator_1.allocate().unwrap();
         assert_eq!(type_id_0, type_id_0);
         assert_ne!(type_id_0, type_id_1);
         assert_ne!(type_id_0, type_id_2);

@@ -54,10 +54,7 @@ pub trait Type<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + De
     /// instances of the same type with potentially different attributes. That is because a [`TypeId`] is a unique
     /// identifier of the corresponding MLIR C++ type for [`Type`] and not for a specific instance of [`Type`].
     fn type_id(&self) -> Result<TypeId<'c>, Error> {
-        unsafe {
-            TypeId::from_c_api(mlirTypeGetTypeID(self.to_c_api()))
-                .ok_or_else(|| Error::internal("expected non-null MLIR type ID handle"))
-        }
+        unsafe { TypeId::from_c_api(mlirTypeGetTypeID(self.to_c_api())) }
     }
 
     /// Returns the [`Dialect`] that this type belongs to.
