@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Added `ryft_mlir::Error` and converted instances of panics throughout the library to fallible functions.
 - Added missing `affine` dialect operations.
 - Added missing `arith` dialect operations.
 - Added support for the `async` dialect.
