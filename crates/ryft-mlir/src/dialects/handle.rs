@@ -53,24 +53,24 @@ mod tests {
 
     #[test]
     fn test_dialect_handle() {
-        assert_eq!(DialectHandle::affine().namespace().unwrap(), "affine");
-        assert_eq!(DialectHandle::r#async().namespace().unwrap(), "async");
-        assert_eq!(DialectHandle::emit_c().namespace().unwrap(), "emitc");
-        assert_eq!(DialectHandle::func().namespace().unwrap(), "func");
-        assert_eq!(DialectHandle::gpu().namespace().unwrap(), "gpu");
-        assert_eq!(DialectHandle::linalg().namespace().unwrap(), "linalg");
-        assert_eq!(DialectHandle::nvgpu().namespace().unwrap(), "nvgpu");
-        assert_eq!(DialectHandle::sparse_tensor().namespace().unwrap(), "sparse_tensor");
-        assert_eq!(DialectHandle::tensor().namespace().unwrap(), "tensor");
-        assert_eq!(DialectHandle::transform().namespace().unwrap(), "transform");
+        assert_eq!(DialectHandle::affine().unwrap().namespace().unwrap(), "affine");
+        assert_eq!(DialectHandle::r#async().unwrap().namespace().unwrap(), "async");
+        assert_eq!(DialectHandle::emit_c().unwrap().namespace().unwrap(), "emitc");
+        assert_eq!(DialectHandle::func().unwrap().namespace().unwrap(), "func");
+        assert_eq!(DialectHandle::gpu().unwrap().namespace().unwrap(), "gpu");
+        assert_eq!(DialectHandle::linalg().unwrap().namespace().unwrap(), "linalg");
+        assert_eq!(DialectHandle::nvgpu().unwrap().namespace().unwrap(), "nvgpu");
+        assert_eq!(DialectHandle::sparse_tensor().unwrap().namespace().unwrap(), "sparse_tensor");
+        assert_eq!(DialectHandle::tensor().unwrap().namespace().unwrap(), "tensor");
+        assert_eq!(DialectHandle::transform().unwrap().namespace().unwrap(), "transform");
 
         // Check that we can construct multiple handles for the same dialect.
-        let handle_1 = DialectHandle::gpu();
-        let handle_2 = DialectHandle::gpu();
+        let handle_1 = DialectHandle::gpu().unwrap();
+        let handle_2 = DialectHandle::gpu().unwrap();
         assert_eq!(handle_1.namespace().unwrap(), handle_2.namespace().unwrap());
 
         // Check that dialect handles integrate properly with the MLIR C API.
-        let handle = unsafe { DialectHandle::from_c_api(DialectHandle::gpu().to_c_api()) };
+        let handle = unsafe { DialectHandle::from_c_api(DialectHandle::gpu().unwrap().to_c_api()) };
         assert!(handle.is_some());
         assert_eq!(handle.unwrap().namespace().unwrap(), "gpu");
     }

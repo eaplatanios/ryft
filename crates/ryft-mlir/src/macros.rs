@@ -822,10 +822,10 @@ macro_rules! mlir_binary_op {
                 #[doc = "Returns the left-hand side input (i.e., first operand)"]
                 #[doc = "of this [`" [<$op:camel Operation>] "`]."]
                 fn lhs(&self) -> Result<$crate::ValueRef<'o, 'c, 't>, $crate::errors::Error> {
-                    $crate::Operation::operand_value(self, 0).ok_or_else(|| {
+                    self.operand_value(0).ok_or_else(|| {
                         $crate::errors::Error::invalid_argument(format!(
                             "missing operand in `{}`",
-                            $crate::Operation::name(self).as_str().unwrap_or("<unknown>"),
+                            self.name().as_str().unwrap_or("<unknown>"),
                         ))
                     })
                 }
@@ -833,10 +833,10 @@ macro_rules! mlir_binary_op {
                 #[doc = "Returns the right-hand side input (i.e., second operand)"]
                 #[doc = "of this [`" [<$op:camel Operation>] "`]."]
                 fn rhs(&self) -> Result<$crate::ValueRef<'o, 'c, 't>, $crate::errors::Error> {
-                    $crate::Operation::operand_value(self, 1).ok_or_else(|| {
+                    self.operand_value(1).ok_or_else(|| {
                         $crate::errors::Error::invalid_argument(format!(
                             "missing operand in `{}`",
-                            $crate::Operation::name(self).as_str().unwrap_or("<unknown>"),
+                            self.name().as_str().unwrap_or("<unknown>"),
                         ))
                     })
                 }
