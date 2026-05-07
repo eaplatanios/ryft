@@ -407,7 +407,20 @@ mod tests {
                 assert_eq!(operation.name().as_str().unwrap(), "builtin.module");
                 assert!(operation.verify());
                 assert_eq!(
-                    operation.region(0).unwrap().blocks().next().unwrap().operations().next().unwrap().name(),
+                    operation
+                        .region(0)
+                        .unwrap()
+                        .blocks()
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .operations()
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .name(),
                     self.context.identifier("func.func"),
                 );
                 LogicalResult::success()

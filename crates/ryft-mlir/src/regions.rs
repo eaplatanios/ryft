@@ -50,20 +50,16 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
 
     /// Returns `true` if this [`Region`] is empty (i.e., if it contains no [`Block`]s).
     fn is_empty(&self) -> bool {
-        self.blocks().current_block.is_none()
+        unsafe { mlirRegionGetFirstBlock(self.to_c_api()).ptr.is_null() }
     }
 
     /// Returns a [`RegionBlockRefIterator`], that enables iteration over references of all [`Block`]s contained
     /// in this [`Region`].
-    fn blocks(&self) -> RegionBlockRefIterator<'r, 'c, 't> {
+    fn blocks(&self) -> Result<RegionBlockRefIterator<'r, 'c, 't>, Error> {
         let handle = unsafe { mlirRegionGetFirstBlock(self.to_c_api()) };
-        RegionBlockRefIterator {
-            current_block: if handle.ptr.is_null() {
-                None
-            } else {
-                unsafe { BlockRef::from_c_api(handle, self.context()).ok() }
-            },
-        }
+        let current_block =
+            if handle.ptr.is_null() { None } else { Some(unsafe { BlockRef::from_c_api(handle, self.context())? }) };
+        Ok(RegionBlockRefIterator { current_block, error: None })
     }
 
     /// Appends the provided [`Block`] to the end of this [`Region`] and returns a reference to the appended [`Block`].
@@ -307,19 +303,30 @@ impl<'r, 'c, 't> TryFrom<&'r DetachedRegion<'c, 't>> for RegionRef<'r, 'c, 't> {
 pub struct RegionBlockRefIterator<'r, 'c: 'r, 't: 'c> {
     /// Current [`BlockRef`] in this iterator (i.e., the [`BlockRef`] that will be returned in the next call to
     /// [`RegionBlockRefIterator::next`]). [`BlockRef`]s are stored in such a way in MLIR that we can always obtain
-    /// the next [`Block`] in a [`Region`] given a [`BlockRef`] in that same [`Region`]s.
+    /// the next [`Block`] in a [`Region`] given a [`BlockRef`] in that same [`Region`].
     current_block: Option<BlockRef<'r, 'c, 't>>,
+
+    /// Error encountered while preparing the next iterator item.
+    error: Option<Error>,
 }
 
 impl<'r, 'c, 't> Iterator for RegionBlockRefIterator<'r, 'c, 't> {
-    type Item = BlockRef<'r, 'c, 't>;
+    type Item = Result<BlockRef<'r, 'c, 't>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let item = self.current_block.take();
-        self.current_block = item.as_ref().and_then(|block| unsafe {
-            BlockRef::from_c_api(mlirBlockGetNextInRegion(block.to_c_api()), block.context()).ok()
-        });
-        item
+        if let Some(error) = self.error.take() {
+            return Some(Err(error));
+        }
+        
+        let current_block = self.current_block.take()?;
+        let handle = unsafe { mlirBlockGetNextInRegion(current_block.to_c_api()) };
+        if !handle.ptr.is_null() {
+            match unsafe { BlockRef::from_c_api(handle, current_block.context()) } {
+                Ok(next_block) => self.current_block = Some(next_block),
+                Err(error) => self.error = Some(error),
+            }
+        }
+        Some(Ok(current_block))
     }
 }
 
@@ -333,7 +340,7 @@ mod tests {
         let mut region_0 = context.region();
         assert!(region_0.is_empty());
         assert_eq!(region_0.context(), &context);
-        assert!(region_0.blocks().next().is_none());
+        assert!(region_0.blocks().unwrap().next().is_none());
         let block_0 = region_0.append_block(context.block_with_no_arguments()).unwrap();
         let block_1 = region_0.append_block(context.block_with_no_arguments()).unwrap();
         let block_2 = region_0.append_block(context.block_with_no_arguments()).unwrap();
@@ -345,7 +352,7 @@ mod tests {
         let block_8 = region_0.insert_block_before(context.block_with_no_arguments(), None).unwrap();
         assert!(!region_0.is_empty());
         assert_eq!(
-            region_0.blocks().collect::<Vec<_>>(),
+            region_0.blocks().unwrap().collect::<Result<Vec<_>, _>>().unwrap(),
             vec![block_6, block_7, block_4, block_0, block_3, block_1, block_5, block_2, block_8],
         );
 
@@ -363,11 +370,11 @@ mod tests {
         region_0.append_block(context.block_with_no_arguments()).unwrap();
         region_0.append_block(context.block_with_no_arguments()).unwrap();
         region_1.append_block(context.block_with_no_arguments()).unwrap();
-        assert_eq!(region_0.blocks().count(), 2);
-        assert_eq!(region_1.blocks().count(), 1);
+        assert_eq!(region_0.blocks().unwrap().count(), 2);
+        assert_eq!(region_1.blocks().unwrap().count(), 1);
         region_1.take_body(region_0.as_ref());
-        assert_eq!(region_0.blocks().count(), 0);
-        assert_eq!(region_1.blocks().count(), 2);
+        assert_eq!(region_0.blocks().unwrap().count(), 0);
+        assert_eq!(region_1.blocks().unwrap().count(), 2);
     }
 
     #[test]
@@ -396,7 +403,7 @@ mod tests {
         let context = Context::new();
         let block = context.block_with_no_arguments();
         let region = DetachedRegion::try_from(block).unwrap();
-        assert_eq!(region.blocks().count(), 1);
+        assert_eq!(region.blocks().unwrap().count(), 1);
     }
 
     #[test]
@@ -404,13 +411,13 @@ mod tests {
         let context = Context::new();
         let blocks = vec![];
         let region = DetachedRegion::try_from_with_context(blocks, &context).unwrap();
-        assert_eq!(region.blocks().count(), 0);
+        assert_eq!(region.blocks().unwrap().count(), 0);
         let blocks = vec![
             context.block_with_no_arguments(),
             context.block_with_no_arguments(),
             context.block_with_no_arguments(),
         ];
         let region = DetachedRegion::try_from_with_context(blocks, &context).unwrap();
-        assert_eq!(region.blocks().count(), 3);
+        assert_eq!(region.blocks().unwrap().count(), 3);
     }
 }

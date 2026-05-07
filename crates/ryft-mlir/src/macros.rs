@@ -275,7 +275,7 @@ macro_rules! mlir_enum_attribute {
                 ) -> Result<[<$rust_name AttributeRef>]<'c, 't>, $crate::errors::Error> {
                     $(
                         // Make sure that the right dialect is loaded into this context to avoid segmentation faults.
-                        self.load_dialect($crate::DialectHandle::$mlir_dialect_handle_constructor()?);
+                        self.load_dialect($crate::DialectHandle::$mlir_dialect_handle_constructor()?)?;
                     )?
                     // While this operation can mutate the context (in that it might add an entry to its corresponding
                     // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
@@ -720,7 +720,7 @@ macro_rules! mlir_generic_unary_op {
                 location: L,
             ) -> Result<[<Detached $op:camel Operation>]<'c, 't>, $crate::errors::Error> {
                 let context = location.context();
-                context.load_dialect($crate::DialectHandle::$dialect()?);
+                context.load_dialect($crate::DialectHandle::$dialect()?)?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
                     .add_operands(&[input])
@@ -784,7 +784,7 @@ macro_rules! mlir_unary_op {
                 location: L,
             ) -> Result<[<Detached $op:camel Operation>]<'c, 'c>, $crate::errors::Error> {
                 let context = location.context();
-                context.load_dialect($crate::DialectHandle::$dialect()?);
+                context.load_dialect($crate::DialectHandle::$dialect()?)?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
                     .add_operands(&[input])
@@ -868,7 +868,7 @@ macro_rules! mlir_binary_op {
                 location: L,
             ) -> Result<[<Detached $op:camel Operation>]<'c, 't>, $crate::errors::Error> {
                 let context = location.context();
-                context.load_dialect($crate::DialectHandle::$dialect()?);
+                context.load_dialect($crate::DialectHandle::$dialect()?)?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
                     .add_operands(&[lhs.as_ref(), rhs.as_ref()])

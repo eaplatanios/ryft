@@ -197,7 +197,11 @@ impl<'c, 't> NamedAttributeRef<'c, 't> {
 
 impl PartialEq for NamedAttributeRef<'_, '_> {
     fn eq(&self, other: &Self) -> bool {
-        self.name() == other.name() && self.attribute().ok() == other.attribute().ok()
+        self.name() == other.name()
+            && match (self.attribute(), other.attribute()) {
+                (Ok(attribute), Ok(other_attribute)) => attribute == other_attribute,
+                _ => false,
+            }
     }
 }
 

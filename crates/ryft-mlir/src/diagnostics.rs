@@ -101,14 +101,15 @@ impl<'o, 'c, 't> Diagnostic<'o, 'c, 't> {
         })
     }
 
-    /// Returns the `index`-th note attached to this [`Diagnostic`]. If `index` is larger than
-    /// [`Diagnostic::note_count`], then this function will return [`None`].
-    pub fn note(&self, index: usize) -> Option<Self> {
-        if index < self.note_count() {
-            unsafe { Self::from_c_api(mlirDiagnosticGetNote(self.handle, index.cast_signed()), self.context).ok() }
-        } else {
-            None
+    /// Returns the `index`-th note attached to this [`Diagnostic`].
+    pub fn note(&self, index: usize) -> Result<Self, Error> {
+        let note_count = self.note_count();
+        if index >= note_count {
+            return Err(Error::invalid_argument(format!(
+                "diagnostic note index {index} is out of bounds for {note_count} diagnostic notes",
+            )));
         }
+        unsafe { Self::from_c_api(mlirDiagnosticGetNote(self.handle, index.cast_signed()), self.context) }
     }
 }
 
@@ -254,7 +255,7 @@ mod tests {
                 diagnostic.note(0).unwrap().to_string(),
                 "see current operation: \"func.return\"(%arg0) : (i32) -> ()".to_string(),
             );
-            assert!(diagnostic.note(100).is_none());
+            assert!(diagnostic.note(100).is_err());
             assert_eq!(
                 format!("{}", diagnostic),
                 "type of return operand 0 ('i32') doesn't match function result type ('i64') in function @test",

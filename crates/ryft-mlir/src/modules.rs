@@ -222,7 +222,7 @@ mod tests {
         let module_0 = context.module(context.file_location("foo", 42, 42)).unwrap();
         assert!(module_0.verify().unwrap());
         assert_eq!(module_0.context(), &context);
-        assert_eq!(module_0.body().unwrap().operations().count(), 0);
+        assert_eq!(module_0.body().unwrap().operations().unwrap().count(), 0);
         assert_eq!(module_0.as_operation().unwrap().name().as_str().unwrap(), "builtin.module");
 
         // Module with one operation.
@@ -232,7 +232,7 @@ mod tests {
             func::func("test_function", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         module_0.body().unwrap().append_operation(function).unwrap();
         assert!(module_0.verify().unwrap());
-        assert_eq!(module_0.body().unwrap().operations().count(), 1);
+        assert_eq!(module_0.body().unwrap().operations().unwrap().count(), 1);
     }
 
     #[test]
@@ -268,7 +268,10 @@ mod tests {
         let context = Context::new();
         context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let module = context.module(context.file_location("foo", 42, 42)).unwrap();
-        assert_eq!(module.as_operation().unwrap().body_region().unwrap().blocks().next(), Some(module.body().unwrap()));
+        assert_eq!(
+            module.as_operation().unwrap().body_region().unwrap().blocks().unwrap().next().unwrap().unwrap(),
+            module.body().unwrap(),
+        );
         assert_eq!(module.as_operation().unwrap(), module.as_operation().unwrap().as_ref());
     }
 
@@ -288,7 +291,7 @@ mod tests {
         assert!(module.is_ok());
         let module = module.unwrap();
         assert!(module.verify().unwrap());
-        assert_eq!(module.body().unwrap().operations().count(), 1);
+        assert_eq!(module.body().unwrap().operations().unwrap().count(), 1);
 
         // Trying parsing a bad module.
         let module = context.parse_module("module{");
@@ -323,7 +326,7 @@ mod tests {
         assert!(module.is_ok());
         let module = module.unwrap();
         assert!(module.verify().unwrap());
-        assert_eq!(module.body().unwrap().operations().count(), 1);
+        assert_eq!(module.body().unwrap().operations().unwrap().count(), 1);
 
         // Clean up our temporary file.
         std::fs::remove_file(module_path).unwrap();
@@ -381,7 +384,7 @@ mod tests {
             .set_attribute("sym_name", context.string_attribute("foo"));
         assert!(ModuleOperationRef::try_from(&module).unwrap().verify());
 
-        let attribute = ModuleOperationRef::try_from(&module).unwrap().attribute("sym_name");
+        let attribute = ModuleOperationRef::try_from(&module).unwrap().attribute("sym_name").unwrap();
         assert!(attribute.is_some());
         assert_eq!(attribute.unwrap().to_string(), "\"foo\"");
     }
