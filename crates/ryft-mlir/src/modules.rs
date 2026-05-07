@@ -354,8 +354,8 @@ mod tests {
         let operation = ModuleOperationRef::try_from(&module).unwrap();
 
         assert!(operation.verify());
-        assert_eq!(operation.symbol_name(), None);
-        assert_eq!(operation.symbol_visibility(), SymbolVisibility::Public);
+        assert_eq!(operation.symbol_name().unwrap(), None);
+        assert_eq!(operation.symbol_visibility().unwrap(), SymbolVisibility::Public);
         assert_eq!(operation.to_string(), "module {\n}\n");
 
         let mut region = context.region();
@@ -365,8 +365,8 @@ mod tests {
         let operation = ModuleOperationRef::try_from(&module).unwrap();
 
         assert!(operation.verify());
-        assert_eq!(operation.symbol_name().map(|name| name.as_str().unwrap()), Some("test_module"));
-        assert_eq!(operation.symbol_visibility(), SymbolVisibility::Private);
+        assert_eq!(operation.symbol_name().unwrap().map(|name| name.as_str().unwrap()), Some("test_module"));
+        assert_eq!(operation.symbol_visibility().unwrap(), SymbolVisibility::Private);
         assert_eq!(operation.to_string(), "module @test_module attributes {sym_visibility = \"private\"} {\n}\n")
     }
 

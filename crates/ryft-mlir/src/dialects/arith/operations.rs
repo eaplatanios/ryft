@@ -1,7 +1,7 @@
 use crate::{
-    Attribute, AttributeRef, DetachedOp, DialectHandle, Error, IntegerAttributeRef, Location, Operation,
-    OperationBuilder, TensorTypeRef, Type, TypeRef, UnrankedTensorTypeRef, Value, ValueRef, VectorTypeRef,
-    mlir_binary_op, mlir_generic_unary_op, mlir_op, mlir_op_trait, mlir_unary_op,
+    Attribute, AttributeRef, DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, TensorTypeRef,
+    Type, TypeRef, UnrankedTensorTypeRef, Value, ValueRef, VectorTypeRef, mlir_binary_op, mlir_generic_unary_op,
+    mlir_op, mlir_op_trait, mlir_unary_op,
 };
 
 pub const CONSTANT_VALUE_ATTRIBUTE: &str = "value";
@@ -290,28 +290,26 @@ pub trait CmpfOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     fn predicate(&self) -> Result<FloatingPointComparisonPredicate, Error> {
-        self.attribute(CMP_PREDICATE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .and_then(|attribute| match attribute.signless_value() {
-                0 => Some(FloatingPointComparisonPredicate::AlwaysFalse),
-                15 => Some(FloatingPointComparisonPredicate::AlwaysTrue),
-                1 => Some(FloatingPointComparisonPredicate::Equal),
-                13 => Some(FloatingPointComparisonPredicate::NotEqual),
-                8 => Some(FloatingPointComparisonPredicate::UnorderedOrEqual),
-                6 => Some(FloatingPointComparisonPredicate::NotUnorderedOrEqual),
-                2 => Some(FloatingPointComparisonPredicate::GreaterThan),
-                9 => Some(FloatingPointComparisonPredicate::UnorderedOrGreaterThan),
-                3 => Some(FloatingPointComparisonPredicate::GreaterThanOrEqual),
-                10 => Some(FloatingPointComparisonPredicate::UnorderedGreaterThanOrEqual),
-                4 => Some(FloatingPointComparisonPredicate::LessThan),
-                11 => Some(FloatingPointComparisonPredicate::UnorderedOrLessThan),
-                5 => Some(FloatingPointComparisonPredicate::LessThanOrEqual),
-                12 => Some(FloatingPointComparisonPredicate::UnorderedLessThanOrEqual),
-                7 => Some(FloatingPointComparisonPredicate::Ordered),
-                14 => Some(FloatingPointComparisonPredicate::Unordered),
-                _ => None,
-            })
-            .ok_or_else(|| Error::invalid_argument("invalid `predicate` attribute in `arith::cmpf`"))
+        match self.integer_attribute(CMP_PREDICATE_ATTRIBUTE)?.signless_value() {
+            0 => Some(FloatingPointComparisonPredicate::AlwaysFalse),
+            15 => Some(FloatingPointComparisonPredicate::AlwaysTrue),
+            1 => Some(FloatingPointComparisonPredicate::Equal),
+            13 => Some(FloatingPointComparisonPredicate::NotEqual),
+            8 => Some(FloatingPointComparisonPredicate::UnorderedOrEqual),
+            6 => Some(FloatingPointComparisonPredicate::NotUnorderedOrEqual),
+            2 => Some(FloatingPointComparisonPredicate::GreaterThan),
+            9 => Some(FloatingPointComparisonPredicate::UnorderedOrGreaterThan),
+            3 => Some(FloatingPointComparisonPredicate::GreaterThanOrEqual),
+            10 => Some(FloatingPointComparisonPredicate::UnorderedGreaterThanOrEqual),
+            4 => Some(FloatingPointComparisonPredicate::LessThan),
+            11 => Some(FloatingPointComparisonPredicate::UnorderedOrLessThan),
+            5 => Some(FloatingPointComparisonPredicate::LessThanOrEqual),
+            12 => Some(FloatingPointComparisonPredicate::UnorderedLessThanOrEqual),
+            7 => Some(FloatingPointComparisonPredicate::Ordered),
+            14 => Some(FloatingPointComparisonPredicate::Unordered),
+            _ => None,
+        }
+        .ok_or_else(|| Error::invalid_argument("invalid `predicate` attribute in `arith::cmpf`"))
     }
 }
 
@@ -374,22 +372,20 @@ pub trait CmpiOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     fn predicate(&self) -> Result<IntegerComparisonPredicate, Error> {
-        self.attribute(CMP_PREDICATE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .and_then(|attribute| match attribute.signless_value() {
-                0 => Some(IntegerComparisonPredicate::Equal),
-                1 => Some(IntegerComparisonPredicate::NotEqual),
-                2 => Some(IntegerComparisonPredicate::SignedLessThan),
-                3 => Some(IntegerComparisonPredicate::SignedLessThanOrEqual),
-                4 => Some(IntegerComparisonPredicate::SignedGreaterThan),
-                5 => Some(IntegerComparisonPredicate::SignedGreaterThanOrEqual),
-                6 => Some(IntegerComparisonPredicate::UnsignedLessThan),
-                7 => Some(IntegerComparisonPredicate::UnsignedLessThanOrEqual),
-                8 => Some(IntegerComparisonPredicate::UnsignedGreaterThan),
-                9 => Some(IntegerComparisonPredicate::UnsignedGreaterThanOrEqual),
-                _ => None,
-            })
-            .ok_or_else(|| Error::invalid_argument("invalid `predicate` attribute in `arith::cmpi`"))
+        match self.integer_attribute(CMP_PREDICATE_ATTRIBUTE)?.signless_value() {
+            0 => Some(IntegerComparisonPredicate::Equal),
+            1 => Some(IntegerComparisonPredicate::NotEqual),
+            2 => Some(IntegerComparisonPredicate::SignedLessThan),
+            3 => Some(IntegerComparisonPredicate::SignedLessThanOrEqual),
+            4 => Some(IntegerComparisonPredicate::SignedGreaterThan),
+            5 => Some(IntegerComparisonPredicate::SignedGreaterThanOrEqual),
+            6 => Some(IntegerComparisonPredicate::UnsignedLessThan),
+            7 => Some(IntegerComparisonPredicate::UnsignedLessThanOrEqual),
+            8 => Some(IntegerComparisonPredicate::UnsignedGreaterThan),
+            9 => Some(IntegerComparisonPredicate::UnsignedGreaterThanOrEqual),
+            _ => None,
+        }
+        .ok_or_else(|| Error::invalid_argument("invalid `predicate` attribute in `arith::cmpi`"))
     }
 }
 

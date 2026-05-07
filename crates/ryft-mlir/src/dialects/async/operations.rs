@@ -1279,9 +1279,7 @@ mod tests {
                 assert_eq!(execute_op.result_type(0).unwrap(), token_type);
                 assert_eq!(execute_op.result_type(1).unwrap(), async_index_type);
                 let execute_op = block.append_operation(execute_op).unwrap();
-                block
-                    .append_operation(func::r#return(&[execute_op.result(1).unwrap()], location).unwrap())
-                    .unwrap();
+                block.append_operation(func::r#return(&[execute_op.result(1).unwrap()], location).unwrap()).unwrap();
                 func::func(
                     "execute_test",
                     func::FuncAttributes {
@@ -1474,20 +1472,14 @@ mod tests {
 
                 let mut suspend_block = context.block_with_no_arguments();
                 suspend_block.append_operation(coro_end(handle, location).unwrap()).unwrap();
-                suspend_block
-                    .append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap())
-                    .unwrap();
+                suspend_block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
 
                 let mut resume_block = context.block_with_no_arguments();
                 resume_block.append_operation(coro_free(id, handle, location).unwrap()).unwrap();
-                resume_block
-                    .append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap())
-                    .unwrap();
+                resume_block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
 
                 let mut cleanup_block = context.block_with_no_arguments();
-                cleanup_block
-                    .append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap())
-                    .unwrap();
+                cleanup_block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
 
                 let suspend_op = coro_suspend(state, &suspend_block, &resume_block, &cleanup_block, location).unwrap();
                 assert_eq!(suspend_op.state().unwrap(), state.as_ref());

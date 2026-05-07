@@ -1,7 +1,7 @@
 use crate::{
-    Attribute, Block, BlockRef, DenseElementsAttributeRef, DenseInteger32ArrayAttributeRef, DetachedOp, DialectHandle,
-    ElementsAttribute, Error, IntegerAttributeRef, IntegerTypeRef, Location, Operation, OperationBuilder, Size,
-    StringAttributeRef, StringRef, TryIntoWithContext, Value, ValueRef, mlir_op, mlir_op_trait,
+    Attribute, Block, BlockRef, DenseInteger32ArrayAttributeRef, DetachedOp, DialectHandle, ElementsAttribute, Error,
+    IntegerAttributeRef, IntegerTypeRef, Location, Operation, OperationBuilder, Size, StringAttributeRef, StringRef,
+    TryIntoWithContext, Value, ValueRef, mlir_op, mlir_op_trait,
 };
 
 /// Name of the `cf.assert` message attribute.
@@ -133,8 +133,12 @@ pub trait ConditionalBranchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> 
     }
 
     /// Returns the optional branch weight attribute.
-    fn branch_weights(&self) -> Option<DenseInteger32ArrayAttributeRef<'c, 't>> {
-        self.attribute(CONDITIONAL_BRANCH_WEIGHTS_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn branch_weights(&self) -> Result<Option<DenseInteger32ArrayAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(CONDITIONAL_BRANCH_WEIGHTS_ATTRIBUTE) {
+            self.dense_integer_32_array_attribute(CONDITIONAL_BRANCH_WEIGHTS_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -258,10 +262,12 @@ pub trait SwitchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn cases(&self) -> Result<Vec<SwitchBranch<'o, 'c, 't>>, Error> {
         let case_operand_counts =
             Vec::<i32>::from(self.dense_integer_32_array_attribute(SWITCH_CASE_OPERAND_COUNTS_ATTRIBUTE)?);
-        let Some(case_values_attribute) = self
-            .attribute(SWITCH_CASE_VALUES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseElementsAttributeRef>())
-        else {
+        let case_values_attribute = if self.has_attribute(SWITCH_CASE_VALUES_ATTRIBUTE) {
+            Some(self.dense_elements_attribute(SWITCH_CASE_VALUES_ATTRIBUTE)?)
+        } else {
+            None
+        };
+        let Some(case_values_attribute) = case_values_attribute else {
             if case_operand_counts.is_empty() {
                 return Ok(Vec::new());
             }
@@ -502,7 +508,7 @@ mod tests {
                 let unweighted_op =
                     cond_br(predicate, &true_block, &false_block, &[true_value], &[false_value], &[], location)
                         .unwrap();
-                assert_eq!(unweighted_op.branch_weights(), None);
+                assert_eq!(unweighted_op.branch_weights().unwrap(), None);
                 let op =
                     cond_br(predicate, &true_block, &false_block, &[true_value], &[false_value], &[13, 21], location)
                         .unwrap();
@@ -511,7 +517,7 @@ mod tests {
                 assert_eq!(op.on_false_successor().unwrap(), false_block.as_ref());
                 assert_eq!(op.on_true_successor_operands().unwrap(), vec![true_value]);
                 assert_eq!(op.on_false_successor_operands().unwrap(), vec![false_value]);
-                assert_eq!(op.branch_weights().map(Vec::<i32>::from), Some(vec![13, 21]));
+                assert_eq!(op.branch_weights().unwrap().map(Vec::<i32>::from), Some(vec![13, 21]));
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
                 assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
                 assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);

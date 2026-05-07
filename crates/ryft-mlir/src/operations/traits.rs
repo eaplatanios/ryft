@@ -6,9 +6,8 @@ use ryft_xla_sys::bindings::{
 
 use crate::{
     ArrayAttributeRef, Attribute, AttributeRef, BlockRef, Context, DictionaryAttributeRef, Error,
-    FlatSymbolRefAttributeRef, FunctionTypeRef, LogicalResult, OperationBuilder, Region, RegionRef, StringAttributeRef,
-    StringRef, SymbolVisibility, SymbolVisibilityAttributeRef, TryFromWithContext, TryIntoWithContext, Type,
-    TypeAndAttributes, TypeAttributeRef, TypeRef, Value, ValueRef,
+    FlatSymbolRefAttributeRef, FunctionTypeRef, LogicalResult, OperationBuilder, Region, RegionRef, StringRef,
+    SymbolVisibility, TryFromWithContext, TryIntoWithContext, Type, TypeAndAttributes, TypeRef, Value, ValueRef,
 };
 
 use super::{Operation, OperationRef};
@@ -106,22 +105,14 @@ pub const FUNCTION_TYPE_ATTRIBUTE: &str = "function_type";
 pub trait Function<'o, 'c: 'o, 't: 'c>: Symbol<'o, 'c, 't> + Callable<'o, 'c, 't> {
     /// Returns the symbol name of this [`Callable`], which can be used to refer to it from other [`Operation`]s.
     fn function_name(&self) -> Result<StringRef<'c>, Error> {
-        self.symbol_name().ok_or_else(|| {
+        self.symbol_name()?.ok_or_else(|| {
             Error::invalid_argument(format!("missing symbol name in `{}`", self.name().as_str().unwrap_or("<unknown>")))
         })
     }
 
     /// Returns the [`Type`] of this [`Function`].
     fn function_type(&self) -> Result<FunctionTypeRef<'c, 't>, Error> {
-        self.attribute(FUNCTION_TYPE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<TypeAttributeRef>())
-            .ok_or_else(|| {
-                Error::invalid_argument(format!(
-                    "missing or invalid `{}` attribute in `{}`",
-                    FUNCTION_TYPE_ATTRIBUTE,
-                    self.name().as_str().unwrap_or("<unknown>")
-                ))
-            })?
+        self.type_attribute(FUNCTION_TYPE_ATTRIBUTE)?
             .r#type()?
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid `function_type` attribute in function operation"))
@@ -229,46 +220,38 @@ pub trait HasCallableArgumentAndResultAttributes<'o, 'c: 'o, 't: 'c>: Operation<
     /// exist, this function returns a [`Vec`] with one element per argument. Each element is a [`HashMap`] that maps
     /// attribute names to their values for the corresponding argument of this operation.
     fn callable_argument_attributes(&self) -> Result<Vec<HashMap<StringRef<'c>, AttributeRef<'c, 't>>>, Error> {
-        self.attribute(ARGUMENT_ATTRIBUTES_ATTRIBUTE)
-            .map(|attribute| {
-                attribute
-                    .cast::<ArrayAttributeRef>()
-                    .ok_or_else(|| Error::invalid_argument("invalid `arg_attrs` attribute"))?
-                    .elements()
-                    .map(|element| {
-                        element?
-                            .cast::<DictionaryAttributeRef>()
-                            .map(HashMap::try_from)
-                            .ok_or_else(|| Error::invalid_argument("invalid `arg_attrs` element"))
-                            .and_then(|attributes| attributes)
-                    })
-                    .collect()
+        if !self.has_attribute(ARGUMENT_ATTRIBUTES_ATTRIBUTE) {
+            return Ok(Vec::new());
+        }
+        self.array_attribute(ARGUMENT_ATTRIBUTES_ATTRIBUTE)?
+            .elements()
+            .map(|element| {
+                element?
+                    .cast::<DictionaryAttributeRef>()
+                    .map(HashMap::try_from)
+                    .ok_or_else(|| Error::invalid_argument("invalid `arg_attrs` element"))
+                    .and_then(|attributes| attributes)
             })
-            .transpose()
-            .map(|attributes| attributes.unwrap_or_default())
+            .collect()
     }
 
     /// Returns the [`Attribute`]s attached to the results of this [`Operation`]. Specifically, when such attributes
     /// exist, this function returns a [`Vec`] with one element per result. Each element is a [`HashMap`] that maps
     /// attribute names to their values for the corresponding result of this operation.
     fn callable_result_attributes(&self) -> Result<Vec<HashMap<StringRef<'c>, AttributeRef<'c, 't>>>, Error> {
-        self.attribute(RESULT_ATTRIBUTES_ATTRIBUTE)
-            .map(|attribute| {
-                attribute
-                    .cast::<ArrayAttributeRef>()
-                    .ok_or_else(|| Error::invalid_argument("invalid `res_attrs` attribute"))?
-                    .elements()
-                    .map(|element| {
-                        element?
-                            .cast::<DictionaryAttributeRef>()
-                            .map(HashMap::try_from)
-                            .ok_or_else(|| Error::invalid_argument("invalid `res_attrs` element"))
-                            .and_then(|attributes| attributes)
-                    })
-                    .collect()
+        if !self.has_attribute(RESULT_ATTRIBUTES_ATTRIBUTE) {
+            return Ok(Vec::new());
+        }
+        self.array_attribute(RESULT_ATTRIBUTES_ATTRIBUTE)?
+            .elements()
+            .map(|element| {
+                element?
+                    .cast::<DictionaryAttributeRef>()
+                    .map(HashMap::try_from)
+                    .ok_or_else(|| Error::invalid_argument("invalid `res_attrs` element"))
+                    .and_then(|attributes| attributes)
             })
-            .transpose()
-            .map(|attributes| attributes.unwrap_or_default())
+            .collect()
     }
 
     /// Adds the provided argument [`Attribute`]s to the provided [`OperationBuilder`], assuming that it is building
@@ -444,36 +427,39 @@ pub const SYMBOL_VISIBILITY_ATTRIBUTE: &str = "sym_visibility";
 pub trait Symbol<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the symbol name of this [`Operation`], which can be used to refer to it from other [`Operation`]s.
     /// Note that if the name is optional and missing, this function will return [`None`].
-    fn symbol_name(&self) -> Option<StringRef<'c>> {
-        self.attribute(SYMBOL_NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef<'c, 't>>().map(|attribute| attribute.string()))
+    fn symbol_name(&self) -> Result<Option<StringRef<'c>>, Error> {
+        if self.has_attribute(SYMBOL_NAME_ATTRIBUTE) {
+            self.string_attribute(SYMBOL_NAME_ATTRIBUTE).map(|attribute| Some(attribute.string()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the [`SymbolVisibility`] of this [`Operation`]. If not specified, then [`SymbolVisibility::default()`]
     /// will be returned (which is [`SymbolVisibility::Public`]).
-    fn symbol_visibility(&self) -> SymbolVisibility {
-        self.attribute(SYMBOL_VISIBILITY_ATTRIBUTE)
-            .and_then(|attribute| {
-                attribute
-                    .cast::<SymbolVisibilityAttributeRef<'c, 't>>()
-                    .and_then(|attribute| attribute.visibility())
-            })
-            .unwrap_or(SymbolVisibility::default())
+    fn symbol_visibility(&self) -> Result<SymbolVisibility, Error> {
+        if self.has_attribute(SYMBOL_VISIBILITY_ATTRIBUTE) {
+            self.symbol_visibility_attribute(SYMBOL_VISIBILITY_ATTRIBUTE)?
+                .visibility()
+                .ok_or_else(|| Error::invalid_argument("invalid symbol visibility attribute"))
+        } else {
+            Ok(SymbolVisibility::default())
+        }
     }
 
     /// Returns `true` if this [`Symbol`]'s visibility is [`SymbolVisibility::Public`].
-    fn is_public(&self) -> bool {
-        self.symbol_visibility() == SymbolVisibility::Public
+    fn is_public(&self) -> Result<bool, Error> {
+        Ok(self.symbol_visibility()? == SymbolVisibility::Public)
     }
 
     /// Returns `true` if this [`Symbol`]'s visibility is [`SymbolVisibility::Private`].
-    fn is_private(&self) -> bool {
-        self.symbol_visibility() == SymbolVisibility::Private
+    fn is_private(&self) -> Result<bool, Error> {
+        Ok(self.symbol_visibility()? == SymbolVisibility::Private)
     }
 
     /// Returns `true` if this [`Symbol`]'s visibility is [`SymbolVisibility::Nested`].
-    fn is_nested(&self) -> bool {
-        self.symbol_visibility() == SymbolVisibility::Nested
+    fn is_nested(&self) -> Result<bool, Error> {
+        Ok(self.symbol_visibility()? == SymbolVisibility::Nested)
     }
 
     /// Replaces all uses of this [`Symbol`] with `new_symbol` in the provided [`Operation`]
@@ -482,13 +468,14 @@ pub trait Symbol<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         &self,
         new_symbol: S,
         operation: O,
-    ) -> LogicalResult
+    ) -> Result<LogicalResult, Error>
     where
         'c: 'r,
     {
-        self.symbol_name()
+        Ok(self
+            .symbol_name()?
             .map(|old_symbol| operation.replace_symbol(old_symbol, new_symbol))
-            .unwrap_or(LogicalResult::failure())
+            .unwrap_or(LogicalResult::failure()))
     }
 }
 
@@ -643,11 +630,11 @@ mod tests {
             location,
         )
         .unwrap();
-        assert_eq!(function.symbol_name().map(|name| name.as_str()), Some(Ok("custom_function")));
-        assert_eq!(function.symbol_visibility(), SymbolVisibility::Private);
-        assert!(!function.is_public());
-        assert!(function.is_private());
-        assert!(!function.is_nested());
+        assert_eq!(function.symbol_name().unwrap().map(|name| name.as_str()), Some(Ok("custom_function")));
+        assert_eq!(function.symbol_visibility().unwrap(), SymbolVisibility::Private);
+        assert!(!function.is_public().unwrap());
+        assert!(function.is_private().unwrap());
+        assert!(!function.is_nested().unwrap());
         assert_eq!(function.function_name().unwrap().as_str(), Ok("custom_function"));
         assert_eq!(
             function.function_type().unwrap(),
@@ -849,7 +836,7 @@ mod tests {
         );
 
         // Try to do another replacement.
-        assert!(function_1_op.replace_all_uses("function_0", module).is_success());
+        assert!(function_1_op.replace_all_uses("function_0", module).unwrap().is_success());
         assert!(module.verify());
         assert_eq!(
             module.to_string(),
