@@ -3,7 +3,7 @@ use ryft_xla_sys::bindings::{
     mlirLocationCallSiteGetTypeID,
 };
 
-use crate::{Context, Location, LocationRef, TypeId, mlir_subtype_trait_impls};
+use crate::{Context, Error, Location, LocationRef, TypeId, mlir_subtype_trait_impls};
 
 /// [`Location`] that represents a specific call chain. For example, think about inlining. In this case, an operation
 /// originates inside a callee, but also at a specific call site in the caller. A [`CallSiteLocationRef`] contains both
@@ -21,20 +21,30 @@ pub struct CallSiteLocationRef<'c, 't> {
 
 impl<'c, 't> CallSiteLocationRef<'c, 't> {
     /// Returns the [`TypeId`] that corresponds to [`CallSiteLocationRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirLocationCallSiteGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirLocationCallSiteGetTypeID()) }
     }
 
     /// Returns the callee [`Location`] of this [`CallSiteLocationRef`] (i.e., the location where the underlying thing was
     /// originally defined; e.g., in a function body).
     pub fn callee(&self) -> LocationRef<'c, 't> {
-        unsafe { LocationRef::from_c_api(mlirLocationCallSiteGetCallee(self.handle), self.context()).unwrap() }
+        unsafe {
+            match LocationRef::from_c_api(mlirLocationCallSiteGetCallee(self.handle), self.context()) {
+                Some(location) => location,
+                None => self.as_ref(),
+            }
+        }
     }
 
     /// Returns the caller [`Location`] of this [`CallSiteLocationRef`] (i.e., the location where the call happened,
     /// which could itself be another call site location, chaining up the stack).
     pub fn caller(&self) -> LocationRef<'c, 't> {
-        unsafe { LocationRef::from_c_api(mlirLocationCallSiteGetCaller(self.handle), self.context()).unwrap() }
+        unsafe {
+            match LocationRef::from_c_api(mlirLocationCallSiteGetCaller(self.handle), self.context()) {
+                Some(location) => location,
+                None => self.as_ref(),
+            }
+        }
     }
 }
 
@@ -54,10 +64,8 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         let _guard = self.borrow();
-        unsafe {
-            CallSiteLocationRef::from_c_api(mlirLocationCallSiteGet(callee.to_c_api(), caller.to_c_api()), self)
-                .unwrap()
-        }
+        let handle = unsafe { mlirLocationCallSiteGet(callee.to_c_api(), caller.to_c_api()) };
+        CallSiteLocationRef { handle, context: self }
     }
 }
 
@@ -71,9 +79,9 @@ mod tests {
 
     #[test]
     fn test_call_site_location_type_id() {
-        let call_site_location_type_id = CallSiteLocationRef::type_id();
-        assert_eq!(CallSiteLocationRef::type_id(), CallSiteLocationRef::type_id());
-        assert_eq!(call_site_location_type_id, CallSiteLocationRef::type_id());
+        let call_site_location_type_id = CallSiteLocationRef::type_id().unwrap();
+        assert_eq!(CallSiteLocationRef::type_id().unwrap(), CallSiteLocationRef::type_id().unwrap());
+        assert_eq!(call_site_location_type_id, CallSiteLocationRef::type_id().unwrap());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use ryft_xla_sys::bindings::{MlirType, mlirIndexTypeGet, mlirIndexTypeGetTypeID};
 
-use crate::{Context, Type, TypeId, mlir_subtype_trait_impls};
+use crate::{Context, Error, Type, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Type`] that represents an index type (i.e., an integer type with an unknown platform-dependent
 /// bit width). Refer to the [MLIR documentation](https://mlir.llvm.org/docs/Dialects/Builtin/#indextype)
@@ -16,8 +16,8 @@ pub struct IndexTypeRef<'c, 't> {
 
 impl<'c, 't> IndexTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`IndexTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirIndexTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirIndexTypeGetTypeID()) }
     }
 }
 
@@ -31,7 +31,8 @@ impl<'t> Context<'t> {
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
-        unsafe { IndexTypeRef::from_c_api(mlirIndexTypeGet(*self.handle.borrow()), self).unwrap() }
+        let handle = unsafe { mlirIndexTypeGet(*self.handle.borrow()) };
+        IndexTypeRef { handle, context: self }
     }
 }
 
@@ -46,11 +47,11 @@ mod tests {
     #[test]
     fn test_index_type_type_id() {
         let context = Context::new();
-        let index_type_id = IndexTypeRef::type_id();
+        let index_type_id = IndexTypeRef::type_id().unwrap();
         let index_type_1 = context.index_type();
         let index_type_2 = context.index_type();
-        assert_eq!(index_type_1.type_id(), index_type_2.type_id());
-        assert_eq!(index_type_id, index_type_1.type_id());
+        assert_eq!(index_type_1.type_id().unwrap(), index_type_2.type_id().unwrap());
+        assert_eq!(index_type_id, index_type_1.type_id().unwrap());
     }
 
     #[test]

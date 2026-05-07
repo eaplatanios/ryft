@@ -1,6 +1,6 @@
 use ryft_xla_sys::bindings::{MlirType, mlirNoneTypeGet, mlirNoneTypeGetTypeID};
 
-use crate::{Context, Type, TypeId, mlir_subtype_trait_impls};
+use crate::{Context, Error, Type, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Type`] that represents a unit type (i.e., a type with exactly one
 /// possible value where its value does not have a defined dynamic representation). Refer to the
@@ -16,8 +16,8 @@ pub struct NoneTypeRef<'c, 't> {
 
 impl<'c, 't> NoneTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`NoneTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirNoneTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirNoneTypeGetTypeID()) }
     }
 }
 
@@ -31,7 +31,8 @@ impl<'t> Context<'t> {
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
-        unsafe { NoneTypeRef::from_c_api(mlirNoneTypeGet(*self.handle.borrow()), self).unwrap() }
+        let handle = unsafe { mlirNoneTypeGet(*self.handle.borrow()) };
+        NoneTypeRef { handle, context: self }
     }
 }
 
@@ -46,11 +47,11 @@ mod tests {
     #[test]
     fn test_none_type_type_id() {
         let context = Context::new();
-        let none_type_id = NoneTypeRef::type_id();
+        let none_type_id = NoneTypeRef::type_id().unwrap();
         let none_type_1 = context.none_type();
         let none_type_2 = context.none_type();
-        assert_eq!(none_type_1.type_id(), none_type_2.type_id());
-        assert_eq!(none_type_id, none_type_1.type_id());
+        assert_eq!(none_type_1.type_id().unwrap(), none_type_2.type_id().unwrap());
+        assert_eq!(none_type_id, none_type_1.type_id().unwrap());
     }
 
     #[test]

@@ -1,5 +1,4 @@
 use half::{bf16, f16};
-
 use ryft_xla_sys::bindings::{
     MlirAttribute, mlirDenseElementsAttrGetRawData, mlirDenseElementsAttrGetSplatValue, mlirDenseElementsAttrIsSplat,
     mlirDenseElementsAttrReshapeGet, mlirDenseIntOrFPElementsAttrGetTypeID, mlirElementsAttrGetNumElements,
@@ -9,7 +8,7 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::{
-    Attribute, AttributeRef, Context, FromWithContext, ShapedType, StringRef, TypeId, VectorTypeDimension,
+    Attribute, AttributeRef, Context, Error, ShapedType, StringRef, TryFromWithContext, TypeId, VectorTypeDimension,
     mlir_subtype_trait_impls,
 };
 
@@ -91,8 +90,8 @@ mlir_subtype_trait_impls!(
 /// for more information.
 pub trait DenseElementsAttribute<'c, 't: 'c>: ElementsAttribute<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`DenseElementsAttributeRef`].
-    fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirDenseIntOrFPElementsAttrGetTypeID()).unwrap() }
+    fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirDenseIntOrFPElementsAttrGetTypeID()) }
     }
 
     /// Returns `true` if this attribute contains a single replicated value.
@@ -290,13 +289,13 @@ macro_rules! mlir_dense_elements_attribute_constructor {
     ($attribute_type:ident, $attribute_name:ident $(,)?) => {
         impl<'t> Context<'t> {
             /// Creates a new dense elements attribute with the specified [`ShapedType`] and elements.
-            /// Returns [`None`] if the provided type is not supported or if it is not compatible with the
-            /// provided elements.
+            /// Returns an error if the provided type is not supported or if it is not compatible with the provided
+            /// elements.
             pub fn $attribute_name<'c, T: ShapedType<'c, 't>, A: Attribute<'c, 't>>(
                 &'c self,
                 shaped_type: T,
                 elements: &[A],
-            ) -> Option<$attribute_type<'c, 't>> {
+            ) -> Result<$attribute_type<'c, 't>, Error> {
                 // While this operation can mutate the context (in that it might add an entry to its corresponding
                 // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
                 // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -313,6 +312,7 @@ macro_rules! mlir_dense_elements_attribute_constructor {
                         ),
                         &self,
                     )
+                    .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
                 }
             }
         }
@@ -342,7 +342,7 @@ macro_rules! mlir_dense_elements_attribute_from_raw_buffer {
                     &'c self,
                     shaped_type: T,
                     buffer: &[D],
-                ) -> Option<$attribute_type<'c, 't>> {
+                ) -> Result<$attribute_type<'c, 't>, Error> {
                     // While this operation can mutate the context (in that it might add an entry to its corresponding
                     // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
                     // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -355,6 +355,7 @@ macro_rules! mlir_dense_elements_attribute_from_raw_buffer {
                             buffer.len() * std::mem::size_of::<D>(),
                             buffer.as_ptr() as *const _,
                         ), &self)
+                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -376,7 +377,7 @@ macro_rules! mlir_dense_elements_attribute_from_element {
                     &'c self,
                     shaped_type: T,
                     value: A,
-                ) -> Option<$attribute_type<'c, 't>> {
+                ) -> Result<$attribute_type<'c, 't>, Error> {
                     // While this operation can mutate the context (in that it might add an entry to its corresponding
                     // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
                     // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -388,6 +389,7 @@ macro_rules! mlir_dense_elements_attribute_from_element {
                             shaped_type.to_c_api(),
                             value.to_c_api(),
                         ), &self)
+                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -402,7 +404,7 @@ macro_rules! mlir_dense_elements_attribute_from_element {
                     &'c self,
                     shaped_type: T,
                     value: [<$rust_type Ref>]<'c, 't>,
-                ) -> Option<$attribute_type<'c, 't>> {
+                ) -> Result<$attribute_type<'c, 't>, Error> {
                     // While this operation can mutate the context (in that it might add an entry to its corresponding
                     // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
                     // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -414,6 +416,7 @@ macro_rules! mlir_dense_elements_attribute_from_element {
                             shaped_type.to_c_api(),
                             value.to_c_api(),
                         ), &self)
+                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -428,7 +431,7 @@ macro_rules! mlir_dense_elements_attribute_from_element {
                     &'c self,
                     shaped_type: T,
                     value: $rust_type,
-                ) -> Option<$attribute_type<'c, 't>> {
+                ) -> Result<$attribute_type<'c, 't>, Error> {
                     // While this operation can mutate the context (in that it might add an entry to its corresponding
                     // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
                     // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -443,6 +446,7 @@ macro_rules! mlir_dense_elements_attribute_from_element {
                             ),
                             &self,
                         )
+                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -460,7 +464,7 @@ macro_rules! mlir_dense_elements_attribute_from_elements {
                     &'c self,
                     shaped_type: T,
                     elements: &[bool],
-                ) -> Option<$attribute_type<'c, 't>> {
+                ) -> Result<$attribute_type<'c, 't>, Error> {
                     // While this operation can mutate the context (in that it might add an entry to its corresponding
                     // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
                     // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -477,6 +481,7 @@ macro_rules! mlir_dense_elements_attribute_from_elements {
                             ),
                             &self,
                         )
+                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -491,7 +496,7 @@ macro_rules! mlir_dense_elements_attribute_from_elements {
                     &'c self,
                     shaped_type: T,
                     elements: &[$rust_type],
-                ) -> Option<$attribute_type<'c, 't>> {
+                ) -> Result<$attribute_type<'c, 't>, Error> {
                     // While this operation can mutate the context (in that it might add an entry to its corresponding
                     // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
                     // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -507,6 +512,7 @@ macro_rules! mlir_dense_elements_attribute_from_elements {
                             ),
                             &self,
                         )
+                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -605,23 +611,19 @@ mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, m
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = UInt64, rust_type = u64);
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = Int64, rust_type = i64);
 
-impl<'c, 't> FromWithContext<'c, 't, &[usize]> for DenseIntegerElementsAttributeRef<'c, 't> {
-    fn from_with_context(value: &[usize], context: &'c Context<'t>) -> Self {
-        context
-            .dense_integer_elements_attribute(
-                context
-                    .vector_type(
-                        context.index_type(),
-                        &[VectorTypeDimension::Fixed(value.len())],
-                        context.unknown_location(),
-                    )
-                    .unwrap(),
-                &value
-                    .iter()
-                    .map(|index| context.integer_attribute(context.index_type(), *index as i64))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap()
+impl<'c, 't> TryFromWithContext<'c, 't, &[usize]> for DenseIntegerElementsAttributeRef<'c, 't> {
+    fn try_from_with_context(value: &[usize], context: &'c Context<'t>) -> Result<Self, Error> {
+        context.dense_integer_elements_attribute(
+            context.vector_type(
+                context.index_type(),
+                &[VectorTypeDimension::Fixed(value.len())],
+                context.unknown_location(),
+            )?,
+            &value
+                .iter()
+                .map(|index| context.integer_attribute(context.index_type(), *index as i64))
+                .collect::<Vec<_>>(),
+        )
     }
 }
 
@@ -802,9 +804,7 @@ macro_rules! mlir_dense_resource_elements_attribute_element {
                 /// This function is unsafe because it can panic if this attribute's element type does not match
                 /// the return type of this function.
                 pub unsafe fn [<$rust_type:snake _elements>](&self) -> impl Iterator<Item = $rust_type> {
-                    unsafe {
-                        (0..self.elements_count()).map(|index| self.[<$rust_type:snake _element>](index).unwrap())
-                    }
+                    unsafe { (0..self.elements_count()).map(|index| self.[<$rust_type:snake _element>](index).unwrap()) }
                 }
             }
         }
@@ -929,25 +929,26 @@ pub struct SparseElementsAttributeRef<'c, 't> {
 
 impl<'c, 't> SparseElementsAttributeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`SparseElementsAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirSparseElementsAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirSparseElementsAttrGetTypeID()) }
     }
 
     /// Returns the indices of this [`SparseElementsAttributeRef`]. These are the indices of the non-zero elements of
     /// the underlying multidimensional array, represented as 64-bit integer values.
-    pub fn indices(&self) -> DenseIntegerElementsAttributeRef<'c, 't> {
+    pub fn indices(&self) -> Result<DenseIntegerElementsAttributeRef<'c, 't>, Error> {
         unsafe {
             DenseIntegerElementsAttributeRef::from_c_api(mlirSparseElementsAttrGetIndices(self.handle), self.context)
-                .unwrap()
+                .ok_or_else(|| Error::internal("expected non-null MLIR sparse element indices handle"))
         }
     }
 
     /// Returns the values of this [`SparseElementsAttributeRef`]. These are the values of the non-zero elements
     /// of the underlying multidimensional array. They correspond to the indices returned by
     /// [`SparseElementsAttributeRef::indices`].
-    pub fn values(&self) -> DenseElementsAttributeRef<'c, 't> {
+    pub fn values(&self) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
         unsafe {
-            DenseElementsAttributeRef::from_c_api(mlirSparseElementsAttrGetValues(self.handle), self.context).unwrap()
+            DenseElementsAttributeRef::from_c_api(mlirSparseElementsAttrGetValues(self.handle), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR sparse element values handle"))
         }
     }
 }
@@ -1000,13 +1001,13 @@ mod tests {
     fn test_dense_elements_attribute_type_id() {
         let context = Context::new();
         let location = context.unknown_location();
-        let dense_elements_attribute_id = <DenseElementsAttributeRef as DenseElementsAttribute>::type_id();
+        let dense_elements_attribute_id = <DenseElementsAttributeRef as DenseElementsAttribute>::type_id().unwrap();
         let i32_type = context.signless_integer_type(32);
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(2)], None, location).unwrap();
         let dense_elements_attribute_1 = context.dense_i32_elements_attribute(tensor_type, &[1, 2]).unwrap();
         let dense_elements_attribute_2 = context.dense_i32_elements_attribute(tensor_type, &[1, 2]).unwrap();
-        assert_eq!(dense_elements_attribute_1.type_id(), dense_elements_attribute_2.type_id());
-        assert_eq!(dense_elements_attribute_id, dense_elements_attribute_1.type_id());
+        assert_eq!(dense_elements_attribute_1.type_id().unwrap(), dense_elements_attribute_2.type_id().unwrap());
+        assert_eq!(dense_elements_attribute_id, dense_elements_attribute_1.type_id().unwrap());
     }
 
     #[test]
@@ -1479,7 +1480,7 @@ mod tests {
     fn test_sparse_elements_attribute_type_id() {
         let context = Context::new();
         let location = context.unknown_location();
-        let sparse_elements_attribute_id = SparseElementsAttributeRef::type_id();
+        let sparse_elements_attribute_id = SparseElementsAttributeRef::type_id().unwrap();
         let i32_type = context.signless_integer_type(32);
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(2)], None, location).unwrap();
         let indices_type = context.tensor_type(i32_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
@@ -1488,9 +1489,12 @@ mod tests {
         let values = context.dense_i32_elements_attribute(values_type, &[1, 5]).unwrap();
         let sparse_elements_attribute_1 = context.sparse_elements_attribute(tensor_type, indices, values).unwrap();
         let sparse_elements_attribute_2 = context.sparse_elements_attribute(tensor_type, indices, values).unwrap();
-        assert_eq!(sparse_elements_attribute_1.type_id(), sparse_elements_attribute_2.type_id());
-        assert_eq!(sparse_elements_attribute_id, sparse_elements_attribute_1.type_id());
-        assert_ne!(sparse_elements_attribute_id, <DenseElementsAttributeRef as DenseElementsAttribute>::type_id());
+        assert_eq!(sparse_elements_attribute_1.type_id().unwrap(), sparse_elements_attribute_2.type_id().unwrap());
+        assert_eq!(sparse_elements_attribute_id, sparse_elements_attribute_1.type_id().unwrap());
+        assert_ne!(
+            sparse_elements_attribute_id,
+            <DenseElementsAttributeRef as DenseElementsAttribute>::type_id().unwrap()
+        );
     }
 
     #[test]
@@ -1501,7 +1505,7 @@ mod tests {
         let i64_type = context.signless_integer_type(64);
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(3), Size::Static(4)], None, location).unwrap();
 
-        // Create indices tensor [[0, 0], [1, 2]] that corresponds to 2 non-zero elements, at (0, 0) and (1, 2).
+        // Create indices tensor [[0, 0], [1, 2]] that corresponds to 2 non-zero elements, at (0, 0) and (1, 2).unwrap().
         let indices_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
         let indices = context.dense_i64_elements_attribute(indices_type, &[0, 0, 1, 2]).unwrap();
 
@@ -1513,10 +1517,10 @@ mod tests {
         let attribute = context.sparse_elements_attribute(tensor_type, indices, values).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.elements_count(), 12);
-        assert_eq!(attribute.indices().elements_count(), 4);
-        assert_eq!(attribute.values().elements_count(), 2);
-        assert_eq!(unsafe { attribute.indices().i64_elements().collect::<Vec<_>>() }, vec![0, 0, 1, 2]);
-        assert_eq!(unsafe { attribute.values().i32_elements().collect::<Vec<_>>() }, vec![1, 5]);
+        assert_eq!(attribute.indices().unwrap().elements_count(), 4);
+        assert_eq!(attribute.values().unwrap().elements_count(), 2);
+        assert_eq!(unsafe { attribute.indices().unwrap().i64_elements().collect::<Vec<_>>() }, vec![0, 0, 1, 2]);
+        assert_eq!(unsafe { attribute.values().unwrap().i32_elements().collect::<Vec<_>>() }, vec![1, 5]);
     }
 
     #[test]

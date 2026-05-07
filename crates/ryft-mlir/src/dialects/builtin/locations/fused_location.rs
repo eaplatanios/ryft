@@ -3,7 +3,7 @@ use ryft_xla_sys::bindings::{
     mlirLocationFusedGetNumLocations, mlirLocationFusedGetTypeID,
 };
 
-use crate::{Attribute, AttributeRef, Context, Location, LocationRef, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, AttributeRef, Context, Error, Location, LocationRef, TypeId, mlir_subtype_trait_impls};
 
 /// [`FusedLocationRef`] are a special kind of [`Location`] that represents multiple underlying locations merged together.
 /// When MLIR transformations happen (e.g., inlining, fusion, canonicalization, lowering, etc.), a single IR operation
@@ -27,8 +27,8 @@ pub struct FusedLocationRef<'c, 't> {
 
 impl<'c, 't> FusedLocationRef<'c, 't> {
     /// Returns the [`TypeId`] that corresponds to [`FusedLocationRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirLocationFusedGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirLocationFusedGetTypeID()) }
     }
 
     /// Returns the number of fused [`Location`]s in this [`FusedLocationRef`].
@@ -37,13 +37,17 @@ impl<'c, 't> FusedLocationRef<'c, 't> {
     }
 
     /// Returns the fused [`Location`]s in this [`FusedLocationRef`].
-    pub fn fused_locations(&self) -> impl Iterator<Item = LocationRef<'c, 't>> {
+    pub fn fused_locations(&self) -> impl Iterator<Item = Result<LocationRef<'c, 't>, Error>> {
         unsafe {
             let count = self.fused_location_count();
             let mut buffer: Vec<MlirLocation> = Vec::with_capacity(count);
             mlirLocationFusedGetLocations(self.handle, buffer.as_mut_ptr());
             buffer.set_len(count);
-            buffer.into_iter().map(|location| LocationRef::from_c_api(location, self.context).unwrap())
+            buffer.into_iter().enumerate().map(|(index, location)| {
+                LocationRef::from_c_api(location, self.context).ok_or_else(|| {
+                    Error::internal(format!("expected non-null MLIR fused location handle at index {index}"))
+                })
+            })
         }
     }
 
@@ -69,16 +73,13 @@ impl<'t> Context<'t> {
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
             let locations = locations.iter().map(|location| location.to_c_api()).collect::<Vec<_>>();
-            FusedLocationRef::from_c_api(
-                mlirLocationFusedGet(
-                    *self.handle.borrow(),
-                    locations.len().cast_signed(),
-                    locations.as_ptr() as *const _,
-                    attribute.to_c_api(),
-                ),
-                self,
-            )
-            .unwrap()
+            let handle = mlirLocationFusedGet(
+                *self.handle.borrow(),
+                locations.len().cast_signed(),
+                locations.as_ptr() as *const _,
+                attribute.to_c_api(),
+            );
+            FusedLocationRef { handle, context: self }
         }
     }
 }
@@ -93,9 +94,9 @@ mod tests {
 
     #[test]
     fn test_fused_location_type_id() {
-        let fused_location_type_id = FusedLocationRef::type_id();
-        assert_eq!(FusedLocationRef::type_id(), FusedLocationRef::type_id());
-        assert_eq!(fused_location_type_id, FusedLocationRef::type_id());
+        let fused_location_type_id = FusedLocationRef::type_id().unwrap();
+        assert_eq!(FusedLocationRef::type_id().unwrap(), FusedLocationRef::type_id().unwrap());
+        assert_eq!(fused_location_type_id, FusedLocationRef::type_id().unwrap());
     }
 
     #[test]
@@ -108,7 +109,10 @@ mod tests {
         let location = context.fused_location(&[location_1, location_2, location_3], metadata);
         assert_eq!(&context, location.context());
         assert_eq!(location.fused_location_count(), 3);
-        assert_eq!(location.fused_locations().collect::<Vec<_>>(), vec![location_1, location_2, location_3]);
+        assert_eq!(
+            location.fused_locations().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![location_1, location_2, location_3]
+        );
         assert!(location.fused_metadata().is_some());
     }
 

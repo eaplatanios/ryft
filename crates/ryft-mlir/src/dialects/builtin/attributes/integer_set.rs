@@ -2,7 +2,7 @@ use ryft_xla_sys::bindings::{
     MlirAttribute, mlirIntegerSetAttrGet, mlirIntegerSetAttrGetTypeID, mlirIntegerSetAttrGetValue,
 };
 
-use crate::{Attribute, Context, FromWithContext, IntegerSet, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, IntegerSet, TryFromWithContext, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that stores an [`IntegerSet`].
 ///
@@ -28,8 +28,8 @@ pub struct IntegerSetAttributeRef<'c, 't> {
 
 impl<'c, 't> IntegerSetAttributeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`IntegerSetAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirIntegerSetAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirIntegerSetAttrGetTypeID()) }
     }
 
     /// Returns the [`IntegerSet`] that is stored in this [`IntegerSetAttributeRef`].
@@ -46,9 +46,9 @@ impl<'c, 't> From<IntegerSet<'c, 't>> for IntegerSetAttributeRef<'c, 't> {
     }
 }
 
-impl<'c, 't> FromWithContext<'c, 't, IntegerSet<'c, 't>> for IntegerSetAttributeRef<'c, 't> {
-    fn from_with_context(value: IntegerSet<'c, 't>, context: &'c Context<'t>) -> Self {
-        context.integer_set_attribute(value)
+impl<'c, 't> TryFromWithContext<'c, 't, IntegerSet<'c, 't>> for IntegerSetAttributeRef<'c, 't> {
+    fn try_from_with_context(value: IntegerSet<'c, 't>, context: &'c Context<'t>) -> Result<Self, Error> {
+        Ok(context.integer_set_attribute(value))
     }
 }
 
@@ -61,7 +61,8 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         let _guard = self.borrow();
-        unsafe { IntegerSetAttributeRef::from_c_api(mlirIntegerSetAttrGet(integer_set.to_c_api()), self).unwrap() }
+        let handle = unsafe { mlirIntegerSetAttrGet(integer_set.to_c_api()) };
+        IntegerSetAttributeRef { handle, context: self }
     }
 }
 
@@ -69,7 +70,7 @@ impl<'t> Context<'t> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::IntoWithContext;
+    use crate::TryIntoWithContext;
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
 
     use super::*;
@@ -77,12 +78,12 @@ mod tests {
     #[test]
     fn test_integer_set_attribute_type_id() {
         let context = Context::new();
-        let integer_set_attribute_id = IntegerSetAttributeRef::type_id();
+        let integer_set_attribute_id = IntegerSetAttributeRef::type_id().unwrap();
         let integer_set_attribute_1: IntegerSetAttributeRef<'_, '_> = context.empty_integer_set(0, 1).into();
         let integer_set_attribute_2: IntegerSetAttributeRef<'_, '_> =
-            context.empty_integer_set(0, 1).into_with_context(&context);
-        assert_eq!(integer_set_attribute_1.type_id(), integer_set_attribute_2.type_id());
-        assert_eq!(integer_set_attribute_id, integer_set_attribute_1.type_id());
+            context.empty_integer_set(0, 1).try_into_with_context(&context).unwrap();
+        assert_eq!(integer_set_attribute_1.type_id().unwrap(), integer_set_attribute_2.type_id().unwrap());
+        assert_eq!(integer_set_attribute_id, integer_set_attribute_1.type_id().unwrap());
     }
 
     #[test]

@@ -3,7 +3,7 @@ use ryft_xla_sys::bindings::{
     mlirFunctionTypeGetNumResults, mlirFunctionTypeGetResult, mlirFunctionTypeGetTypeID,
 };
 
-use crate::{Context, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
+use crate::{Context, Error, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Type`] that represents the type of functions where a function is defined as a mapping from a list
 /// of inputs to a list of outputs. A [`FunctionTypeRef`] can be thought of as a function signature. It consists of a
@@ -22,8 +22,8 @@ pub struct FunctionTypeRef<'c, 't> {
 
 impl<'c, 't> FunctionTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`FunctionTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirFunctionTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirFunctionTypeGetTypeID()) }
     }
 
     /// Returns the number of inputs (i.e., parameters) of this [`FunctionTypeRef`].
@@ -37,38 +37,52 @@ impl<'c, 't> FunctionTypeRef<'c, 't> {
     }
 
     /// Returns the input (i.e., parameter) [`Type`]s of this [`FunctionTypeRef`].
-    pub fn inputs(&self) -> impl Iterator<Item = TypeRef<'c, 't>> {
-        (0..self.input_count()).map(|index| self.input(index))
+    pub fn inputs(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
+        let input_count = self.input_count();
+        (0..input_count).map(|index| unsafe {
+            TypeRef::from_c_api(mlirFunctionTypeGetInput(self.handle, index.cast_signed()), self.context).ok_or_else(
+                || Error::internal(format!("expected non-null MLIR function input type handle at index {index}")),
+            )
+        })
     }
 
     /// Returns the output (i.e., result) [`Type`]s of this [`FunctionTypeRef`].
-    pub fn outputs(&self) -> impl Iterator<Item = TypeRef<'c, 't>> {
-        (0..self.output_count()).map(|index| self.output(index))
+    pub fn outputs(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
+        let output_count = self.output_count();
+        (0..output_count).map(|index| unsafe {
+            TypeRef::from_c_api(mlirFunctionTypeGetResult(self.handle, index.cast_signed()), self.context).ok_or_else(
+                || Error::internal(format!("expected non-null MLIR function output type handle at index {index}")),
+            )
+        })
     }
 
-    /// Returns the `index`-th input (i.e., parameter) [`Type`] of this [`FunctionTypeRef`].
-    ///
-    /// Note that this function will panic if the provided index is out of bounds.
-    pub fn input(&self, index: usize) -> TypeRef<'c, 't> {
-        if index >= self.input_count() {
-            panic!("function type input index is out of bounds");
+    /// Returns the `index`-th input (i.e., parameter) [`Type`] of this [`FunctionTypeRef`], or an error if the index
+    /// is out of bounds.
+    pub fn input(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        let input_count = self.input_count();
+        if index >= input_count {
+            return Err(Error::invalid_argument(format!(
+                "function type input index {index} is out of bounds for input count {input_count}"
+            )));
         }
         unsafe {
-            let element = mlirFunctionTypeGetInput(self.handle, index.cast_signed());
-            TypeRef::from_c_api(element, self.context).unwrap()
+            TypeRef::from_c_api(mlirFunctionTypeGetInput(self.handle, index.cast_signed()), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR function input type handle"))
         }
     }
 
-    /// Returns the `index`-th output (i.e., result) [`Type`] of this [`FunctionTypeRef`].
-    ///
-    /// Note that this function will panic if the provided index is out of bounds.
-    pub fn output(&self, index: usize) -> TypeRef<'c, 't> {
-        if index >= self.output_count() {
-            panic!("function type output index is out of bounds");
+    /// Returns the `index`-th output (i.e., result) [`Type`] of this [`FunctionTypeRef`], or an error if the index is
+    /// out of bounds.
+    pub fn output(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        let output_count = self.output_count();
+        if index >= output_count {
+            return Err(Error::invalid_argument(format!(
+                "function type output index {index} is out of bounds for output count {output_count}"
+            )));
         }
         unsafe {
-            let element = mlirFunctionTypeGetResult(self.handle, index.cast_signed());
-            TypeRef::from_c_api(element, self.context).unwrap()
+            TypeRef::from_c_api(mlirFunctionTypeGetResult(self.handle, index.cast_signed()), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR function output type handle"))
         }
     }
 }
@@ -91,17 +105,14 @@ impl<'t> Context<'t> {
         unsafe {
             let inputs = inputs.iter().map(|input| input.to_c_api()).collect::<Vec<_>>();
             let outputs = outputs.iter().map(|output| output.to_c_api()).collect::<Vec<_>>();
-            FunctionTypeRef::from_c_api(
-                mlirFunctionTypeGet(
-                    *self.handle.borrow(),
-                    inputs.len().cast_signed(),
-                    inputs.as_ptr() as *const _,
-                    outputs.len().cast_signed(),
-                    outputs.as_ptr() as *const _,
-                ),
-                self,
-            )
-            .unwrap()
+            let handle = mlirFunctionTypeGet(
+                *self.handle.borrow(),
+                inputs.len().cast_signed(),
+                inputs.as_ptr() as *const _,
+                outputs.len().cast_signed(),
+                outputs.as_ptr() as *const _,
+            );
+            FunctionTypeRef { handle, context: self }
         }
     }
 }
@@ -117,11 +128,11 @@ mod tests {
     #[test]
     fn test_function_type_type_id() {
         let context = Context::new();
-        let function_type = FunctionTypeRef::type_id();
+        let function_type = FunctionTypeRef::type_id().unwrap();
         let function_type_1 = context.function_type::<TypeRef, TypeRef>(&[], &[]);
         let function_type_2 = context.function_type::<TypeRef, TypeRef>(&[], &[]);
-        assert_eq!(function_type_1.type_id(), function_type_2.type_id());
-        assert_eq!(function_type, function_type_1.type_id());
+        assert_eq!(function_type_1.type_id().unwrap(), function_type_2.type_id().unwrap());
+        assert_eq!(function_type, function_type_1.type_id().unwrap());
     }
 
     #[test]
@@ -137,11 +148,19 @@ mod tests {
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.input_count(), 2);
         assert_eq!(r#type.output_count(), 1);
-        assert_eq!(r#type.inputs().collect::<Vec<_>>(), vec![input_1, input_2]);
-        assert_eq!(r#type.outputs().collect::<Vec<_>>(), vec![output_1]);
-        assert_eq!(r#type.input(0), input_1);
-        assert_eq!(r#type.input(1), input_2);
-        assert_eq!(r#type.output(0), output_1);
+        assert_eq!(
+            r#type.inputs().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![input_1, input_2]
+        );
+        assert_eq!(
+            r#type.outputs().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![output_1]
+        );
+        assert_eq!(r#type.input(0).unwrap(), input_1);
+        assert_eq!(r#type.input(1).unwrap(), input_2);
+        assert!(r#type.input(2).is_err());
+        assert_eq!(r#type.output(0).unwrap(), output_1);
+        assert!(r#type.output(1).is_err());
 
         // No inputs and single output.
         let r#type = context.function_type::<TypeRef, _>(&[], &[output_1]);
@@ -157,11 +176,19 @@ mod tests {
         let r#type = context.function_type(&[input_1], &[output_1, output_2]);
         assert_eq!(r#type.input_count(), 1);
         assert_eq!(r#type.output_count(), 2);
-        assert_eq!(r#type.inputs().collect::<Vec<_>>(), vec![input_1]);
-        assert_eq!(r#type.outputs().collect::<Vec<_>>(), vec![output_1, output_2]);
-        assert_eq!(r#type.input(0), input_1);
-        assert_eq!(r#type.output(0), output_1);
-        assert_eq!(r#type.output(1), output_2);
+        assert_eq!(
+            r#type.inputs().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![input_1]
+        );
+        assert_eq!(
+            r#type.outputs().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![output_1, output_2]
+        );
+        assert_eq!(r#type.input(0).unwrap(), input_1);
+        assert!(r#type.input(1).is_err());
+        assert_eq!(r#type.output(0).unwrap(), output_1);
+        assert_eq!(r#type.output(1).unwrap(), output_2);
+        assert!(r#type.output(2).is_err());
     }
 
     #[test]

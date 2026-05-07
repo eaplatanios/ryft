@@ -1,6 +1,6 @@
 use ryft_xla_sys::bindings::{MlirAttribute, mlirLocationFromAttribute, mlirLocationGetAttribute};
 
-use crate::{Attribute, Context, Location, LocationRef, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, Location, LocationRef, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that stores a [`Location`]. Refer to the
 /// [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/Builtin/#location-attributes)
@@ -16,8 +16,11 @@ pub struct LocationAttributeRef<'c, 't> {
 
 impl<'c, 't> LocationAttributeRef<'c, 't> {
     /// Returns the [`Location`] that is stored in this [`LocationAttributeRef`].
-    pub fn location(&self) -> LocationRef<'c, 't> {
-        unsafe { LocationRef::from_c_api(mlirLocationFromAttribute(self.handle), self.context).unwrap() }
+    pub fn location(&self) -> Result<LocationRef<'c, 't>, Error> {
+        unsafe {
+            LocationRef::from_c_api(mlirLocationFromAttribute(self.handle), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR location attribute value handle"))
+        }
     }
 }
 
@@ -32,7 +35,8 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         let _guard = self.borrow();
-        unsafe { LocationAttributeRef::from_c_api(mlirLocationGetAttribute(location.to_c_api()), self).unwrap() }
+        let handle = unsafe { mlirLocationGetAttribute(location.to_c_api()) };
+        LocationAttributeRef { handle, context: self }
     }
 }
 
@@ -52,13 +56,13 @@ mod tests {
         let location = context.unknown_location();
         let attribute = context.location_attribute(location);
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.location(), location);
+        assert_eq!(attribute.location().unwrap(), location);
 
         // Test with file location.
         let location = context.file_location("test.rs", 10, 5);
         let attribute = context.location_attribute(location);
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.location(), location);
+        assert_eq!(attribute.location().unwrap(), location);
     }
 
     #[test]

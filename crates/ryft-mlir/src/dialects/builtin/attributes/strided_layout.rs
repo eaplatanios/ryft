@@ -3,7 +3,7 @@ use ryft_xla_sys::bindings::{
     mlirStridedLayoutAttrGetStride, mlirStridedLayoutAttrGetTypeID,
 };
 
-use crate::{Attribute, Context, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that represents the strided layout of a [`MemRefTypeRef`](crate::MemRefTypeRef).
 ///
@@ -31,8 +31,8 @@ pub struct StridedLayoutAttributeRef<'c, 't> {
 
 impl<'c, 't> StridedLayoutAttributeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`StridedLayoutAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirStridedLayoutAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirStridedLayoutAttrGetTypeID()) }
     }
 
     /// Returns the number of dimensions of this [`StridedLayoutAttributeRef`].
@@ -72,18 +72,15 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         let strides = strides.iter().map(|&stride| stride as i64).collect::<Vec<_>>();
-        unsafe {
-            StridedLayoutAttributeRef::from_c_api(
-                mlirStridedLayoutAttrGet(
-                    *self.handle.borrow(),
-                    offset as i64,
-                    strides.len().cast_signed(),
-                    strides.as_ptr(),
-                ),
-                self,
+        let handle = unsafe {
+            mlirStridedLayoutAttrGet(
+                *self.handle.borrow(),
+                offset as i64,
+                strides.len().cast_signed(),
+                strides.as_ptr(),
             )
-            .unwrap()
-        }
+        };
+        StridedLayoutAttributeRef { handle, context: self }
     }
 }
 
@@ -98,11 +95,11 @@ mod tests {
     #[test]
     fn test_strided_layout_attribute_type_id() {
         let context = Context::new();
-        let strided_layout_attribute_id = StridedLayoutAttributeRef::type_id();
+        let strided_layout_attribute_id = StridedLayoutAttributeRef::type_id().unwrap();
         let strided_layout_attribute_1 = context.strided_layout_attribute(0, &[4, 1]);
         let strided_layout_attribute_2 = context.strided_layout_attribute(0, &[4, 1]);
-        assert_eq!(strided_layout_attribute_1.type_id(), strided_layout_attribute_2.type_id());
-        assert_eq!(strided_layout_attribute_id, strided_layout_attribute_1.type_id());
+        assert_eq!(strided_layout_attribute_1.type_id().unwrap(), strided_layout_attribute_2.type_id().unwrap());
+        assert_eq!(strided_layout_attribute_id, strided_layout_attribute_1.type_id().unwrap());
     }
 
     #[test]

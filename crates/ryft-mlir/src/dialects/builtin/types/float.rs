@@ -211,12 +211,8 @@ macro_rules! mlir_float_type_constructor {
                     // function quite inconvenient/annoying in practice. This should have no negative consequences in
                     // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
                     // should be no possibility for this function to cause problems with an immutable borrow.
-                    unsafe {
-                        [<$type TypeRef>]::from_c_api(
-                            mlir_float_type_get_function!($type)(*self.handle.borrow()),
-                            &self,
-                        ).unwrap()
-                    }
+                    let handle = unsafe { mlir_float_type_get_function!($type)(*self.handle.borrow()) };
+                    [<$type TypeRef>] { handle, context: self }
                 }
             }
         }
@@ -255,7 +251,8 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         let _guard = self.borrow();
-        unsafe { ComplexTypeRef::from_c_api(mlirComplexTypeGet(element_type.to_c_api()), self).unwrap() }
+        let handle = unsafe { mlirComplexTypeGet(element_type.to_c_api()) };
+        ComplexTypeRef { handle, context: self }
     }
 }
 

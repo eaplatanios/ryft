@@ -1,6 +1,6 @@
 use ryft_xla_sys::bindings::{MlirAttribute, mlirTypeAttrGet, mlirTypeAttrGetTypeID, mlirTypeAttrGetValue};
 
-use crate::{Attribute, Context, FromWithContext, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, TryFromWithContext, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that stores a [`Type`].
 ///
@@ -27,21 +27,24 @@ pub struct TypeAttributeRef<'c, 't> {
 
 impl<'c, 't> TypeAttributeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`TypeAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirTypeAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirTypeAttrGetTypeID()) }
     }
 
     /// Returns the [`Type`] that is stored in this [`TypeAttributeRef`].
-    pub fn r#type(&self) -> TypeRef<'c, 't> {
-        unsafe { TypeRef::from_c_api(mlirTypeAttrGetValue(self.handle), self.context).unwrap() }
+    pub fn r#type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        unsafe {
+            TypeRef::from_c_api(mlirTypeAttrGetValue(self.handle), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR type attribute value handle"))
+        }
     }
 }
 
 mlir_subtype_trait_impls!(TypeAttributeRef<'c, 't> as Attribute, mlir_type = Attribute, mlir_subtype = Type);
 
-impl<'c, 't, T: Type<'c, 't>> FromWithContext<'c, 't, T> for TypeAttributeRef<'c, 't> {
-    fn from_with_context(value: T, context: &'c Context<'t>) -> Self {
-        context.type_attribute(value)
+impl<'c, 't, T: Type<'c, 't>> TryFromWithContext<'c, 't, T> for TypeAttributeRef<'c, 't> {
+    fn try_from_with_context(value: T, context: &'c Context<'t>) -> Result<Self, Error> {
+        Ok(context.type_attribute(value))
     }
 }
 
@@ -54,7 +57,8 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         let _guard = self.borrow();
-        unsafe { TypeAttributeRef::from_c_api(mlirTypeAttrGet(r#type.to_c_api()), self).unwrap() }
+        let handle = unsafe { mlirTypeAttrGet(r#type.to_c_api()) };
+        TypeAttributeRef { handle, context: self }
     }
 }
 
@@ -62,7 +66,7 @@ impl<'t> Context<'t> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::IntoWithContext;
+    use crate::TryIntoWithContext;
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
 
     use super::*;
@@ -70,11 +74,11 @@ mod tests {
     #[test]
     fn test_type_attribute_type_id() {
         let context = Context::new();
-        let type_attribute_id = TypeAttributeRef::type_id();
+        let type_attribute_id = TypeAttributeRef::type_id().unwrap();
         let type_attribute_1 = context.type_attribute(context.index_type());
-        let type_attribute_2: TypeAttributeRef<'_, '_> = context.index_type().into_with_context(&context);
-        assert_eq!(type_attribute_1.type_id(), type_attribute_2.type_id());
-        assert_eq!(type_attribute_id, type_attribute_1.type_id());
+        let type_attribute_2: TypeAttributeRef<'_, '_> = context.index_type().try_into_with_context(&context).unwrap();
+        assert_eq!(type_attribute_1.type_id().unwrap(), type_attribute_2.type_id().unwrap());
+        assert_eq!(type_attribute_id, type_attribute_1.type_id().unwrap());
     }
 
     #[test]
@@ -85,19 +89,19 @@ mod tests {
         let index_type = context.index_type();
         let attribute = context.type_attribute(index_type);
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.r#type(), index_type.as_ref());
+        assert_eq!(attribute.r#type().unwrap(), index_type.as_ref());
 
         // Test with integer type.
         let i64_type = context.signless_integer_type(64);
         let attribute = context.type_attribute(i64_type);
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.r#type(), i64_type.as_ref());
+        assert_eq!(attribute.r#type().unwrap(), i64_type.as_ref());
 
         // Test with float type.
         let f32_type = context.float32_type();
         let attribute = context.type_attribute(f32_type);
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.r#type(), f32_type.as_ref());
+        assert_eq!(attribute.r#type().unwrap(), f32_type.as_ref());
     }
 
     #[test]

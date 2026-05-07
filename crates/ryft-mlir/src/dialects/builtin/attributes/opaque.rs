@@ -2,7 +2,7 @@ use ryft_xla_sys::bindings::{
     MlirAttribute, mlirOpaqueAttrGet, mlirOpaqueAttrGetData, mlirOpaqueAttrGetDialectNamespace, mlirOpaqueAttrGetTypeID,
 };
 
-use crate::{Attribute, Context, StringRef, Type, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, StringRef, Type, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that stores an opaque representation of another [`Attribute`]. Opaque attributes
 /// represent attributes of non-registered dialects. These attributes are represented in their raw string form,
@@ -30,8 +30,8 @@ pub struct OpaqueAttributeRef<'c, 't> {
 
 impl<'c, 't> OpaqueAttributeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`OpaqueAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirOpaqueAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirOpaqueAttrGetTypeID()) }
     }
 
     /// Returns the namespace of the dialect with which this [`OpaqueAttributeRef`] is associated. The returned string
@@ -64,19 +64,16 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         let data = data.as_ref();
-        unsafe {
-            OpaqueAttributeRef::from_c_api(
-                mlirOpaqueAttrGet(
-                    *self.handle.borrow(),
-                    StringRef::from(dialect_namespace.as_ref()).to_c_api(),
-                    data.len().cast_signed(),
-                    data.as_ptr() as *const _,
-                    r#type.to_c_api(),
-                ),
-                self,
+        let handle = unsafe {
+            mlirOpaqueAttrGet(
+                *self.handle.borrow(),
+                StringRef::from(dialect_namespace.as_ref()).to_c_api(),
+                data.len().cast_signed(),
+                data.as_ptr() as *const _,
+                r#type.to_c_api(),
             )
-            .unwrap()
-        }
+        };
+        OpaqueAttributeRef { handle, context: self }
     }
 }
 
@@ -91,11 +88,11 @@ mod tests {
     #[test]
     fn test_opaque_attribute_type_id() {
         let context = Context::new();
-        let opaque_attribute_id = OpaqueAttributeRef::type_id();
+        let opaque_attribute_id = OpaqueAttributeRef::type_id().unwrap();
         let opaque_attribute_1 = context.opaque_attribute("test_dialect", "test_data", context.index_type());
         let opaque_attribute_2 = context.opaque_attribute("test_dialect", "test_data", context.index_type());
-        assert_eq!(opaque_attribute_1.type_id(), opaque_attribute_2.type_id());
-        assert_eq!(opaque_attribute_id, opaque_attribute_1.type_id());
+        assert_eq!(opaque_attribute_1.type_id().unwrap(), opaque_attribute_2.type_id().unwrap());
+        assert_eq!(opaque_attribute_id, opaque_attribute_1.type_id().unwrap());
     }
 
     #[test]

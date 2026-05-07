@@ -4,7 +4,7 @@ use ryft_xla_sys::bindings::{
     mlirSymbolRefAttrGetRootReference, mlirSymbolRefAttrGetTypeID,
 };
 
-use crate::{Attribute, AttributeRef, Context, FromWithContext, StringRef, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, AttributeRef, Context, Error, StringRef, TryFromWithContext, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that stores a symbolic reference to an operation. A symbol reference attribute is a
 /// literal attribute that represents a named reference to an operation that is nested within an operation with the
@@ -41,8 +41,8 @@ pub struct SymbolRefAttributeRef<'c, 't> {
 
 impl<'c, 't> SymbolRefAttributeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`SymbolRefAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirSymbolRefAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirSymbolRefAttrGetTypeID()) }
     }
 
     /// Returns a string reference to the root referenced symbol of this [`SymbolRefAttributeRef`].
@@ -61,8 +61,13 @@ impl<'c, 't> SymbolRefAttributeRef<'c, 't> {
     }
 
     /// Returns the references nested in this [`SymbolRefAttributeRef`].
-    pub fn nested_references(&self) -> impl Iterator<Item = AttributeRef<'c, 't>> {
-        (0..self.nested_reference_count()).map(|index| self.nested_reference(index).unwrap())
+    pub fn nested_references(&self) -> impl Iterator<Item = Result<AttributeRef<'c, 't>, Error>> {
+        let nested_reference_count = self.nested_reference_count();
+        (0..nested_reference_count).map(|index| {
+            self.nested_reference(index).ok_or_else(|| {
+                Error::internal(format!("expected non-null MLIR symbol reference handle at index {index}"))
+            })
+        })
     }
 
     /// Returns the `index`-th reference nested in this [`SymbolRefAttributeRef`]
@@ -92,19 +97,16 @@ impl<'t> Context<'t> {
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
-        unsafe {
-            let references = references.iter().map(|reference| reference.to_c_api()).collect::<Vec<_>>();
-            SymbolRefAttributeRef::from_c_api(
-                mlirSymbolRefAttrGet(
-                    *self.handle.borrow(),
-                    symbol.to_c_api(),
-                    references.len().cast_signed(),
-                    references.as_ptr() as *const _,
-                ),
-                self,
+        let references = references.iter().map(|reference| unsafe { reference.to_c_api() }).collect::<Vec<_>>();
+        let handle = unsafe {
+            mlirSymbolRefAttrGet(
+                *self.handle.borrow(),
+                symbol.to_c_api(),
+                references.len().cast_signed(),
+                references.as_ptr() as *const _,
             )
-            .unwrap()
-        }
+        };
+        SymbolRefAttributeRef { handle, context: self }
     }
 }
 
@@ -132,9 +134,9 @@ mlir_subtype_trait_impls!(
     mlir_subtype = FlatSymbolRef,
 );
 
-impl<'c, 't, 's, S: Into<StringRef<'s>>> FromWithContext<'c, 't, S> for FlatSymbolRefAttributeRef<'c, 't> {
-    fn from_with_context(value: S, context: &'c Context<'t>) -> Self {
-        context.flat_symbol_ref_attribute(value)
+impl<'c, 't, 's, S: Into<StringRef<'s>>> TryFromWithContext<'c, 't, S> for FlatSymbolRefAttributeRef<'c, 't> {
+    fn try_from_with_context(value: S, context: &'c Context<'t>) -> Result<Self, Error> {
+        Ok(context.flat_symbol_ref_attribute(value))
     }
 }
 
@@ -150,13 +152,8 @@ impl<'t> Context<'t> {
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
-        unsafe {
-            FlatSymbolRefAttributeRef::from_c_api(
-                mlirFlatSymbolRefAttrGet(*self.handle.borrow(), symbol.into().to_c_api()),
-                self,
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirFlatSymbolRefAttrGet(*self.handle.borrow(), symbol.into().to_c_api()) };
+        FlatSymbolRefAttributeRef { handle, context: self }
     }
 }
 
@@ -227,11 +224,11 @@ mod tests {
     #[test]
     fn test_symbol_ref_attribute_type_id() {
         let context = Context::new();
-        let symbol_ref_attribute_id = SymbolRefAttributeRef::type_id();
+        let symbol_ref_attribute_id = SymbolRefAttributeRef::type_id().unwrap();
         let symbol_ref_attribute_1 = context.symbol_ref_attribute::<AttributeRef>("test_symbol".into(), &[]);
         let symbol_ref_attribute_2 = context.symbol_ref_attribute::<AttributeRef>("test_symbol".into(), &[]);
-        assert_eq!(symbol_ref_attribute_1.type_id(), symbol_ref_attribute_2.type_id());
-        assert_eq!(symbol_ref_attribute_id, symbol_ref_attribute_1.type_id());
+        assert_eq!(symbol_ref_attribute_1.type_id().unwrap(), symbol_ref_attribute_2.type_id().unwrap());
+        assert_eq!(symbol_ref_attribute_id, symbol_ref_attribute_1.type_id().unwrap());
     }
 
     #[test]
@@ -252,7 +249,15 @@ mod tests {
         assert_eq!(attribute.root_reference().as_str().unwrap(), "root");
         assert_eq!(attribute.leaf_reference().as_str().unwrap(), "nested2");
         assert_eq!(attribute.nested_reference_count(), 2);
-        assert_eq!(attribute.nested_references().collect::<Vec<_>>(), vec![nested_1, nested_2]);
+        assert_eq!(
+            attribute
+                .nested_references()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![nested_1, nested_2]
+        );
     }
 
     #[test]

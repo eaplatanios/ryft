@@ -6,7 +6,7 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::{
-    AffineMap, Attribute, AttributeRef, Context, Location, LogicalResult, Type, TypeId, mlir_subtype_trait_impls,
+    AffineMap, Attribute, AttributeRef, Context, Error, Location, LogicalResult, Type, TypeId, mlir_subtype_trait_impls,
 };
 
 use super::{ShapedType, Size};
@@ -157,8 +157,8 @@ pub struct MemRefTypeRef<'c, 't> {
 
 impl<'c, 't> MemRefTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`MemRefTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirMemRefTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirMemRefTypeGetTypeID()) }
     }
 
     /// Returns the rank of this [`MemRefTypeRef`] (i.e., the number of dimensions it has).
@@ -168,7 +168,13 @@ impl<'c, 't> MemRefTypeRef<'c, 't> {
 
     /// Returns all dimension [`Size`]s of this [`MemRefTypeRef`].
     pub fn dimensions(&self) -> impl Iterator<Item = Size> {
-        (0..self.rank()).map(|dimension| self.dimension(dimension))
+        (0..self.rank()).map(|dimension| unsafe {
+            if mlirShapedTypeIsStaticDim(self.handle, dimension.cast_signed()) {
+                Size::Static(mlirShapedTypeGetDimSize(self.handle, dimension.cast_signed()) as usize)
+            } else {
+                Size::Dynamic
+            }
+        })
     }
 
     /// Returns `true` if all dimensions of this [`MemRefTypeRef`] has a static size.
@@ -176,20 +182,21 @@ impl<'c, 't> MemRefTypeRef<'c, 't> {
         self.dimensions().all(|dimension| dimension.is_static())
     }
 
-    /// Returns the `dimension`-th [`Size`] of this [`MemRefTypeRef`].
-    ///
-    /// Note that this function will panic if the provided dimension is out of bounds.
-    pub fn dimension(&self, dimension: usize) -> Size {
-        if dimension >= self.rank() {
-            panic!("dimension is out of bounds");
+    /// Returns the `dimension`-th [`Size`] of this [`MemRefTypeRef`], or an error if `dimension` is out of bounds.
+    pub fn dimension(&self, dimension: usize) -> Result<Size, Error> {
+        let rank = self.rank();
+        if dimension >= rank {
+            return Err(Error::invalid_argument(format!(
+                "memref type dimension {dimension} is out of bounds for rank {rank}"
+            )));
         }
-        unsafe {
+        Ok(unsafe {
             if mlirShapedTypeIsStaticDim(self.handle, dimension.cast_signed()) {
                 Size::Static(mlirShapedTypeGetDimSize(self.handle, dimension.cast_signed()) as usize)
             } else {
                 Size::Dynamic
             }
-        }
+        })
     }
 
     /// Returns the layout [`Attribute`] of this [`MemRefTypeRef`].
@@ -232,8 +239,11 @@ impl<'c, 't> MemRefTypeRef<'c, 't> {
     }
 
     /// Returns the [`AffineMap`] of this [`MemRefTypeRef`].
-    pub fn affine_map(&self) -> AffineMap<'c, 't> {
-        unsafe { AffineMap::from_c_api(mlirMemRefTypeGetAffineMap(self.handle), self.context).unwrap() }
+    pub fn affine_map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        unsafe {
+            AffineMap::from_c_api(mlirMemRefTypeGetAffineMap(self.handle), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR memref affine map handle"))
+        }
     }
 }
 
@@ -243,7 +253,7 @@ mlir_subtype_trait_impls!(MemRefTypeRef<'c, 't> as Type, mlir_type = Type, mlir_
 
 impl<'t> Context<'t> {
     /// Creates a new [`MemRefTypeRef`] owned by this [`Context`]. If any of the arguments are invalid, then
-    /// this function will return [`None`] and will also emit the appropriate diagnostics at the provided location.
+    /// this function will return an [`Error`] and will also emit the appropriate diagnostics at the provided location.
     /// For example, this can happen if `element_type` is not an [`IndexTypeRef`](crate::IndexTypeRef),
     /// an [`IntegerTypeRef`](crate::IntegerTypeRef), a [`FloatType`](crate::FloatTypeRef),
     /// a [`VectorTypeRef`](crate::VectorTypeRef), another [`MemRefTypeRef`], or a [`UnrankedMemRefTypeRef`].
@@ -254,7 +264,7 @@ impl<'t> Context<'t> {
         layout: Option<AttributeRef<'c, 't>>,
         memory_space: Option<AttributeRef<'c, 't>>,
         location: L,
-    ) -> Option<MemRefTypeRef<'c, 't>> {
+    ) -> Result<MemRefTypeRef<'c, 't>, Error> {
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -274,11 +284,12 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::mem_ref_type`"))
         }
     }
 
     /// Creates a new contiguous [`MemRefTypeRef`] (i.e., one with a contiguous memory layout) owned by this
-    /// [`Context`]. If any of the arguments are invalid, then this function will return [`None`] and will also emit
+    /// [`Context`]. If any of the arguments are invalid, then this function will return an [`Error`] and will also emit
     /// the appropriate diagnostics at the provided location. For example, this can happen if `element_type` is not
     /// an [`IndexTypeRef`](crate::IndexTypeRef), an [`IntegerTypeRef`](crate::IntegerTypeRef),
     /// a [`FloatType`](crate::FloatTypeRef), a [`VectorTypeRef`](crate::VectorTypeRef), another [`MemRefTypeRef`],
@@ -289,7 +300,7 @@ impl<'t> Context<'t> {
         shape: &[Size],
         memory_space: Option<AttributeRef<'c, 't>>,
         location: L,
-    ) -> Option<MemRefTypeRef<'c, 't>> {
+    ) -> Result<MemRefTypeRef<'c, 't>, Error> {
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -308,6 +319,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::contiguous_mem_ref_type`"))
         }
     }
 }
@@ -350,8 +362,8 @@ pub struct UnrankedMemRefTypeRef<'c, 't> {
 
 impl<'c, 't> UnrankedMemRefTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`UnrankedMemRefTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirUnrankedMemRefTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirUnrankedMemRefTypeGetTypeID()) }
     }
 
     /// Returns the memory space [`Attribute`] of this [`UnrankedMemRefTypeRef`].
@@ -366,7 +378,7 @@ mlir_subtype_trait_impls!(UnrankedMemRefTypeRef<'c, 't> as Type, mlir_type = Typ
 
 impl<'t> Context<'t> {
     /// Creates a new [`UnrankedMemRefTypeRef`] owned by this [`Context`]. If any of the arguments are invalid, then
-    /// this function will return [`None`] and will also emit the appropriate diagnostics at the provided location.
+    /// this function will return an [`Error`] and will also emit the appropriate diagnostics at the provided location.
     /// For example, this can happen if `element_type` is not an [`IndexTypeRef`](crate::IndexTypeRef),
     /// an [`IntegerTypeRef`](crate::IntegerTypeRef), a [`FloatType`](crate::FloatTypeRef),
     /// a [`VectorTypeRef`](crate::VectorTypeRef), a [`MemRefTypeRef`], or another [`UnrankedMemRefTypeRef`].
@@ -375,7 +387,7 @@ impl<'t> Context<'t> {
         element_type: T,
         memory_space: Option<AttributeRef<'c, 't>>,
         location: L,
-    ) -> Option<UnrankedMemRefTypeRef<'c, 't>> {
+    ) -> Result<UnrankedMemRefTypeRef<'c, 't>, Error> {
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -391,6 +403,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::unranked_mem_ref_type`"))
         }
     }
 }
@@ -407,13 +420,13 @@ mod tests {
     fn test_mem_ref_type_type_id() {
         let context = Context::new();
         let location = context.unknown_location();
-        let mem_ref_type = MemRefTypeRef::type_id();
+        let mem_ref_type = MemRefTypeRef::type_id().unwrap();
         let mem_ref_1_type =
             context.mem_ref_type(context.float32_type(), &[Size::Static(32)], None, None, location).unwrap();
         let mem_ref_2_type =
             context.mem_ref_type(context.float32_type(), &[Size::Static(64)], None, None, location).unwrap();
-        assert_eq!(mem_ref_1_type.type_id(), mem_ref_2_type.type_id());
-        assert_eq!(mem_ref_type, mem_ref_1_type.type_id());
+        assert_eq!(mem_ref_1_type.type_id().unwrap(), mem_ref_2_type.type_id().unwrap());
+        assert_eq!(mem_ref_type, mem_ref_1_type.type_id().unwrap());
     }
 
     #[test]
@@ -428,28 +441,29 @@ mod tests {
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.rank(), 4);
         assert_eq!(r#type.dimensions().collect::<Vec<_>>(), shape);
-        assert_eq!(r#type.dimension(0), Size::Static(32));
-        assert_eq!(r#type.dimension(1), Size::Dynamic);
-        assert_eq!(r#type.dimension(2), Size::Dynamic);
-        assert_eq!(r#type.dimension(3), Size::Static(2));
+        assert_eq!(r#type.dimension(0).unwrap(), Size::Static(32));
+        assert_eq!(r#type.dimension(1).unwrap(), Size::Dynamic);
+        assert_eq!(r#type.dimension(2).unwrap(), Size::Dynamic);
+        assert_eq!(r#type.dimension(3).unwrap(), Size::Static(2));
+        assert!(r#type.dimension(4).is_err());
         assert_eq!(r#type.layout(), Some(context.affine_map_attribute(context.identity_affine_map(4)).as_ref()),);
         assert_eq!(r#type.strides_and_offset(), Some((vec![], Size::Static(0))));
         assert_eq!(r#type.memory_space(), None);
-        assert_eq!(r#type.affine_map(), context.identity_affine_map(4));
+        assert_eq!(r#type.affine_map().unwrap(), context.identity_affine_map(4));
         assert!(!r#type.has_static_shape());
-        assert_eq!(r#type.element_type(), element_type);
+        assert_eq!(r#type.element_type().unwrap(), element_type);
 
         // Contiguous mem-ref type with valid element type.
         let r#type = context.contiguous_mem_ref_type(element_type, &shape, None, location).unwrap();
         assert_eq!(r#type.rank(), 4);
         assert_eq!(r#type.dimensions().collect::<Vec<_>>(), shape);
         assert_eq!(r#type.layout(), Some(context.affine_map_attribute(context.identity_affine_map(4)).as_ref()),);
-        assert_eq!(r#type.affine_map(), context.identity_affine_map(4));
+        assert_eq!(r#type.affine_map().unwrap(), context.identity_affine_map(4));
 
         // Invalid element type.
         let element_type = context.none_type();
         let r#type = context.mem_ref_type(element_type, &shape, None, None, location);
-        assert!(r#type.is_none());
+        assert!(r#type.is_err());
     }
 
     #[test]
@@ -518,11 +532,11 @@ mod tests {
     fn test_unranked_mem_ref_type_type_id() {
         let context = Context::new();
         let location = context.unknown_location();
-        let unranked_mem_ref_type = UnrankedMemRefTypeRef::type_id();
+        let unranked_mem_ref_type = UnrankedMemRefTypeRef::type_id().unwrap();
         let unranked_mem_ref_1_type = context.unranked_mem_ref_type(context.float32_type(), None, location).unwrap();
         let unranked_mem_ref_2_type = context.unranked_mem_ref_type(context.bfloat16_type(), None, location).unwrap();
-        assert_eq!(unranked_mem_ref_1_type.type_id(), unranked_mem_ref_2_type.type_id());
-        assert_eq!(unranked_mem_ref_type, unranked_mem_ref_1_type.type_id());
+        assert_eq!(unranked_mem_ref_1_type.type_id().unwrap(), unranked_mem_ref_2_type.type_id().unwrap());
+        assert_eq!(unranked_mem_ref_type, unranked_mem_ref_1_type.type_id().unwrap());
     }
 
     #[test]
@@ -534,13 +548,13 @@ mod tests {
         let element_type = context.bfloat16_type();
         let r#type = context.unranked_mem_ref_type(element_type, None, location).unwrap();
         assert_eq!(&context, r#type.context());
-        assert_eq!(r#type.element_type(), element_type);
+        assert_eq!(r#type.element_type().unwrap(), element_type);
         assert_eq!(r#type.memory_space(), None);
 
         // Invalid element type.
         let element_type = context.none_type();
         let r#type = context.unranked_mem_ref_type(element_type, None, location);
-        assert!(r#type.is_none());
+        assert!(r#type.is_err());
     }
 
     #[test]

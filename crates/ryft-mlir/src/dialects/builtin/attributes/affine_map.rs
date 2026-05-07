@@ -2,7 +2,7 @@ use ryft_xla_sys::bindings::{
     MlirAttribute, mlirAffineMapAttrGet, mlirAffineMapAttrGetTypeID, mlirAffineMapAttrGetValue,
 };
 
-use crate::{AffineMap, Attribute, Context, FromWithContext, TypeId, mlir_subtype_trait_impls};
+use crate::{AffineMap, Attribute, Context, Error, TryFromWithContext, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that stores an [`AffineMap`].
 ///
@@ -29,13 +29,16 @@ pub struct AffineMapAttributeRef<'c, 't> {
 
 impl<'c, 't> AffineMapAttributeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`AffineMapAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirAffineMapAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirAffineMapAttrGetTypeID()) }
     }
 
     /// Returns the [`AffineMap`] that is stored in this [`AffineMapAttributeRef`].
-    pub fn affine_map(&self) -> AffineMap<'c, 't> {
-        unsafe { AffineMap::from_c_api(mlirAffineMapAttrGetValue(self.handle), self.context).unwrap() }
+    pub fn affine_map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        unsafe {
+            AffineMap::from_c_api(mlirAffineMapAttrGetValue(self.handle), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR affine map attribute value handle"))
+        }
     }
 }
 
@@ -47,9 +50,9 @@ impl<'c, 't> From<AffineMap<'c, 't>> for AffineMapAttributeRef<'c, 't> {
     }
 }
 
-impl<'c, 't> FromWithContext<'c, 't, AffineMap<'c, 't>> for AffineMapAttributeRef<'c, 't> {
-    fn from_with_context(value: AffineMap<'c, 't>, context: &'c Context<'t>) -> Self {
-        context.affine_map_attribute(value)
+impl<'c, 't> TryFromWithContext<'c, 't, AffineMap<'c, 't>> for AffineMapAttributeRef<'c, 't> {
+    fn try_from_with_context(value: AffineMap<'c, 't>, context: &'c Context<'t>) -> Result<Self, Error> {
+        Ok(context.affine_map_attribute(value))
     }
 }
 
@@ -62,7 +65,8 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         let _guard = self.borrow();
-        unsafe { AffineMapAttributeRef::from_c_api(mlirAffineMapAttrGet(affine_map.to_c_api()), self).unwrap() }
+        let handle = unsafe { mlirAffineMapAttrGet(affine_map.to_c_api()) };
+        AffineMapAttributeRef { handle, context: self }
     }
 }
 
@@ -70,7 +74,7 @@ impl<'t> Context<'t> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::IntoWithContext;
+    use crate::TryIntoWithContext;
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
 
     use super::*;
@@ -78,12 +82,12 @@ mod tests {
     #[test]
     fn test_affine_map_attribute_type_id() {
         let context = Context::new();
-        let affine_map_attribute_id = AffineMapAttributeRef::type_id();
+        let affine_map_attribute_id = AffineMapAttributeRef::type_id().unwrap();
         let affine_map = context.zero_result_affine_map(1, 0);
-        let affine_map_attribute_1: AffineMapAttributeRef<'_, '_> = affine_map.into_with_context(&context);
+        let affine_map_attribute_1: AffineMapAttributeRef<'_, '_> = affine_map.try_into_with_context(&context).unwrap();
         let affine_map_attribute_2 = AffineMapAttributeRef::from(affine_map);
-        assert_eq!(affine_map_attribute_1.type_id(), affine_map_attribute_2.type_id());
-        assert_eq!(affine_map_attribute_id, affine_map_attribute_1.type_id());
+        assert_eq!(affine_map_attribute_1.type_id().unwrap(), affine_map_attribute_2.type_id().unwrap());
+        assert_eq!(affine_map_attribute_id, affine_map_attribute_1.type_id().unwrap());
     }
 
     #[test]
@@ -92,7 +96,7 @@ mod tests {
         let affine_map = context.zero_result_affine_map(1, 0);
         let attribute = context.affine_map_attribute(affine_map);
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.affine_map(), affine_map);
+        assert_eq!(attribute.affine_map().unwrap(), affine_map);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use ryft_xla_sys::bindings::{
     MlirType, mlirTupleTypeGet, mlirTupleTypeGetNumTypes, mlirTupleTypeGetType, mlirTupleTypeGetTypeID,
 };
 
-use crate::{Context, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
+use crate::{Context, Error, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Type`] that represents a fixed-size collection of other [`Type`]. Note that, while [`TupleTypeRef`]s
 /// are first-class in the MLIR type system, MLIR provides no standard operations for operating on [`TupleTypeRef`]s.
@@ -30,8 +30,8 @@ pub struct TupleTypeRef<'c, 't> {
 
 impl<'c, 't> TupleTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`TupleTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirTupleTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirTupleTypeGetTypeID()) }
     }
 
     /// Returns the length of this [`TupleTypeRef`] (i.e., the number of element [`Type`]s it contains).
@@ -45,18 +45,28 @@ impl<'c, 't> TupleTypeRef<'c, 't> {
     }
 
     /// Returns all element [`Type`]s of this [`TupleTypeRef`].
-    pub fn elements(&self) -> impl Iterator<Item = TypeRef<'c, 't>> {
-        (0..self.len()).map(|index| self.element(index))
+    pub fn elements(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
+        let len = self.len();
+        (0..len).map(|index| unsafe {
+            TypeRef::from_c_api(mlirTupleTypeGetType(self.handle, index.cast_signed()), self.context).ok_or_else(|| {
+                Error::internal(format!("expected non-null MLIR tuple element type handle at index {index}"))
+            })
+        })
     }
 
-    /// Returns the element [`Type`] of this [`TupleTypeRef`] at the specified index.
-    ///
-    /// Note that this function will panic if the provided index is out of bounds.
-    pub fn element(&self, index: usize) -> TypeRef<'c, 't> {
-        if index >= self.len() {
-            panic!("index is out of bounds");
+    /// Returns the element [`Type`] of this [`TupleTypeRef`] at the specified index, or an error if the index is out
+    /// of bounds.
+    pub fn element(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        let len = self.len();
+        if index >= len {
+            return Err(Error::invalid_argument(format!(
+                "tuple type element index {index} is out of bounds for length {len}"
+            )));
         }
-        unsafe { TypeRef::from_c_api(mlirTupleTypeGetType(self.handle, index.cast_signed()), self.context).unwrap() }
+        unsafe {
+            TypeRef::from_c_api(mlirTupleTypeGetType(self.handle, index.cast_signed()), self.context)
+                .ok_or_else(|| Error::internal("expected non-null MLIR tuple element type handle"))
+        }
     }
 }
 
@@ -72,11 +82,9 @@ impl<'t> Context<'t> {
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
             let elements = elements.iter().map(|element| element.to_c_api()).collect::<Vec<_>>();
-            TupleTypeRef::from_c_api(
-                mlirTupleTypeGet(*self.handle.borrow(), elements.len().cast_signed(), elements.as_ptr() as *const _),
-                self,
-            )
-            .unwrap()
+            let handle =
+                mlirTupleTypeGet(*self.handle.borrow(), elements.len().cast_signed(), elements.as_ptr() as *const _);
+            TupleTypeRef { handle, context: self }
         }
     }
 }
@@ -92,11 +100,11 @@ mod tests {
     #[test]
     fn test_tuple_type_type_id() {
         let context = Context::new();
-        let tuple_type = TupleTypeRef::type_id();
+        let tuple_type = TupleTypeRef::type_id().unwrap();
         let tuple_type_1 = context.tuple_type(&[context.index_type()]);
         let tuple_type_2 = context.tuple_type(&[context.float32_type()]);
-        assert_eq!(tuple_type_1.type_id(), tuple_type_2.type_id());
-        assert_eq!(tuple_type, tuple_type_1.type_id());
+        assert_eq!(tuple_type_1.type_id().unwrap(), tuple_type_2.type_id().unwrap());
+        assert_eq!(tuple_type, tuple_type_1.type_id().unwrap());
     }
 
     #[test]
@@ -111,7 +119,7 @@ mod tests {
         let r#type = context.tuple_type(&[element]);
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.len(), 1);
-        assert_eq!(r#type.elements().collect::<Vec<_>>(), vec![element]);
+        assert_eq!(r#type.elements().collect::<Result<Vec<_>, _>>().unwrap(), vec![element]);
 
         let element_1 = context.signless_integer_type(32).as_ref();
         let element_2 = context.float32_type().as_ref();
@@ -119,7 +127,11 @@ mod tests {
         let r#type = context.tuple_type(&[element_1, element_2, element_3]);
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.len(), 3);
-        assert_eq!(r#type.elements().collect::<Vec<_>>(), vec![element_1, element_2, element_3]);
+        assert_eq!(r#type.element(0).unwrap(), element_1);
+        assert_eq!(r#type.element(1).unwrap(), element_2);
+        assert_eq!(r#type.element(2).unwrap(), element_3);
+        assert!(r#type.element(3).is_err());
+        assert_eq!(r#type.elements().collect::<Result<Vec<_>, _>>().unwrap(), vec![element_1, element_2, element_3]);
     }
 
     #[test]
