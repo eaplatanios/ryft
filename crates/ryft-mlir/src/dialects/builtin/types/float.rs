@@ -4,7 +4,7 @@ use ryft_xla_sys::bindings::{
     mlirTypeIsAFloat8E5M2FNUZ, mlirTypeIsAFloat8E8M0FNU,
 };
 
-use crate::{Context, Type, mlir_subtype_trait_impls};
+use crate::{Context, Error, Type, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Type`] that represents a floating-point type.
 ///
@@ -72,11 +72,13 @@ macro_rules! mlir_float_type {
             }
 
             impl<'c, 't> Type<'c, 't> for [<$type TypeRef>]<'c, 't> {
-                unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
-                    if !handle.ptr.is_null() && unsafe { mlir_float_type_is_a_function!($type)(handle) } {
-                        Some(Self { handle, context })
+                unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
+                    if handle.ptr.is_null() {
+                        Err(Error::internal("expected non-null MLIR type handle"))
+                    } else if unsafe { mlir_float_type_is_a_function!($type)(handle) } {
+                        Ok(Self { handle, context })
                     } else {
-                        None
+                        Err(Error::invalid_argument(concat!("expected MLIR ", stringify!($type), " type handle")))
                     }
                 }
 
@@ -134,22 +136,22 @@ pub struct Float8TypeRef<'c, 't> {
 }
 
 impl<'c, 't> Type<'c, 't> for Float8TypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null()
-            && unsafe {
-                mlirTypeIsAFloat8E3M4(handle)
-                    || mlirTypeIsAFloat8E4M3(handle)
-                    || mlirTypeIsAFloat8E4M3B11FNUZ(handle)
-                    || mlirTypeIsAFloat8E4M3FN(handle)
-                    || mlirTypeIsAFloat8E4M3FNUZ(handle)
-                    || mlirTypeIsAFloat8E5M2(handle)
-                    || mlirTypeIsAFloat8E5M2FNUZ(handle)
-                    || mlirTypeIsAFloat8E8M0FNU(handle)
-            }
-        {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR type handle"))
+        } else if unsafe {
+            mlirTypeIsAFloat8E3M4(handle)
+                || mlirTypeIsAFloat8E4M3(handle)
+                || mlirTypeIsAFloat8E4M3B11FNUZ(handle)
+                || mlirTypeIsAFloat8E4M3FN(handle)
+                || mlirTypeIsAFloat8E4M3FNUZ(handle)
+                || mlirTypeIsAFloat8E5M2(handle)
+                || mlirTypeIsAFloat8E5M2FNUZ(handle)
+                || mlirTypeIsAFloat8E8M0FNU(handle)
+        } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR 8-bit float type handle"))
         }
     }
 

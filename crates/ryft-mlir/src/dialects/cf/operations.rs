@@ -41,7 +41,7 @@ pub fn assert<
     location: L,
 ) -> Result<DetachedAssertOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::cf()?);
+    context.load_dialect(DialectHandle::cf()?)?;
     OperationBuilder::new("cf.assert", location)
         .add_operand(argument)
         .add_attribute(ASSERT_MESSAGE_ATTRIBUTE, message.try_into_with_context(context)?)
@@ -82,7 +82,7 @@ pub fn br<'b, 'v, 'c: 'b + 'v, 't: 'c, B: Block<'b, 'c, 't>, V: Value<'v, 'c, 't
     location: L,
 ) -> Result<DetachedBranchOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::cf()?);
+    context.load_dialect(DialectHandle::cf()?)?;
     OperationBuilder::new("cf.br", location)
         .add_operands(operands)
         .add_successor(successor)
@@ -178,7 +178,7 @@ pub fn cond_br<
     location: L,
 ) -> Result<DetachedConditionalBranchOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::cf()?);
+    context.load_dialect(DialectHandle::cf()?)?;
     let mut builder = OperationBuilder::new("cf.cond_br", location)
         .add_operand(predicate)
         .add_operands(on_true_successor_operands)
@@ -292,8 +292,12 @@ pub trait SwitchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 value: case_values
                     .by_ref()
                     .next()
-                    .flatten()
-                    .and_then(|value| value.cast::<IntegerAttributeRef>())
+                    .ok_or_else(|| {
+                        Error::invalid_argument(format!(
+                            "invalid '{SWITCH_CASE_VALUES_ATTRIBUTE}' attribute in `cf::switch`"
+                        ))
+                    })??
+                    .cast::<IntegerAttributeRef>()
                     .ok_or_else(|| {
                         Error::invalid_argument(format!(
                             "invalid '{SWITCH_CASE_VALUES_ATTRIBUTE}' attribute in `cf::switch`"
@@ -336,7 +340,7 @@ pub fn switch<
     location: L,
 ) -> Result<DetachedSwitchOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::cf()?);
+    context.load_dialect(DialectHandle::cf()?)?;
     let mut builder = OperationBuilder::new("cf.switch", location)
         .add_operand(flag)
         .add_operands(default.successor_operands.as_slice())

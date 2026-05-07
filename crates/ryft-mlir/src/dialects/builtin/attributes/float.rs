@@ -104,7 +104,7 @@ impl<'t> Context<'t> {
                 mlirFloatAttrDoubleGetChecked(location.to_c_api(), r#type.to_c_api(), value),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::checked_float_attribute`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::checked_float_attribute`"))
         }
     }
 }

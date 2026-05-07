@@ -156,7 +156,7 @@ impl<'t> Context<'t> {
                 )
             };
             VectorTypeRef::from_c_api(handle, self)
-                .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::vector_type`"))
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::vector_type`"))
         }
     }
 }

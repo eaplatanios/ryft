@@ -63,16 +63,17 @@ impl<'c, 't> SymbolRefAttributeRef<'c, 't> {
     /// Returns the references nested in this [`SymbolRefAttributeRef`].
     pub fn nested_references(&self) -> impl Iterator<Item = Result<AttributeRef<'c, 't>, Error>> {
         let nested_reference_count = self.nested_reference_count();
-        (0..nested_reference_count).map(|index| {
-            self.nested_reference(index).ok_or_else(|| {
-                Error::internal(format!("expected non-null MLIR symbol reference handle at index {index}"))
-            })
-        })
+        (0..nested_reference_count).map(|index| self.nested_reference(index))
     }
 
-    /// Returns the `index`-th reference nested in this [`SymbolRefAttributeRef`]
-    /// and [`None`] if the provided index is out of bounds.
-    pub fn nested_reference(&self, index: usize) -> Option<AttributeRef<'c, 't>> {
+    /// Returns the `index`-th reference nested in this [`SymbolRefAttributeRef`].
+    pub fn nested_reference(&self, index: usize) -> Result<AttributeRef<'c, 't>, Error> {
+        let nested_reference_count = self.nested_reference_count();
+        if index >= nested_reference_count {
+            return Err(Error::invalid_argument(format!(
+                "nested symbol reference index {index} is out of bounds for {nested_reference_count} nested references",
+            )));
+        }
         unsafe {
             AttributeRef::from_c_api(
                 mlirSymbolRefAttrGetNestedReference(self.handle, index.cast_signed()),

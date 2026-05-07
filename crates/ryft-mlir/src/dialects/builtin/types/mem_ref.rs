@@ -200,8 +200,13 @@ impl<'c, 't> MemRefTypeRef<'c, 't> {
     }
 
     /// Returns the layout [`Attribute`] of this [`MemRefTypeRef`].
-    pub fn layout(&self) -> Option<AttributeRef<'c, 't>> {
-        unsafe { AttributeRef::from_c_api(mlirMemRefTypeGetLayout(self.handle), self.context) }
+    pub fn layout(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirMemRefTypeGetLayout(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context).map(Some) }
+        }
     }
 
     /// Returns the strides and the offset of this [`MemRefTypeRef`]. The strides are [`Size`]s that encode the distance
@@ -234,16 +239,18 @@ impl<'c, 't> MemRefTypeRef<'c, 't> {
     }
 
     /// Returns the memory space [`Attribute`] of this [`MemRefTypeRef`].
-    pub fn memory_space(&self) -> Option<AttributeRef<'c, 't>> {
-        unsafe { AttributeRef::from_c_api(mlirMemRefTypeGetMemorySpace(self.handle), self.context) }
+    pub fn memory_space(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirMemRefTypeGetMemorySpace(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context).map(Some) }
+        }
     }
 
     /// Returns the [`AffineMap`] of this [`MemRefTypeRef`].
     pub fn affine_map(&self) -> Result<AffineMap<'c, 't>, Error> {
-        unsafe {
-            AffineMap::from_c_api(mlirMemRefTypeGetAffineMap(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR memref affine map handle"))
-        }
+        unsafe { AffineMap::from_c_api(mlirMemRefTypeGetAffineMap(self.handle), self.context) }
     }
 }
 
@@ -284,7 +291,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::mem_ref_type`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::mem_ref_type`"))
         }
     }
 
@@ -319,7 +326,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::contiguous_mem_ref_type`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::contiguous_mem_ref_type`"))
         }
     }
 }
@@ -367,8 +374,13 @@ impl<'c, 't> UnrankedMemRefTypeRef<'c, 't> {
     }
 
     /// Returns the memory space [`Attribute`] of this [`UnrankedMemRefTypeRef`].
-    pub fn memory_space(&self) -> Option<AttributeRef<'c, 't>> {
-        unsafe { AttributeRef::from_c_api(mlirUnrankedMemrefGetMemorySpace(self.handle), self.context) }
+    pub fn memory_space(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirUnrankedMemrefGetMemorySpace(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context).map(Some) }
+        }
     }
 }
 
@@ -403,7 +415,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::unranked_mem_ref_type`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::unranked_mem_ref_type`"))
         }
     }
 }
@@ -446,9 +458,12 @@ mod tests {
         assert_eq!(r#type.dimension(2).unwrap(), Size::Dynamic);
         assert_eq!(r#type.dimension(3).unwrap(), Size::Static(2));
         assert!(r#type.dimension(4).is_err());
-        assert_eq!(r#type.layout(), Some(context.affine_map_attribute(context.identity_affine_map(4)).as_ref()),);
+        assert_eq!(
+            r#type.layout().unwrap(),
+            Some(context.affine_map_attribute(context.identity_affine_map(4)).as_ref()),
+        );
         assert_eq!(r#type.strides_and_offset(), Some((vec![], Size::Static(0))));
-        assert_eq!(r#type.memory_space(), None);
+        assert_eq!(r#type.memory_space().unwrap(), None);
         assert_eq!(r#type.affine_map().unwrap(), context.identity_affine_map(4));
         assert!(!r#type.has_static_shape());
         assert_eq!(r#type.element_type().unwrap(), element_type);
@@ -457,7 +472,10 @@ mod tests {
         let r#type = context.contiguous_mem_ref_type(element_type, &shape, None, location).unwrap();
         assert_eq!(r#type.rank(), 4);
         assert_eq!(r#type.dimensions().collect::<Vec<_>>(), shape);
-        assert_eq!(r#type.layout(), Some(context.affine_map_attribute(context.identity_affine_map(4)).as_ref()),);
+        assert_eq!(
+            r#type.layout().unwrap(),
+            Some(context.affine_map_attribute(context.identity_affine_map(4)).as_ref()),
+        );
         assert_eq!(r#type.affine_map().unwrap(), context.identity_affine_map(4));
 
         // Invalid element type.
@@ -549,7 +567,7 @@ mod tests {
         let r#type = context.unranked_mem_ref_type(element_type, None, location).unwrap();
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.element_type().unwrap(), element_type);
-        assert_eq!(r#type.memory_space(), None);
+        assert_eq!(r#type.memory_space().unwrap(), None);
 
         // Invalid element type.
         let element_type = context.none_type();

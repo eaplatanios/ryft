@@ -32,10 +32,8 @@ impl<'c, 't> NamedLocationRef<'c, 't> {
     /// then this function will return an [`UnknownLocationRef`](crate::UnknownLocationRef).
     pub fn child(&self) -> LocationRef<'c, 't> {
         unsafe {
-            match LocationRef::from_c_api(mlirLocationNameGetChildLoc(self.handle), self.context) {
-                Some(location) => location,
-                None => self.as_ref(),
-            }
+            LocationRef::from_c_api(mlirLocationNameGetChildLoc(self.handle), self.context)
+                .unwrap_or_else(|_| self.as_ref())
         }
     }
 }

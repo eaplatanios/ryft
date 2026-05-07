@@ -35,10 +35,7 @@ impl<'c, 't> AffineMapAttributeRef<'c, 't> {
 
     /// Returns the [`AffineMap`] that is stored in this [`AffineMapAttributeRef`].
     pub fn affine_map(&self) -> Result<AffineMap<'c, 't>, Error> {
-        unsafe {
-            AffineMap::from_c_api(mlirAffineMapAttrGetValue(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR affine map attribute value handle"))
-        }
+        unsafe { AffineMap::from_c_api(mlirAffineMapAttrGetValue(self.handle), self.context) }
     }
 }
 

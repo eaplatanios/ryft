@@ -1,6 +1,6 @@
 use ryft_xla_sys::bindings::{MlirAttribute, mlirDistinctAttrCreate};
 
-use crate::{Attribute, Context, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that associates an attribute with a unique identifier. As a result, multiple
 /// [`DistinctAttributeRef`]s may point to the same underlying attribute. Every call to [`Context::distinct_attribute`]
@@ -36,13 +36,13 @@ pub struct DistinctAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for DistinctAttributeRef<'c, 't> {
-    unsafe fn from_c_api(_handle: MlirAttribute, _context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(_handle: MlirAttribute, _context: &'c Context<'t>) -> Result<Self, Error> {
         // Unfortunately, the MLIR C API does not provide a way to check if an [`MlirAttribute`] is a
         // [`DistinctAttributeRef`] or not and so we do not allow constructing [`DistinctAttributeRef`]s this way at all.
         // This means that downcasting [`Attribute`]s to [`DistinctAttributeRef`]s is not possible, for example. The
         // only way to construct a [`DistinctAttributeRef`] is to use the [`Context::distinct_attribute`] method, or
         // to call [`Attribute::into`] to wrap an existing [`Attribute`] into a new [`DistinctAttributeRef`].
-        None
+        Err(Error::invalid_argument("distinct attributes cannot be constructed from raw MLIR attribute handles"))
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -88,8 +88,8 @@ mod tests {
         let attribute = context.distinct_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
         assert_eq!(&context, attribute.context());
 
-        // Verify that [`DistinctAttributeRef::from_c_api`] always returns [`None`].
-        assert_eq!(unsafe { DistinctAttributeRef::from_c_api(attribute.handle, &context) }, None);
+        // Verify that [`DistinctAttributeRef::from_c_api`] always fails.
+        assert!(unsafe { DistinctAttributeRef::from_c_api(attribute.handle, &context) }.is_err());
     }
 
     #[test]

@@ -65,10 +65,7 @@ impl Size {
 pub trait ShapedType<'c, 't: 'c>: Type<'c, 't> {
     /// Returns element [`Type`] of this shaped type.
     fn element_type(&self) -> Result<TypeRef<'c, 't>, Error> {
-        unsafe {
-            TypeRef::from_c_api(mlirShapedTypeGetElementType(self.to_c_api()), self.context())
-                .ok_or_else(|| Error::internal("expected non-null MLIR shaped element type handle"))
-        }
+        unsafe { TypeRef::from_c_api(mlirShapedTypeGetElementType(self.to_c_api()), self.context()) }
     }
 }
 
@@ -111,7 +108,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shaped_type`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shaped_type`"))
         }
     }
 }

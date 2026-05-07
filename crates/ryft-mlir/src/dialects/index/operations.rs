@@ -23,7 +23,7 @@ pub fn constant<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedConstantOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::index()?);
+    context.load_dialect(DialectHandle::index()?)?;
     OperationBuilder::new("index.constant", location)
         .add_attribute("value", context.integer_attribute(context.index_type(), value as i64))
         .enable_result_type_inference()
@@ -51,7 +51,7 @@ pub fn bool_constant<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedBoolConstantOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::index()?);
+    context.load_dialect(DialectHandle::index()?)?;
     OperationBuilder::new("index.bool.constant", location)
         .add_attribute("value", context.boolean_attribute(value))
         .enable_result_type_inference()
@@ -113,7 +113,7 @@ pub trait CmpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     fn predicate(&self) -> Result<ComparisonPredicate, Error> {
-        self.attribute(CMP_PREDICATE_ATTRIBUTE)
+        self.attribute(CMP_PREDICATE_ATTRIBUTE)?
             .and_then(|attribute| match attribute.to_string().as_str() {
                 "#index<cmp_predicate eq>" => Some(ComparisonPredicate::Equal),
                 "#index<cmp_predicate ne>" => Some(ComparisonPredicate::NotEqual),
@@ -150,7 +150,7 @@ pub fn cmp<
     location: L,
 ) -> Result<DetachedCmpOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::index()?);
+    context.load_dialect(DialectHandle::index()?)?;
     OperationBuilder::new("index.cmp", location)
         .add_attribute(
             CMP_PREDICATE_ATTRIBUTE,

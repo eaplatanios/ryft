@@ -36,8 +36,12 @@ impl<'c, 't> AffineMap<'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirAffineMap, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+    pub unsafe fn from_c_api(handle: MlirAffineMap, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR affine map handle"))
+        } else {
+            Ok(Self { handle, context })
+        }
     }
 
     /// Returns the [`MlirAffineMap`] that corresponds to this [`AffineMap`]
@@ -81,7 +85,7 @@ impl<'c, 't> AffineMap<'c, 't> {
         let result_count = self.result_count();
         (0..result_count).map(|index| unsafe {
             AffineExpressionRef::from_c_api(mlirAffineMapGetResult(self.handle, index.cast_signed()), self.context)
-                .ok_or_else(|| {
+                .map_err(|_| {
                     Error::internal(format!("expected non-null MLIR affine map result handle at index {index}"))
                 })
         })
@@ -94,7 +98,7 @@ impl<'c, 't> AffineMap<'c, 't> {
         }
         unsafe {
             AffineExpressionRef::from_c_api(mlirAffineMapGetResult(self.handle, index.cast_signed()), self.context)
-                .ok_or_else(|| Error::internal("mlir returned an invalid affine map result"))
+                .map_err(|_| Error::internal("mlir returned an invalid affine map result"))
         }
     }
 
@@ -146,16 +150,24 @@ impl<'c, 't> AffineMap<'c, 't> {
     }
 
     /// Returns the [`AffineMap`] that consists only of the most major `result_count` results of this [`AffineMap`].
-    /// Returns [`None`] if `result_count` is set to zero and returns `self` if it is set to a number that is greater
-    /// than or equal to the number of results of this [`AffineMap`].
-    pub fn major_sub_map(&self, result_count: usize) -> Option<Self> {
+    ///
+    /// Returns an error if `result_count` is zero. If `result_count` is greater than or equal to the number of results
+    /// of this [`AffineMap`], this returns `self`.
+    pub fn major_sub_map(&self, result_count: usize) -> Result<Self, Error> {
+        if result_count == 0 {
+            return Err(Error::invalid_argument("major affine sub-map result count must be non-zero"));
+        }
         unsafe { Self::from_c_api(mlirAffineMapGetMajorSubMap(self.handle, result_count.cast_signed()), self.context) }
     }
 
     /// Returns the [`AffineMap`] that consists only of the most minor `result_count` results of this [`AffineMap`].
-    /// Returns [`None`] if `result_count` is set to zero and returns `self` if it is set to a number that is greater
-    /// than or equal to the number of results of this [`AffineMap`].
-    pub fn minor_sub_map(&self, result_count: usize) -> Option<Self> {
+    ///
+    /// Returns an error if `result_count` is zero. If `result_count` is greater than or equal to the number of results
+    /// of this [`AffineMap`], this returns `self`.
+    pub fn minor_sub_map(&self, result_count: usize) -> Result<Self, Error> {
+        if result_count == 0 {
+            return Err(Error::invalid_argument("minor affine sub-map result count must be non-zero"));
+        }
         unsafe { Self::from_c_api(mlirAffineMapGetMinorSubMap(self.handle, result_count.cast_signed()), self.context) }
     }
 
@@ -510,7 +522,7 @@ mod tests {
         let major_sub_map = map.major_sub_map(2).unwrap();
         assert_eq!(major_sub_map.result_count(), 2);
         assert_eq!(major_sub_map.to_string(), "(d0, d1, d2) -> (d0, d1)");
-        assert!(map.major_sub_map(0).is_none());
+        assert!(map.major_sub_map(0).is_err());
         assert_eq!(map.major_sub_map(5).unwrap(), map);
     }
 
@@ -524,7 +536,7 @@ mod tests {
         let minor_sub_map = map.minor_sub_map(2).unwrap();
         assert_eq!(minor_sub_map.result_count(), 2);
         assert_eq!(minor_sub_map.to_string(), "(d0, d1, d2) -> (d1, d2)");
-        assert!(map.minor_sub_map(0).is_none());
+        assert!(map.minor_sub_map(0).is_err());
         assert_eq!(map.minor_sub_map(5).unwrap(), map);
     }
 

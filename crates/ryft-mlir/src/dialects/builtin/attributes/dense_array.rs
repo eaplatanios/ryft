@@ -52,21 +52,21 @@ impl<'c, 't> DenseArrayAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for DenseArrayAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null()
-            && unsafe {
-                mlirAttributeIsADenseBoolArray(handle)
-                    || mlirAttributeIsADenseI8Array(handle)
-                    || mlirAttributeIsADenseI16Array(handle)
-                    || mlirAttributeIsADenseI32Array(handle)
-                    || mlirAttributeIsADenseI64Array(handle)
-                    || mlirAttributeIsADenseF32Array(handle)
-                    || mlirAttributeIsADenseF64Array(handle)
-            }
-        {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR attribute handle"))
+        } else if unsafe {
+            mlirAttributeIsADenseBoolArray(handle)
+                || mlirAttributeIsADenseI8Array(handle)
+                || mlirAttributeIsADenseI16Array(handle)
+                || mlirAttributeIsADenseI32Array(handle)
+                || mlirAttributeIsADenseI64Array(handle)
+                || mlirAttributeIsADenseF32Array(handle)
+                || mlirAttributeIsADenseF64Array(handle)
+        } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR dense array attribute handle"))
         }
     }
 
@@ -229,11 +229,17 @@ macro_rules! mlir_dense_array_attribute {
             }
 
             impl<'c, 't> Attribute<'c, 't> for [<Dense $type_name ArrayAttributeRef>]<'c, 't> {
-                unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-                    if !handle.ptr.is_null() && unsafe { mlir_dense_array_is_a_function!($type_name)(handle) } {
-                        Some(Self { handle, context })
+                unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+                    if handle.ptr.is_null() {
+                        Err(Error::internal("expected non-null MLIR attribute handle"))
+                    } else if unsafe { mlir_dense_array_is_a_function!($type_name)(handle) } {
+                        Ok(Self { handle, context })
                     } else {
-                        None
+                        Err(Error::invalid_argument(concat!(
+                            "expected MLIR dense ",
+                            stringify!($type_name),
+                            " array attribute handle",
+                        )))
                     }
                 }
 
@@ -276,7 +282,7 @@ macro_rules! mlir_dense_array_attribute {
                     &'c self,
                     values: &[$type],
                 ) -> Result<[<Dense $type_name ArrayAttributeRef>]<'c, 't>, Error> {
-                    unsafe { mlir_dense_array_constructor_call!($type_name, self, values) }.ok_or_else(|| {
+                    unsafe { mlir_dense_array_constructor_call!($type_name, self, values) }.map_err(|_| {
                         Error::invalid_argument(concat!("invalid arguments to `Context::dense_", stringify!($type), "_array_attribute`"))
                     })
                 }

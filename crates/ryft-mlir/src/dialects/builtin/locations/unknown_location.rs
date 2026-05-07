@@ -3,7 +3,7 @@ use ryft_xla_sys::bindings::{
     mlirLocationUnknownGet,
 };
 
-use crate::{Context, Location, mlir_subtype_trait_impls};
+use crate::{Context, Error, Location, mlir_subtype_trait_impls};
 
 /// [`UnknownLocationRef`]s represent unknown [`Location`]s (either because they were specified as such or because we
 /// were unable to parse them from the MLIR native library). They exist because locations are an important concept in
@@ -20,20 +20,20 @@ pub struct UnknownLocationRef<'c, 't> {
 }
 
 impl<'c, 't> Location<'c, 't> for UnknownLocationRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirLocation, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirLocation, context: &'c Context<'t>) -> Result<Self, Error> {
         // Unfortunately, there is no `mlirLocationIsAUnknown` or `mlirLocationUnknownGetTypeID` function in the MLIR
         // C API and so we just check that this handle does not correspond to any of the other known location types.
-        if !handle.ptr.is_null()
-            && unsafe {
-                !mlirLocationIsACallSite(handle)
-                    && !mlirLocationIsAFileLineColRange(handle)
-                    && !mlirLocationIsAFused(handle)
-                    && !mlirLocationIsAName(handle)
-            }
-        {
-            Some(Self { handle, context })
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR location handle"))
+        } else if unsafe {
+            !mlirLocationIsACallSite(handle)
+                && !mlirLocationIsAFileLineColRange(handle)
+                && !mlirLocationIsAFused(handle)
+                && !mlirLocationIsAName(handle)
+        } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR location handle"))
         }
     }
 

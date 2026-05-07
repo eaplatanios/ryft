@@ -11,7 +11,7 @@ use ryft_xla_sys::mlir::dialects::arith::{
 
 use crate::{Attribute, Context, DialectHandle, Error, TryFromWithContext, mlir_subtype_trait_impls};
 
-/// Atomic read-modify-write reduction kind used by MLIR arithmetic operations and affine parallel reductions.
+/// Atomic read-modify-write reduction kind used by MLIR `arith`metic operations and affine parallel reductions.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AtomicRmwKind {
     /// Floating-point addition reduction.
@@ -129,11 +129,13 @@ impl AtomicRmwKindAttributeRef<'_, '_> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for AtomicRmwKindAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirAttributeIsAArithAtomicRmwKindAttr(handle) } {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR attribute handle"))
+        } else if unsafe { mlirAttributeIsAArithAtomicRmwKindAttr(handle) } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR `arith` atomic RMW kind attribute handle"))
         }
     }
 
@@ -154,7 +156,7 @@ impl<'c, 't> TryFromWithContext<'c, 't, AtomicRmwKind> for AtomicRmwKindAttribut
     }
 }
 
-/// Floating-point fast-math flags used by MLIR arithmetic operations.
+/// Floating-point fast-math flags used by MLIR `arith`metic operations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FastMathFlags {
     /// Bit mask storing the MLIR fast-math flags.
@@ -274,11 +276,13 @@ impl FastMathFlagsAttributeRef<'_, '_> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for FastMathFlagsAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirAttributeIsAArithFastMathFlagsAttr(handle) } {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR attribute handle"))
+        } else if unsafe { mlirAttributeIsAArithFastMathFlagsAttr(handle) } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR `arith` fast-math flags attribute handle"))
         }
     }
 
@@ -299,7 +303,7 @@ impl<'c, 't> TryFromWithContext<'c, 't, FastMathFlags> for FastMathFlagsAttribut
     }
 }
 
-/// Integer overflow flags used by MLIR arithmetic operations.
+/// Integer overflow flags used by MLIR `arith`metic operations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IntegerOverflowFlags {
     /// Bit mask storing the MLIR integer overflow flags.
@@ -401,11 +405,13 @@ impl IntegerOverflowFlagsAttributeRef<'_, '_> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for IntegerOverflowFlagsAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirAttributeIsAArithIntegerOverflowFlagsAttr(handle) } {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR attribute handle"))
+        } else if unsafe { mlirAttributeIsAArithIntegerOverflowFlagsAttr(handle) } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR `arith` integer overflow flags attribute handle"))
         }
     }
 
@@ -426,7 +432,7 @@ impl<'c, 't> TryFromWithContext<'c, 't, IntegerOverflowFlags> for IntegerOverflo
     }
 }
 
-/// Floating-point rounding mode used by MLIR arithmetic cast operations.
+/// Floating-point rounding mode used by MLIR `arith`metic cast operations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RoundingMode {
     /// Rounds to the nearest value, with ties rounded to the even significand.
@@ -489,11 +495,13 @@ impl RoundingModeAttributeRef<'_, '_> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for RoundingModeAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirAttributeIsAArithRoundingModeAttr(handle) } {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR attribute handle"))
+        } else if unsafe { mlirAttributeIsAArithRoundingModeAttr(handle) } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR `arith` rounding mode attribute handle"))
         }
     }
 
@@ -520,7 +528,7 @@ impl<'t> Context<'t> {
         &'c self,
         value: AtomicRmwKind,
     ) -> Result<AtomicRmwKindAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::arith()?);
+        self.load_dialect(DialectHandle::arith()?)?;
         Ok(unsafe {
             AtomicRmwKindAttributeRef {
                 handle: mlirArithAtomicRmwKindAttrGet(*self.handle.borrow_mut(), value.value() as u64),
@@ -534,7 +542,7 @@ impl<'t> Context<'t> {
         &'c self,
         value: FastMathFlags,
     ) -> Result<FastMathFlagsAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::arith()?);
+        self.load_dialect(DialectHandle::arith()?)?;
         Ok(unsafe {
             FastMathFlagsAttributeRef {
                 handle: mlirArithFastMathFlagsAttrGet(*self.handle.borrow_mut(), value.bits()),
@@ -548,7 +556,7 @@ impl<'t> Context<'t> {
         &'c self,
         value: IntegerOverflowFlags,
     ) -> Result<IntegerOverflowFlagsAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::arith()?);
+        self.load_dialect(DialectHandle::arith()?)?;
         Ok(unsafe {
             IntegerOverflowFlagsAttributeRef {
                 handle: mlirArithIntegerOverflowFlagsAttrGet(*self.handle.borrow_mut(), value.bits()),
@@ -562,7 +570,7 @@ impl<'t> Context<'t> {
         &'c self,
         value: RoundingMode,
     ) -> Result<RoundingModeAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::arith()?);
+        self.load_dialect(DialectHandle::arith()?)?;
         Ok(unsafe {
             RoundingModeAttributeRef {
                 handle: mlirArithRoundingModeAttrGet(*self.handle.borrow_mut(), value.value()),

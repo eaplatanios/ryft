@@ -62,7 +62,7 @@ pub fn execute<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedExecuteOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     let operand_segment_sizes = [dependencies.len() as i32, body_operands.len() as i32];
     let mut result_types = vec![context.async_token_type()?.as_ref()];
     for r#type in body_result_types {
@@ -131,7 +131,7 @@ pub fn func<'c, 't: 'c, 's, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c,
     location: L,
 ) -> Result<DetachedFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     let mut builder = OperationBuilder::new("async.func", location)
         .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
         .add_attribute(
@@ -219,7 +219,7 @@ pub fn call<
     location: L,
 ) -> Result<DetachedCallOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     let mut builder = OperationBuilder::new("async.call", location)
         .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)
         .add_operands(&properties.arguments.iter().map(|argument| argument.value).collect::<Vec<_>>())
@@ -262,7 +262,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedReturnOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.return", location)
         .add_operands(values)
         .build()
@@ -292,7 +292,7 @@ pub fn yield_<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedYieldOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.yield", location)
         .add_operands(values)
         .build()
@@ -324,7 +324,7 @@ pub fn r#await<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedAwaitOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     let mut builder = OperationBuilder::new("async.await", location).add_operand(operand);
     if let Some(value_type) = operand.r#type()?.cast::<ValueTypeRef>() {
         builder = builder.add_result(value_type.value_type()?);
@@ -362,7 +362,7 @@ pub fn create_group<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't
     location: L,
 ) -> Result<DetachedCreateGroupOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.create_group", location)
         .add_operand(size)
         .add_result(context.async_group_type()?)
@@ -412,7 +412,7 @@ pub fn add_to_group<
     location: L,
 ) -> Result<DetachedAddToGroupOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.add_to_group", location)
         .add_operand(operand)
         .add_operand(group)
@@ -443,7 +443,7 @@ pub fn await_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedAwaitAllOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.await_all", location)
         .add_operand(operand)
         .build()
@@ -469,7 +469,7 @@ mlir_op_trait!(CoroId, ZeroSuccessors);
 /// Constructs a new detached [`CoroIdOperation`].
 pub fn coro_id<'c, 't: 'c, L: Location<'c, 't>>(location: L) -> Result<DetachedCoroIdOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.id", location)
         .add_result(context.async_coro_id_type()?)
         .build()
@@ -503,7 +503,7 @@ pub fn coro_begin<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
     location: L,
 ) -> Result<DetachedCoroBeginOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.begin", location)
         .add_operand(id)
         .add_result(context.async_coro_handle_type()?)
@@ -545,7 +545,7 @@ pub fn coro_free<
     location: L,
 ) -> Result<DetachedCoroFreeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.free", location)
         .add_operand(id)
         .add_operand(handle)
@@ -573,7 +573,7 @@ pub fn coro_end<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedCoroEndOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.end", location)
         .add_operand(handle)
         .build()
@@ -607,7 +607,7 @@ pub fn coro_save<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedCoroSaveOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.save", location)
         .add_operand(handle)
         .add_result(context.async_coro_state_type()?)
@@ -664,7 +664,7 @@ pub fn coro_suspend<
     location: L,
 ) -> Result<DetachedCoroSuspendOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.suspend", location)
         .add_operand(state)
         .add_successor(suspend_destination)
@@ -698,7 +698,7 @@ pub fn runtime_create<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedRuntimeCreateOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.create", location).add_result(result_type).build().and_then(
         |operation| unsafe {
             operation
@@ -733,7 +733,7 @@ pub fn runtime_create_group<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Locatio
     location: L,
 ) -> Result<DetachedRuntimeCreateGroupOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.create_group", location)
         .add_operand(size)
         .add_result(context.async_group_type()?)
@@ -768,7 +768,7 @@ macro_rules! async_runtime_unary_op {
                 location: L,
             ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 let context = location.context();
-                context.load_dialect(DialectHandle::r#async()?);
+                context.load_dialect(DialectHandle::r#async()?)?;
                 OperationBuilder::new($operation_name, location)
                     .add_operand(operand)
                     .build()
@@ -832,7 +832,7 @@ pub fn runtime_is_error<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
     location: L,
 ) -> Result<DetachedRuntimeIsErrorOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.is_error", location)
         .add_operand(operand)
         .add_result(context.signless_integer_type(1))
@@ -862,7 +862,7 @@ pub fn runtime_resume<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 
     location: L,
 ) -> Result<DetachedRuntimeResumeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.resume", location)
         .add_operand(handle)
         .build()
@@ -905,7 +905,7 @@ pub fn runtime_await_and_resume<
     location: L,
 ) -> Result<DetachedRuntimeAwaitAndResumeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.await_and_resume", location)
         .add_operand(operand)
         .add_operand(handle)
@@ -949,7 +949,7 @@ pub fn runtime_store<
     location: L,
 ) -> Result<DetachedRuntimeStoreOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.store", location)
         .add_operand(value)
         .add_operand(storage)
@@ -986,7 +986,7 @@ pub fn runtime_load<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't
     location: L,
 ) -> Result<DetachedRuntimeLoadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     let result_type = storage
         .r#type()?
         .cast::<ValueTypeRef>()
@@ -1041,7 +1041,7 @@ pub fn runtime_add_to_group<
     location: L,
 ) -> Result<DetachedRuntimeAddToGroupOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.add_to_group", location)
         .add_operand(operand)
         .add_operand(group)
@@ -1078,7 +1078,7 @@ pub fn runtime_add_ref<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c,
     location: L,
 ) -> Result<DetachedRuntimeAddRefOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.add_ref", location)
         .add_operand(operand)
         .add_attribute(COUNT_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), count))
@@ -1114,7 +1114,7 @@ pub fn runtime_drop_ref<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
     location: L,
 ) -> Result<DetachedRuntimeDropRefOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.drop_ref", location)
         .add_operand(operand)
         .add_attribute(COUNT_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), count))
@@ -1145,7 +1145,7 @@ pub fn runtime_num_worker_threads<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedRuntimeNumWorkerThreadsOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::r#async()?);
+    context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.num_worker_threads", location)
         .add_result(context.index_type())
         .build()

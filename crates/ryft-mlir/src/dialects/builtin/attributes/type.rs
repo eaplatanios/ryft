@@ -33,10 +33,7 @@ impl<'c, 't> TypeAttributeRef<'c, 't> {
 
     /// Returns the [`Type`] that is stored in this [`TypeAttributeRef`].
     pub fn r#type(&self) -> Result<TypeRef<'c, 't>, Error> {
-        unsafe {
-            TypeRef::from_c_api(mlirTypeAttrGetValue(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR type attribute value handle"))
-        }
+        unsafe { TypeRef::from_c_api(mlirTypeAttrGetValue(self.handle), self.context) }
     }
 }
 

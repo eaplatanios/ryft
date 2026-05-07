@@ -11,7 +11,7 @@ use ryft_xla_sys::bindings::{
     mlirSimplifyAffineExpr,
 };
 
-use crate::{AffineMap, Context, mlir_subtype_trait_impls};
+use crate::{AffineMap, Context, Error, mlir_subtype_trait_impls};
 
 /// [`AffineExpression`]s are used to represent the mathematical functions that define [`AffineMap`]s.
 ///
@@ -24,7 +24,7 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Option<Self>;
+    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Result<Self, Error>;
 
     /// Returns the [`MlirAffineExpr`] that corresponds to this instance and which can be passed to functions
     /// in the MLIR C API.
@@ -46,7 +46,7 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     /// Tries to cast this type to an instance of `A` (e.g., an instance of [`ConstantAffineExpressionRef`]).
     /// If this is not an instance of the specified type, this function will return [`None`].
     fn cast<A: AffineExpression<'c, 't>>(&self) -> Option<A> {
-        unsafe { A::from_c_api(self.to_c_api(), self.context()) }
+        unsafe { A::from_c_api(self.to_c_api(), self.context()).ok() }
     }
 
     /// Up-casts this affine expression to an instance of [`AffineExpression`].
@@ -200,8 +200,12 @@ pub struct AffineExpressionRef<'c, 't> {
 }
 
 impl<'c, 't> AffineExpression<'c, 't> for AffineExpressionRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR affine expression handle"))
+        } else {
+            Ok(Self { handle, context })
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAffineExpr {
@@ -472,11 +476,13 @@ impl<'c, 't> FloorDivAffineExpressionRef<'c, 't> {
 }
 
 impl<'c, 't> AffineExpression<'c, 't> for FloorDivAffineExpressionRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirAffineExprIsAFloorDiv(handle) } {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR affine expression handle"))
+        } else if unsafe { mlirAffineExprIsAFloorDiv(handle) } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR floor-div affine expression handle"))
         }
     }
 
@@ -746,7 +752,7 @@ mod tests {
         assert_eq!(dimension_0_erased_casted, dimension_0);
         assert!(!symbol_0.is::<DimensionAffineExpressionRef>());
         let bad_handle = MlirAffineExpr { ptr: std::ptr::null() };
-        assert!(unsafe { AffineExpressionRef::from_c_api(bad_handle, &context).is_none() });
+        assert!(unsafe { AffineExpressionRef::from_c_api(bad_handle, &context).is_err() });
     }
 
     #[test]

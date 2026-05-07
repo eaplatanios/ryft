@@ -48,9 +48,7 @@ impl<'c, 't> TupleTypeRef<'c, 't> {
     pub fn elements(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
         let len = self.len();
         (0..len).map(|index| unsafe {
-            TypeRef::from_c_api(mlirTupleTypeGetType(self.handle, index.cast_signed()), self.context).ok_or_else(|| {
-                Error::internal(format!("expected non-null MLIR tuple element type handle at index {index}"))
-            })
+            TypeRef::from_c_api(mlirTupleTypeGetType(self.handle, index.cast_signed()), self.context)
         })
     }
 
@@ -63,10 +61,7 @@ impl<'c, 't> TupleTypeRef<'c, 't> {
                 "tuple type element index {index} is out of bounds for length {len}"
             )));
         }
-        unsafe {
-            TypeRef::from_c_api(mlirTupleTypeGetType(self.handle, index.cast_signed()), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR tuple element type handle"))
-        }
+        unsafe { TypeRef::from_c_api(mlirTupleTypeGetType(self.handle, index.cast_signed()), self.context) }
     }
 }
 

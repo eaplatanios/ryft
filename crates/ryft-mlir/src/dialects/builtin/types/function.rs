@@ -40,9 +40,7 @@ impl<'c, 't> FunctionTypeRef<'c, 't> {
     pub fn inputs(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
         let input_count = self.input_count();
         (0..input_count).map(|index| unsafe {
-            TypeRef::from_c_api(mlirFunctionTypeGetInput(self.handle, index.cast_signed()), self.context).ok_or_else(
-                || Error::internal(format!("expected non-null MLIR function input type handle at index {index}")),
-            )
+            TypeRef::from_c_api(mlirFunctionTypeGetInput(self.handle, index.cast_signed()), self.context)
         })
     }
 
@@ -50,9 +48,7 @@ impl<'c, 't> FunctionTypeRef<'c, 't> {
     pub fn outputs(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
         let output_count = self.output_count();
         (0..output_count).map(|index| unsafe {
-            TypeRef::from_c_api(mlirFunctionTypeGetResult(self.handle, index.cast_signed()), self.context).ok_or_else(
-                || Error::internal(format!("expected non-null MLIR function output type handle at index {index}")),
-            )
+            TypeRef::from_c_api(mlirFunctionTypeGetResult(self.handle, index.cast_signed()), self.context)
         })
     }
 
@@ -65,10 +61,7 @@ impl<'c, 't> FunctionTypeRef<'c, 't> {
                 "function type input index {index} is out of bounds for input count {input_count}"
             )));
         }
-        unsafe {
-            TypeRef::from_c_api(mlirFunctionTypeGetInput(self.handle, index.cast_signed()), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR function input type handle"))
-        }
+        unsafe { TypeRef::from_c_api(mlirFunctionTypeGetInput(self.handle, index.cast_signed()), self.context) }
     }
 
     /// Returns the `index`-th output (i.e., result) [`Type`] of this [`FunctionTypeRef`], or an error if the index is
@@ -80,10 +73,7 @@ impl<'c, 't> FunctionTypeRef<'c, 't> {
                 "function type output index {index} is out of bounds for output count {output_count}"
             )));
         }
-        unsafe {
-            TypeRef::from_c_api(mlirFunctionTypeGetResult(self.handle, index.cast_signed()), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR function output type handle"))
-        }
+        unsafe { TypeRef::from_c_api(mlirFunctionTypeGetResult(self.handle, index.cast_signed()), self.context) }
     }
 }
 

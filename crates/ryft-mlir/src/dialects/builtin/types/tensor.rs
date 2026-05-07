@@ -96,8 +96,13 @@ impl<'c, 't> TensorTypeRef<'c, 't> {
     }
 
     /// Returns the encoding [`Attribute`] of this [`TensorTypeRef`].
-    pub fn encoding(&self) -> Option<AttributeRef<'c, 't>> {
-        unsafe { AttributeRef::from_c_api(mlirRankedTensorTypeGetEncoding(self.handle), self.context) }
+    pub fn encoding(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirRankedTensorTypeGetEncoding(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context).map(Some) }
+        }
     }
 }
 
@@ -135,7 +140,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::tensor_type`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::tensor_type`"))
         }
     }
 }
@@ -196,7 +201,7 @@ impl<'t> Context<'t> {
                 mlirUnrankedTensorTypeGetChecked(location.to_c_api(), element_type.to_c_api()),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::unranked_tensor_type`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::unranked_tensor_type`"))
         }
     }
 }
@@ -239,7 +244,7 @@ mod tests {
         assert!(r#type.dimension(4).is_err());
         assert!(!r#type.has_static_shape());
         assert_eq!(r#type.element_type().unwrap(), element_type);
-        assert!(r#type.encoding().is_none());
+        assert!(r#type.encoding().unwrap().is_none());
 
         // Invalid element type.
         let element_type = context.none_type();

@@ -74,12 +74,13 @@ impl<'c, 't> DictionaryAttributeRef<'c, 't> {
 
     /// Returns the [`AttributeRef`] with the specified name stored in this [`DictionaryAttributeRef`],
     /// and [`None`] if the provided name does not exist in this [`DictionaryAttributeRef`].
-    pub fn element_by_name<S: AsRef<str>>(&self, name: S) -> Option<AttributeRef<'c, 't>> {
-        unsafe {
-            AttributeRef::from_c_api(
-                mlirDictionaryAttrGetElementByName(self.handle, StringRef::from(name.as_ref()).to_c_api()),
-                self.context,
-            )
+    pub fn element_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        let handle =
+            unsafe { mlirDictionaryAttrGetElementByName(self.handle, StringRef::from(name.as_ref()).to_c_api()) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context).map(Some) }
         }
     }
 }
@@ -193,12 +194,12 @@ mod tests {
         assert!(attribute.element(2).is_err());
 
         // Test [`DictionaryAttributeRef::element_by_name`].
-        let element = attribute.element_by_name("int_key").unwrap();
+        let element = attribute.element_by_name("int_key").unwrap().unwrap();
         assert_eq!(element.cast::<crate::IntegerAttributeRef>().unwrap(), i32_attribute);
 
-        let element = attribute.element_by_name("str_key").unwrap();
+        let element = attribute.element_by_name("str_key").unwrap().unwrap();
         assert_eq!(element.cast::<crate::StringAttributeRef>().unwrap(), string_attribute);
-        assert_eq!(attribute.element_by_name("nonexistent"), None);
+        assert_eq!(attribute.element_by_name("nonexistent").unwrap(), None);
     }
 
     #[test]

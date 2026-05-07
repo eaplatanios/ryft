@@ -26,12 +26,16 @@ macro_rules! async_unit_type {
         }
 
         impl<'c, 't> Type<'c, 't> for $name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR type handle"));
                 }
                 let r#type = unsafe { TypeRef::from_c_api(handle, context) }?;
-                if r#type.to_string() == $mnemonic { Some(Self { handle, context }) } else { None }
+                if r#type.to_string() == $mnemonic {
+                    Ok(Self { handle, context })
+                } else {
+                    Err(Error::invalid_argument(concat!("expected MLIR ", $mnemonic, " type handle")))
+                }
             }
 
             unsafe fn to_c_api(&self) -> MlirType {
@@ -50,7 +54,7 @@ macro_rules! async_unit_type {
             #[doc = $summary]
             #[doc = " owned by this [`Context`]."]
             pub fn $context_method<'c>(&'c self) -> Result<$name<'c, 't>, Error> {
-                self.load_dialect(DialectHandle::r#async()?);
+                self.load_dialect(DialectHandle::r#async()?)?;
                 self.parse_type($mnemonic)
                     .and_then(|r#type| {
                         r#type.cast().ok_or_else(|| {
@@ -98,16 +102,16 @@ impl<'c, 't> ValueTypeRef<'c, 't> {
 }
 
 impl<'c, 't> Type<'c, 't> for ValueTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
         let r#type = unsafe { TypeRef::from_c_api(handle, context) }?;
         let rendered_type = r#type.to_string();
         if rendered_type.starts_with("!async.value<") && rendered_type.ends_with('>') {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR async value type handle"))
         }
     }
 
@@ -157,7 +161,7 @@ async_unit_type!(
 impl<'t> Context<'t> {
     /// Creates a new [`ValueTypeRef`] owned by this [`Context`] for the provided underlying value type.
     pub fn async_value_type<'c, T: Type<'c, 't>>(&'c self, value_type: T) -> Result<ValueTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::r#async()?);
+        self.load_dialect(DialectHandle::r#async()?)?;
         let source = format!("!async.value<{value_type}>");
         self.parse_type(source)
             .and_then(|r#type| r#type.cast().ok_or_else(|| Error::internal("invalid async value type cast")))

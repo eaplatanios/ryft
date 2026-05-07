@@ -43,17 +43,18 @@ impl<'c, 't> FusedLocationRef<'c, 't> {
             let mut buffer: Vec<MlirLocation> = Vec::with_capacity(count);
             mlirLocationFusedGetLocations(self.handle, buffer.as_mut_ptr());
             buffer.set_len(count);
-            buffer.into_iter().enumerate().map(|(index, location)| {
-                LocationRef::from_c_api(location, self.context).ok_or_else(|| {
-                    Error::internal(format!("expected non-null MLIR fused location handle at index {index}"))
-                })
-            })
+            buffer.into_iter().map(|location| LocationRef::from_c_api(location, self.context))
         }
     }
 
-    /// Returns the (optional) metadata of this [`FusedLocationRef`].
-    pub fn fused_metadata(&self) -> Option<AttributeRef<'c, 't>> {
-        unsafe { AttributeRef::from_c_api(mlirLocationFusedGetMetadata(self.handle), self.context) }
+    /// Returns the optional metadata of this [`FusedLocationRef`].
+    pub fn fused_metadata(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirLocationFusedGetMetadata(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context).map(Some) }
+        }
     }
 }
 
@@ -113,7 +114,7 @@ mod tests {
             location.fused_locations().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
             vec![location_1, location_2, location_3]
         );
-        assert!(location.fused_metadata().is_some());
+        assert!(location.fused_metadata().unwrap().is_some());
     }
 
     #[test]

@@ -8,7 +8,7 @@ pub const CONSTANT_VALUE_ATTRIBUTE: &str = "value";
 
 pub trait ConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn value(&self) -> Result<AttributeRef<'c, 't>, Error> {
-        self.attribute(CONSTANT_VALUE_ATTRIBUTE)
+        self.attribute(CONSTANT_VALUE_ATTRIBUTE)?
             .ok_or_else(|| Error::invalid_argument("missing `value` attribute in `arith::constant`"))
     }
 }
@@ -25,7 +25,7 @@ pub fn constant<'c, 't: 'c, V: Attribute<'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedConstantOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith()?);
+    context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.constant", location)
         .add_attribute("value", value)
         .enable_result_type_inference()
@@ -95,12 +95,12 @@ pub fn addui_extended<
     location: L,
 ) -> Result<DetachedAdduiExtendedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith()?);
+    context.load_dialect(DialectHandle::arith()?)?;
     let input_type = lhs.r#type()?;
     let i1_type = context.signless_integer_type(1);
     let overflow_type: TypeRef<'c, 't> = if let Some(tensor_type) = input_type.cast::<TensorTypeRef>() {
         let shape = tensor_type.dimensions().collect::<Vec<_>>();
-        context.tensor_type(i1_type, &shape, tensor_type.encoding(), location)?.as_ref()
+        context.tensor_type(i1_type, &shape, tensor_type.encoding()?, location)?.as_ref()
     } else if input_type.is::<UnrankedTensorTypeRef>() {
         context.unranked_tensor_type(i1_type, location)?.as_ref()
     } else if let Some(vector_type) = input_type.cast::<VectorTypeRef>() {
@@ -180,7 +180,7 @@ pub fn mulsi_extended<
     location: L,
 ) -> Result<DetachedMulsiExtendedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith()?);
+    context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.mulsi_extended", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .enable_result_type_inference()
@@ -234,7 +234,7 @@ pub fn mului_extended<
     location: L,
 ) -> Result<DetachedMuluiExtendedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith()?);
+    context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.mului_extended", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .enable_result_type_inference()
@@ -332,7 +332,7 @@ pub fn cmpf<
     location: L,
 ) -> Result<DetachedCmpfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith()?);
+    context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.cmpf", location)
         .add_attribute(
             CMP_PREDICATE_ATTRIBUTE,
@@ -408,7 +408,7 @@ pub fn cmpi<
     location: L,
 ) -> Result<DetachedCmpiOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith()?);
+    context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.cmpi", location)
         .add_attribute(
             CMP_PREDICATE_ATTRIBUTE,
@@ -457,7 +457,7 @@ pub fn select<
     on_false: F,
     location: L,
 ) -> Result<DetachedSelectOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::arith()?);
+    location.context().load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.select", location)
         .add_operand(predicate)
         .add_operand(on_true)

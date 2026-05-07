@@ -48,10 +48,9 @@ impl<'c, 't> ArrayAttributeRef<'c, 't> {
     pub fn elements(&self) -> impl Iterator<Item = Result<AttributeRef<'c, 't>, Error>> {
         let len = self.len();
         (0..len).map(|index| unsafe {
-            AttributeRef::from_c_api(mlirArrayAttrGetElement(self.handle, index.cast_signed()), self.context)
-                .ok_or_else(|| {
-                    Error::internal(format!("expected non-null MLIR array attribute element handle at index {index}"))
-                })
+            AttributeRef::from_c_api(mlirArrayAttrGetElement(self.handle, index.cast_signed()), self.context).map_err(
+                |_| Error::internal(format!("expected non-null MLIR array attribute element handle at index {index}")),
+            )
         })
     }
 
@@ -64,10 +63,7 @@ impl<'c, 't> ArrayAttributeRef<'c, 't> {
                 "array attribute element index {index} is out of bounds for length {len}"
             )));
         }
-        unsafe {
-            AttributeRef::from_c_api(mlirArrayAttrGetElement(self.handle, index.cast_signed()), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR array attribute element handle"))
-        }
+        unsafe { AttributeRef::from_c_api(mlirArrayAttrGetElement(self.handle, index.cast_signed()), self.context) }
     }
 }
 

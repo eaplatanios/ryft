@@ -17,10 +17,7 @@ pub struct LocationAttributeRef<'c, 't> {
 impl<'c, 't> LocationAttributeRef<'c, 't> {
     /// Returns the [`Location`] that is stored in this [`LocationAttributeRef`].
     pub fn location(&self) -> Result<LocationRef<'c, 't>, Error> {
-        unsafe {
-            LocationRef::from_c_api(mlirLocationFromAttribute(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR location attribute value handle"))
-        }
+        unsafe { LocationRef::from_c_api(mlirLocationFromAttribute(self.handle), self.context) }
     }
 }
 

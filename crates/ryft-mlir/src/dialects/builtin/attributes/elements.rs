@@ -27,19 +27,17 @@ pub trait ElementsAttribute<'c, 't: 'c>: Attribute<'c, 't> {
         unsafe { mlirElementsAttrGetNumElements(self.to_c_api()) as usize }
     }
 
-    /// Returns the element at the specified multidimensional index of this attribute,
-    /// or [`None`] if the index is out of bounds.
-    fn element(&self, index: &[usize]) -> Option<AttributeRef<'c, 't>> {
+    /// Returns the element at the specified multidimensional index of this attribute.
+    fn element(&self, index: &[usize]) -> Result<AttributeRef<'c, 't>, Error> {
         unsafe {
             let mut index = index.iter().map(|&index| index as u64).collect::<Vec<_>>();
-            if mlirElementsAttrIsValidIndex(self.to_c_api(), index.len().cast_signed(), index.as_mut_ptr()) {
-                AttributeRef::from_c_api(
-                    mlirElementsAttrGetValue(self.to_c_api(), index.len().cast_signed(), index.as_mut_ptr()),
-                    self.context(),
-                )
-            } else {
-                None
+            if !mlirElementsAttrIsValidIndex(self.to_c_api(), index.len().cast_signed(), index.as_mut_ptr()) {
+                return Err(Error::invalid_argument("elements attribute index is out of bounds"));
             }
+            AttributeRef::from_c_api(
+                mlirElementsAttrGetValue(self.to_c_api(), index.len().cast_signed(), index.as_mut_ptr()),
+                self.context(),
+            )
         }
     }
 }
@@ -99,12 +97,17 @@ pub trait DenseElementsAttribute<'c, 't: 'c>: ElementsAttribute<'c, 't> {
         unsafe { mlirDenseElementsAttrIsSplat(self.to_c_api()) }
     }
 
-    /// Returns the value of the replicated element if this attribute is a splat and [`None`] otherwise.
-    fn splat(&self) -> Option<AttributeRef<'c, 't>> {
+    /// Returns the value of the replicated element if this attribute is a splat and `Ok(None)` otherwise.
+    fn splat(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         if !self.is_splat() {
-            None
+            Ok(None)
         } else {
-            unsafe { AttributeRef::from_c_api(mlirDenseElementsAttrGetSplatValue(self.to_c_api()), self.context()) }
+            let handle = unsafe { mlirDenseElementsAttrGetSplatValue(self.to_c_api()) };
+            if handle.ptr.is_null() {
+                Err(Error::internal("expected non-null MLIR dense elements splat attribute handle"))
+            } else {
+                unsafe { AttributeRef::from_c_api(handle, self.context()).map(Some) }
+            }
         }
     }
 
@@ -181,8 +184,8 @@ macro_rules! mlir_dense_elements_attribute_elements {
         /// Returns all the elements of this attribute, flattened.
         /// This function is unsafe because it can panic if this attribute's element type does not match
         /// the return type of this function.
-        pub unsafe fn string_ref_elements(&self) -> impl Iterator<Item = StringRef<'c>> {
-            unsafe { (0..self.elements_count()).map(|index| self.string_ref_element(index).unwrap()) }
+        pub unsafe fn string_ref_elements(&self) -> impl Iterator<Item = Result<StringRef<'c>, Error>> {
+            unsafe { (0..self.elements_count()).map(|index| self.string_ref_element(index)) }
         }
     };
     (mlir_type = $mlir_type:ident, rust_type = $rust_type:ident) => {
@@ -190,8 +193,8 @@ macro_rules! mlir_dense_elements_attribute_elements {
             /// Returns all the elements of this attribute, flattened.
             /// This function is unsafe because it can panic if this attribute's element type does not match
             /// the return type of this function.
-            pub unsafe fn [<$rust_type:snake _elements>](&self) -> impl Iterator<Item = $rust_type> {
-                unsafe { (0..self.elements_count()).map(|index| self.[<$rust_type:snake _element>](index).unwrap()) }
+            pub unsafe fn [<$rust_type:snake _elements>](&self) -> impl Iterator<Item = Result<$rust_type, Error>> {
+                unsafe { (0..self.elements_count()).map(|index| self.[<$rust_type:snake _element>](index)) }
             }
         }
     };
@@ -203,17 +206,19 @@ macro_rules! mlir_dense_elements_attribute_element {
             /// Returns the element at the `index`-th position of this attribute, assuming flat contiguous indexing.
             /// This function is unsafe because it can panic if this attribute's element type does not match
             /// the return type of this function.
-            pub unsafe fn string_ref_element(&self, index: usize) -> Option<StringRef<'c>> {
-                if index >= self.elements_count() {
-                    None
-                } else {
-                    unsafe {
-                        Some(StringRef::from_c_api(ryft_xla_sys::bindings::mlirDenseElementsAttrGetStringValue(
-                            self.to_c_api(),
-                            index.cast_signed(),
-                        )))
-                    }
+            pub unsafe fn string_ref_element(&self, index: usize) -> Result<StringRef<'c>, Error> {
+                let elements_count = self.elements_count();
+                if index >= elements_count {
+                    return Err(Error::invalid_argument(format!(
+                        "dense elements attribute index {index} is out of bounds for {elements_count} elements",
+                    )));
                 }
+                Ok(unsafe {
+                    StringRef::from_c_api(ryft_xla_sys::bindings::mlirDenseElementsAttrGetStringValue(
+                        self.to_c_api(),
+                        index.cast_signed(),
+                    ))
+                })
             }
         }
     };
@@ -222,17 +227,19 @@ macro_rules! mlir_dense_elements_attribute_element {
             /// Returns the element at the `index`-th position of this attribute, assuming flat contiguous indexing.
             /// This function is unsafe because it can panic if this attribute's element type does not match
             /// the return type of this function.
-            pub unsafe fn [<$rust_type:snake _element>](&self, index: usize) -> Option<$rust_type> {
-                if index >= self.elements_count() {
-                    None
-                } else {
-                    unsafe {
-                        Some(ryft_xla_sys::bindings::[<mlirDenseElementsAttrGet $mlir_type Value>](
-                            self.to_c_api(),
-                            index.cast_signed(),
-                        ) as $rust_type)
-                    }
+            pub unsafe fn [<$rust_type:snake _element>](&self, index: usize) -> Result<$rust_type, Error> {
+                let elements_count = self.elements_count();
+                if index >= elements_count {
+                    return Err(Error::invalid_argument(format!(
+                        "dense elements attribute index {index} is out of bounds for {elements_count} elements",
+                    )));
                 }
+                Ok(unsafe {
+                    ryft_xla_sys::bindings::[<mlirDenseElementsAttrGet $mlir_type Value>](
+                        self.to_c_api(),
+                        index.cast_signed(),
+                    ) as $rust_type
+                })
             }
         }
     };
@@ -312,7 +319,7 @@ macro_rules! mlir_dense_elements_attribute_constructor {
                         ),
                         &self,
                     )
-                    .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
+                    .map_err(|_| Error::invalid_argument("invalid arguments to dense elements construction"))
                 }
             }
         }
@@ -354,8 +361,7 @@ macro_rules! mlir_dense_elements_attribute_from_raw_buffer {
                             shaped_type.to_c_api(),
                             buffer.len() * std::mem::size_of::<D>(),
                             buffer.as_ptr() as *const _,
-                        ), &self)
-                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
+                        ), &self).map_err(|_| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -388,8 +394,7 @@ macro_rules! mlir_dense_elements_attribute_from_element {
                         $attribute_type::from_c_api(ryft_xla_sys::bindings::mlirDenseElementsAttrSplatGet(
                             shaped_type.to_c_api(),
                             value.to_c_api(),
-                        ), &self)
-                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
+                        ), &self).map_err(|_| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -415,8 +420,7 @@ macro_rules! mlir_dense_elements_attribute_from_element {
                         $attribute_type::from_c_api(ryft_xla_sys::bindings::mlirDenseElementsAttrSplatGet(
                             shaped_type.to_c_api(),
                             value.to_c_api(),
-                        ), &self)
-                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
+                        ), &self).map_err(|_| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -445,8 +449,7 @@ macro_rules! mlir_dense_elements_attribute_from_element {
                                 value,
                             ),
                             &self,
-                        )
-                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
+                        ).map_err(|_| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -480,8 +483,7 @@ macro_rules! mlir_dense_elements_attribute_from_elements {
                                 elements.as_ptr(),
                             ),
                             &self,
-                        )
-                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
+                        ).map_err(|_| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -511,8 +513,7 @@ macro_rules! mlir_dense_elements_attribute_from_elements {
                                 elements.as_ptr() as _,
                             ),
                             &self,
-                        )
-                        .ok_or_else(|| Error::invalid_argument("invalid arguments to dense elements construction"))
+                        ).map_err(|_| Error::invalid_argument("invalid arguments to dense elements construction"))
                     }
                 }
             }
@@ -529,12 +530,15 @@ mlir_dense_elements_attribute_from_elements!(DenseElementsAttributeRef, mlir_typ
 pub trait DenseIntegerOrFloatElementsAttribute<'c, 't: 'c>: DenseElementsAttribute<'c, 't> {
     /// Reshapes this attribute to the provided [`ShapedType`], returning a new attribute if successful.
     /// The provided type must have the same total number of elements as this attribute.
-    fn reshape<T: ShapedType<'c, 't>>(&self, shaped_type: T) -> Option<DenseElementsAttributeRef<'c, 't>> {
-        unsafe {
-            DenseElementsAttributeRef::from_c_api(
-                mlirDenseElementsAttrReshapeGet(self.to_c_api(), shaped_type.to_c_api()),
-                self.context(),
-            )
+    fn reshape<T: ShapedType<'c, 't>>(
+        &self,
+        shaped_type: T,
+    ) -> Result<Option<DenseElementsAttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirDenseElementsAttrReshapeGet(self.to_c_api(), shaped_type.to_c_api()) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { DenseElementsAttributeRef::from_c_api(handle, self.context()).map(Some) }
         }
     }
 }
@@ -735,7 +739,7 @@ impl<'t> Context<'t> {
         shaped_type: T,
         name: StringRef<'s>,
         data: &[D],
-    ) -> Option<DenseResourceElementsAttributeRef<'c, 't>> {
+    ) -> Result<DenseResourceElementsAttributeRef<'c, 't>, Error> {
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -787,24 +791,28 @@ macro_rules! mlir_dense_resource_elements_attribute_element {
                 /// Returns the element at the `index`-th position of this [`DenseResourceElementsAttributeRef`],
                 /// assuming flat contiguous indexing. This function is unsafe because it can panic if this attribute's
                 /// element type does not match the return type of this function.
-                pub unsafe fn [<$rust_type:snake _element>](&self, index: usize) -> Option<$rust_type> {
-                    if index >= self.elements_count() {
-                        None
-                    } else {
-                        unsafe {
-                            Some(ryft_xla_sys::bindings::[<mlirDense $mlir_type ResourceElementsAttrGetValue>](
-                                self.to_c_api(),
-                                index.cast_signed(),
-                            ))
-                        }
+                pub unsafe fn [<$rust_type:snake _element>](&self, index: usize) -> Result<$rust_type, Error> {
+                    let elements_count = self.elements_count();
+                    if index >= elements_count {
+                        return Err(Error::invalid_argument(format!(
+                            "dense resource elements attribute index {} is out of bounds for {} elements",
+                            index,
+                            elements_count,
+                        )));
                     }
+                    Ok(unsafe {
+                        ryft_xla_sys::bindings::[<mlirDense $mlir_type ResourceElementsAttrGetValue>](
+                            self.to_c_api(),
+                            index.cast_signed(),
+                        )
+                    })
                 }
 
                 /// Returns all the elements of this [`DenseResourceElementsAttributeRef`], flattened.
                 /// This function is unsafe because it can panic if this attribute's element type does not match
                 /// the return type of this function.
-                pub unsafe fn [<$rust_type:snake _elements>](&self) -> impl Iterator<Item = $rust_type> {
-                    unsafe { (0..self.elements_count()).map(|index| self.[<$rust_type:snake _element>](index).unwrap()) }
+                pub unsafe fn [<$rust_type:snake _elements>](&self) -> impl Iterator<Item = Result<$rust_type, Error>> {
+                    unsafe { (0..self.elements_count()).map(|index| self.[<$rust_type:snake _element>](index)) }
                 }
             }
         }
@@ -821,7 +829,7 @@ macro_rules! mlir_dense_resource_elements_attribute_from_elements {
                 shaped_type: T,
                 name: StringRef<'s>,
                 elements: &[bool],
-            ) -> Option<DenseResourceElementsAttributeRef<'c, 't>> {
+            ) -> Result<DenseResourceElementsAttributeRef<'c, 't>, Error> {
                 // While this operation can mutate the context (in that it might add an entry to its corresponding
                 // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
                 // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -853,7 +861,7 @@ macro_rules! mlir_dense_resource_elements_attribute_from_elements {
                     shaped_type: T,
                     name: StringRef<'s>,
                     elements: &[$rust_type],
-                ) -> Option<DenseResourceElementsAttributeRef<'c, 't>> {
+                ) -> Result<DenseResourceElementsAttributeRef<'c, 't>, Error> {
                     // While this operation can mutate the context (in that it might add an entry to its corresponding
                     // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
                     // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -938,7 +946,6 @@ impl<'c, 't> SparseElementsAttributeRef<'c, 't> {
     pub fn indices(&self) -> Result<DenseIntegerElementsAttributeRef<'c, 't>, Error> {
         unsafe {
             DenseIntegerElementsAttributeRef::from_c_api(mlirSparseElementsAttrGetIndices(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR sparse element indices handle"))
         }
     }
 
@@ -946,10 +953,7 @@ impl<'c, 't> SparseElementsAttributeRef<'c, 't> {
     /// of the underlying multidimensional array. They correspond to the indices returned by
     /// [`SparseElementsAttributeRef::indices`].
     pub fn values(&self) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
-        unsafe {
-            DenseElementsAttributeRef::from_c_api(mlirSparseElementsAttrGetValues(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR sparse element values handle"))
-        }
+        unsafe { DenseElementsAttributeRef::from_c_api(mlirSparseElementsAttrGetValues(self.handle), self.context) }
     }
 }
 
@@ -972,7 +976,7 @@ impl<'t> Context<'t> {
         shaped_type: T,
         indices: DenseIntegerElementsAttributeRef<'c, 't>,
         values: V,
-    ) -> Option<SparseElementsAttributeRef<'c, 't>> {
+    ) -> Result<SparseElementsAttributeRef<'c, 't>, Error> {
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -1032,16 +1036,16 @@ mod tests {
         assert!(unsafe { !attribute.raw_data().is_null() });
         assert_eq!(attribute.elements_count(), 3);
         assert!(!attribute.is_splat());
-        assert!(attribute.splat().is_none());
+        assert!(attribute.splat().unwrap().is_none());
         assert!(unsafe { attribute.i32_splat().is_none() });
-        assert_eq!(unsafe { attribute.i32_element(0) }, Some(1));
-        assert_eq!(unsafe { attribute.i32_element(1) }, Some(2));
-        assert_eq!(unsafe { attribute.i32_element(2) }, Some(3));
-        assert_eq!(unsafe { attribute.i32_elements().collect::<Vec<_>>() }, vec![1, 2, 3]);
+        assert_eq!(unsafe { attribute.i32_element(0).unwrap() }, 1);
+        assert_eq!(unsafe { attribute.i32_element(1).unwrap() }, 2);
+        assert_eq!(unsafe { attribute.i32_element(2).unwrap() }, 3);
+        assert_eq!(unsafe { attribute.i32_elements().collect::<Result<Vec<_>, _>>().unwrap() }, vec![1, 2, 3]);
         assert_eq!(attribute.element(&[0]).unwrap(), context.integer_attribute(i32_type, 1));
         assert_eq!(attribute.element(&[1]).unwrap(), context.integer_attribute(i32_type, 2));
         assert_eq!(attribute.element(&[2]).unwrap(), context.integer_attribute(i32_type, 3));
-        assert!(attribute.element(&[3]).is_none());
+        assert!(attribute.element(&[3]).is_err());
 
         let tensor_type = context.shaped_type(context.none_type(), &[Size::Static(3)]).unwrap();
         let attribute = context
@@ -1054,9 +1058,9 @@ mod tests {
         assert_eq!(unsafe { attribute.string_ref_element(0).unwrap().as_str() }, Ok("1"));
         assert_eq!(unsafe { attribute.string_ref_element(1).unwrap().as_str() }, Ok("2"));
         assert_eq!(unsafe { attribute.string_ref_element(2).unwrap().as_str() }, Ok("3"));
-        assert!(unsafe { attribute.string_ref_element(3).is_none() });
+        assert!(unsafe { attribute.string_ref_element(3).is_err() });
         assert_eq!(
-            unsafe { attribute.string_ref_elements().collect::<Vec<_>>() },
+            unsafe { attribute.string_ref_elements().collect::<Result<Vec<_>, _>>().unwrap() },
             vec![StringRef::from("1"), StringRef::from("2"), StringRef::from("3")]
         );
 
@@ -1066,17 +1070,20 @@ mod tests {
         assert_eq!(attribute.elements_count(), 3);
         assert!(attribute.is_splat());
         assert_eq!(unsafe { attribute.i32_splat() }, Some(42));
-        assert!(attribute.splat().is_some());
-        assert_eq!(attribute.splat().unwrap(), context.integer_attribute(i32_type, 42));
+        assert!(attribute.splat().unwrap().is_some());
+        assert_eq!(attribute.splat().unwrap().unwrap(), context.integer_attribute(i32_type, 42));
 
         let tensor_type = context.tensor_type(i1_type, &[Size::Static(3)], None, context.unknown_location()).unwrap();
         let attribute = context.dense_bool_elements_attribute(tensor_type, &[true, false, true]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.elements_count(), 3);
         assert!(!attribute.is_splat());
-        assert!(attribute.splat().is_none());
+        assert!(attribute.splat().unwrap().is_none());
         assert!(unsafe { attribute.bool_splat().is_none() });
-        assert_eq!(unsafe { attribute.bool_elements().collect::<Vec<_>>() }, vec![true, false, true]);
+        assert_eq!(
+            unsafe { attribute.bool_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+            vec![true, false, true]
+        );
 
         let tensor_type = context.tensor_type(i1_type, &[Size::Static(3)], None, context.unknown_location()).unwrap();
         let attribute = context.splatted_dense_bool_elements_attribute(tensor_type, true).unwrap();
@@ -1098,8 +1105,8 @@ mod tests {
         let attribute = context.dense_f32_elements_attribute(tensor_type, &[1.5, 2.5]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.elements_count(), 2);
-        assert!(unsafe { attribute.f32_element(2).is_none() });
-        let elements = unsafe { attribute.f32_elements().collect::<Vec<_>>() };
+        assert!(unsafe { attribute.f32_element(2).is_err() });
+        let elements = unsafe { attribute.f32_elements().collect::<Result<Vec<_>, _>>().unwrap() };
         assert_eq!(elements.len(), 2);
         assert!((elements[0] - 1.5).abs() < 1e-6);
         assert!((elements[1] - 2.5).abs() < 1e-6);
@@ -1115,10 +1122,10 @@ mod tests {
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.elements_count(), 3);
         assert!(!attribute.is_splat());
-        assert_eq!(unsafe { attribute.i32_element(0) }, Some(1));
-        assert_eq!(unsafe { attribute.i32_element(1) }, Some(2));
-        assert_eq!(unsafe { attribute.i32_element(2) }, Some(3));
-        assert_eq!(unsafe { attribute.i32_elements().collect::<Vec<_>>() }, vec![1, 2, 3]);
+        assert_eq!(unsafe { attribute.i32_element(0).unwrap() }, 1);
+        assert_eq!(unsafe { attribute.i32_element(1).unwrap() }, 2);
+        assert_eq!(unsafe { attribute.i32_element(2).unwrap() }, 3);
+        assert_eq!(unsafe { attribute.i32_elements().collect::<Result<Vec<_>, _>>().unwrap() }, vec![1, 2, 3]);
         assert_eq!(attribute.element(&[0]).unwrap(), context.integer_attribute(i32_type, 1));
         assert_eq!(attribute.element(&[1]).unwrap(), context.integer_attribute(i32_type, 2));
         assert_eq!(attribute.element(&[2]).unwrap(), context.integer_attribute(i32_type, 3));
@@ -1140,14 +1147,14 @@ mod tests {
             )
             .unwrap();
         let tensor_type = context.shaped_type(i32_type, &[Size::Static(1), Size::Static(3)]).unwrap();
-        let attribute = attribute.reshape(tensor_type).unwrap();
+        let attribute = attribute.reshape(tensor_type).unwrap().unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.elements_count(), 3);
         assert!(!attribute.is_splat());
-        assert_eq!(unsafe { attribute.i32_element(0) }, Some(1));
-        assert_eq!(unsafe { attribute.i32_element(1) }, Some(2));
-        assert_eq!(unsafe { attribute.i32_element(2) }, Some(3));
-        assert_eq!(unsafe { attribute.i32_elements().collect::<Vec<_>>() }, vec![1, 2, 3]);
+        assert_eq!(unsafe { attribute.i32_element(0).unwrap() }, 1);
+        assert_eq!(unsafe { attribute.i32_element(1).unwrap() }, 2);
+        assert_eq!(unsafe { attribute.i32_element(2).unwrap() }, 3);
+        assert_eq!(unsafe { attribute.i32_elements().collect::<Result<Vec<_>, _>>().unwrap() }, vec![1, 2, 3]);
         assert_eq!(attribute.element(&[0, 0]).unwrap(), context.integer_attribute(i32_type, 1));
         assert_eq!(attribute.element(&[0, 1]).unwrap(), context.integer_attribute(i32_type, 2));
         assert_eq!(attribute.element(&[0, 2]).unwrap(), context.integer_attribute(i32_type, 3));
@@ -1217,10 +1224,10 @@ mod tests {
         let attribute = context.dense_i64_elements_attribute(tensor_type, &[10, 20, 30]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.elements_count(), 3);
-        assert_eq!(unsafe { attribute.i64_element(0) }, Some(10));
-        assert_eq!(unsafe { attribute.i64_element(1) }, Some(20));
-        assert_eq!(unsafe { attribute.i64_element(2) }, Some(30));
-        assert_eq!(unsafe { attribute.i64_elements().collect::<Vec<_>>() }, vec![10, 20, 30]);
+        assert_eq!(unsafe { attribute.i64_element(0).unwrap() }, 10);
+        assert_eq!(unsafe { attribute.i64_element(1).unwrap() }, 20);
+        assert_eq!(unsafe { attribute.i64_element(2).unwrap() }, 30);
+        assert_eq!(unsafe { attribute.i64_elements().collect::<Result<Vec<_>, _>>().unwrap() }, vec![10, 20, 30]);
 
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(4)], None, context.unknown_location()).unwrap();
         let attribute = context.splatted_dense_i32_elements_attribute(tensor_type, 7).unwrap();
@@ -1295,7 +1302,7 @@ mod tests {
         assert!((unsafe { attribute.f32_element(0) }.unwrap() - 1.0).abs() < 1e-6);
         assert!((unsafe { attribute.f32_element(1) }.unwrap() - 2.5).abs() < 1e-6);
         assert!((unsafe { attribute.f32_element(2) }.unwrap() - 3.7).abs() < 1e-6);
-        assert_eq!(unsafe { attribute.f32_elements() }.collect::<Vec<_>>().len(), 3);
+        assert_eq!(unsafe { attribute.f32_elements() }.collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
 
         let tensor_type = context.tensor_type(f64_type, &[Size::Static(4)], None, context.unknown_location()).unwrap();
         let attribute = context.splatted_dense_f64_elements_attribute(tensor_type, 3.14).unwrap();
@@ -1366,11 +1373,11 @@ mod tests {
             .unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.elements_count(), 3);
-        assert_eq!(unsafe { attribute.i8_element(0) }, Some(10));
-        assert_eq!(unsafe { attribute.i8_element(1) }, Some(20));
-        assert_eq!(unsafe { attribute.i8_element(2) }, Some(30));
-        assert!(unsafe { attribute.i8_element(3).is_none() });
-        assert_eq!(unsafe { attribute.i8_elements().collect::<Vec<_>>() }, vec![10, 20, 30]);
+        assert_eq!(unsafe { attribute.i8_element(0).unwrap() }, 10);
+        assert_eq!(unsafe { attribute.i8_element(1).unwrap() }, 20);
+        assert_eq!(unsafe { attribute.i8_element(2).unwrap() }, 30);
+        assert!(unsafe { attribute.i8_element(3).is_err() });
+        assert_eq!(unsafe { attribute.i8_elements().collect::<Result<Vec<_>, _>>().unwrap() }, vec![10, 20, 30]);
     }
 
     #[test]
@@ -1425,11 +1432,11 @@ mod tests {
         };
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.elements_count(), 3);
-        assert_eq!(unsafe { attribute.i32_element(0) }, Some(10));
-        assert_eq!(unsafe { attribute.i32_element(1) }, Some(20));
-        assert_eq!(unsafe { attribute.i32_element(2) }, Some(30));
-        assert!(unsafe { attribute.i32_element(3).is_none() });
-        assert_eq!(unsafe { attribute.i32_elements().collect::<Vec<_>>() }, vec![10, 20, 30]);
+        assert_eq!(unsafe { attribute.i32_element(0).unwrap() }, 10);
+        assert_eq!(unsafe { attribute.i32_element(1).unwrap() }, 20);
+        assert_eq!(unsafe { attribute.i32_element(2).unwrap() }, 30);
+        assert!(unsafe { attribute.i32_element(3).is_err() });
+        assert_eq!(unsafe { attribute.i32_elements().collect::<Result<Vec<_>, _>>().unwrap() }, vec![10, 20, 30]);
     }
 
     #[test]
@@ -1519,8 +1526,14 @@ mod tests {
         assert_eq!(attribute.elements_count(), 12);
         assert_eq!(attribute.indices().unwrap().elements_count(), 4);
         assert_eq!(attribute.values().unwrap().elements_count(), 2);
-        assert_eq!(unsafe { attribute.indices().unwrap().i64_elements().collect::<Vec<_>>() }, vec![0, 0, 1, 2]);
-        assert_eq!(unsafe { attribute.values().unwrap().i32_elements().collect::<Vec<_>>() }, vec![1, 5]);
+        assert_eq!(
+            unsafe { attribute.indices().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+            vec![0, 0, 1, 2]
+        );
+        assert_eq!(
+            unsafe { attribute.values().unwrap().i32_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+            vec![1, 5]
+        );
     }
 
     #[test]

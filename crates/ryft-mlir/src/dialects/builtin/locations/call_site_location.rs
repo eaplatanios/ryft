@@ -29,10 +29,8 @@ impl<'c, 't> CallSiteLocationRef<'c, 't> {
     /// originally defined; e.g., in a function body).
     pub fn callee(&self) -> LocationRef<'c, 't> {
         unsafe {
-            match LocationRef::from_c_api(mlirLocationCallSiteGetCallee(self.handle), self.context()) {
-                Some(location) => location,
-                None => self.as_ref(),
-            }
+            LocationRef::from_c_api(mlirLocationCallSiteGetCallee(self.handle), self.context())
+                .unwrap_or_else(|_| self.as_ref())
         }
     }
 
@@ -40,10 +38,8 @@ impl<'c, 't> CallSiteLocationRef<'c, 't> {
     /// which could itself be another call site location, chaining up the stack).
     pub fn caller(&self) -> LocationRef<'c, 't> {
         unsafe {
-            match LocationRef::from_c_api(mlirLocationCallSiteGetCaller(self.handle), self.context()) {
-                Some(location) => location,
-                None => self.as_ref(),
-            }
+            LocationRef::from_c_api(mlirLocationCallSiteGetCaller(self.handle), self.context())
+                .unwrap_or_else(|_| self.as_ref())
         }
     }
 }

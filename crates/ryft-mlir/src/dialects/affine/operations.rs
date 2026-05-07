@@ -46,7 +46,7 @@ pub fn apply<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedApplyOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.apply", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operands(map_operands)
@@ -131,7 +131,7 @@ pub fn r#for<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedForOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     let operand_segment_sizes =
         [lower_bound_operands.len() as i32, upper_bound_operands.len() as i32, inits.len() as i32];
     let builder = OperationBuilder::new("affine.for", location)
@@ -190,7 +190,7 @@ pub fn r#if<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedIfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.if", location)
         .add_attribute(CONDITION_ATTRIBUTE, context.integer_set_attribute(condition))
         .add_operands(condition_operands)
@@ -236,7 +236,7 @@ pub fn load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedLoadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.load", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operand(memref)
@@ -276,7 +276,7 @@ pub fn min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMinOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.min", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operands(map_operands)
@@ -315,7 +315,7 @@ pub fn max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.max", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operands(map_operands)
@@ -367,7 +367,7 @@ pub trait ParallelOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the grouping of lower-bound affine map results by loop dimension.
     fn lower_bounds_groups(&self) -> Result<Vec<i32>, Error> {
         let attribute = self.dense_integer_elements_attribute(LOWER_BOUNDS_GROUPS_ATTRIBUTE)?;
-        unsafe { Ok(attribute.i32_elements().collect()) }
+        unsafe { attribute.i32_elements().collect() }
     }
 
     /// Returns the operands supplied to this operation's lower-bound affine map.
@@ -383,7 +383,7 @@ pub trait ParallelOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the grouping of upper-bound affine map results by loop dimension.
     fn upper_bounds_groups(&self) -> Result<Vec<i32>, Error> {
         let attribute = self.dense_integer_elements_attribute(UPPER_BOUNDS_GROUPS_ATTRIBUTE)?;
-        unsafe { Ok(attribute.i32_elements().collect()) }
+        unsafe { attribute.i32_elements().collect() }
     }
 
     /// Returns the operands supplied to this operation's upper-bound affine map.
@@ -431,7 +431,7 @@ pub fn parallel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedParallelOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     let lower_bounds_groups_type = context.vector_type(
         context.signless_integer_type(32),
         &[VectorTypeDimension::Fixed(lower_bounds_groups.len())],
@@ -530,7 +530,7 @@ pub fn prefetch<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedPrefetchOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.prefetch", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operand(memref)
@@ -584,7 +584,7 @@ pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedStoreOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.store", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operand(value)
@@ -616,7 +616,7 @@ pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedYieldOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.yield", location)
         .add_operands(values)
         .build()
@@ -658,7 +658,7 @@ pub fn vector_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedVectorLoadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.vector_load", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operand(memref)
@@ -709,7 +709,7 @@ pub fn vector_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedVectorStoreOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.vector_store", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operand(value)
@@ -760,7 +760,7 @@ pub fn delinearize_index<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedDelinearizeIndexOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.delinearize_index", location)
         .add_operand(linear_index)
         .add_operands(dynamic_basis)
@@ -822,7 +822,7 @@ pub fn linearize_index<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedLinearizeIndexOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     let operand_segment_sizes = [multi_index.len() as i32, dynamic_basis.len() as i32];
     let builder = OperationBuilder::new("affine.linearize_index", location)
         .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&operand_segment_sizes)?);
@@ -951,7 +951,7 @@ pub fn dma_start<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedDmaStartOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     let builder = OperationBuilder::new("affine.dma_start", location)
         .add_operand(source)
         .add_attribute(SOURCE_MAP_ATTRIBUTE, context.affine_map_attribute(source_map));
@@ -1010,7 +1010,7 @@ pub fn dma_wait<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedDmaWaitOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine()?);
+    context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.dma_wait", location)
         .add_operand(tag)
         .add_attribute(TAG_MAP_ATTRIBUTE, context.affine_map_attribute(tag_map))
@@ -1038,7 +1038,7 @@ mod tests {
     fn test_affine_dialect_is_not_loaded_by_default() {
         let context = Context::new();
 
-        assert_eq!(context.load_dialect_by_name("affine"), None);
+        assert_eq!(context.load_dialect_by_name("affine").unwrap(), None);
         assert!(!context.is_registered("affine.apply"));
     }
 
@@ -1053,7 +1053,7 @@ mod tests {
             .unwrap()
             .append_operation({
                 let mut block = context.block(&[(index_type, location), (index_type, location)]);
-                let operands = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
+                let operands = block.arguments().map(|argument| argument.unwrap().as_ref()).collect::<Vec<_>>();
                 let expression =
                     (context.dimension_affine_expression(0) + context.symbol_affine_expression(0)).as_ref();
                 let map = context.affine_map(1, 1, &[expression]);
@@ -1118,7 +1118,7 @@ mod tests {
                 assert_eq!(operation.upper_bound_operands().unwrap(), Vec::<ValueRef<'_, '_, '_>>::new());
                 assert_eq!(operation.inits().unwrap(), Vec::<ValueRef<'_, '_, '_>>::new());
                 assert_eq!(operation.step().unwrap(), 1);
-                assert_eq!(operation.body().unwrap().blocks().next().unwrap().argument_count(), 1);
+                assert_eq!(operation.body().unwrap().blocks().unwrap().next().unwrap().unwrap().argument_count(), 1);
                 block.append_operation(operation).unwrap();
                 block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
                 func::func("test", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap()
@@ -1168,8 +1168,8 @@ mod tests {
                 .unwrap();
                 assert_eq!(operation.condition().unwrap().dimension_count(), 1);
                 assert_eq!(operation.condition_operands().unwrap(), vec![condition_operand]);
-                assert_eq!(operation.then_region().unwrap().blocks().count(), 1);
-                assert_eq!(operation.else_region().unwrap().blocks().count(), 1);
+                assert_eq!(operation.then_region().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(operation.else_region().unwrap().blocks().unwrap().count(), 1);
                 block.append_operation(operation).unwrap();
                 block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
                 func::func(
@@ -1260,7 +1260,7 @@ mod tests {
             .unwrap()
             .append_operation({
                 let mut block = context.block(&[(index_type, location), (index_type, location)]);
-                let operands = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
+                let operands = block.arguments().map(|argument| argument.unwrap().as_ref()).collect::<Vec<_>>();
                 let dimension = context.dimension_affine_expression(0);
                 let symbol = context.symbol_affine_expression(0);
                 let map = context.affine_map(1, 1, &[dimension.as_ref(), symbol.as_ref()]);
@@ -1310,7 +1310,7 @@ mod tests {
             .unwrap()
             .append_operation({
                 let mut block = context.block(&[(index_type, location), (index_type, location)]);
-                let operands = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
+                let operands = block.arguments().map(|argument| argument.unwrap().as_ref()).collect::<Vec<_>>();
                 let dimension = context.dimension_affine_expression(0);
                 let symbol = context.symbol_affine_expression(0);
                 let map = context.affine_map(1, 1, &[dimension.as_ref(), symbol.as_ref()]);
@@ -1388,7 +1388,7 @@ mod tests {
                 assert_eq!(operation.lower_bounds_operands().unwrap(), Vec::<ValueRef<'_, '_, '_>>::new());
                 assert_eq!(operation.upper_bounds_operands().unwrap(), Vec::<ValueRef<'_, '_, '_>>::new());
                 assert_eq!(operation.steps().unwrap(), vec![1]);
-                assert_eq!(operation.body().unwrap().blocks().next().unwrap().argument_count(), 1);
+                assert_eq!(operation.body().unwrap().blocks().unwrap().next().unwrap().unwrap().argument_count(), 1);
                 let output = operation.result(0).unwrap();
                 block.append_operation(operation).unwrap();
                 block.append_operation(func::r#return(&[output], location).unwrap()).unwrap();
@@ -1760,7 +1760,7 @@ mod tests {
             .unwrap()
             .append_operation({
                 let mut block = context.block(&[(index_type, location), (index_type, location)]);
-                let multi_index = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
+                let multi_index = block.arguments().map(|argument| argument.unwrap().as_ref()).collect::<Vec<_>>();
                 let operation =
                     linearize_index(&multi_index, &[], &[4, 8], true, index_type.as_ref(), location).unwrap();
                 assert_eq!(operation.multi_index().unwrap(), multi_index);

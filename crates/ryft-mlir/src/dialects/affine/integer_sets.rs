@@ -114,9 +114,7 @@ impl<'c, 't> IntegerSet<'c, 't> {
                 )));
             }
             Ok(IntegerSetConstraint {
-                expression: AffineExpressionRef::from_c_api(constraint_handle, self.context).ok_or_else(|| {
-                    Error::internal(format!("expected valid MLIR integer set constraint expression at index {index}"))
-                })?,
+                expression: AffineExpressionRef::from_c_api(constraint_handle, self.context)?,
                 is_equality: mlirIntegerSetIsConstraintEq(self.handle, index.cast_signed()),
             })
         }
