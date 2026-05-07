@@ -8,7 +8,7 @@ use ryft_xla_sys::bindings::{
     mlirIntegerSetReplaceGet,
 };
 
-use crate::{AffineExpression, AffineExpressionRef, Context, support::write_to_formatter_callback};
+use crate::{AffineExpression, AffineExpressionRef, Context, Error, support::write_to_formatter_callback};
 
 /// Constraint for an [`IntegerSet`].
 pub struct IntegerSetConstraint<'c, 't> {
@@ -93,26 +93,32 @@ impl<'c, 't> IntegerSet<'c, 't> {
     }
 
     /// Returns the constraints of this [`IntegerSet`].
-    pub fn constraints(&self) -> impl Iterator<Item = IntegerSetConstraint<'c, 't>> {
-        (0..self.constraint_count()).map(|index| self.constraint(index).unwrap())
+    pub fn constraints(&self) -> impl Iterator<Item = Result<IntegerSetConstraint<'c, 't>, Error>> {
+        let constraint_count = self.constraint_count();
+        (0..constraint_count).map(|index| self.constraint(index))
     }
 
-    /// Returns the `index`-th constraint of this [`IntegerSet`] and [`None`] if the provided index is out of bounds.
-    pub fn constraint(&self, index: usize) -> Option<IntegerSetConstraint<'c, 't>> {
-        if index >= self.constraint_count() {
-            None
-        } else {
-            unsafe {
-                let constraint_handle = mlirIntegerSetGetConstraint(self.handle, index.cast_signed());
-                if constraint_handle.ptr.is_null() {
-                    None
-                } else {
-                    Some(IntegerSetConstraint {
-                        expression: AffineExpressionRef::from_c_api(constraint_handle, self.context).unwrap(),
-                        is_equality: mlirIntegerSetIsConstraintEq(self.handle, index.cast_signed()),
-                    })
-                }
+    /// Returns the `index`-th constraint of this [`IntegerSet`] or an error if the provided index is out of bounds.
+    pub fn constraint(&self, index: usize) -> Result<IntegerSetConstraint<'c, 't>, Error> {
+        let constraint_count = self.constraint_count();
+        if index >= constraint_count {
+            return Err(Error::invalid_argument(format!(
+                "integer set constraint index {index} is out of bounds for constraint count {constraint_count}"
+            )));
+        }
+        unsafe {
+            let constraint_handle = mlirIntegerSetGetConstraint(self.handle, index.cast_signed());
+            if constraint_handle.ptr.is_null() {
+                return Err(Error::internal(format!(
+                    "expected non-null MLIR integer set constraint handle at index {index}"
+                )));
             }
+            Ok(IntegerSetConstraint {
+                expression: AffineExpressionRef::from_c_api(constraint_handle, self.context).ok_or_else(|| {
+                    Error::internal(format!("expected valid MLIR integer set constraint expression at index {index}"))
+                })?,
+                is_equality: mlirIntegerSetIsConstraintEq(self.handle, index.cast_signed()),
+            })
         }
     }
 
@@ -252,7 +258,7 @@ mod tests {
         assert_eq!(set.symbol_count(), 0);
         assert_eq!(set.input_count(), 1);
         assert_eq!(set.constraint_count(), 2);
-        assert!(set.constraint(2).is_none());
+        assert!(set.constraint(2).is_err());
     }
 
     #[test]
@@ -278,7 +284,7 @@ mod tests {
         let constraint_0 = IntegerSetConstraint { expression: (dimension_0 + constant_0).as_ref(), is_equality: true };
         let constraint_1 = IntegerSetConstraint { expression: (dimension_0 + constant_1).as_ref(), is_equality: false };
         let set = context.integer_set(1, 0, &[&constraint_0, &constraint_1]);
-        let constraints = set.constraints().collect::<Vec<_>>();
+        let constraints = set.constraints().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(constraints.len(), 2);
         assert_eq!(constraints[0].is_equality, true);
         assert_eq!(constraints[1].is_equality, false);

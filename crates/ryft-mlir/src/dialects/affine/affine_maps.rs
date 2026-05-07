@@ -11,7 +11,7 @@ use ryft_xla_sys::bindings::{
     mlirAffineMapZeroResultGet,
 };
 
-use crate::{Context, support::write_to_formatter_callback};
+use crate::{Context, Error, support::write_to_formatter_callback};
 
 use super::affine_expressions::{AffineExpression, AffineExpressionRef};
 
@@ -77,20 +77,24 @@ impl<'c, 't> AffineMap<'c, 't> {
     }
 
     /// Returns the result [`AffineExpression`]s of this [`AffineMap`].
-    pub fn results(&self) -> impl Iterator<Item = AffineExpressionRef<'c, 't>> {
-        (0..self.result_count()).map(|index| self.result(index))
+    pub fn results(&self) -> impl Iterator<Item = Result<AffineExpressionRef<'c, 't>, Error>> {
+        let result_count = self.result_count();
+        (0..result_count).map(|index| unsafe {
+            AffineExpressionRef::from_c_api(mlirAffineMapGetResult(self.handle, index.cast_signed()), self.context)
+                .ok_or_else(|| {
+                    Error::internal(format!("expected non-null MLIR affine map result handle at index {index}"))
+                })
+        })
     }
 
     /// Returns the `index`-th result [`AffineExpression`] of this [`AffineMap`].
-    ///
-    /// Note that this function will panic if the provided index is out of bounds.
-    pub fn result(&self, index: usize) -> AffineExpressionRef<'c, 't> {
+    pub fn result(&self, index: usize) -> Result<AffineExpressionRef<'c, 't>, Error> {
         if index >= self.result_count() {
-            panic!("result index is out of bounds");
+            return Err(Error::invalid_argument("affine map result index is out of bounds"));
         }
         unsafe {
             AffineExpressionRef::from_c_api(mlirAffineMapGetResult(self.handle, index.cast_signed()), self.context)
-                .unwrap()
+                .ok_or_else(|| Error::internal("mlir returned an invalid affine map result"))
         }
     }
 
@@ -137,13 +141,8 @@ impl<'c, 't> AffineMap<'c, 't> {
 
     /// Returns the [`AffineMap`] that consists only of the results at the specified indices of this [`AffineMap`].
     pub fn sub_map(&self, size: usize, results: &[usize]) -> Self {
-        unsafe {
-            Self::from_c_api(
-                mlirAffineMapGetSubMap(self.handle, size.cast_signed(), results.as_ptr() as *mut _),
-                self.context,
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirAffineMapGetSubMap(self.handle, size.cast_signed(), results.as_ptr() as *mut _) };
+        Self { handle, context: self.context }
     }
 
     /// Returns the [`AffineMap`] that consists only of the most major `result_count` results of this [`AffineMap`].
@@ -169,19 +168,16 @@ impl<'c, 't> AffineMap<'c, 't> {
         result_dimensions_count: usize,
         result_symbols_count: usize,
     ) -> Self {
-        unsafe {
-            Self::from_c_api(
-                mlirAffineMapReplace(
-                    self.handle,
-                    expression.to_c_api(),
-                    replacement.to_c_api(),
-                    result_dimensions_count.cast_signed(),
-                    result_symbols_count.cast_signed(),
-                ),
-                self.context,
+        let handle = unsafe {
+            mlirAffineMapReplace(
+                self.handle,
+                expression.to_c_api(),
+                replacement.to_c_api(),
+                result_dimensions_count.cast_signed(),
+                result_symbols_count.cast_signed(),
             )
-            .unwrap()
-        }
+        };
+        Self { handle, context: self.context }
     }
 
     /// Dumps this [`AffineMap`] to the standard error stream.
@@ -216,7 +212,7 @@ impl<'c, 't> AffineMap<'c, 't> {
             buffer
                 .into_iter()
                 .zip(maps.iter())
-                .map(|(compressed_map, original_map)| Self::from_c_api(compressed_map, original_map.context).unwrap())
+                .map(|(handle, original_map)| Self { handle, context: original_map.context })
         }
     }
 }
@@ -259,94 +255,76 @@ impl<'t> Context<'t> {
         symbol_count: usize,
         affine_expressions: &[A],
     ) -> AffineMap<'c, 't> {
-        unsafe {
-            let affine_expressions = affine_expressions.iter().map(|e| e.to_c_api()).collect::<Vec<_>>();
-            AffineMap::from_c_api(
-                mlirAffineMapGet(
-                    *self.handle.borrow_mut(),
-                    dimension_count.cast_signed(),
-                    symbol_count.cast_signed(),
-                    affine_expressions.len().cast_signed(),
-                    affine_expressions.as_ptr() as *mut _,
-                ),
-                self,
+        let affine_expressions = affine_expressions.iter().map(|e| unsafe { e.to_c_api() }).collect::<Vec<_>>();
+        let handle = unsafe {
+            mlirAffineMapGet(
+                *self.handle.borrow_mut(),
+                dimension_count.cast_signed(),
+                symbol_count.cast_signed(),
+                affine_expressions.len().cast_signed(),
+                affine_expressions.as_ptr() as *mut _,
             )
-            .unwrap()
-        }
+        };
+        AffineMap { handle, context: self }
     }
 
     /// Creates an empty [`AffineMap`] (i.e., a zero result affine map with no dimensions or symbols; `() -> ()`)
     /// owned by this [`Context`].
     pub fn empty_affine_map<'c>(&'c self) -> AffineMap<'c, 't> {
-        unsafe { AffineMap::from_c_api(mlirAffineMapEmptyGet(*self.handle.borrow_mut()), self).unwrap() }
+        let handle = unsafe { mlirAffineMapEmptyGet(*self.handle.borrow_mut()) };
+        AffineMap { handle, context: self }
     }
 
     /// Creates a zero result [`AffineMap`] with the provided number of dimensions and symbols (i.e., `(...) -> ()`),
     /// owned by this [`Context`].
     pub fn zero_result_affine_map<'c>(&'c self, dimension_count: usize, symbol_count: usize) -> AffineMap<'c, 't> {
-        unsafe {
-            AffineMap::from_c_api(
-                mlirAffineMapZeroResultGet(
-                    *self.handle.borrow_mut(),
-                    dimension_count.cast_signed(),
-                    symbol_count.cast_signed(),
-                ),
-                self,
+        let handle = unsafe {
+            mlirAffineMapZeroResultGet(
+                *self.handle.borrow_mut(),
+                dimension_count.cast_signed(),
+                symbol_count.cast_signed(),
             )
-            .unwrap()
-        }
+        };
+        AffineMap { handle, context: self }
     }
 
     /// Creates an [`AffineMap`] with a single constant result. The resulting map is owned by this [`Context`].
     pub fn constant_affine_map<'c>(&'c self, value: i64) -> AffineMap<'c, 't> {
-        unsafe { AffineMap::from_c_api(mlirAffineMapConstantGet(*self.handle.borrow_mut(), value), self).unwrap() }
+        let handle = unsafe { mlirAffineMapConstantGet(*self.handle.borrow_mut(), value) };
+        AffineMap { handle, context: self }
     }
 
     /// Creates a multidimensional identity [`AffineMap`] with the specified number of dimensions.
     /// The resulting map is owned by this [`Context`].
     pub fn identity_affine_map<'c>(&'c self, dimension_count: usize) -> AffineMap<'c, 't> {
-        unsafe {
-            AffineMap::from_c_api(
-                mlirAffineMapMultiDimIdentityGet(*self.handle.borrow_mut(), dimension_count.cast_signed()),
-                self,
-            )
-            .unwrap()
-        }
+        let handle =
+            unsafe { mlirAffineMapMultiDimIdentityGet(*self.handle.borrow_mut(), dimension_count.cast_signed()) };
+        AffineMap { handle, context: self }
     }
 
     /// Creates a multidimensional identity [`AffineMap`] on the most minor dimensions for the specified number of
     /// dimensions and results (where the number of dimensions must be greater than or equal to the number of results).
     /// The resulting map is owned by this [`Context`].
     pub fn minor_identity_affine_map<'c>(&'c self, dimension_count: usize, result_count: usize) -> AffineMap<'c, 't> {
-        unsafe {
-            AffineMap::from_c_api(
-                mlirAffineMapMinorIdentityGet(
-                    *self.handle.borrow_mut(),
-                    dimension_count.cast_signed(),
-                    result_count.cast_signed(),
-                ),
-                self,
+        let handle = unsafe {
+            mlirAffineMapMinorIdentityGet(
+                *self.handle.borrow_mut(),
+                dimension_count.cast_signed(),
+                result_count.cast_signed(),
             )
-            .unwrap()
-        }
+        };
+        AffineMap { handle, context: self }
     }
 
     /// Creates an [`AffineMap`] based on the provided permutation which contains a permutation of indexes starting
     /// from 0 and ending at `size - 1` (e.g., `[1, 2, 0]` is a valid permutation but `[2, 0]` and `[1, 1, 2]` are
     /// not valid permutations). The resulting map is owned by this [`Context`].
     pub fn permutation_affine_map<'c>(&'c self, size: usize, permutation: &[usize]) -> AffineMap<'c, 't> {
-        unsafe {
-            let permutation = permutation.iter().map(|value| *value as std::ffi::c_uint).collect::<Vec<_>>();
-            AffineMap::from_c_api(
-                mlirAffineMapPermutationGet(
-                    *self.handle.borrow_mut(),
-                    size.cast_signed(),
-                    permutation.as_ptr() as *mut _,
-                ),
-                self,
-            )
-            .unwrap()
-        }
+        let permutation = permutation.iter().map(|value| *value as std::ffi::c_uint).collect::<Vec<_>>();
+        let handle = unsafe {
+            mlirAffineMapPermutationGet(*self.handle.borrow_mut(), size.cast_signed(), permutation.as_ptr() as *mut _)
+        };
+        AffineMap { handle, context: self }
     }
 }
 
@@ -396,9 +374,16 @@ mod tests {
         let result_0 = (dimension_0 + dimension_1).as_ref();
         let result_1 = dimension_0.as_ref();
         let map = context.affine_map(2, 0, &[result_0, result_1]);
-        assert_eq!(map.result(0), result_0);
-        assert_eq!(map.result(1), result_1);
-        assert_eq!(map.results().collect::<Vec<_>>(), vec![result_0, result_1]);
+        assert_eq!(map.result(0).unwrap(), result_0);
+        assert_eq!(map.result(1).unwrap(), result_1);
+        assert!(matches!(
+            map.result(2),
+            Err(Error::InvalidArgument { message, .. }) if message == "affine map result index is out of bounds",
+        ));
+        assert_eq!(
+            map.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![result_0, result_1]
+        );
     }
 
     #[test]

@@ -51,7 +51,7 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
 
     /// Up-casts this affine expression to an instance of [`AffineExpression`].
     fn as_ref(&self) -> AffineExpressionRef<'c, 't> {
-        unsafe { AffineExpressionRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
+        AffineExpressionRef { handle: unsafe { self.to_c_api() }, context: self.context() }
     }
 
     /// Returns `true` if this expression is made out of only symbols and constants (i.e., it does not involve any
@@ -97,26 +97,18 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
         dimension_count: usize,
         shift: usize,
     ) -> AffineExpressionRef<'c, 't> {
-        unsafe {
-            AffineExpressionRef::from_c_api(
-                mlirAffineExprShiftDims(self.to_c_api(), dimension_count as u32, shift as u32, offset as u32),
-                self.context(),
-            )
-            .unwrap()
-        }
+        let handle =
+            unsafe { mlirAffineExprShiftDims(self.to_c_api(), dimension_count as u32, shift as u32, offset as u32) };
+        AffineExpressionRef { handle, context: self.context() }
     }
 
     /// Returns a new [`AffineExpression`] that is the same as this one but with some of its
     /// [`SymbolAffineExpressionRef`]s shifted by `shift`. Specifically, all [`SymbolAffineExpressionRef`]s for symbols
     /// in the range `[offset, symbol_count)` are shifted by `shift`.
     fn with_shifted_symbols(&self, offset: usize, symbol_count: usize, shift: usize) -> AffineExpressionRef<'c, 't> {
-        unsafe {
-            AffineExpressionRef::from_c_api(
-                mlirAffineExprShiftSymbols(self.to_c_api(), symbol_count as u32, shift as u32, offset as u32),
-                self.context(),
-            )
-            .unwrap()
-        }
+        let handle =
+            unsafe { mlirAffineExprShiftSymbols(self.to_c_api(), symbol_count as u32, shift as u32, offset as u32) };
+        AffineExpressionRef { handle, context: self.context() }
     }
 
     /// Returns a new [`ModAffineExpressionRef`]that represents the application of the modulus operator
@@ -162,10 +154,8 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     /// Composed Expression: `d0 * 2 + d1 + d2 + s1`
     /// ```
     fn compose(&self, map: AffineMap<'c, 't>) -> AffineExpressionRef<'c, 't> {
-        unsafe {
-            AffineExpressionRef::from_c_api(mlirAffineExprCompose(self.to_c_api(), map.to_c_api()), self.context())
-                .unwrap()
-        }
+        let handle = unsafe { mlirAffineExprCompose(self.to_c_api(), map.to_c_api()) };
+        AffineExpressionRef { handle, context: self.context() }
     }
 
     /// Simplifies this affine expression by flattening it and performing some amount of simple analysis, returning the
@@ -173,13 +163,8 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     /// this expression is a semi-affine expression, then a simplified semi-affine expression will be constructed with
     /// a sorted list of dimensions and symbols.
     fn simplify(&self, dimension_count: usize, symbol_count: usize) -> AffineExpressionRef<'c, 't> {
-        unsafe {
-            AffineExpressionRef::from_c_api(
-                mlirSimplifyAffineExpr(self.to_c_api(), dimension_count as u32, symbol_count as u32),
-                self.context(),
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirSimplifyAffineExpr(self.to_c_api(), dimension_count as u32, symbol_count as u32) };
+        AffineExpressionRef { handle, context: self.context() }
     }
 }
 
@@ -263,13 +248,8 @@ mlir_affine_expression_operator_impls!(DimensionAffineExpressionRef);
 impl<'t> Context<'t> {
     /// Creates a new [`DimensionAffineExpressionRef`] with the specified position.
     pub fn dimension_affine_expression<'c>(&'c self, position: usize) -> DimensionAffineExpressionRef<'c, 't> {
-        unsafe {
-            DimensionAffineExpressionRef::from_c_api(
-                mlirAffineDimExprGet(*self.handle.borrow_mut(), position.cast_signed()),
-                self,
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirAffineDimExprGet(*self.handle.borrow_mut(), position.cast_signed()) };
+        DimensionAffineExpressionRef { handle, context: self }
     }
 }
 
@@ -304,13 +284,8 @@ mlir_affine_expression_operator_impls!(SymbolAffineExpressionRef);
 impl<'t> Context<'t> {
     /// Creates a new [`SymbolAffineExpressionRef`] with the specified position.
     pub fn symbol_affine_expression<'c>(&'c self, position: usize) -> SymbolAffineExpressionRef<'c, 't> {
-        unsafe {
-            SymbolAffineExpressionRef::from_c_api(
-                mlirAffineSymbolExprGet(*self.handle.borrow_mut(), position.cast_signed()),
-                self,
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirAffineSymbolExprGet(*self.handle.borrow_mut(), position.cast_signed()) };
+        SymbolAffineExpressionRef { handle, context: self }
     }
 }
 
@@ -345,10 +320,8 @@ mlir_affine_expression_operator_impls!(ConstantAffineExpressionRef);
 impl<'t> Context<'t> {
     /// Creates a new [`ConstantAffineExpressionRef`] with the specified value.
     pub fn constant_affine_expression<'c>(&'c self, value: i64) -> ConstantAffineExpressionRef<'c, 't> {
-        unsafe {
-            ConstantAffineExpressionRef::from_c_api(mlirAffineConstantExprGet(*self.handle.borrow_mut(), value), self)
-                .unwrap()
-        }
+        let handle = unsafe { mlirAffineConstantExprGet(*self.handle.borrow_mut(), value) };
+        ConstantAffineExpressionRef { handle, context: self }
     }
 }
 
@@ -370,12 +343,14 @@ pub struct BinaryOperationAffineExpressionRef<'c, 't> {
 impl<'c, 't> BinaryOperationAffineExpressionRef<'c, 't> {
     /// Returns the left-hand side (LHS) operand of this [`BinaryOperationAffineExpressionRef`].
     pub fn lhs_operand(&self) -> AffineExpressionRef<'c, 't> {
-        unsafe { AffineExpressionRef::from_c_api(mlirAffineBinaryOpExprGetLHS(self.handle), self.context).unwrap() }
+        let handle = unsafe { mlirAffineBinaryOpExprGetLHS(self.handle) };
+        AffineExpressionRef { handle, context: self.context }
     }
 
     /// Returns the right-hand side (RHS) operand of this [`BinaryOperationAffineExpressionRef`].
     pub fn rhs_operand(&self) -> AffineExpressionRef<'c, 't> {
-        unsafe { AffineExpressionRef::from_c_api(mlirAffineBinaryOpExprGetRHS(self.handle), self.context).unwrap() }
+        let handle = unsafe { mlirAffineBinaryOpExprGetRHS(self.handle) };
+        AffineExpressionRef { handle, context: self.context }
     }
 }
 
@@ -403,10 +378,8 @@ pub struct AddAffineExpressionRef<'c, 't> {
 impl<'c, 't> AddAffineExpressionRef<'c, 't> {
     /// Creates a new [`AddAffineExpressionRef`] using the provided [`AffineExpression`]s as its operands.
     pub fn new<LHS: AffineExpression<'c, 't>, RHS: AffineExpression<'c, 't>>(lhs: LHS, rhs: RHS) -> Self {
-        unsafe {
-            AddAffineExpressionRef::from_c_api(mlirAffineAddExprGet(lhs.to_c_api(), rhs.to_c_api()), lhs.context())
-                .unwrap()
-        }
+        let handle = unsafe { mlirAffineAddExprGet(lhs.to_c_api(), rhs.to_c_api()) };
+        AddAffineExpressionRef { handle, context: lhs.context() }
     }
 }
 
@@ -434,10 +407,8 @@ pub struct MulAffineExpressionRef<'c, 't> {
 impl<'c, 't> MulAffineExpressionRef<'c, 't> {
     /// Creates a new [`MulAffineExpressionRef`] using the provided [`AffineExpression`]s as its operands.
     pub fn new<LHS: AffineExpression<'c, 't>, RHS: AffineExpression<'c, 't>>(lhs: LHS, rhs: RHS) -> Self {
-        unsafe {
-            MulAffineExpressionRef::from_c_api(mlirAffineMulExprGet(lhs.to_c_api(), rhs.to_c_api()), lhs.context())
-                .unwrap()
-        }
+        let handle = unsafe { mlirAffineMulExprGet(lhs.to_c_api(), rhs.to_c_api()) };
+        MulAffineExpressionRef { handle, context: lhs.context() }
     }
 }
 
@@ -465,10 +436,8 @@ pub struct ModAffineExpressionRef<'c, 't> {
 impl<'c, 't> ModAffineExpressionRef<'c, 't> {
     /// Creates a new [`ModAffineExpressionRef`]using the provided [`AffineExpression`]s as its operands.
     pub fn new<LHS: AffineExpression<'c, 't>, RHS: AffineExpression<'c, 't>>(lhs: LHS, rhs: RHS) -> Self {
-        unsafe {
-            ModAffineExpressionRef::from_c_api(mlirAffineModExprGet(lhs.to_c_api(), rhs.to_c_api()), lhs.context())
-                .unwrap()
-        }
+        let handle = unsafe { mlirAffineModExprGet(lhs.to_c_api(), rhs.to_c_api()) };
+        ModAffineExpressionRef { handle, context: lhs.context() }
     }
 }
 
@@ -497,13 +466,8 @@ pub struct FloorDivAffineExpressionRef<'c, 't> {
 impl<'c, 't> FloorDivAffineExpressionRef<'c, 't> {
     /// Creates a new [`FloorDivAffineExpressionRef`] using the provided [`AffineExpression`]s as its operands.
     pub fn new<LHS: AffineExpression<'c, 't>, RHS: AffineExpression<'c, 't>>(lhs: LHS, rhs: RHS) -> Self {
-        unsafe {
-            FloorDivAffineExpressionRef::from_c_api(
-                mlirAffineFloorDivExprGet(lhs.to_c_api(), rhs.to_c_api()),
-                lhs.context(),
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirAffineFloorDivExprGet(lhs.to_c_api(), rhs.to_c_api()) };
+        Self { handle, context: lhs.context() }
     }
 }
 
@@ -546,13 +510,8 @@ pub struct CeilDivAffineExpressionRef<'c, 't> {
 impl<'c, 't> CeilDivAffineExpressionRef<'c, 't> {
     /// Creates a new [`CeilDivAffineExpressionRef`] using the provided [`AffineExpression`]s as its operands.
     pub fn new<LHS: AffineExpression<'c, 't>, RHS: AffineExpression<'c, 't>>(lhs: LHS, rhs: RHS) -> Self {
-        unsafe {
-            CeilDivAffineExpressionRef::from_c_api(
-                mlirAffineCeilDivExprGet(lhs.to_c_api(), rhs.to_c_api()),
-                lhs.context(),
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirAffineCeilDivExprGet(lhs.to_c_api(), rhs.to_c_api()) };
+        CeilDivAffineExpressionRef { handle, context: lhs.context() }
     }
 }
 

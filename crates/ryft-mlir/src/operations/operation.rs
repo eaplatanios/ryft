@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
+use std::ops::Range;
 
 use ryft_xla_sys::bindings::{
     MlirOperation, MlirWalkOrder, MlirWalkOrder_MlirWalkPostOrder, MlirWalkOrder_MlirWalkPreOrder, MlirWalkResult,
@@ -23,12 +24,37 @@ use ryft_xla_sys::bindings::{
 
 use crate::support::{write_to_formatter_callback, write_to_string_callback};
 use crate::{
-    Attribute, AttributeRef, Block, BlockRef, Context, Error, Identifier, Location, LocationRef, LogicalResult,
-    NamedAttributeRef, OperandRef, OperationResultRef, RegionRef, StringRef, TypeId, TypeRef, Value, ValueRef,
-    write_to_bytes_callback,
+    AffineMapAttributeRef, ArrayAttributeRef, Attribute, AttributeRef, Block, BlockRef, BooleanAttributeRef, Context,
+    DenseArrayAttributeRef, DenseBooleanArrayAttributeRef, DenseElementsAttributeRef, DenseFloat32ArrayAttributeRef,
+    DenseFloat64ArrayAttributeRef, DenseFloatElementsAttributeRef, DenseInteger8ArrayAttributeRef,
+    DenseInteger16ArrayAttributeRef, DenseInteger32ArrayAttributeRef, DenseInteger64ArrayAttributeRef,
+    DenseIntegerElementsAttributeRef, DenseResourceElementsAttributeRef, DictionaryAttributeRef, DistinctAttributeRef,
+    ElementsAttributeRef, Error, FlatSymbolRefAttributeRef, FloatAttributeRef, Identifier, IntegerAttributeRef,
+    IntegerSetAttributeRef, Location, LocationAttributeRef, LocationRef, LogicalResult, NamedAttributeRef,
+    OpaqueAttributeRef, OperandRef, OperationResultRef, RegionRef, SparseElementsAttributeRef,
+    StridedLayoutAttributeRef, StringAttributeRef, StringRef, SymbolRefAttributeRef, SymbolVisibilityAttributeRef,
+    TypeAttributeRef, TypeId, TypeRef, UnitAttributeRef, Value, ValueRef, write_to_bytes_callback,
 };
 
 use super::printing::{AsmState, BytecodeWriterConfiguration, OperationPrintingFlags};
+
+/// Helper macro for defining typed attribute accessor functions for [`Operation`]s.
+macro_rules! mlir_operation_builtin_attribute {
+    ($method_name:ident, $attribute_type:ty) => {
+        /// Returns an [`Attribute`] of this [`Operation`] with the provided name. If no such attribute
+        /// can be found or if it is not of the appropriate type, then this function returns an [`Error`].
+        fn $method_name<N: AsRef<str>>(&self, name: N) -> Result<$attribute_type, Error> {
+            let name = name.as_ref();
+            self.attribute(name).and_then(|attribute| attribute.cast::<$attribute_type>()).ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    name,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })
+        }
+    };
+}
 
 /// [`Operation`]s are one of the main building blocks of MLIR programs. MLIR is fundamentally based on a graph-like
 /// data structure of nodes, called [`Operation`]s, and edges, called [`Value`]s. Each [`Value`] is either a
@@ -376,6 +402,119 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
                 self.context(),
             )
         }
+    }
+
+    mlir_operation_builtin_attribute!(affine_map_attribute, AffineMapAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(array_attribute, ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(boolean_attribute, BooleanAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_array_attribute, DenseArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_boolean_array_attribute, DenseBooleanArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_integer_8_array_attribute, DenseInteger8ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_integer_16_array_attribute, DenseInteger16ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_integer_32_array_attribute, DenseInteger32ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_integer_64_array_attribute, DenseInteger64ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_float_32_array_attribute, DenseFloat32ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_float_64_array_attribute, DenseFloat64ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dictionary_attribute, DictionaryAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(distinct_attribute, DistinctAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(elements_attribute, ElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_elements_attribute, DenseElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_integer_elements_attribute, DenseIntegerElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_float_elements_attribute, DenseFloatElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_resource_elements_attribute, DenseResourceElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(sparse_elements_attribute, SparseElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(flat_symbol_ref_attribute, FlatSymbolRefAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(float_attribute, FloatAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(integer_attribute, IntegerAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(integer_set_attribute, IntegerSetAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(location_attribute, LocationAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(opaque_attribute, OpaqueAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(strided_layout_attribute, StridedLayoutAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(string_attribute, StringAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(symbol_ref_attribute, SymbolRefAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(symbol_visibility_attribute, SymbolVisibilityAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(type_attribute, TypeAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(unit_attribute, UnitAttributeRef<'c, 't>);
+
+    /// Returns a named dense 32-bit integer array attribute element as a `usize`.
+    ///
+    /// This is primarily useful for operation segment-size attributes, whose MLIR representation is a dense i32
+    /// array but whose values are naturally used as Rust indices and counts.
+    ///
+    /// # Parameters
+    ///
+    ///   - `name`: Name of the operation attribute to retrieve.
+    ///   - `index`: Index of the attribute element to retrieve.
+    fn dense_integer_32_array_attribute_usize_value<N: AsRef<str>>(
+        &self,
+        name: N,
+        index: usize,
+    ) -> Result<usize, Error> {
+        let name = name.as_ref();
+        let attribute = self.dense_integer_32_array_attribute(name)?;
+        if index >= attribute.len() {
+            return Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                name,
+                self.name().as_str().unwrap_or("<unknown>"),
+            )));
+        }
+        usize::try_from(attribute.value(index)).map_err(|_| {
+            Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                name,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
+    }
+
+    /// Returns the flat operand/result index range represented by one segment-size entry.
+    ///
+    /// This helper interprets the named [`DenseInteger32ArrayAttributeRef`] as an MLIR segment-size attribute, such as
+    /// `operandSegmentSizes` or `operand_segment_sizes`. In that convention, operations store multiple variadic operand
+    /// or result groups as one flat list, and the dense i32 array stores the length of each consecutive group.
+    ///
+    /// For example, a segment-size attribute with values `[2, 3, 1]` describes three consecutive groups
+    /// in the flat list:
+    ///
+    /// ```text
+    /// segment 0: size 2 -> range 0..2
+    /// segment 1: size 3 -> range 2..5
+    /// segment 2: size 1 -> range 5..6
+    /// ```
+    ///
+    /// Therefore, requesting segment `1` returns `2..5`. The returned range indexes the operation's flat operand or
+    /// result list; it is not a range over the dense array attribute values themselves.
+    ///
+    /// # Parameters
+    ///
+    ///   - `name`: Name of the operation attribute to retrieve.
+    ///   - `index`: Index of the segment to retrieve.
+    fn dense_integer_32_array_attribute_segment_range<N: AsRef<str>>(
+        &self,
+        name: N,
+        index: usize,
+    ) -> Result<Range<usize>, Error> {
+        let name = name.as_ref();
+        let operation_name = self.name().as_str().unwrap_or("<unknown>").to_string();
+        let attribute = self.dense_integer_32_array_attribute(name)?;
+        if index >= attribute.len() {
+            return Err(Error::invalid_argument(format!("invalid `{name}` attribute in `{operation_name}`")));
+        }
+        let mut start = 0usize;
+        for segment in 0..index {
+            start = start
+                .checked_add(usize::try_from(attribute.value(segment)).map_err(|_| {
+                    Error::invalid_argument(format!("invalid `{name}` attribute in `{operation_name}`"))
+                })?)
+                .ok_or_else(|| Error::invalid_argument(format!("invalid `{name}` attribute in `{operation_name}`")))?;
+        }
+        let size = usize::try_from(attribute.value(index))
+            .map_err(|_| Error::invalid_argument(format!("invalid `{name}` attribute in `{operation_name}`")))?;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| Error::invalid_argument(format!("invalid `{name}` attribute in `{operation_name}`")))?;
+        Ok(start..end)
     }
 
     /// Sets an attribute of this [`Operation`] with the provided name to the provided value.
@@ -1234,7 +1373,8 @@ mod tests {
 
     use crate::dialects::func;
     use crate::{
-        Block, Context, DetachedModuleOperation, DialectHandle, OperationBuilder, Region, Type, Value, ValueRef,
+        Block, Context, DetachedModuleOperation, DialectHandle, OperationBuilder, Region, Size, SymbolVisibility, Type,
+        Value, ValueRef,
     };
 
     use super::*;
@@ -1334,6 +1474,188 @@ mod tests {
         let attribute = op.attributes().next().unwrap();
         assert_eq!(attribute.name(), context.identifier("foo"));
         assert_eq!(attribute.attribute().unwrap(), context.string_attribute("foo"));
+
+        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
+        let tensor_type = context.tensor_type(i32_type, &[Size::Static(2)], None, location).unwrap();
+        let float_tensor_type =
+            context.tensor_type(context.float32_type(), &[Size::Static(2)], None, location).unwrap();
+
+        let affine_map_attribute = context.affine_map_attribute(context.empty_affine_map());
+        op.set_attribute("affine_map", affine_map_attribute);
+        assert_eq!(op.affine_map_attribute("affine_map").unwrap(), affine_map_attribute);
+
+        let array_attribute =
+            context.array_attribute(&[context.integer_attribute(i32_type, 1), context.integer_attribute(i32_type, 2)]);
+        op.set_attribute("array", array_attribute);
+        assert_eq!(op.array_attribute("array").unwrap(), array_attribute);
+
+        let boolean_attribute = context.boolean_attribute(true);
+        op.set_attribute("boolean", boolean_attribute);
+        assert_eq!(op.boolean_attribute("boolean").unwrap(), boolean_attribute);
+
+        let dense_array_attribute = context.dense_i32_array_attribute(&[1, 2, 3]).unwrap();
+        op.set_attribute("dense_array", dense_array_attribute);
+        assert_eq!(
+            op.dense_array_attribute("dense_array").unwrap(),
+            dense_array_attribute.cast::<DenseArrayAttributeRef<'_, '_>>().unwrap()
+        );
+
+        let dense_boolean_array_attribute = context.dense_bool_array_attribute(&[true, false]).unwrap();
+        op.set_attribute("dense_boolean_array", dense_boolean_array_attribute);
+        assert_eq!(op.dense_boolean_array_attribute("dense_boolean_array").unwrap(), dense_boolean_array_attribute);
+
+        let dense_integer_8_array_attribute = context.dense_i8_array_attribute(&[1, 2, 3]).unwrap();
+        op.set_attribute("dense_integer_8_array", dense_integer_8_array_attribute);
+        assert_eq!(
+            op.dense_integer_8_array_attribute("dense_integer_8_array").unwrap(),
+            dense_integer_8_array_attribute
+        );
+
+        let dense_integer_16_array_attribute = context.dense_i16_array_attribute(&[1, 2, 3]).unwrap();
+        op.set_attribute("dense_integer_16_array", dense_integer_16_array_attribute);
+        assert_eq!(
+            op.dense_integer_16_array_attribute("dense_integer_16_array").unwrap(),
+            dense_integer_16_array_attribute
+        );
+
+        let dense_integer_32_array_attribute = context.dense_i32_array_attribute(&[1, 2, 3]).unwrap();
+        op.set_attribute("dense_integer_32_array", dense_integer_32_array_attribute);
+        assert_eq!(
+            op.dense_integer_32_array_attribute("dense_integer_32_array").unwrap(),
+            dense_integer_32_array_attribute
+        );
+
+        let dense_integer_64_array_attribute = context.dense_i64_array_attribute(&[1, 2, 3]).unwrap();
+        op.set_attribute("dense_integer_64_array", dense_integer_64_array_attribute);
+        assert_eq!(
+            op.dense_integer_64_array_attribute("dense_integer_64_array").unwrap(),
+            dense_integer_64_array_attribute
+        );
+
+        let dense_float_32_array_attribute = context.dense_f32_array_attribute(&[1.0, 2.0, 3.0]).unwrap();
+        op.set_attribute("dense_float_32_array", dense_float_32_array_attribute);
+        assert_eq!(op.dense_float_32_array_attribute("dense_float_32_array").unwrap(), dense_float_32_array_attribute);
+
+        let dense_float_64_array_attribute = context.dense_f64_array_attribute(&[1.0, 2.0, 3.0]).unwrap();
+        op.set_attribute("dense_float_64_array", dense_float_64_array_attribute);
+        assert_eq!(op.dense_float_64_array_attribute("dense_float_64_array").unwrap(), dense_float_64_array_attribute);
+
+        let dictionary_attribute = context.dictionary_attribute(&[
+            context.named_attribute(context.identifier("value"), context.integer_attribute(i32_type, 42))
+        ]);
+        op.set_attribute("dictionary", dictionary_attribute);
+        assert_eq!(op.dictionary_attribute("dictionary").unwrap(), dictionary_attribute);
+
+        let distinct_attribute = context.distinct_attribute(context.integer_attribute(i32_type, 42));
+        op.set_attribute("distinct", distinct_attribute);
+        assert_eq!(op.attribute("distinct").unwrap(), distinct_attribute.as_ref());
+        // The MLIR C API does not expose a distinct-attribute predicate, so this accessor cannot downcast attributes
+        // recovered from an operation.
+        assert!(op.distinct_attribute("distinct").is_err());
+
+        let dense_integer_elements_attribute = context.dense_i32_elements_attribute(tensor_type, &[1, 2]).unwrap();
+        op.set_attribute("dense_integer_elements", dense_integer_elements_attribute);
+        assert_eq!(
+            op.elements_attribute("dense_integer_elements").unwrap(),
+            dense_integer_elements_attribute.cast::<ElementsAttributeRef<'_, '_>>().unwrap()
+        );
+        assert_eq!(
+            op.dense_elements_attribute("dense_integer_elements").unwrap(),
+            dense_integer_elements_attribute.cast::<DenseElementsAttributeRef<'_, '_>>().unwrap()
+        );
+        assert_eq!(
+            op.dense_integer_elements_attribute("dense_integer_elements").unwrap(),
+            dense_integer_elements_attribute
+        );
+
+        let dense_float_elements_attribute =
+            context.dense_f32_elements_attribute(float_tensor_type, &[1.0, 2.0]).unwrap();
+        op.set_attribute("dense_float_elements", dense_float_elements_attribute);
+        assert_eq!(op.dense_float_elements_attribute("dense_float_elements").unwrap(), dense_float_elements_attribute);
+
+        let dense_resource_elements_attribute = context
+            .dense_i32_resource_elements_attribute(
+                tensor_type,
+                StringRef::from("operation_attribute_resource"),
+                &[1, 2],
+            )
+            .unwrap();
+        op.set_attribute("dense_resource_elements", dense_resource_elements_attribute);
+        assert_eq!(
+            op.dense_resource_elements_attribute("dense_resource_elements").unwrap(),
+            dense_resource_elements_attribute
+        );
+
+        let sparse_indices_type =
+            context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
+        let sparse_indices = context.dense_i64_elements_attribute(sparse_indices_type, &[0, 0, 1, 1]).unwrap();
+        let sparse_values = context.dense_i32_elements_attribute(tensor_type, &[1, 2]).unwrap();
+        let sparse_elements_attribute =
+            context.sparse_elements_attribute(tensor_type, sparse_indices, sparse_values).unwrap();
+        op.set_attribute("sparse_elements", sparse_elements_attribute);
+        assert_eq!(op.sparse_elements_attribute("sparse_elements").unwrap(), sparse_elements_attribute);
+
+        let flat_symbol_ref_attribute = context.flat_symbol_ref_attribute("symbol");
+        op.set_attribute("flat_symbol_ref", flat_symbol_ref_attribute);
+        assert_eq!(op.flat_symbol_ref_attribute("flat_symbol_ref").unwrap(), flat_symbol_ref_attribute);
+
+        let nested_symbol_ref = context.flat_symbol_ref_attribute("nested");
+        let symbol_ref_attribute = context.symbol_ref_attribute("root".into(), &[nested_symbol_ref]);
+        op.set_attribute("symbol_ref", symbol_ref_attribute);
+        assert_eq!(op.symbol_ref_attribute("symbol_ref").unwrap(), symbol_ref_attribute);
+
+        let float_attribute = context.float_attribute(context.float64_type(), 1.5);
+        op.set_attribute("float", float_attribute);
+        assert_eq!(op.float_attribute("float").unwrap(), float_attribute);
+
+        let integer_attribute = context.integer_attribute(i32_type, 42);
+        op.set_attribute("integer", integer_attribute);
+        assert_eq!(op.integer_attribute("integer").unwrap(), integer_attribute);
+
+        let integer_set_attribute = context.integer_set_attribute(context.empty_integer_set(0, 1));
+        op.set_attribute("integer_set", integer_set_attribute);
+        assert_eq!(op.integer_set_attribute("integer_set").unwrap(), integer_set_attribute);
+
+        let location_attribute = context.location_attribute(location);
+        op.set_attribute("location", location_attribute);
+        assert_eq!(op.location_attribute("location").unwrap(), location_attribute);
+
+        let opaque_attribute = context.opaque_attribute("test_dialect", "opaque_data", context.index_type());
+        op.set_attribute("opaque", opaque_attribute);
+        assert_eq!(op.opaque_attribute("opaque").unwrap(), opaque_attribute);
+
+        let strided_layout_attribute = context.strided_layout_attribute(0, &[4, 1]);
+        op.set_attribute("strided_layout", strided_layout_attribute);
+        assert_eq!(op.strided_layout_attribute("strided_layout").unwrap(), strided_layout_attribute);
+
+        let string_attribute = context.string_attribute("value");
+        op.set_attribute("string", string_attribute);
+        assert_eq!(op.string_attribute("string").unwrap(), string_attribute);
+
+        let symbol_visibility_attribute = context.symbol_visibility_attribute(SymbolVisibility::Private);
+        op.set_attribute("symbol_visibility", symbol_visibility_attribute);
+        assert_eq!(op.symbol_visibility_attribute("symbol_visibility").unwrap(), symbol_visibility_attribute);
+
+        let type_attribute = context.type_attribute(context.index_type());
+        op.set_attribute("type", type_attribute);
+        assert_eq!(op.type_attribute("type").unwrap(), type_attribute);
+
+        let unit_attribute = context.unit_attribute();
+        op.set_attribute("unit", unit_attribute);
+        assert_eq!(op.unit_attribute("unit").unwrap(), unit_attribute);
+
+        op.set_attribute("segments", context.dense_i32_array_attribute(&[2, 3, 1]).unwrap());
+        assert_eq!(op.dense_integer_32_array_attribute_usize_value("segments", 0).unwrap(), 2);
+        assert_eq!(op.dense_integer_32_array_attribute_usize_value("segments", 1).unwrap(), 3);
+        assert_eq!(op.dense_integer_32_array_attribute_usize_value("segments", 2).unwrap(), 1);
+        assert_eq!(op.dense_integer_32_array_attribute_segment_range("segments", 0).unwrap(), 0..2);
+        assert_eq!(op.dense_integer_32_array_attribute_segment_range("segments", 1).unwrap(), 2..5);
+        assert_eq!(op.dense_integer_32_array_attribute_segment_range("segments", 2).unwrap(), 5..6);
+        assert!(op.dense_integer_32_array_attribute_usize_value("segments", 3).is_err());
+        assert!(op.dense_integer_32_array_attribute_segment_range("segments", 3).is_err());
+        assert!(op.boolean_attribute("missing").is_err());
+        assert!(op.string_attribute("boolean").is_err());
     }
 
     #[test]
