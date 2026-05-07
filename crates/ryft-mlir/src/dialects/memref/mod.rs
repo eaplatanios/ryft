@@ -13,10 +13,7 @@ pub use operations::*;
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `memref` [`Dialect`](crate::Dialect).
     pub fn memref() -> Result<Self, Error> {
-        unsafe {
-            Self::from_c_api(mlirGetDialectHandle__memref__())
-                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
-        }
+        unsafe { Self::from_c_api(mlirGetDialectHandle__memref__()) }
     }
 }
 

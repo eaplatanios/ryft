@@ -20,10 +20,7 @@ pub use operations::*;
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `scf` [`Dialect`](crate::Dialect).
     pub fn scf() -> Result<Self, Error> {
-        unsafe {
-            Self::from_c_api(mlirGetDialectHandle__scf__())
-                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
-        }
+        unsafe { Self::from_c_api(mlirGetDialectHandle__scf__()) }
     }
 }
 

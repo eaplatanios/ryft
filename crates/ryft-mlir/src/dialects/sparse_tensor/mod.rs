@@ -24,10 +24,7 @@ pub use types::*;
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `sparse_tensor` [`Dialect`](crate::Dialect).
     pub fn sparse_tensor() -> Result<Self, Error> {
-        unsafe {
-            Self::from_c_api(mlirGetDialectHandle__sparse_tensor__())
-                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
-        }
+        unsafe { Self::from_c_api(mlirGetDialectHandle__sparse_tensor__()) }
     }
 }
 
