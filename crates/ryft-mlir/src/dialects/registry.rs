@@ -35,7 +35,7 @@ impl DialectRegistry {
     }
 
     /// Inserts the [`Dialect`] that corresponds to the provided [`DialectHandle`] into this [`DialectRegistry`].
-    pub fn insert(&self, dialect: DialectHandle) {
+    pub fn insert<'c, 't: 'c>(&self, dialect: DialectHandle<'c, 't>) {
         unsafe { mlirDialectHandleInsertDialect(dialect.to_c_api(), *self.handle.borrow_mut()) }
     }
 
@@ -209,8 +209,8 @@ mod tests {
         let registry = DialectRegistry::default();
 
         // Insert multiple dialects without crashing.
-        registry.insert(DialectHandle::gpu());
-        registry.insert(DialectHandle::linalg());
+        registry.insert(DialectHandle::gpu().unwrap());
+        registry.insert(DialectHandle::linalg().unwrap());
 
         // Verify that we can create a context with this registry.
         let _ = Context::new_with_registry(&registry, Threading::Disabled);
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn test_dialect_registry_clone() {
         let registry = DialectRegistry::new();
-        registry.insert(DialectHandle::gpu());
+        registry.insert(DialectHandle::gpu().unwrap());
         let _ = Context::new_with_registry(&registry, Threading::Disabled);
         let _ = Context::new_with_registry(&registry.clone(), Threading::Disabled);
     }
@@ -247,11 +247,11 @@ mod tests {
     fn test_context_register_dialect() {
         let context = Context::new();
         let initial_dialect_count = context.registered_dialect_count();
-        context.register_dialect(DialectHandle::gpu());
+        context.register_dialect(DialectHandle::gpu().unwrap());
         assert_eq!(context.registered_dialect_count(), initial_dialect_count + 1);
-        context.register_dialect(DialectHandle::gpu());
+        context.register_dialect(DialectHandle::gpu().unwrap());
         assert_eq!(context.registered_dialect_count(), initial_dialect_count + 1);
-        context.register_dialect(DialectHandle::linalg());
+        context.register_dialect(DialectHandle::linalg().unwrap());
         assert_eq!(context.registered_dialect_count(), initial_dialect_count + 2);
     }
 
@@ -260,9 +260,9 @@ mod tests {
         let context = Context::new();
         let initial_dialect_count = context.registered_dialect_count();
         let registry = DialectRegistry::new();
-        registry.insert(DialectHandle::gpu());
-        registry.insert(DialectHandle::linalg());
-        registry.insert(DialectHandle::sparse_tensor());
+        registry.insert(DialectHandle::gpu().unwrap());
+        registry.insert(DialectHandle::linalg().unwrap());
+        registry.insert(DialectHandle::sparse_tensor().unwrap());
         context.register_dialects(&registry);
         assert_eq!(context.registered_dialect_count(), initial_dialect_count + 3);
         context.register_dialects(&registry);
@@ -272,18 +272,16 @@ mod tests {
     #[test]
     fn test_context_load_dialect() {
         let context = Context::new();
-        let dialect_0 = DialectHandle::gpu();
-        let dialect_1 = DialectHandle::linalg();
+        let dialect_0 = DialectHandle::gpu().unwrap();
+        let dialect_1 = DialectHandle::linalg().unwrap();
         context.register_dialect(dialect_0);
-        let dialect_2 = context.load_dialect(dialect_0);
-        assert!(dialect_2.is_some());
-        assert_eq!(dialect_2.unwrap().namespace().unwrap(), "gpu");
+        let dialect_2 = context.load_dialect(dialect_0).unwrap();
+        assert_eq!(dialect_2.namespace().unwrap(), "gpu");
         assert_eq!(context.loaded_dialect_count(), 3);
-        let dialect_3 = context.load_dialect(dialect_1);
-        assert!(dialect_3.is_some());
-        assert_eq!(dialect_3.unwrap().namespace().unwrap(), "linalg");
+        let dialect_3 = context.load_dialect(dialect_1).unwrap();
+        assert_eq!(dialect_3.namespace().unwrap(), "linalg");
         assert_eq!(context.loaded_dialect_count(), 10);
-        let dialect_4 = context.load_dialect(dialect_0);
+        let dialect_4 = context.load_dialect(dialect_0).unwrap();
         assert_eq!(dialect_2, dialect_4);
         assert_eq!(context.loaded_dialect_count(), 10);
     }
@@ -296,7 +294,7 @@ mod tests {
         assert_eq!(context.load_dialect_by_name("gpu"), None);
 
         // Register and then load the `gpu` dialect by name.
-        context.register_dialect(DialectHandle::gpu());
+        context.register_dialect(DialectHandle::gpu().unwrap());
         let dialect_0 = context.load_dialect_by_name("gpu");
         assert!(dialect_0.is_some());
         assert_eq!(dialect_0.unwrap().namespace().unwrap(), "gpu");
@@ -309,9 +307,9 @@ mod tests {
     fn test_context_load_all_available_dialects() {
         let context = Context::new();
         let initial_dialect_count = context.loaded_dialect_count();
-        context.register_dialect(DialectHandle::gpu());
-        context.register_dialect(DialectHandle::linalg());
-        context.register_dialect(DialectHandle::sparse_tensor());
+        context.register_dialect(DialectHandle::gpu().unwrap());
+        context.register_dialect(DialectHandle::linalg().unwrap());
+        context.register_dialect(DialectHandle::sparse_tensor().unwrap());
         assert_eq!(context.loaded_dialect_count(), initial_dialect_count);
         context.load_all_available_dialects();
         assert!(context.as_ref().loaded_dialect_count() > initial_dialect_count);
@@ -330,8 +328,8 @@ mod tests {
     #[test]
     fn test_context_is_registered() {
         let context = Context::new();
-        context.register_dialect(DialectHandle::func());
-        context.load_dialect(DialectHandle::func());
+        context.register_dialect(DialectHandle::func().unwrap());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         assert_eq!(context.is_registered("func.func"), true);
         assert_eq!(context.as_ref().is_registered("func.return"), true);
         assert_eq!(context.is_registered("nonexistent.op"), false);

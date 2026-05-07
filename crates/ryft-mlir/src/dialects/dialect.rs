@@ -79,8 +79,8 @@ mod tests {
         let context = Context::new();
 
         // Load the `gpu` dialect and verify we can get its context.
-        context.register_dialect(DialectHandle::gpu().unwrap()).unwrap();
-        let dialect = context.load_dialect(DialectHandle::gpu().unwrap()).unwrap().unwrap();
+        context.register_dialect(DialectHandle::gpu().unwrap());
+        let dialect = context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
         let dialect_context = dialect.context();
         assert_eq!(context, dialect_context);
 
@@ -94,22 +94,19 @@ mod tests {
         let context = Context::new();
 
         // Load the `gpu` dialect and check its namespace.
-        context.register_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        context.register_dialect(DialectHandle::gpu().unwrap());
         let dialect = context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
-        assert!(dialect.is_some());
-        assert_eq!(dialect.unwrap().namespace().unwrap(), "gpu");
+        assert_eq!(dialect.namespace().unwrap(), "gpu");
 
         // Load the `linalg` dialect and check its namespace.
-        context.register_dialect(DialectHandle::linalg().unwrap()).unwrap();
+        context.register_dialect(DialectHandle::linalg().unwrap());
         let dialect = context.load_dialect(DialectHandle::linalg().unwrap()).unwrap();
-        assert!(dialect.is_some());
-        assert_eq!(dialect.unwrap().namespace().unwrap(), "linalg");
+        assert_eq!(dialect.namespace().unwrap(), "linalg");
 
         // Load the `sparse_tensor` dialect and check its namespace.
-        context.register_dialect(DialectHandle::sparse_tensor().unwrap()).unwrap();
+        context.register_dialect(DialectHandle::sparse_tensor().unwrap());
         let dialect = context.load_dialect(DialectHandle::sparse_tensor().unwrap()).unwrap();
-        assert!(dialect.is_some());
-        assert_eq!(dialect.unwrap().namespace().unwrap(), "sparse_tensor");
+        assert_eq!(dialect.namespace().unwrap(), "sparse_tensor");
     }
 
     #[test]
@@ -117,13 +114,13 @@ mod tests {
         let context = Context::new();
 
         // Load the `gpu` dialect twice and verify that the two loaded dialects are equal.
-        context.register_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        context.register_dialect(DialectHandle::gpu().unwrap());
         let dialect_0 = context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
         let dialect_1 = context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
         assert_eq!(dialect_0, dialect_1);
 
         // Load the `linalg` dialect and make sure that it is not equal to the loaded `gpu` dialect.
-        context.register_dialect(DialectHandle::linalg().unwrap()).unwrap();
+        context.register_dialect(DialectHandle::linalg().unwrap());
         let dialect_2 = context.load_dialect(DialectHandle::linalg().unwrap()).unwrap();
         assert_ne!(dialect_0, dialect_2);
     }
@@ -131,9 +128,8 @@ mod tests {
     #[test]
     fn test_dialect_c_api() {
         let context = Context::new();
-        context.register_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        context.register_dialect(DialectHandle::gpu().unwrap());
         let dialect = context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
-        assert!(dialect.is_some());
-        assert_eq!(unsafe { Dialect::from_c_api(dialect.unwrap().to_c_api()) }, dialect);
+        assert_eq!(unsafe { Dialect::from_c_api(dialect.to_c_api()) }, Some(dialect));
     }
 }
