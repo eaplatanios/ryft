@@ -1,9 +1,7 @@
 use crate::dialects::arith::{AtomicRmwKind, AtomicRmwKindAttributeRef};
 use crate::{
-    AffineMap, AffineMapAttributeRef, ArrayAttributeRef, Attribute, BooleanAttributeRef,
-    DenseInteger32ArrayAttributeRef, DenseInteger64ArrayAttributeRef, DenseIntegerElementsAttributeRef, DetachedOp,
-    DetachedRegion, DialectHandle, IntegerAttributeRef, IntegerSet, IntegerSetAttributeRef, Location, Operation,
-    OperationBuilder, RegionRef, TypeRef, ValueRef, VectorTypeDimension, mlir_op, mlir_op_trait,
+    AffineMap, Attribute, DetachedOp, DetachedRegion, DialectHandle, Error, IntegerAttributeRef, IntegerSet, Location,
+    Operation, OperationBuilder, RegionRef, TypeRef, ValueRef, VectorTypeDimension, mlir_op, mlir_op_trait,
 };
 
 /// Name of the affine map attribute used by single-map affine operations.
@@ -12,24 +10,24 @@ pub const MAP_ATTRIBUTE: &str = "map";
 /// Trait representing the `affine.apply` operation.
 pub trait ApplyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the affine map applied by this operation.
-    fn map(&self) -> AffineMap<'c, 't> {
-        self.attribute(MAP_ATTRIBUTE).unwrap().cast::<AffineMapAttributeRef>().unwrap().affine_map()
+    fn map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the operands supplied to the affine map.
-    fn map_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn map_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.operand_values().collect()
     }
 
     /// Returns the dimension operands supplied to the affine map.
-    fn dimension_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.map().dimension_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn dimension_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (0..self.map()?.dimension_count()).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the symbol operands supplied to the affine map.
-    fn symbol_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let dimension_count = self.map().dimension_count();
-        (dimension_count..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn symbol_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let dimension_count = self.map()?.dimension_count();
+        (dimension_count..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 }
 
@@ -46,16 +44,17 @@ pub fn apply<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     map: AffineMap<'c, 't>,
     map_operands: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedApplyOperation<'c, 't> {
+) -> Result<DetachedApplyOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.apply", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operands(map_operands)
         .add_result(context.index_type())
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::apply`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::apply`"))
+        })
 }
 
 /// Name of the lower-bound affine map attribute used by [`ForOperation`].
@@ -73,71 +72,44 @@ pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operandSegmentSizes";
 /// Trait representing the `affine.for` operation.
 pub trait ForOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the affine map used to compute this loop's lower bound.
-    fn lower_bound_map(&self) -> AffineMap<'c, 't> {
-        self.attribute(LOWER_BOUND_MAP_ATTRIBUTE)
-            .unwrap()
-            .cast::<AffineMapAttributeRef>()
-            .unwrap()
-            .affine_map()
+    fn lower_bound_map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(LOWER_BOUND_MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the operands supplied to this loop's lower-bound affine map.
-    fn lower_bound_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap()
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap()
-            .values()
-            .collect::<Vec<_>>();
-        (0..sizes[0] as usize).map(|index| self.operand_value(index).unwrap()).collect()
+    fn lower_bound_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?
+            .map(|index| self.operand_value(index))
+            .collect()
     }
 
     /// Returns the affine map used to compute this loop's upper bound.
-    fn upper_bound_map(&self) -> AffineMap<'c, 't> {
-        self.attribute(UPPER_BOUND_MAP_ATTRIBUTE)
-            .unwrap()
-            .cast::<AffineMapAttributeRef>()
-            .unwrap()
-            .affine_map()
+    fn upper_bound_map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(UPPER_BOUND_MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the operands supplied to this loop's upper-bound affine map.
-    fn upper_bound_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap()
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap()
-            .values()
-            .collect::<Vec<_>>();
-        let start = sizes[0] as usize;
-        let end = start + sizes[1] as usize;
-        (start..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn upper_bound_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?
+            .map(|index| self.operand_value(index))
+            .collect()
     }
 
     /// Returns the initial values passed to this loop.
-    fn inits(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap()
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap()
-            .values()
-            .collect::<Vec<_>>();
-        let start = (sizes[0] + sizes[1]) as usize;
-        let end = start + sizes[2] as usize;
-        (start..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn inits(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?
+            .map(|index| self.operand_value(index))
+            .collect()
     }
 
     /// Returns the positive integer step used by this loop.
-    fn step(&self) -> i64 {
-        self.attribute(STEP_ATTRIBUTE).unwrap().cast::<IntegerAttributeRef>().unwrap().signless_value()
+    fn step(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(STEP_ATTRIBUTE)?.signless_value())
     }
 
     /// Returns this loop's body region.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -157,16 +129,13 @@ pub fn r#for<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedForOperation<'c, 't> {
+) -> Result<DetachedForOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     let operand_segment_sizes =
         [lower_bound_operands.len() as i32, upper_bound_operands.len() as i32, inits.len() as i32];
     let builder = OperationBuilder::new("affine.for", location)
-        .add_attribute(
-            OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context.dense_i32_array_attribute(&operand_segment_sizes).unwrap(),
-        )
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&operand_segment_sizes)?)
         .add_attribute(LOWER_BOUND_MAP_ATTRIBUTE, context.affine_map_attribute(lower_bound_map))
         .add_attribute(UPPER_BOUND_MAP_ATTRIBUTE, context.affine_map_attribute(upper_bound_map));
     builder
@@ -177,8 +146,9 @@ pub fn r#for<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_results(result_types)
         .add_region(body)
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::for`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::for`"))
+        })
 }
 
 /// Name of the integer-set condition attribute used by [`IfOperation`].
@@ -187,23 +157,23 @@ pub const CONDITION_ATTRIBUTE: &str = "condition";
 /// Trait representing the `affine.if` operation.
 pub trait IfOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the integer-set condition evaluated by this operation.
-    fn condition(&self) -> IntegerSet<'c, 't> {
-        self.attribute(CONDITION_ATTRIBUTE).unwrap().cast::<IntegerSetAttributeRef>().unwrap().integer_set()
+    fn condition(&self) -> Result<IntegerSet<'c, 't>, Error> {
+        Ok(self.integer_set_attribute(CONDITION_ATTRIBUTE)?.integer_set())
     }
 
     /// Returns the operands supplied to this operation's condition.
-    fn condition_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn condition_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.operand_values().collect()
     }
 
     /// Returns this operation's then-region.
-    fn then_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn then_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns this operation's else-region.
-    fn else_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(1).unwrap()
+    fn else_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(1)
     }
 }
 
@@ -218,9 +188,9 @@ pub fn r#if<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     then_region: DetachedRegion<'c, 't>,
     else_region: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedIfOperation<'c, 't> {
+) -> Result<DetachedIfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.if", location)
         .add_attribute(CONDITION_ATTRIBUTE, context.integer_set_attribute(condition))
         .add_operands(condition_operands)
@@ -228,25 +198,26 @@ pub fn r#if<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_region(then_region)
         .add_region(else_region)
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::if`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::if`"))
+        })
 }
 
 /// Trait representing the `affine.load` operation.
 pub trait LoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the memref being loaded from.
-    fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn memref(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the affine map used to index the memref.
-    fn map(&self) -> AffineMap<'c, 't> {
-        self.attribute(MAP_ATTRIBUTE).unwrap().cast::<AffineMapAttributeRef>().unwrap().affine_map()
+    fn map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the affine index operands used to access the memref.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (1..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (1..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 }
 
@@ -263,29 +234,30 @@ pub fn load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     indices: &[ValueRef<'v, 'c, 't>],
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedLoadOperation<'c, 't> {
+) -> Result<DetachedLoadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.load", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operand(memref)
         .add_operands(indices)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::load`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::load`"))
+        })
 }
 
 /// Trait representing the `affine.min` operation.
 pub trait MinOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the affine map whose results are minimized by this operation.
-    fn map(&self) -> AffineMap<'c, 't> {
-        self.attribute(MAP_ATTRIBUTE).unwrap().cast::<AffineMapAttributeRef>().unwrap().affine_map()
+    fn map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the operands supplied to the affine map.
-    fn map_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn map_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.operand_values().collect()
     }
 }
 
@@ -302,28 +274,29 @@ pub fn min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     map: AffineMap<'c, 't>,
     map_operands: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedMinOperation<'c, 't> {
+) -> Result<DetachedMinOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.min", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operands(map_operands)
         .add_result(context.index_type())
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::min`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::min`"))
+        })
 }
 
 /// Trait representing the `affine.max` operation.
 pub trait MaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the affine map whose results are maximized by this operation.
-    fn map(&self) -> AffineMap<'c, 't> {
-        self.attribute(MAP_ATTRIBUTE).unwrap().cast::<AffineMapAttributeRef>().unwrap().affine_map()
+    fn map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the operands supplied to the affine map.
-    fn map_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn map_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.operand_values().collect()
     }
 }
 
@@ -340,16 +313,17 @@ pub fn max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     map: AffineMap<'c, 't>,
     map_operands: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedMaxOperation<'c, 't> {
+) -> Result<DetachedMaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.max", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operands(map_operands)
         .add_result(context.index_type())
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::max`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::max`"))
+        })
 }
 
 /// Name of the reduction-kind attribute used by [`ParallelOperation`].
@@ -373,81 +347,67 @@ pub const STEPS_ATTRIBUTE: &str = "steps";
 /// Trait representing the `affine.parallel` operation.
 pub trait ParallelOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the reduction kinds used by this operation's results.
-    fn reductions(&self) -> Vec<AtomicRmwKind> {
-        self.attribute(REDUCTIONS_ATTRIBUTE)
-            .unwrap()
-            .cast::<ArrayAttributeRef>()
-            .unwrap()
+    fn reductions(&self) -> Result<Vec<AtomicRmwKind>, Error> {
+        self.array_attribute(REDUCTIONS_ATTRIBUTE)?
             .elements()
-            .map(|attribute| attribute.cast::<AtomicRmwKindAttributeRef>().unwrap().value())
+            .map(|attribute| {
+                attribute?
+                    .cast::<AtomicRmwKindAttributeRef>()
+                    .ok_or_else(|| Error::invalid_argument("invalid `reductions` attribute in `affine.parallel`"))?
+                    .value()
+            })
             .collect()
     }
 
     /// Returns the affine map used to compute this operation's lower bounds.
-    fn lower_bounds_map(&self) -> AffineMap<'c, 't> {
-        self.attribute(LOWER_BOUNDS_MAP_ATTRIBUTE)
-            .unwrap()
-            .cast::<AffineMapAttributeRef>()
-            .unwrap()
-            .affine_map()
+    fn lower_bounds_map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(LOWER_BOUNDS_MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the grouping of lower-bound affine map results by loop dimension.
-    fn lower_bounds_groups(&self) -> Vec<i32> {
-        let attribute = self
-            .attribute(LOWER_BOUNDS_GROUPS_ATTRIBUTE)
-            .unwrap()
-            .cast::<DenseIntegerElementsAttributeRef>()
-            .unwrap();
-        unsafe { attribute.i32_elements().collect() }
+    fn lower_bounds_groups(&self) -> Result<Vec<i32>, Error> {
+        let attribute = self.dense_integer_elements_attribute(LOWER_BOUNDS_GROUPS_ATTRIBUTE)?;
+        unsafe { Ok(attribute.i32_elements().collect()) }
     }
 
     /// Returns the operands supplied to this operation's lower-bound affine map.
-    fn lower_bounds_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.lower_bounds_map().input_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn lower_bounds_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (0..self.lower_bounds_map()?.input_count()).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the affine map used to compute this operation's upper bounds.
-    fn upper_bounds_map(&self) -> AffineMap<'c, 't> {
-        self.attribute(UPPER_BOUNDS_MAP_ATTRIBUTE)
-            .unwrap()
-            .cast::<AffineMapAttributeRef>()
-            .unwrap()
-            .affine_map()
+    fn upper_bounds_map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(UPPER_BOUNDS_MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the grouping of upper-bound affine map results by loop dimension.
-    fn upper_bounds_groups(&self) -> Vec<i32> {
-        let attribute = self
-            .attribute(UPPER_BOUNDS_GROUPS_ATTRIBUTE)
-            .unwrap()
-            .cast::<DenseIntegerElementsAttributeRef>()
-            .unwrap();
-        unsafe { attribute.i32_elements().collect() }
+    fn upper_bounds_groups(&self) -> Result<Vec<i32>, Error> {
+        let attribute = self.dense_integer_elements_attribute(UPPER_BOUNDS_GROUPS_ATTRIBUTE)?;
+        unsafe { Ok(attribute.i32_elements().collect()) }
     }
 
     /// Returns the operands supplied to this operation's upper-bound affine map.
-    fn upper_bounds_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let lower_bound_operand_count = self.lower_bounds_map().input_count();
-        (lower_bound_operand_count..self.operand_count())
-            .map(|index| self.operand_value(index).unwrap())
-            .collect()
+    fn upper_bounds_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let lower_bound_operand_count = self.lower_bounds_map()?.input_count();
+        (lower_bound_operand_count..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the positive integer steps for each parallel loop dimension.
-    fn steps(&self) -> Vec<i64> {
-        self.attribute(STEPS_ATTRIBUTE)
-            .unwrap()
-            .cast::<ArrayAttributeRef>()
-            .unwrap()
+    fn steps(&self) -> Result<Vec<i64>, Error> {
+        self.array_attribute(STEPS_ATTRIBUTE)?
             .elements()
-            .map(|attribute| attribute.cast::<IntegerAttributeRef>().unwrap().signless_value())
+            .map(|attribute| {
+                attribute?
+                    .cast::<IntegerAttributeRef>()
+                    .map(|attribute| attribute.signless_value())
+                    .ok_or_else(|| Error::invalid_argument("invalid `steps` attribute in `affine.parallel`"))
+            })
             .collect()
     }
 
     /// Returns this operation's body region.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -469,29 +429,25 @@ pub fn parallel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedParallelOperation<'c, 't> {
+) -> Result<DetachedParallelOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
-    let lower_bounds_groups_type = context
-        .vector_type(
-            context.signless_integer_type(32),
-            &[VectorTypeDimension::Fixed(lower_bounds_groups.len())],
-            context.unknown_location(),
-        )
-        .unwrap();
-    let upper_bounds_groups_type = context
-        .vector_type(
-            context.signless_integer_type(32),
-            &[VectorTypeDimension::Fixed(upper_bounds_groups.len())],
-            context.unknown_location(),
-        )
-        .unwrap();
+    context.load_dialect(DialectHandle::affine()?);
+    let lower_bounds_groups_type = context.vector_type(
+        context.signless_integer_type(32),
+        &[VectorTypeDimension::Fixed(lower_bounds_groups.len())],
+        context.unknown_location(),
+    )?;
+    let upper_bounds_groups_type = context.vector_type(
+        context.signless_integer_type(32),
+        &[VectorTypeDimension::Fixed(upper_bounds_groups.len())],
+        context.unknown_location(),
+    )?;
     let step_type = context.signless_integer_type(64);
     let step_attributes = steps.iter().map(|step| context.integer_attribute(step_type, *step)).collect::<Vec<_>>();
     let reduction_attributes = reductions
         .iter()
         .map(|reduction| context.arith_atomic_rmw_kind_attribute(*reduction))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let builder = OperationBuilder::new("affine.parallel", location)
         .add_attribute(REDUCTIONS_ATTRIBUTE, context.array_attribute(&reduction_attributes))
         .add_attribute(LOWER_BOUNDS_MAP_ATTRIBUTE, context.affine_map_attribute(lower_bounds_map))
@@ -499,11 +455,11 @@ pub fn parallel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     builder
         .add_attribute(
             LOWER_BOUNDS_GROUPS_ATTRIBUTE,
-            context.dense_i32_elements_attribute(lower_bounds_groups_type, lower_bounds_groups).unwrap(),
+            context.dense_i32_elements_attribute(lower_bounds_groups_type, lower_bounds_groups)?,
         )
         .add_attribute(
             UPPER_BOUNDS_GROUPS_ATTRIBUTE,
-            context.dense_i32_elements_attribute(upper_bounds_groups_type, upper_bounds_groups).unwrap(),
+            context.dense_i32_elements_attribute(upper_bounds_groups_type, upper_bounds_groups)?,
         )
         .add_attribute(STEPS_ATTRIBUTE, context.array_attribute(&step_attributes))
         .add_operands(lower_bounds_operands)
@@ -511,8 +467,9 @@ pub fn parallel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_results(result_types)
         .add_region(body)
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::parallel`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::parallel`"))
+        })
 }
 
 /// Name of the read/write flag attribute used by [`PrefetchOperation`].
@@ -527,37 +484,33 @@ pub const IS_DATA_CACHE_ATTRIBUTE: &str = "isDataCache";
 /// Trait representing the `affine.prefetch` operation.
 pub trait PrefetchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the memref being prefetched.
-    fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn memref(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the affine map used to index the memref.
-    fn map(&self) -> AffineMap<'c, 't> {
-        self.attribute(MAP_ATTRIBUTE).unwrap().cast::<AffineMapAttributeRef>().unwrap().affine_map()
+    fn map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the affine index operands used to access the memref.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (1..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (1..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns `true` if this prefetch writes, and `false` if it reads.
-    fn is_write(&self) -> bool {
-        self.attribute(IS_WRITE_ATTRIBUTE).unwrap().cast::<BooleanAttributeRef>().unwrap().value()
+    fn is_write(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(IS_WRITE_ATTRIBUTE)?.value())
     }
 
     /// Returns the locality hint in the inclusive range `0..=3`.
-    fn locality_hint(&self) -> i32 {
-        self.attribute(LOCALITY_HINT_ATTRIBUTE)
-            .unwrap()
-            .cast::<IntegerAttributeRef>()
-            .unwrap()
-            .signless_value() as i32
+    fn locality_hint(&self) -> Result<i32, Error> {
+        Ok(self.integer_attribute(LOCALITY_HINT_ATTRIBUTE)?.signless_value() as i32)
     }
 
     /// Returns `true` if this prefetch targets the data cache, and `false` if it targets the instruction cache.
-    fn is_data_cache(&self) -> bool {
-        self.attribute(IS_DATA_CACHE_ATTRIBUTE).unwrap().cast::<BooleanAttributeRef>().unwrap().value()
+    fn is_data_cache(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(IS_DATA_CACHE_ATTRIBUTE)?.value())
     }
 }
 
@@ -575,9 +528,9 @@ pub fn prefetch<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     locality_hint: i32,
     is_data_cache: bool,
     location: L,
-) -> DetachedPrefetchOperation<'c, 't> {
+) -> Result<DetachedPrefetchOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.prefetch", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operand(memref)
@@ -589,30 +542,31 @@ pub fn prefetch<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         )
         .add_attribute(IS_DATA_CACHE_ATTRIBUTE, context.boolean_attribute(is_data_cache))
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::prefetch`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::prefetch`"))
+        })
 }
 
 /// Trait representing the `affine.store` operation.
 pub trait StoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the value being stored.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the memref being stored to.
-    fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn memref(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the affine map used to index the memref.
-    fn map(&self) -> AffineMap<'c, 't> {
-        self.attribute(MAP_ATTRIBUTE).unwrap().cast::<AffineMapAttributeRef>().unwrap().affine_map()
+    fn map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the affine index operands used to access the memref.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (2..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (2..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 }
 
@@ -628,24 +582,25 @@ pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     map: AffineMap<'c, 't>,
     indices: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedStoreOperation<'c, 't> {
+) -> Result<DetachedStoreOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.store", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operand(value)
         .add_operand(memref)
         .add_operands(indices)
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::store`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::store`"))
+        })
 }
 
 /// Trait representing the `affine.yield` operation.
 pub trait YieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the values yielded by this operation.
-    fn values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.operand_values().collect()
     }
 }
 
@@ -659,31 +614,32 @@ mlir_op_trait!(Yield, ZeroSuccessors);
 pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     values: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedYieldOperation<'c, 't> {
+) -> Result<DetachedYieldOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.yield", location)
         .add_operands(values)
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::yield`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::yield`"))
+        })
 }
 
 /// Trait representing the `affine.vector_load` operation.
 pub trait VectorLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the memref being loaded from.
-    fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn memref(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the affine map used to index the memref.
-    fn map(&self) -> AffineMap<'c, 't> {
-        self.attribute(MAP_ATTRIBUTE).unwrap().cast::<AffineMapAttributeRef>().unwrap().affine_map()
+    fn map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the affine index operands used to access the memref.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (1..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (1..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 }
 
@@ -700,39 +656,42 @@ pub fn vector_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     indices: &[ValueRef<'v, 'c, 't>],
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedVectorLoadOperation<'c, 't> {
+) -> Result<DetachedVectorLoadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.vector_load", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operand(memref)
         .add_operands(indices)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::vector_load`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::vector_load`"))
+        })
 }
 
 /// Trait representing the `affine.vector_store` operation.
 pub trait VectorStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the vector value being stored.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the memref being stored to.
-    fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn memref(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the affine map used to index the memref.
-    fn map(&self) -> AffineMap<'c, 't> {
-        self.attribute(MAP_ATTRIBUTE).unwrap().cast::<AffineMapAttributeRef>().unwrap().affine_map()
+    fn map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the affine index operands used to access the memref.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (2..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (2..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 }
 
@@ -748,17 +707,20 @@ pub fn vector_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     map: AffineMap<'c, 't>,
     indices: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedVectorStoreOperation<'c, 't> {
+) -> Result<DetachedVectorStoreOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.vector_store", location)
         .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
         .add_operand(value)
         .add_operand(memref)
         .add_operands(indices)
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::vector_store`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::vector_store`"))
+        })
 }
 
 /// Name of the static-basis attribute used by affine index linearization operations.
@@ -767,23 +729,18 @@ pub const STATIC_BASIS_ATTRIBUTE: &str = "static_basis";
 /// Trait representing the `affine.delinearize_index` operation.
 pub trait DelinearizeIndexOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the linear index to delinearize.
-    fn linear_index(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn linear_index(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the dynamic basis operands.
-    fn dynamic_basis(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (1..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn dynamic_basis(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (1..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the static basis values.
-    fn static_basis(&self) -> Vec<i64> {
-        self.attribute(STATIC_BASIS_ATTRIBUTE)
-            .unwrap()
-            .cast::<DenseInteger64ArrayAttributeRef>()
-            .unwrap()
-            .values()
-            .collect()
+    fn static_basis(&self) -> Result<Vec<i64>, Error> {
+        Ok(self.dense_integer_64_array_attribute(STATIC_BASIS_ATTRIBUTE)?.values().collect())
     }
 }
 
@@ -801,17 +758,20 @@ pub fn delinearize_index<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     static_basis: &[i64],
     result_types: &[TypeRef<'c, 't>],
     location: L,
-) -> DetachedDelinearizeIndexOperation<'c, 't> {
+) -> Result<DetachedDelinearizeIndexOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.delinearize_index", location)
         .add_operand(linear_index)
         .add_operands(dynamic_basis)
-        .add_attribute(STATIC_BASIS_ATTRIBUTE, context.dense_i64_array_attribute(static_basis).unwrap())
+        .add_attribute(STATIC_BASIS_ATTRIBUTE, context.dense_i64_array_attribute(static_basis)?)
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::delinearize_index`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::delinearize_index`"))
+        })
 }
 
 /// Name of the disjoint hint attribute used by [`LinearizeIndexOperation`].
@@ -820,39 +780,22 @@ pub const DISJOINT_ATTRIBUTE: &str = "disjoint";
 /// Trait representing the `affine.linearize_index` operation.
 pub trait LinearizeIndexOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the multi-index operands to linearize.
-    fn multi_index(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap()
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap()
-            .values()
-            .collect::<Vec<_>>();
-        (0..sizes[0] as usize).map(|index| self.operand_value(index).unwrap()).collect()
+    fn multi_index(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?
+            .map(|index| self.operand_value(index))
+            .collect()
     }
 
     /// Returns the dynamic basis operands.
-    fn dynamic_basis(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap()
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap()
-            .values()
-            .collect::<Vec<_>>();
-        let start = sizes[0] as usize;
-        let end = start + sizes[1] as usize;
-        (start..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn dynamic_basis(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?
+            .map(|index| self.operand_value(index))
+            .collect()
     }
 
     /// Returns the static basis values.
-    fn static_basis(&self) -> Vec<i64> {
-        self.attribute(STATIC_BASIS_ATTRIBUTE)
-            .unwrap()
-            .cast::<DenseInteger64ArrayAttributeRef>()
-            .unwrap()
-            .values()
-            .collect()
+    fn static_basis(&self) -> Result<Vec<i64>, Error> {
+        Ok(self.dense_integer_64_array_attribute(STATIC_BASIS_ATTRIBUTE)?.values().collect())
     }
 
     /// Returns `true` if the linearization has the `disjoint` optimization hint.
@@ -877,24 +820,22 @@ pub fn linearize_index<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     disjoint: bool,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedLinearizeIndexOperation<'c, 't> {
+) -> Result<DetachedLinearizeIndexOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     let operand_segment_sizes = [multi_index.len() as i32, dynamic_basis.len() as i32];
-    let builder = OperationBuilder::new("affine.linearize_index", location).add_attribute(
-        OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-        context.dense_i32_array_attribute(&operand_segment_sizes).unwrap(),
-    );
+    let builder = OperationBuilder::new("affine.linearize_index", location)
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&operand_segment_sizes)?);
     let builder = builder
         .add_operands(multi_index)
         .add_operands(dynamic_basis)
-        .add_attribute(STATIC_BASIS_ATTRIBUTE, context.dense_i64_array_attribute(static_basis).unwrap());
+        .add_attribute(STATIC_BASIS_ATTRIBUTE, context.dense_i64_array_attribute(static_basis)?);
     let builder = if disjoint { builder.add_attribute(DISJOINT_ATTRIBUTE, context.unit_attribute()) } else { builder };
-    builder
-        .add_result(result_type)
-        .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::linearize_index`")
+    builder.add_result(result_type).build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::linearize_index`"))
+    })
 }
 
 /// Name of the source affine map attribute used by [`DmaStartOperation`].
@@ -909,82 +850,82 @@ pub const TAG_MAP_ATTRIBUTE: &str = "tag_map";
 /// Trait representing the `affine.dma_start` operation.
 pub trait DmaStartOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source memref.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the affine map used to index the source memref.
-    fn source_map(&self) -> AffineMap<'c, 't> {
-        self.attribute(SOURCE_MAP_ATTRIBUTE).unwrap().cast::<AffineMapAttributeRef>().unwrap().affine_map()
+    fn source_map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(SOURCE_MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the source memref indices.
-    fn source_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let end = 1 + self.source_map().input_count();
-        (1..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn source_indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let end = 1 + self.source_map()?.input_count();
+        (1..end).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the destination memref.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1 + self.source_map().input_count()).unwrap()
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1 + self.source_map()?.input_count())
     }
 
     /// Returns the affine map used to index the destination memref.
-    fn destination_map(&self) -> AffineMap<'c, 't> {
-        self.attribute(DESTINATION_MAP_ATTRIBUTE)
-            .unwrap()
-            .cast::<AffineMapAttributeRef>()
-            .unwrap()
-            .affine_map()
+    fn destination_map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(DESTINATION_MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the destination memref indices.
-    fn destination_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let start = 2 + self.source_map().input_count();
-        let end = start + self.destination_map().input_count();
-        (start..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn destination_indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let start = 2 + self.source_map()?.input_count();
+        let end = start + self.destination_map()?.input_count();
+        (start..end).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the tag memref.
-    fn tag(&self) -> ValueRef<'o, 'c, 't> {
-        let index = 2 + self.source_map().input_count() + self.destination_map().input_count();
-        self.operand_value(index).unwrap()
+    fn tag(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let index = 2 + self.source_map()?.input_count() + self.destination_map()?.input_count();
+        self.operand_value(index)
     }
 
     /// Returns the affine map used to index the tag memref.
-    fn tag_map(&self) -> AffineMap<'c, 't> {
-        self.attribute(TAG_MAP_ATTRIBUTE).unwrap().cast::<AffineMapAttributeRef>().unwrap().affine_map()
+    fn tag_map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(TAG_MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the tag memref indices.
-    fn tag_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let start = 3 + self.source_map().input_count() + self.destination_map().input_count();
-        let end = start + self.tag_map().input_count();
-        (start..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn tag_indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let start = 3 + self.source_map()?.input_count() + self.destination_map()?.input_count();
+        let end = start + self.tag_map()?.input_count();
+        (start..end).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the number of elements to transfer.
-    fn num_elements(&self) -> ValueRef<'o, 'c, 't> {
-        let index =
-            3 + self.source_map().input_count() + self.destination_map().input_count() + self.tag_map().input_count();
-        self.operand_value(index).unwrap()
+    fn num_elements(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let index = 3
+            + self.source_map()?.input_count()
+            + self.destination_map()?.input_count()
+            + self.tag_map()?.input_count();
+        self.operand_value(index)
     }
 
     /// Returns `true` if this operation has stride operands.
-    fn is_strided(&self) -> bool {
-        let base_operand_count =
-            4 + self.source_map().input_count() + self.destination_map().input_count() + self.tag_map().input_count();
-        self.operand_count() != base_operand_count
+    fn is_strided(&self) -> Result<bool, Error> {
+        let base_operand_count = 4
+            + self.source_map()?.input_count()
+            + self.destination_map()?.input_count()
+            + self.tag_map()?.input_count();
+        Ok(self.operand_count() != base_operand_count)
     }
 
     /// Returns the optional stride operand.
-    fn stride(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        if self.is_strided() { self.operand_value(self.operand_count() - 2) } else { None }
+    fn stride(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.is_strided()? { self.operand_value(self.operand_count() - 2).map(Some) } else { Ok(None) }
     }
 
     /// Returns the optional elements-per-stride operand.
-    fn elements_per_stride(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        if self.is_strided() { self.operand_value(self.operand_count() - 1) } else { None }
+    fn elements_per_stride(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.is_strided()? { self.operand_value(self.operand_count() - 1).map(Some) } else { Ok(None) }
     }
 }
 
@@ -1008,9 +949,9 @@ pub fn dma_start<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     stride: Option<ValueRef<'v, 'c, 't>>,
     elements_per_stride: Option<ValueRef<'v, 'c, 't>>,
     location: L,
-) -> DetachedDmaStartOperation<'c, 't> {
+) -> Result<DetachedDmaStartOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     let builder = OperationBuilder::new("affine.dma_start", location)
         .add_operand(source)
         .add_attribute(SOURCE_MAP_ATTRIBUTE, context.affine_map_attribute(source_map));
@@ -1022,35 +963,36 @@ pub fn dma_start<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let builder = match (stride, elements_per_stride) {
         (Some(stride), Some(elements_per_stride)) => builder.add_operand(stride).add_operand(elements_per_stride),
         (None, None) => builder,
-        _ => panic!("`affine::dma_start` requires either both stride operands or neither"),
+        _ => {
+            return Err(Error::invalid_argument("`affine::dma_start` requires either both stride operands or neither"));
+        }
     };
-    builder
-        .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::dma_start`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::dma_start`"))
+    })
 }
 
 /// Trait representing the `affine.dma_wait` operation.
 pub trait DmaWaitOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tag memref.
-    fn tag(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tag(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the affine map used to index the tag memref.
-    fn tag_map(&self) -> AffineMap<'c, 't> {
-        self.attribute(TAG_MAP_ATTRIBUTE).unwrap().cast::<AffineMapAttributeRef>().unwrap().affine_map()
+    fn tag_map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(TAG_MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the tag memref indices.
-    fn tag_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let end = 1 + self.tag_map().input_count();
-        (1..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn tag_indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let end = 1 + self.tag_map()?.input_count();
+        (1..end).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the number of elements associated with the DMA operation.
-    fn num_elements(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1 + self.tag_map().input_count()).unwrap()
+    fn num_elements(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1 + self.tag_map()?.input_count())
     }
 }
 
@@ -1066,17 +1008,18 @@ pub fn dma_wait<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     tag_indices: &[ValueRef<'v, 'c, 't>],
     num_elements: ValueRef<'v, 'c, 't>,
     location: L,
-) -> DetachedDmaWaitOperation<'c, 't> {
+) -> Result<DetachedDmaWaitOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::affine());
+    context.load_dialect(DialectHandle::affine()?);
     OperationBuilder::new("affine.dma_wait", location)
         .add_operand(tag)
         .add_attribute(TAG_MAP_ATTRIBUTE, context.affine_map_attribute(tag_map))
         .add_operands(tag_indices)
         .add_operand(num_elements)
         .build()
-        .and_then(|operation| unsafe { DetachedOp::cast(operation) })
-        .expect("invalid arguments to `affine::dma_wait`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::dma_wait`"))
+        })
 }
 
 #[cfg(test)]
@@ -1103,34 +1046,40 @@ mod tests {
     fn test_apply() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type, location), (index_type, location)]);
-            let operands = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
-            let expression = (context.dimension_affine_expression(0) + context.symbol_affine_expression(0)).as_ref();
-            let map = context.affine_map(1, 1, &[expression]);
-            let operation = apply(map, &operands, location);
-            assert_eq!(operation.map(), map);
-            assert_eq!(operation.map_operands(), operands);
-            assert_eq!(operation.dimension_operands(), vec![operands[0]]);
-            assert_eq!(operation.symbol_operands(), vec![operands[1]]);
-            assert_eq!(operation.output().r#type(), index_type);
-            let output = operation.output();
-            block.append_operation(operation);
-            block.append_operation(func::r#return(&[output], location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into(), index_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type, location), (index_type, location)]);
+                let operands = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
+                let expression =
+                    (context.dimension_affine_expression(0) + context.symbol_affine_expression(0)).as_ref();
+                let map = context.affine_map(1, 1, &[expression]);
+                let operation = apply(map, &operands, location).unwrap();
+                assert_eq!(operation.map().unwrap(), map);
+                assert_eq!(operation.map_operands().unwrap(), operands);
+                assert_eq!(operation.dimension_operands().unwrap(), vec![operands[0]]);
+                assert_eq!(operation.symbol_operands().unwrap(), vec![operands[1]]);
+                let operation = apply(map, &operands, location).unwrap();
+                let output = operation.output().unwrap();
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&[output], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into(), index_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1149,27 +1098,33 @@ mod tests {
     fn test_for() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let mut body = context.block(&[(index_type, location)]);
-            body.append_operation(r#yield(&[], location));
-            let lower_bound_map = context.constant_affine_map(0);
-            let upper_bound_map = context.constant_affine_map(4);
-            let operation = r#for(lower_bound_map, &[], upper_bound_map, &[], 1, &[], &[], body.into(), location);
-            assert_eq!(operation.lower_bound_map(), lower_bound_map);
-            assert_eq!(operation.upper_bound_map(), upper_bound_map);
-            assert_eq!(operation.lower_bound_operands(), Vec::<ValueRef<'_, '_, '_>>::new());
-            assert_eq!(operation.upper_bound_operands(), Vec::<ValueRef<'_, '_, '_>>::new());
-            assert_eq!(operation.inits(), Vec::<ValueRef<'_, '_, '_>>::new());
-            assert_eq!(operation.step(), 1);
-            assert_eq!(operation.body().blocks().next().unwrap().argument_count(), 1);
-            block.append_operation(operation);
-            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-            func::func("test", func::FuncAttributes::default(), block.into(), location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let mut body = context.block(&[(index_type, location)]);
+                body.append_operation(r#yield(&[], location).unwrap()).unwrap();
+                let lower_bound_map = context.constant_affine_map(0);
+                let upper_bound_map = context.constant_affine_map(4);
+                let operation =
+                    r#for(lower_bound_map, &[], upper_bound_map, &[], 1, &[], &[], body.try_into().unwrap(), location)
+                        .unwrap();
+                assert_eq!(operation.lower_bound_map().unwrap(), lower_bound_map);
+                assert_eq!(operation.upper_bound_map().unwrap(), upper_bound_map);
+                assert_eq!(operation.lower_bound_operands().unwrap(), Vec::<ValueRef<'_, '_, '_>>::new());
+                assert_eq!(operation.upper_bound_operands().unwrap(), Vec::<ValueRef<'_, '_, '_>>::new());
+                assert_eq!(operation.inits().unwrap(), Vec::<ValueRef<'_, '_, '_>>::new());
+                assert_eq!(operation.step().unwrap(), 1);
+                assert_eq!(operation.body().unwrap().blocks().next().unwrap().argument_count(), 1);
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func::func("test", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1188,32 +1143,45 @@ mod tests {
     fn test_if() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type, location)]);
-            let condition_operand = block.argument(0).unwrap().as_ref();
-            let condition_operands = [condition_operand];
-            let mut then_block = context.block_with_no_arguments();
-            then_block.append_operation(r#yield(&[], location));
-            let mut else_block = context.block_with_no_arguments();
-            else_block.append_operation(r#yield(&[], location));
-            let condition = context.empty_integer_set(1, 0);
-            let operation = r#if(condition, &condition_operands, &[], then_block.into(), else_block.into(), location);
-            assert_eq!(operation.condition().dimension_count(), 1);
-            assert_eq!(operation.condition_operands(), vec![condition_operand]);
-            assert_eq!(operation.then_region().blocks().count(), 1);
-            assert_eq!(operation.else_region().blocks().count(), 1);
-            block.append_operation(operation);
-            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-            func::func(
-                "test",
-                func::FuncAttributes { arguments: vec![index_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type, location)]);
+                let condition_operand = block.argument(0).unwrap().as_ref();
+                let condition_operands = [condition_operand];
+                let mut then_block = context.block_with_no_arguments();
+                then_block.append_operation(r#yield(&[], location).unwrap()).unwrap();
+                let mut else_block = context.block_with_no_arguments();
+                else_block.append_operation(r#yield(&[], location).unwrap()).unwrap();
+                let condition = context.empty_integer_set(1, 0);
+                let operation = r#if(
+                    condition,
+                    &condition_operands,
+                    &[],
+                    then_block.try_into().unwrap(),
+                    else_block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(operation.condition().unwrap().dimension_count(), 1);
+                assert_eq!(operation.condition_operands().unwrap(), vec![condition_operand]);
+                assert_eq!(operation.then_region().unwrap().blocks().count(), 1);
+                assert_eq!(operation.else_region().unwrap().blocks().count(), 1);
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes { arguments: vec![index_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1234,35 +1202,40 @@ mod tests {
     fn test_load() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let index_type = context.index_type();
         let memref_type = context.mem_ref_type(i32_type, &[Size::Static(4)], None, None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(memref_type.as_ref(), location), (index_type.as_ref(), location)]);
-            let memref = block.argument(0).unwrap().as_ref();
-            let index = block.argument(1).unwrap().as_ref();
-            let map = context.identity_affine_map(1);
-            let operation = load(memref, map, &[index], i32_type.as_ref(), location);
-            assert_eq!(operation.memref(), memref);
-            assert_eq!(operation.map(), map);
-            assert_eq!(operation.indices(), vec![index]);
-            assert_eq!(operation.output().r#type(), i32_type);
-            let output = operation.output();
-            block.append_operation(operation);
-            block.append_operation(func::r#return(&[output], location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![memref_type.into(), index_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(memref_type.as_ref(), location), (index_type.as_ref(), location)]);
+                let memref = block.argument(0).unwrap().as_ref();
+                let index = block.argument(1).unwrap().as_ref();
+                let map = context.identity_affine_map(1);
+                let operation = load(memref, map, &[index], i32_type.as_ref(), location).unwrap();
+                assert_eq!(operation.memref().unwrap(), memref);
+                assert_eq!(operation.map().unwrap(), map);
+                assert_eq!(operation.indices().unwrap(), vec![index]);
+                let operation = load(memref, map, &[index], i32_type.as_ref(), location).unwrap();
+                let output = operation.output().unwrap();
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&[output], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![memref_type.into(), index_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1280,33 +1253,38 @@ mod tests {
     fn test_min() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type, location), (index_type, location)]);
-            let operands = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
-            let dimension = context.dimension_affine_expression(0);
-            let symbol = context.symbol_affine_expression(0);
-            let map = context.affine_map(1, 1, &[dimension.as_ref(), symbol.as_ref()]);
-            let operation = min(map, &operands, location);
-            assert_eq!(operation.map(), map);
-            assert_eq!(operation.map_operands(), operands);
-            assert_eq!(operation.output().r#type(), index_type);
-            let output = operation.output();
-            block.append_operation(operation);
-            block.append_operation(func::r#return(&[output], location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into(), index_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type, location), (index_type, location)]);
+                let operands = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
+                let dimension = context.dimension_affine_expression(0);
+                let symbol = context.symbol_affine_expression(0);
+                let map = context.affine_map(1, 1, &[dimension.as_ref(), symbol.as_ref()]);
+                let operation = min(map, &operands, location).unwrap();
+                assert_eq!(operation.map().unwrap(), map);
+                assert_eq!(operation.map_operands().unwrap(), operands);
+                let operation = min(map, &operands, location).unwrap();
+                let output = operation.output().unwrap();
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&[output], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into(), index_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1325,33 +1303,38 @@ mod tests {
     fn test_max() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type, location), (index_type, location)]);
-            let operands = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
-            let dimension = context.dimension_affine_expression(0);
-            let symbol = context.symbol_affine_expression(0);
-            let map = context.affine_map(1, 1, &[dimension.as_ref(), symbol.as_ref()]);
-            let operation = max(map, &operands, location);
-            assert_eq!(operation.map(), map);
-            assert_eq!(operation.map_operands(), operands);
-            assert_eq!(operation.output().r#type(), index_type);
-            let output = operation.output();
-            block.append_operation(operation);
-            block.append_operation(func::r#return(&[output], location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into(), index_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type, location), (index_type, location)]);
+                let operands = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
+                let dimension = context.dimension_affine_expression(0);
+                let symbol = context.symbol_affine_expression(0);
+                let map = context.affine_map(1, 1, &[dimension.as_ref(), symbol.as_ref()]);
+                let operation = max(map, &operands, location).unwrap();
+                assert_eq!(operation.map().unwrap(), map);
+                assert_eq!(operation.map_operands().unwrap(), operands);
+                let operation = max(map, &operands, location).unwrap();
+                let output = operation.output().unwrap();
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&[output], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into(), index_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1370,53 +1353,59 @@ mod tests {
     fn test_parallel() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let mut body = context.block(&[(index_type, location)]);
-            body.append_operation(r#yield(&[input], location));
-            let lower_bounds_map = context.constant_affine_map(0);
-            let upper_bounds_map = context.constant_affine_map(4);
-            let operation = parallel(
-                lower_bounds_map,
-                &[1],
-                &[],
-                upper_bounds_map,
-                &[1],
-                &[],
-                &[1],
-                &[AtomicRmwKind::AddInteger],
-                &[i32_type.as_ref()],
-                body.into(),
-                location,
-            );
-            assert_eq!(operation.reductions(), vec![AtomicRmwKind::AddInteger]);
-            assert_eq!(operation.lower_bounds_map(), lower_bounds_map);
-            assert_eq!(operation.upper_bounds_map(), upper_bounds_map);
-            assert_eq!(operation.lower_bounds_groups(), vec![1]);
-            assert_eq!(operation.upper_bounds_groups(), vec![1]);
-            assert_eq!(operation.lower_bounds_operands(), Vec::<ValueRef<'_, '_, '_>>::new());
-            assert_eq!(operation.upper_bounds_operands(), Vec::<ValueRef<'_, '_, '_>>::new());
-            assert_eq!(operation.steps(), vec![1]);
-            assert_eq!(operation.body().blocks().next().unwrap().argument_count(), 1);
-            let output = operation.result(0).unwrap();
-            block.append_operation(operation);
-            block.append_operation(func::r#return(&[output], location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let mut body = context.block(&[(index_type, location)]);
+                body.append_operation(r#yield(&[input], location).unwrap()).unwrap();
+                let lower_bounds_map = context.constant_affine_map(0);
+                let upper_bounds_map = context.constant_affine_map(4);
+                let operation = parallel(
+                    lower_bounds_map,
+                    &[1],
+                    &[],
+                    upper_bounds_map,
+                    &[1],
+                    &[],
+                    &[1],
+                    &[AtomicRmwKind::AddInteger],
+                    &[i32_type.as_ref()],
+                    body.try_into().unwrap(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(operation.reductions().unwrap(), vec![AtomicRmwKind::AddInteger]);
+                assert_eq!(operation.lower_bounds_map().unwrap(), lower_bounds_map);
+                assert_eq!(operation.upper_bounds_map().unwrap(), upper_bounds_map);
+                assert_eq!(operation.lower_bounds_groups().unwrap(), vec![1]);
+                assert_eq!(operation.upper_bounds_groups().unwrap(), vec![1]);
+                assert_eq!(operation.lower_bounds_operands().unwrap(), Vec::<ValueRef<'_, '_, '_>>::new());
+                assert_eq!(operation.upper_bounds_operands().unwrap(), Vec::<ValueRef<'_, '_, '_>>::new());
+                assert_eq!(operation.steps().unwrap(), vec![1]);
+                assert_eq!(operation.body().unwrap().blocks().next().unwrap().argument_count(), 1);
+                let output = operation.result(0).unwrap();
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&[output], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1436,32 +1425,40 @@ mod tests {
     fn test_prefetch() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let index_type = context.index_type();
         let memref_type = context.mem_ref_type(i32_type, &[Size::Static(4)], None, None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(memref_type.as_ref(), location), (index_type.as_ref(), location)]);
-            let memref = block.argument(0).unwrap().as_ref();
-            let index = block.argument(1).unwrap().as_ref();
-            let map = context.identity_affine_map(1);
-            let operation = prefetch(memref, map, &[index], false, 3, true, location);
-            assert_eq!(operation.memref(), memref);
-            assert_eq!(operation.map(), map);
-            assert_eq!(operation.indices(), vec![index]);
-            assert!(!operation.is_write());
-            assert_eq!(operation.locality_hint(), 3);
-            assert!(operation.is_data_cache());
-            block.append_operation(operation);
-            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-            func::func(
-                "test",
-                func::FuncAttributes { arguments: vec![memref_type.into(), index_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(memref_type.as_ref(), location), (index_type.as_ref(), location)]);
+                let memref = block.argument(0).unwrap().as_ref();
+                let index = block.argument(1).unwrap().as_ref();
+                let map = context.identity_affine_map(1);
+                let operation = prefetch(memref, map, &[index], false, 3, true, location).unwrap();
+                assert_eq!(operation.memref().unwrap(), memref);
+                assert_eq!(operation.map().unwrap(), map);
+                assert_eq!(operation.indices().unwrap(), vec![index]);
+                assert!(!operation.is_write().unwrap());
+                assert_eq!(operation.locality_hint().unwrap(), 3);
+                assert!(operation.is_data_cache().unwrap());
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![memref_type.into(), index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1479,38 +1476,43 @@ mod tests {
     fn test_store() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let index_type = context.index_type();
         let memref_type = context.mem_ref_type(i32_type, &[Size::Static(4)], None, None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (memref_type.as_ref(), location),
-                (i32_type.as_ref(), location),
-                (index_type.as_ref(), location),
-            ]);
-            let memref = block.argument(0).unwrap().as_ref();
-            let value = block.argument(1).unwrap().as_ref();
-            let index = block.argument(2).unwrap().as_ref();
-            let map = context.identity_affine_map(1);
-            let operation = store(value, memref, map, &[index], location);
-            assert_eq!(operation.value(), value);
-            assert_eq!(operation.memref(), memref);
-            assert_eq!(operation.map(), map);
-            assert_eq!(operation.indices(), vec![index]);
-            block.append_operation(operation);
-            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![memref_type.into(), i32_type.into(), index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (memref_type.as_ref(), location),
+                    (i32_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                ]);
+                let memref = block.argument(0).unwrap().as_ref();
+                let value = block.argument(1).unwrap().as_ref();
+                let index = block.argument(2).unwrap().as_ref();
+                let map = context.identity_affine_map(1);
+                let operation = store(value, memref, map, &[index], location).unwrap();
+                assert_eq!(operation.value().unwrap(), value);
+                assert_eq!(operation.memref().unwrap(), memref);
+                assert_eq!(operation.map().unwrap(), map);
+                assert_eq!(operation.indices().unwrap(), vec![index]);
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![memref_type.into(), i32_type.into(), index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1528,44 +1530,50 @@ mod tests {
     fn test_yield() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let mut body = context.block(&[(index_type, location)]);
-            let operation = r#yield(&[input], location);
-            assert_eq!(operation.values(), vec![input]);
-            body.append_operation(operation);
-            let parallel_operation = parallel(
-                context.constant_affine_map(0),
-                &[1],
-                &[],
-                context.constant_affine_map(4),
-                &[1],
-                &[],
-                &[1],
-                &[AtomicRmwKind::AddInteger],
-                &[i32_type.as_ref()],
-                body.into(),
-                location,
-            );
-            let output = parallel_operation.result(0).unwrap();
-            block.append_operation(parallel_operation);
-            block.append_operation(func::r#return(&[output], location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let mut body = context.block(&[(index_type, location)]);
+                let operation = r#yield(&[input], location).unwrap();
+                assert_eq!(operation.values().unwrap(), vec![input]);
+                body.append_operation(operation).unwrap();
+                let parallel_operation = parallel(
+                    context.constant_affine_map(0),
+                    &[1],
+                    &[],
+                    context.constant_affine_map(4),
+                    &[1],
+                    &[],
+                    &[1],
+                    &[AtomicRmwKind::AddInteger],
+                    &[i32_type.as_ref()],
+                    body.try_into().unwrap(),
+                    location,
+                )
+                .unwrap();
+                let output = parallel_operation.result(0).unwrap();
+                block.append_operation(parallel_operation).unwrap();
+                block.append_operation(func::r#return(&[output], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1585,31 +1593,39 @@ mod tests {
     fn test_vector_load() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let index_type = context.index_type();
         let memref_type = context.mem_ref_type(f32_type, &[Size::Static(16)], None, None, location).unwrap();
         let vector_type = context.vector_type(f32_type, &[VectorTypeDimension::Fixed(4)], location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(memref_type.as_ref(), location), (index_type.as_ref(), location)]);
-            let memref = block.argument(0).unwrap().as_ref();
-            let index = block.argument(1).unwrap().as_ref();
-            let map = context.identity_affine_map(1);
-            let operation = vector_load(memref, map, &[index], vector_type.as_ref(), location);
-            assert_eq!(operation.memref(), memref);
-            assert_eq!(operation.map(), map);
-            assert_eq!(operation.indices(), vec![index]);
-            assert_eq!(operation.output_type(), vector_type);
-            block.append_operation(operation);
-            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-            func::func(
-                "test",
-                func::FuncAttributes { arguments: vec![memref_type.into(), index_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(memref_type.as_ref(), location), (index_type.as_ref(), location)]);
+                let memref = block.argument(0).unwrap().as_ref();
+                let index = block.argument(1).unwrap().as_ref();
+                let map = context.identity_affine_map(1);
+                let operation = vector_load(memref, map, &[index], vector_type.as_ref(), location).unwrap();
+                assert_eq!(operation.memref().unwrap(), memref);
+                assert_eq!(operation.map().unwrap(), map);
+                assert_eq!(operation.indices().unwrap(), vec![index]);
+                assert_eq!(operation.output_type().unwrap(), vector_type);
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![memref_type.into(), index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1627,39 +1643,44 @@ mod tests {
     fn test_vector_store() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let index_type = context.index_type();
         let memref_type = context.mem_ref_type(f32_type, &[Size::Static(16)], None, None, location).unwrap();
         let vector_type = context.vector_type(f32_type, &[VectorTypeDimension::Fixed(4)], location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (memref_type.as_ref(), location),
-                (vector_type.as_ref(), location),
-                (index_type.as_ref(), location),
-            ]);
-            let memref = block.argument(0).unwrap().as_ref();
-            let value = block.argument(1).unwrap().as_ref();
-            let index = block.argument(2).unwrap().as_ref();
-            let map = context.identity_affine_map(1);
-            let operation = vector_store(value, memref, map, &[index], location);
-            assert_eq!(operation.value(), value);
-            assert_eq!(operation.memref(), memref);
-            assert_eq!(operation.map(), map);
-            assert_eq!(operation.indices(), vec![index]);
-            block.append_operation(operation);
-            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![memref_type.into(), vector_type.into(), index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (memref_type.as_ref(), location),
+                    (vector_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                ]);
+                let memref = block.argument(0).unwrap().as_ref();
+                let value = block.argument(1).unwrap().as_ref();
+                let index = block.argument(2).unwrap().as_ref();
+                let map = context.identity_affine_map(1);
+                let operation = vector_store(value, memref, map, &[index], location).unwrap();
+                assert_eq!(operation.value().unwrap(), value);
+                assert_eq!(operation.memref().unwrap(), memref);
+                assert_eq!(operation.map().unwrap(), map);
+                assert_eq!(operation.indices().unwrap(), vec![index]);
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![memref_type.into(), vector_type.into(), index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1677,32 +1698,44 @@ mod tests {
     fn test_delinearize_index() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type, location)]);
-            let linear_index = block.argument(0).unwrap().as_ref();
-            let operation =
-                delinearize_index(linear_index, &[], &[4, 8], &[index_type.as_ref(), index_type.as_ref()], location);
-            assert_eq!(operation.linear_index(), linear_index);
-            assert_eq!(operation.dynamic_basis(), Vec::<ValueRef<'_, '_, '_>>::new());
-            assert_eq!(operation.static_basis(), vec![4, 8]);
-            assert_eq!(operation.result_count(), 2);
-            let results = operation.results().collect::<Vec<_>>();
-            block.append_operation(operation);
-            block.append_operation(func::r#return(&results, location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into()],
-                    results: vec![index_type.into(), index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type, location)]);
+                let linear_index = block.argument(0).unwrap().as_ref();
+                let operation = delinearize_index(
+                    linear_index,
+                    &[],
+                    &[4, 8],
+                    &[index_type.as_ref(), index_type.as_ref()],
+                    location,
+                )
+                .unwrap();
+                assert_eq!(operation.linear_index().unwrap(), linear_index);
+                assert_eq!(operation.dynamic_basis().unwrap(), Vec::<ValueRef<'_, '_, '_>>::new());
+                assert_eq!(operation.static_basis().unwrap(), vec![4, 8]);
+                assert_eq!(operation.result_count(), 2);
+                let results =
+                    operation.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>();
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&results, location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into()],
+                        results: vec![index_type.into(), index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1720,32 +1753,38 @@ mod tests {
     fn test_linearize_index() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type, location), (index_type, location)]);
-            let multi_index = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
-            let operation = linearize_index(&multi_index, &[], &[4, 8], true, index_type.as_ref(), location);
-            assert_eq!(operation.multi_index(), multi_index);
-            assert_eq!(operation.dynamic_basis(), Vec::<ValueRef<'_, '_, '_>>::new());
-            assert_eq!(operation.static_basis(), vec![4, 8]);
-            assert!(operation.is_disjoint());
-            assert_eq!(operation.output().r#type(), index_type);
-            let output = operation.output();
-            block.append_operation(operation);
-            block.append_operation(func::r#return(&[output], location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into(), index_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type, location), (index_type, location)]);
+                let multi_index = block.arguments().map(|argument| argument.as_ref()).collect::<Vec<_>>();
+                let operation =
+                    linearize_index(&multi_index, &[], &[4, 8], true, index_type.as_ref(), location).unwrap();
+                assert_eq!(operation.multi_index().unwrap(), multi_index);
+                assert_eq!(operation.dynamic_basis().unwrap(), Vec::<ValueRef<'_, '_, '_>>::new());
+                assert_eq!(operation.static_basis().unwrap(), vec![4, 8]);
+                assert!(operation.is_disjoint());
+                assert_eq!(operation.output().unwrap().r#type().unwrap(), index_type);
+                let output = operation.output().unwrap();
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&[output], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into(), index_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1763,7 +1802,7 @@ mod tests {
     fn test_dma_start() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let i32_type = context.signless_integer_type(32);
         let index_type = context.index_type();
@@ -1779,67 +1818,73 @@ mod tests {
         let tag_type = context
             .mem_ref_type(i32_type, &[Size::Static(1)], None, Some(tag_memory_space.as_ref()), location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (source_type.as_ref(), location),
-                (destination_type.as_ref(), location),
-                (tag_type.as_ref(), location),
-                (index_type.as_ref(), location),
-                (index_type.as_ref(), location),
-            ]);
-            let source = block.argument(0).unwrap().as_ref();
-            let destination = block.argument(1).unwrap().as_ref();
-            let tag = block.argument(2).unwrap().as_ref();
-            let num_elements = block.argument(3).unwrap().as_ref();
-            let index = block.argument(4).unwrap().as_ref();
-            let map = context.identity_affine_map(1);
-            let operation = dma_start(
-                source,
-                map,
-                &[index],
-                destination,
-                map,
-                &[index],
-                tag,
-                map,
-                &[index],
-                num_elements,
-                None,
-                None,
-                location,
-            );
-            assert_eq!(operation.source(), source);
-            assert_eq!(operation.destination(), destination);
-            assert_eq!(operation.tag(), tag);
-            assert_eq!(operation.source_map(), map);
-            assert_eq!(operation.destination_map(), map);
-            assert_eq!(operation.tag_map(), map);
-            assert_eq!(operation.source_indices(), vec![index]);
-            assert_eq!(operation.destination_indices(), vec![index]);
-            assert_eq!(operation.tag_indices(), vec![index]);
-            assert_eq!(operation.num_elements(), num_elements);
-            assert!(!operation.is_strided());
-            assert!(operation.stride().is_none());
-            assert!(operation.elements_per_stride().is_none());
-            block.append_operation(operation);
-            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        source_type.into(),
-                        destination_type.into(),
-                        tag_type.into(),
-                        index_type.into(),
-                        index_type.into(),
-                    ],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (source_type.as_ref(), location),
+                    (destination_type.as_ref(), location),
+                    (tag_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                ]);
+                let source = block.argument(0).unwrap().as_ref();
+                let destination = block.argument(1).unwrap().as_ref();
+                let tag = block.argument(2).unwrap().as_ref();
+                let num_elements = block.argument(3).unwrap().as_ref();
+                let index = block.argument(4).unwrap().as_ref();
+                let map = context.identity_affine_map(1);
+                let operation = dma_start(
+                    source,
+                    map,
+                    &[index],
+                    destination,
+                    map,
+                    &[index],
+                    tag,
+                    map,
+                    &[index],
+                    num_elements,
+                    None,
+                    None,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(operation.source().unwrap(), source);
+                assert_eq!(operation.destination().unwrap(), destination);
+                assert_eq!(operation.tag().unwrap(), tag);
+                assert_eq!(operation.source_map().unwrap(), map);
+                assert_eq!(operation.destination_map().unwrap(), map);
+                assert_eq!(operation.tag_map().unwrap(), map);
+                assert_eq!(operation.source_indices().unwrap(), vec![index]);
+                assert_eq!(operation.destination_indices().unwrap(), vec![index]);
+                assert_eq!(operation.tag_indices().unwrap(), vec![index]);
+                assert_eq!(operation.num_elements().unwrap(), num_elements);
+                assert!(!operation.is_strided().unwrap());
+                assert!(operation.stride().unwrap().is_none());
+                assert!(operation.elements_per_stride().unwrap().is_none());
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            source_type.into(),
+                            destination_type.into(),
+                            tag_type.into(),
+                            index_type.into(),
+                            index_type.into(),
+                        ],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             concat!(
@@ -1859,41 +1904,46 @@ mod tests {
     fn test_dma_wait() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let index_type = context.index_type();
         let tag_memory_space = context.integer_attribute(index_type, 2);
         let tag_type = context
             .mem_ref_type(i32_type, &[Size::Static(1)], None, Some(tag_memory_space.as_ref()), location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (tag_type.as_ref(), location),
-                (index_type.as_ref(), location),
-                (index_type.as_ref(), location),
-            ]);
-            let tag = block.argument(0).unwrap().as_ref();
-            let num_elements = block.argument(1).unwrap().as_ref();
-            let index = block.argument(2).unwrap().as_ref();
-            let map = context.identity_affine_map(1);
-            let operation = dma_wait(tag, map, &[index], num_elements, location);
-            assert_eq!(operation.tag(), tag);
-            assert_eq!(operation.tag_map(), map);
-            assert_eq!(operation.tag_indices(), vec![index]);
-            assert_eq!(operation.num_elements(), num_elements);
-            block.append_operation(operation);
-            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-            func::func(
-                "test",
-                func::FuncAttributes {
-                    arguments: vec![tag_type.into(), index_type.into(), index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (tag_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                ]);
+                let tag = block.argument(0).unwrap().as_ref();
+                let num_elements = block.argument(1).unwrap().as_ref();
+                let index = block.argument(2).unwrap().as_ref();
+                let map = context.identity_affine_map(1);
+                let operation = dma_wait(tag, map, &[index], num_elements, location).unwrap();
+                assert_eq!(operation.tag().unwrap(), tag);
+                assert_eq!(operation.tag_map().unwrap(), map);
+                assert_eq!(operation.tag_indices().unwrap(), vec![index]);
+                assert_eq!(operation.num_elements().unwrap(), num_elements);
+                block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func::func(
+                    "test",
+                    func::FuncAttributes {
+                        arguments: vec![tag_type.into(), index_type.into(), index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
