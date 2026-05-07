@@ -18,10 +18,7 @@ pub use operations::*;
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `affine` [`Dialect`](crate::Dialect).
     pub fn affine() -> Result<Self, Error> {
-        unsafe {
-            Self::from_c_api(mlirGetDialectHandle__affine__())
-                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
-        }
+        unsafe { Self::from_c_api(mlirGetDialectHandle__affine__()) }
     }
 }
 

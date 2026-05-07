@@ -91,7 +91,7 @@ pub fn call<
     location: L,
 ) -> Result<DetachedCallOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::func()?);
+    context.load_dialect(DialectHandle::func()?)?;
     let mut builder = OperationBuilder::new("func.call", location)
         .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)
         .add_operands(&properties.arguments.iter().map(|argument| argument.value).collect::<Vec<_>>())
@@ -188,7 +188,7 @@ pub fn call_indirect<'f, 'v, 'c: 'f + 'v, 't: 'c, 's, C: Value<'f, 'c, 't>, L: L
     location: L,
 ) -> Result<DetachedCallIndirectOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::func()?);
+    context.load_dialect(DialectHandle::func()?)?;
     let mut builder = OperationBuilder::new("func.call_indirect", location)
         .add_operand(callee)
         .add_operands(&properties.arguments.iter().map(|argument| argument.value).collect::<Vec<_>>())
@@ -277,7 +277,7 @@ pub fn constant<
     location: L,
 ) -> Result<DetachedConstantOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::func()?);
+    context.load_dialect(DialectHandle::func()?)?;
     OperationBuilder::new("func.constant", location)
         .add_attribute(FUNCTION_CONSTANT_VALUE_ATTRIBUTE, function.try_into_with_context(context)?)
         .add_result(function_type.try_into_with_context(context)?)
@@ -409,7 +409,7 @@ pub fn func<'c, 't: 'c, 's, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c,
     location: L,
 ) -> Result<DetachedFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::func()?);
+    context.load_dialect(DialectHandle::func()?)?;
 
     let mut builder = OperationBuilder::new("func.func", location)
         .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?);
@@ -501,7 +501,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedReturnOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::func()?);
+    context.load_dialect(DialectHandle::func()?)?;
     OperationBuilder::new("func.return", location)
         .add_operands(values)
         .build()
@@ -1414,7 +1414,7 @@ mod tests {
                 let return_op = r#return(&[block.argument(0).unwrap(), block.argument(1).unwrap()], location).unwrap();
                 assert_eq!(
                     return_op.values().unwrap().into_iter().collect::<Vec<_>>(),
-                    block.arguments().collect::<Vec<_>>()
+                    block.arguments().collect::<Result<Vec<_>, _>>().unwrap()
                 );
                 block.append_operation(return_op).unwrap();
                 func(

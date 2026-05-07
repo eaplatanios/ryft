@@ -18,10 +18,7 @@ pub use types::*;
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the Mosaic TPU [`Dialect`](crate::Dialect).
     pub fn mosaic_tpu() -> Result<Self, Error> {
-        unsafe {
-            Self::from_c_api(mlirGetDialectHandle__tpu__())
-                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
-        }
+        unsafe { Self::from_c_api(mlirGetDialectHandle__tpu__()) }
     }
 }
 

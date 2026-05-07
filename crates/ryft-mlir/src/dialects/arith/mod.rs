@@ -19,10 +19,7 @@ pub use operations::*;
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `arith` [`Dialect`](crate::Dialect).
     pub fn arith() -> Result<Self, Error> {
-        unsafe {
-            Self::from_c_api(mlirGetDialectHandle__arith__())
-                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
-        }
+        unsafe { Self::from_c_api(mlirGetDialectHandle__arith__()) }
     }
 }
 

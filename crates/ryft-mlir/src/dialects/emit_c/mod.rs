@@ -21,10 +21,7 @@ pub use types::*;
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `emitc` [`Dialect`](crate::Dialect).
     pub fn emit_c() -> Result<Self, Error> {
-        unsafe {
-            Self::from_c_api(mlirGetDialectHandle__emitc__())
-                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
-        }
+        unsafe { Self::from_c_api(mlirGetDialectHandle__emitc__()) }
     }
 }
 

@@ -12,10 +12,7 @@ use crate::{DialectHandle, Error};
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `chlo` [`Dialect`](crate::Dialect).
     pub fn chlo() -> Result<Self, Error> {
-        unsafe {
-            Self::from_c_api(mlirGetDialectHandle__chlo__())
-                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
-        }
+        unsafe { Self::from_c_api(mlirGetDialectHandle__chlo__()) }
     }
 }
 

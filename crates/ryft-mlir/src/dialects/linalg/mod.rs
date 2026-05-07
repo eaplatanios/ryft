@@ -17,10 +17,7 @@ pub use passes::*;
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `linalg` [`Dialect`](crate::Dialect).
     pub fn linalg() -> Result<Self, Error> {
-        unsafe {
-            Self::from_c_api(mlirGetDialectHandle__linalg__())
-                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
-        }
+        unsafe { Self::from_c_api(mlirGetDialectHandle__linalg__()) }
     }
 }
 

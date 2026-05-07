@@ -41,9 +41,13 @@ pub struct AllToAllParamAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for AllToAllParamAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-        if attribute_has_shardy_mnemonic(attribute, "all_to_all_param") { Some(Self { handle, context }) } else { None }
+        if attribute_has_shardy_mnemonic(attribute, "all_to_all_param") {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -71,12 +75,12 @@ pub struct AllToAllParamListAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for AllToAllParamListAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
         if attribute_has_shardy_mnemonic(attribute, "all_to_all_param_list") {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -111,17 +115,22 @@ impl<'c, 't> AxisRefAttributeRef<'c, 't> {
     }
 
     /// Returns split metadata when this references a sub-axis.
-    pub fn sub_axis_info(&self) -> Option<SubAxisInfoAttributeRef<'c, 't>> {
-        unsafe { SubAxisInfoAttributeRef::from_c_api(sdyAxisRefAttrGetSubAxisInfo(self.handle), self.context) }
+    pub fn sub_axis_info(&self) -> Result<Option<SubAxisInfoAttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { sdyAxisRefAttrGetSubAxisInfo(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { SubAxisInfoAttributeRef::from_c_api(handle, self.context).map(Some) }
+        }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for AxisRefAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsAnAxisRefAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -148,7 +157,7 @@ impl<'t> Context<'t> {
         name: N,
         sub_axis_info: Option<SubAxisInfoAttributeRef<'c, 't>>,
     ) -> Result<AxisRefAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::shardy()?);
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             AxisRefAttributeRef::from_c_api(
                 sdyAxisRefAttrGet(
@@ -158,7 +167,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shardy_axis_ref`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_axis_ref`"))
         }
     }
 }
@@ -177,9 +186,13 @@ pub struct AxisRefListAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for AxisRefListAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-        if attribute_has_shardy_mnemonic(attribute, "axis_ref_list") { Some(Self { handle, context }) } else { None }
+        if attribute_has_shardy_mnemonic(attribute, "axis_ref_list") {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -221,11 +234,11 @@ impl<'c, 't> DimMappingAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for DimMappingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsADimMappingAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -247,7 +260,7 @@ impl<'t> Context<'t> {
     ///
     ///   - `factor_indices`: Rule-factor indices mapped to a tensor dimension.
     pub fn shardy_dim_mapping<'c>(&'c self, factor_indices: &[usize]) -> Result<DimMappingAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::shardy()?);
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let factor_indices = factor_indices.iter().map(|value| *value as i64).collect::<Vec<_>>();
             DimMappingAttributeRef::from_c_api(
@@ -258,7 +271,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shardy_dim_mapping`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_dim_mapping`"))
         }
     }
 }
@@ -303,11 +316,11 @@ impl<'c, 't> DimensionShardingAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for DimensionShardingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsADimensionShardingAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -336,7 +349,7 @@ impl<'t> Context<'t> {
         is_closed: bool,
         priority: Option<usize>,
     ) -> Result<DimensionShardingAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::shardy()?);
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let axes = axes.into_iter().map(|axis| axis.to_c_api()).collect::<Vec<_>>();
             DimensionShardingAttributeRef::from_c_api(
@@ -349,7 +362,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shardy_dimension_sharding`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_dimension_sharding`"))
         }
     }
 }
@@ -368,12 +381,12 @@ pub struct ListOfAxisRefListsAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for ListOfAxisRefListsAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
         if attribute_has_shardy_mnemonic(attribute, "list_of_axis_ref_lists") {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -416,11 +429,11 @@ impl<'c, 't> ManualAxesAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for ManualAxesAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsAManualAxesAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -445,14 +458,14 @@ impl<'t> Context<'t> {
         &'c self,
         axes: &[A],
     ) -> Result<ManualAxesAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::shardy()?);
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let axes = axes.iter().map(|axis| self.string_attribute(axis.as_ref()).to_c_api()).collect::<Vec<_>>();
             ManualAxesAttributeRef::from_c_api(
                 sdyManualAxesAttrGet(*self.handle.borrow(), axes.len().cast_signed(), axes.as_ptr()),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shardy_manual_axes`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_manual_axes`"))
         }
     }
 }
@@ -498,11 +511,11 @@ impl<'c, 't> MeshAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for MeshAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsAMeshAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -529,7 +542,7 @@ impl<'t> Context<'t> {
         axes: I,
         device_ids: &[usize],
     ) -> Result<MeshAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::shardy()?);
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let axes = axes.into_iter().map(|axis| axis.to_c_api()).collect::<Vec<_>>();
             let device_ids = device_ids.iter().map(|value| *value as i64).collect::<Vec<_>>();
@@ -543,7 +556,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shardy_mesh`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_mesh`"))
         }
     }
 }
@@ -574,11 +587,11 @@ impl<'c, 't> MeshAxisAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for MeshAxisAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsAMeshAxisAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -605,13 +618,13 @@ impl<'t> Context<'t> {
         name: N,
         size: usize,
     ) -> Result<MeshAxisAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::shardy()?);
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             MeshAxisAttributeRef::from_c_api(
                 sdyMeshAxisAttrGet(*self.handle.borrow(), StringRef::from(name.as_ref()).to_c_api(), size as i64),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shardy_mesh_axis`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_mesh_axis`"))
         }
     }
 }
@@ -725,11 +738,11 @@ impl<'c, 't> OpShardingRuleAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for OpShardingRuleAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsAOpShardingRuleAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -769,7 +782,7 @@ impl<'t> Context<'t> {
         blocked_propagation_factors: &[usize],
         is_custom_rule: bool,
     ) -> Result<OpShardingRuleAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::shardy()?);
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let factor_sizes = factor_sizes.iter().map(|value| *value as i64).collect::<Vec<_>>();
             let operand_mappings = operand_mappings.iter().map(|value| value.to_c_api()).collect::<Vec<_>>();
@@ -801,7 +814,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shardy_op_sharding_rule`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_op_sharding_rule`"))
         }
     }
 }
@@ -832,11 +845,11 @@ impl<'c, 't> SubAxisInfoAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for SubAxisInfoAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsASubAxisInfoAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -863,13 +876,13 @@ impl<'t> Context<'t> {
         pre_size: usize,
         size: usize,
     ) -> Result<SubAxisInfoAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::shardy()?);
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             SubAxisInfoAttributeRef::from_c_api(
                 sdySubAxisInfoAttrGet(*self.handle.borrow(), pre_size as i64, size as i64),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shardy_sub_axis_info`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_sub_axis_info`"))
         }
     }
 }
@@ -908,11 +921,11 @@ impl<'c, 't> TensorMappingAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for TensorMappingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsATensorMappingAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -937,14 +950,14 @@ impl<'t> Context<'t> {
         &'c self,
         dim_mappings: &[DimMappingAttributeRef<'c, 't>],
     ) -> Result<TensorMappingAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::shardy()?);
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let dim_mappings = dim_mappings.iter().map(|value| value.to_c_api()).collect::<Vec<_>>();
             TensorMappingAttributeRef::from_c_api(
                 sdyTensorMappingAttrGet(*self.handle.borrow(), dim_mappings.len().cast_signed(), dim_mappings.as_ptr()),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shardy_tensor_mapping`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_tensor_mapping`"))
         }
     }
 }
@@ -967,7 +980,7 @@ impl<'c, 't> TensorShardingAttributeRef<'c, 't> {
     pub fn mesh_or_ref(&self) -> Result<AttributeRef<'c, 't>, Error> {
         unsafe {
             AttributeRef::from_c_api(sdyTensorShardingAttrGetMeshOrRef(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null Shardy tensor sharding mesh attribute"))
+                .map_err(|_| Error::internal("expected non-null Shardy tensor sharding mesh attribute"))
         }
     }
 
@@ -1012,11 +1025,11 @@ impl<'c, 't> TensorShardingAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for TensorShardingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsATensorShardingAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -1047,7 +1060,7 @@ impl<'t> Context<'t> {
         replicated_axes: &[AxisRefAttributeRef<'c, 't>],
         unreduced_axes: &[AxisRefAttributeRef<'c, 't>],
     ) -> Result<TensorShardingAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::shardy()?);
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let dim_shardings = dim_shardings.iter().map(|value| value.to_c_api()).collect::<Vec<_>>();
             let replicated_axes = replicated_axes.iter().map(|value| value.to_c_api()).collect::<Vec<_>>();
@@ -1065,7 +1078,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shardy_tensor_sharding`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_tensor_sharding`"))
         }
     }
 }
@@ -1099,11 +1112,11 @@ impl<'c, 't> TensorShardingPerValueAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for TensorShardingPerValueAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsATensorShardingPerValueAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -1128,7 +1141,7 @@ impl<'t> Context<'t> {
         &'c self,
         shardings: &[TensorShardingAttributeRef<'c, 't>],
     ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::shardy()?);
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let shardings = shardings.iter().map(|value| value.to_c_api()).collect::<Vec<_>>();
             TensorShardingPerValueAttributeRef::from_c_api(
@@ -1139,7 +1152,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shardy_tensor_sharding_per_value`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_tensor_sharding_per_value`"))
         }
     }
 }
@@ -1212,7 +1225,7 @@ mod tests {
         let attribute = context.shardy_axis_ref("data", Some(sub_axis_info)).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.name().as_str().unwrap(), "data");
-        assert_eq!(attribute.sub_axis_info(), Some(sub_axis_info));
+        assert_eq!(attribute.sub_axis_info().unwrap(), Some(sub_axis_info));
         test_attribute_casting(attribute);
     }
 
