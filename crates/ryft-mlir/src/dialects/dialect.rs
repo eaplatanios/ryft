@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use ryft_xla_sys::bindings::{MlirDialect, mlirDialectEqual, mlirDialectGetContext, mlirDialectGetNamespace};
 
-use crate::{Context, ContextRef, StringRef};
+use crate::{Context, ContextRef, Error, StringRef};
 
 /// [`Dialect`]s are the mechanism by which the MLIR ecosystem achieves great extensibility. They enable the definition
 /// of new/custom [`Operation`](crate::Operation)s, [`Attribute`](crate::Attribute)s, and [`Type`](crate::Type)s. Each
@@ -31,8 +31,12 @@ impl<'c, 't> Dialect<'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirDialect) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, owner: PhantomData }) }
+    pub unsafe fn from_c_api(handle: MlirDialect) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR dialect handle"))
+        } else {
+            Ok(Self { handle, owner: PhantomData })
+        }
     }
 
     /// Returns the [`MlirDialect`] that corresponds to this [`Dialect`]
@@ -130,6 +134,6 @@ mod tests {
         let context = Context::new();
         context.register_dialect(DialectHandle::gpu().unwrap());
         let dialect = context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
-        assert_eq!(unsafe { Dialect::from_c_api(dialect.to_c_api()) }, Some(dialect));
+        assert_eq!(unsafe { Dialect::from_c_api(dialect.to_c_api()) }.unwrap(), dialect);
     }
 }

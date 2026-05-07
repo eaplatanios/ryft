@@ -468,7 +468,7 @@ impl<'o, 'c, 't> Iterator for OperandRefIterator<'o, 'c, 't> {
         if let Some(error) = self.error.take() {
             return Some(Err(error));
         }
-        
+
         let current_operand = self.current_operand.take()?;
         let handle = unsafe { mlirOpOperandGetNextUse(current_operand.to_c_api()) };
         if !unsafe { mlirOpOperandIsNull(handle) } {

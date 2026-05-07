@@ -86,11 +86,11 @@ impl<'o, 'c, 't: 'c> SymbolTable<'o, 'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api<O: Operation<'o, 'c, 't>>(handle: MlirSymbolTable, operation: &O) -> Option<Self> {
+    pub unsafe fn from_c_api<O: Operation<'o, 'c, 't>>(handle: MlirSymbolTable, operation: &O) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            None
+            Err(Error::internal("expected non-null MLIR symbol table handle"))
         } else {
-            Some(Self { handle: RefCell::new(handle), operation: operation.as_ref() })
+            Ok(Self { handle: RefCell::new(handle), operation: operation.as_ref() })
         }
     }
 
@@ -105,9 +105,10 @@ impl<'o, 'c, 't: 'c> SymbolTable<'o, 'c, 't> {
         &self.handle
     }
 
-    /// Looks up a symbol with the provided `name` in this [`SymbolTable`] and returns a reference to the [`Operation`]
-    /// that corresponds to that symbol. If the symbol cannot be found, then this function will return [`None`].
-    pub fn lookup<'r, S: AsRef<str>>(&self, name: S) -> Option<OperationRef<'r, 'c, 't>>
+    /// Looks up a symbol with the provided `name` in this [`SymbolTable`] and returns a reference to the
+    /// [`Operation`] that corresponds to that symbol. If the symbol cannot be found, then this function returns
+    /// `Ok(None)`.
+    pub fn lookup<'r, S: AsRef<str>>(&self, name: S) -> Result<Option<OperationRef<'r, 'c, 't>>, Error>
     where
         'o: 'r,
     {
@@ -115,11 +116,11 @@ impl<'o, 'c, 't: 'c> SymbolTable<'o, 'c, 't> {
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.operation.context().borrow();
-        unsafe {
-            OperationRef::from_c_api(
-                mlirSymbolTableLookup(*self.handle.borrow(), StringRef::from(name.as_ref()).to_c_api()),
-                self.operation.context(),
-            )
+        let handle = unsafe { mlirSymbolTableLookup(*self.handle.borrow(), StringRef::from(name.as_ref()).to_c_api()) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { OperationRef::from_c_api(handle, self.operation.context()).map(Some) }
         }
     }
 
@@ -141,7 +142,6 @@ impl<'o, 'c, 't: 'c> SymbolTable<'o, 'c, 't> {
                 self.operation.context(),
             )
             .map(|attribute| attribute.string())
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to symbol table insertion"))
         }
     }
 
@@ -246,12 +246,12 @@ mod tests {
 
         // Look up a symbol that exists in the test module.
         let symbol_table = module.new_symbol_table().unwrap();
-        let function = symbol_table.lookup("test_function");
+        let function = symbol_table.lookup("test_function").unwrap();
         assert!(function.is_some());
         assert_eq!(function.unwrap().name().as_str().unwrap(), "func.func");
 
         // Look up a non-existent symbol.
-        let non_existent = symbol_table.lookup("non_existent");
+        let non_existent = symbol_table.lookup("non_existent").unwrap();
         assert!(non_existent.is_none());
 
         // Attempt to insert a symbol with the same name as the function that is already there.
@@ -260,13 +260,13 @@ mod tests {
             func::func("test_function", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         let name = symbol_table.insert(&op).unwrap();
         assert_eq!(name.as_str().unwrap(), "test_function_0");
-        let function = symbol_table.lookup("test_function_0");
+        let function = symbol_table.lookup("test_function_0").unwrap();
         assert!(function.is_some());
         assert_eq!(function.unwrap().name().as_str().unwrap(), "func.func");
 
         // Remove the `test_function_0` symbol.
         symbol_table.erase(op);
-        let non_existent = symbol_table.lookup("test_function_0");
+        let non_existent = symbol_table.lookup("test_function_0").unwrap();
         assert!(non_existent.is_none());
     }
 
@@ -279,8 +279,8 @@ mod tests {
         let symbol_table = ManuallyDrop::new(symbol_table);
         let handle = unsafe { *symbol_table.to_c_api().borrow() };
         let symbol_table = unsafe { super::SymbolTable::from_c_api(handle, &symbol_table.operation) };
-        assert!(symbol_table.is_some());
-        let non_existent = symbol_table.unwrap().lookup("non_existent");
+        assert!(symbol_table.is_ok());
+        let non_existent = symbol_table.unwrap().lookup("non_existent").unwrap();
         assert!(non_existent.is_none());
     }
 }

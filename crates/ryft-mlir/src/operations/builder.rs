@@ -175,13 +175,10 @@ impl<'c, 't: 'c> OperationBuilder<'c, 't> {
     /// inference is enabled (via [`OperationBuilder::enable_result_type_inference`]) and fails, this function will
     /// return an [`Error`] and emit some diagnostics.
     pub fn build(mut self) -> Result<DetachedOperation<'c, 't>, Error> {
-        let operation = unsafe { DetachedOperation::from_c_api(mlirOperationCreate(&mut self.handle), self.context) };
-        if let Some(operation) = operation {
-            std::mem::forget(self);
-            Ok(operation)
-        } else {
-            Err(Error::invalid_argument("failed to build operation"))
-        }
+        let operation = unsafe { DetachedOperation::from_c_api(mlirOperationCreate(&mut self.handle), self.context) }
+            .map_err(|_| Error::invalid_argument("failed to build operation"))?;
+        std::mem::forget(self);
+        Ok(operation)
     }
 }
 
@@ -255,7 +252,7 @@ mod tests {
         assert_eq!(op.region_count(), 3);
         assert_eq!(op.successor_count(), 3);
 
-        let attribute = op.attribute("attr_name");
+        let attribute = op.attribute("attr_name").unwrap();
         assert!(attribute.is_some());
         assert_eq!(attribute.unwrap().to_string(), "\"attr_value\"");
 

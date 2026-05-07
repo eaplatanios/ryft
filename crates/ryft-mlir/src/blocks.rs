@@ -174,7 +174,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
                 "block predecessor index {index} is out of bounds for {predecessor_count} block predecessors",
             )));
         }
-        
+
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely
         // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to
         // MLIR internals that we have when working with the MLIR C API.
@@ -220,7 +220,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
                 "block successor index {index} is out of bounds for {successor_count} block successors",
             )));
         }
-        
+
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely
         // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to
         // MLIR internals that we have when working with the MLIR C API.
@@ -703,7 +703,7 @@ impl<'b, 'c, 't> Iterator for BlockOperationRefIterator<'b, 'c, 't> {
         if let Some(error) = self.error.take() {
             return Some(Err(error));
         }
-        
+
         let current_operation = self.current_operation.take()?;
         let handle = unsafe { mlirOperationGetNextInBlock(current_operation.to_c_api()) };
         if !handle.ptr.is_null() {

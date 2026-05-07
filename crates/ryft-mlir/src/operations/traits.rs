@@ -405,9 +405,9 @@ pub trait SingleBlock<'o, 'c: 'o, 't: 'c>:
     /// Returns a reference to the [`Block`](crate::Block) that represents the body of this [`Operation`]
     /// (i.e., the only [`Block`](crate::Block) it contains).
     fn body(&self) -> Result<BlockRef<'o, 'c, 't>, Error> {
-        self.body_region()?.blocks().next().ok_or_else(|| {
+        self.body_region()?.blocks()?.next().ok_or_else(|| {
             Error::invalid_argument(format!("missing body block in `{}`", self.name().as_str().unwrap_or("<unknown>")))
-        })
+        })?
     }
 }
 
@@ -491,7 +491,6 @@ pub trait SymbolTable<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow_mut();
         unsafe { super::symbol_table::SymbolTable::from_c_api(mlirSymbolTableCreate(self.to_c_api()), self) }
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to symbol table construction"))
     }
 
     /// Replaces all uses of `old_symbol` with `new_symbol` in this [`Operation`] and returns a [`LogicalResult`]
@@ -542,7 +541,7 @@ pub trait SymbolTable<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             unsafe {
                 let data = data as *mut (&mut F, &'c Context<'t>);
                 let (ref mut callback, context) = *data;
-                if let Some(operation) = OperationRef::from_c_api(operation, context) {
+                if let Ok(operation) = OperationRef::from_c_api(operation, context) {
                     callback(operation, all_symbol_uses_visible);
                 }
             }
@@ -700,7 +699,7 @@ mod tests {
         assert_eq!(module.region_count(), 1);
         assert!(module.region(0).is_ok());
         assert!(module.region(1).is_err());
-        assert_eq!(module.body_region().unwrap().blocks().count(), 1);
+        assert_eq!(module.body_region().unwrap().blocks().unwrap().count(), 1);
     }
 
     #[test]
@@ -813,10 +812,10 @@ mod tests {
 
         // Verify what symbols exist.
         let symbol_table = module.new_symbol_table().unwrap();
-        assert!(symbol_table.lookup("function_0").is_some());
-        assert!(symbol_table.lookup("function_1").is_some());
-        assert!(symbol_table.lookup("function_2").is_some());
-        assert!(symbol_table.lookup("function_3").is_none());
+        assert!(symbol_table.lookup("function_0").unwrap().is_some());
+        assert!(symbol_table.lookup("function_1").unwrap().is_some());
+        assert!(symbol_table.lookup("function_2").unwrap().is_some());
+        assert!(symbol_table.lookup("function_3").unwrap().is_none());
 
         // Try to do a replacement.
         assert!(module.replace_symbol("function_0", "function_1").is_success());

@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use ryft_xla_sys::bindings::{MlirDialectHandle, mlirDialectHandleGetNamespace};
 
-use crate::{Context, StringRef};
+use crate::{Context, Error, StringRef};
 
 /// [`DialectHandle`]s are the means by which dialects can be referred to and registered in MLIR.
 #[derive(Copy, Clone, Debug)]
@@ -23,8 +23,12 @@ impl<'c, 't> DialectHandle<'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirDialectHandle) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, owner: PhantomData }) }
+    pub unsafe fn from_c_api(handle: MlirDialectHandle) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR dialect handle"))
+        } else {
+            Ok(Self { handle, owner: PhantomData })
+        }
     }
 
     /// Returns the [`MlirDialectHandle`] that corresponds to this [`DialectHandle`]
@@ -71,7 +75,7 @@ mod tests {
 
         // Check that dialect handles integrate properly with the MLIR C API.
         let handle = unsafe { DialectHandle::from_c_api(DialectHandle::gpu().unwrap().to_c_api()) };
-        assert!(handle.is_some());
+        assert!(handle.is_ok());
         assert_eq!(handle.unwrap().namespace().unwrap(), "gpu");
     }
 }

@@ -317,7 +317,7 @@ impl<'r, 'c, 't> Iterator for RegionBlockRefIterator<'r, 'c, 't> {
         if let Some(error) = self.error.take() {
             return Some(Err(error));
         }
-        
+
         let current_block = self.current_block.take()?;
         let handle = unsafe { mlirBlockGetNextInRegion(current_block.to_c_api()) };
         if !handle.ptr.is_null() {

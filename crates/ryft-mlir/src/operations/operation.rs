@@ -45,7 +45,7 @@ macro_rules! mlir_operation_builtin_attribute {
         /// can be found or if it is not of the appropriate type, then this function returns an [`Error`].
         fn $method_name<N: AsRef<str>>(&self, name: N) -> Result<$attribute_type, Error> {
             let name = name.as_ref();
-            self.attribute(name).and_then(|attribute| attribute.cast::<$attribute_type>()).ok_or_else(|| {
+            self.attribute(name)?.and_then(|attribute| attribute.cast::<$attribute_type>()).ok_or_else(|| {
                 Error::invalid_argument(format!(
                     "missing or invalid `{}` attribute in `{}`",
                     name,
@@ -81,7 +81,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Option<Self>;
+    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Result<Self, Error>;
 
     /// Returns the [`MlirOperation`] that corresponds to this [`Operation`] and which can be passed to functions
     /// in the MLIR C API.
@@ -114,10 +114,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
 
     /// Returns the [`Location`] of this [`Operation`].
     fn location(&self) -> Result<LocationRef<'c, 't>, Error> {
-        unsafe {
-            LocationRef::from_c_api(mlirOperationGetLocation(self.to_c_api()), self.context())
-                .ok_or_else(|| Error::internal("expected non-null MLIR operation location handle"))
-        }
+        unsafe { LocationRef::from_c_api(mlirOperationGetLocation(self.to_c_api()), self.context()) }
     }
 
     /// Sets the [`Location`] of this [`Operation`].
@@ -160,20 +157,22 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     }
 
     /// Returns an inherent [`Attribute`] of this [`Operation`] with the provided name. If no such attribute can be
-    /// found, then this function returns [`None`].
+    /// found, then this function returns `Ok(None)`.
     ///
     /// Refer to the documentation of [`Operation::attributes`] for information on the distinction between
     /// inherent and discardable attributes.
-    fn inherent_attribute<N: AsRef<str>>(&self, name: N) -> Option<AttributeRef<'c, 't>> {
+    fn inherent_attribute<N: AsRef<str>>(&self, name: N) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe {
-            AttributeRef::from_c_api(
-                mlirOperationGetInherentAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api()),
-                self.context(),
-            )
+        let handle = unsafe {
+            mlirOperationGetInherentAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api())
+        };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context()).map(Some) }
         }
     }
 
@@ -233,24 +232,29 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        self.discardable_attribute(name).is_some()
+        let handle = unsafe {
+            mlirOperationGetDiscardableAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api())
+        };
+        !handle.ptr.is_null()
     }
 
     /// Returns a discardable [`Attribute`] of this [`Operation`] with the provided name. If no such attribute can be
-    /// found, then this function returns [`None`].
+    /// found, then this function returns `Ok(None)`.
     ///
     /// Refer to the documentation of [`Operation::attributes`] for information on the distinction between
     /// inherent and discardable attributes.
-    fn discardable_attribute<N: AsRef<str>>(&self, name: N) -> Option<AttributeRef<'c, 't>> {
+    fn discardable_attribute<N: AsRef<str>>(&self, name: N) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe {
-            AttributeRef::from_c_api(
-                mlirOperationGetDiscardableAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api()),
-                self.context(),
-            )
+        let handle = unsafe {
+            mlirOperationGetDiscardableAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api())
+        };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context()).map(Some) }
         }
     }
 
@@ -382,25 +386,32 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// [`Operation::has_discardable_attribute`]. Refer to the documentation of [`Operation::attributes`] for
     /// information on the distinction between inherent and discardable attributes.
     fn has_attribute<N: AsRef<str>>(&self, name: N) -> bool {
-        self.attribute(name).is_some()
-    }
-
-    /// Returns an [`Attribute`] of this [`Operation`] with the provided name. If no such attribute can be found,
-    /// then this function returns [`None`].
-    ///
-    /// It is recommended to instead use [`Operation::inherent_attribute`] or
-    /// [`Operation::discardable_attribute`]. Refer to the documentation of [`Operation::attributes`] for information
-    /// on the distinction between inherent and discardable attributes.
-    fn attribute<N: AsRef<str>>(&self, name: N) -> Option<AttributeRef<'c, 't>> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe {
-            AttributeRef::from_c_api(
-                mlirOperationGetAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api()),
-                self.context(),
-            )
+        let handle =
+            unsafe { mlirOperationGetAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api()) };
+        !handle.ptr.is_null()
+    }
+
+    /// Returns an [`Attribute`] of this [`Operation`] with the provided name. If no such attribute can be found,
+    /// then this function returns `Ok(None)`.
+    ///
+    /// It is recommended to instead use [`Operation::inherent_attribute`] or
+    /// [`Operation::discardable_attribute`]. Refer to the documentation of [`Operation::attributes`] for information
+    /// on the distinction between inherent and discardable attributes.
+    fn attribute<N: AsRef<str>>(&self, name: N) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
+        // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
+        // internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        let handle =
+            unsafe { mlirOperationGetAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api()) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context()).map(Some) }
         }
     }
 
@@ -585,9 +596,6 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
         let _guard = self.context().borrow();
         unsafe {
             OperandRef::from_c_api(mlirOperationGetOpOperand(self.to_c_api(), index.cast_signed()), self.context())
-                .ok_or_else(|| {
-                    Error::internal(format!("expected non-null MLIR operation operand handle at index {index}"))
-                })
         }
     }
 
@@ -615,12 +623,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
         // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
         // to MLIR internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe {
-            ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context())
-                .ok_or_else(|| {
-                    Error::internal(format!("expected non-null MLIR operation operand value handle at index {index}"))
-                })
-        }
+        unsafe { ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context()) }
     }
 
     /// Returns an [`Iterator`] over the [`Type`](crate::Type)s of the [`Operation::operands`] of this [`Operation`].
@@ -735,9 +738,6 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
         let _guard = self.context().borrow();
         unsafe {
             OperationResultRef::from_c_api(mlirOperationGetResult(self.to_c_api(), index.cast_signed()), self.context())
-                .ok_or_else(|| {
-                    Error::internal(format!("expected non-null MLIR operation result handle at index {index}"))
-                })
         }
     }
 
@@ -794,12 +794,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
         // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
         // to MLIR internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe {
-            RegionRef::from_c_api(mlirOperationGetRegion(self.to_c_api(), index.cast_signed()), self.context())
-                .ok_or_else(|| {
-                    Error::internal(format!("expected non-null MLIR operation region handle at index {index}"))
-                })
-        }
+        unsafe { RegionRef::from_c_api(mlirOperationGetRegion(self.to_c_api(), index.cast_signed()), self.context()) }
     }
 
     /// Returns the number of successor [`Block`]s of this [`Operation`]. Refer to [`Block::successors`]
@@ -838,12 +833,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
         // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
         // to MLIR internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe {
-            BlockRef::from_c_api(mlirOperationGetSuccessor(self.to_c_api(), index.cast_signed()), self.context())
-                .ok_or_else(|| {
-                    Error::internal(format!("expected non-null MLIR operation successor handle at index {index}"))
-                })
-        }
+        unsafe { BlockRef::from_c_api(mlirOperationGetSuccessor(self.to_c_api(), index.cast_signed()), self.context()) }
     }
 
     /// Replaces the successor at the `index`-pth position in the successors list of this [`Operation`], with the
@@ -865,23 +855,29 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Returns a reference to the parent [`Block`] of this [`Operation`] (i.e., the [`Block`] that owns this
     /// operation), if one exists (i.e., if this is not a [`DetachedOperation`] or a reference to a detached
     /// operation).
-    fn parent_block(&self) -> Option<BlockRef<'o, 'c, 't>> {
+    fn parent_block(&self) -> Result<Option<BlockRef<'o, 'c, 't>>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe { BlockRef::from_c_api(mlirOperationGetBlock(self.to_c_api()), self.context()) }
+        let handle = unsafe { mlirOperationGetBlock(self.to_c_api()) };
+        if handle.ptr.is_null() { Ok(None) } else { unsafe { BlockRef::from_c_api(handle, self.context()).map(Some) } }
     }
 
     /// Returns a reference to the parent [`Operation`] of this [`Operation`] (i.e., the [`Operation`] that owns this
     /// operation), if one exists (i.e., if this is not a [`DetachedOperation`] or a reference to a detached
     /// operation).
-    fn parent_operation(&self) -> Option<OperationRef<'o, 'c, 't>> {
+    fn parent_operation(&self) -> Result<Option<OperationRef<'o, 'c, 't>>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe { OperationRef::from_c_api(mlirOperationGetParentOperation(self.to_c_api()), self.context()) }
+        let handle = unsafe { mlirOperationGetParentOperation(self.to_c_api()) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { OperationRef::from_c_api(handle, self.context()).map(Some) }
+        }
     }
 
     /// Returns `true` if this operation appears before `other` in the parent [`Block`] of this operation (assuming
@@ -1097,7 +1093,7 @@ pub trait DetachedOp<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// there is no guaranteed/safe way to ensure that the desired cast is valid. Therefore, attempting an invalid
     /// cast can result in undefined behavior and so this function needs to be used with care.
     unsafe fn cast<O: DetachedOp<'o, 'c, 't>>(self) -> Option<O> {
-        let operation = unsafe { O::from_c_api(self.to_c_api(), self.context()) };
+        let operation = unsafe { O::from_c_api(self.to_c_api(), self.context()).ok() };
         if operation.is_some() {
             std::mem::forget(self);
         }
@@ -1110,7 +1106,7 @@ pub trait OpRef<'o, 'c: 'o, 't: 'c>: Copy + Clone + Operation<'o, 'c, 't> {
     /// Tries to cast this [`OpRef`] to an instance of `O` (e.g., an instance of [`OperationRef`]). If this
     /// is not an instance of the specified [`OpRef`] type, this function will return [`None`].
     unsafe fn cast<O: OpRef<'o, 'c, 't>>(&self) -> Option<O> {
-        unsafe { O::from_c_api(self.to_c_api(), self.context()) }
+        unsafe { O::from_c_api(self.to_c_api(), self.context()).ok() }
     }
 }
 
@@ -1131,8 +1127,12 @@ pub struct DetachedOperation<'c, 't: 'c> {
 }
 
 impl<'o, 'c: 'o, 't: 'c> Operation<'o, 'c, 't> for DetachedOperation<'c, 't> {
-    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR operation handle"))
+        } else {
+            Ok(Self { handle, context })
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirOperation {
@@ -1213,23 +1213,30 @@ impl Drop for DetachedOperation<'_, '_> {
 }
 
 impl<'t> Context<'t> {
-    /// Parses a [`DetachedOperation`] from the provided string representation. Returns [`None`] if MLIR fails to parse
-    /// the provided string into an [`Operation`] (this function will also emit diagnostics if that happens). The
-    /// provided `filename` is used to create a [`FileLocationRef`](crate::FileLocationRef) that will be used as the
-    /// location of the resulting [`Operation`].
-    pub fn parse_operation<'o, 'c: 'o>(&'c self, source: &str, filename: &str) -> Option<DetachedOperation<'c, 't>> {
+    /// Parses a [`DetachedOperation`] from the provided string representation.
+    ///
+    /// Returns an [`Error`] if MLIR fails to parse the provided string into an [`Operation`] (this function will also
+    /// emit diagnostics if that happens). The provided `filename` is used to create a
+    /// [`FileLocationRef`](crate::FileLocationRef) that will be used as the location of the resulting [`Operation`].
+    pub fn parse_operation<'o, 'c: 'o>(
+        &'c self,
+        source: &str,
+        filename: &str,
+    ) -> Result<DetachedOperation<'c, 't>, Error> {
         unsafe {
-            DetachedOperation::from_c_api(
-                mlirOperationCreateParse(
-                    // The following context borrow ensures that access to the underlying MLIR data structures is done
-                    // safely from Rust. It is maybe more conservative than would be ideal, but that is due to the
-                    // limited exposure to MLIR internals that we have when working with the MLIR C API.
-                    *self.handle.borrow(),
-                    StringRef::from(source).to_c_api(),
-                    StringRef::from(filename).to_c_api(),
-                ),
-                self,
-            )
+            let handle = mlirOperationCreateParse(
+                // The following context borrow ensures that access to the underlying MLIR data structures is done
+                // safely from Rust. It is maybe more conservative than would be ideal, but that is due to the
+                // limited exposure to MLIR internals that we have when working with the MLIR C API.
+                *self.handle.borrow(),
+                StringRef::from(source).to_c_api(),
+                StringRef::from(filename).to_c_api(),
+            );
+            if handle.ptr.is_null() {
+                Err(Error::parsing_error(format!("failed to parse MLIR operation from `{filename}`")))
+            } else {
+                DetachedOperation::from_c_api(handle, self)
+            }
         }
     }
 }
@@ -1252,8 +1259,12 @@ pub struct OperationRef<'o, 'c: 'o, 't: 'c> {
 }
 
 impl<'r, 'o: 'r, 'c: 'o, 't: 'c> Operation<'r, 'c, 't> for OperationRef<'o, 'c, 't> {
-    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context, owner: PhantomData }) }
+    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR operation handle"))
+        } else {
+            Ok(Self { handle, context, owner: PhantomData })
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirOperation {
@@ -1421,9 +1432,9 @@ mod tests {
             func::func("test_func", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         assert!(op.inherent_attribute_count() > 0);
         assert!(op.has_inherent_attribute("sym_name"));
-        assert_eq!(op.inherent_attribute("sym_name"), Some(context.string_attribute("test_func").as_ref()));
+        assert_eq!(op.inherent_attribute("sym_name").unwrap(), Some(context.string_attribute("test_func").as_ref()));
         op.set_inherent_attribute("sym_name", context.string_attribute("modified"));
-        assert_eq!(op.inherent_attribute("sym_name"), Some(context.string_attribute("modified").as_ref()));
+        assert_eq!(op.inherent_attribute("sym_name").unwrap(), Some(context.string_attribute("modified").as_ref()));
     }
 
     #[test]
@@ -1441,7 +1452,7 @@ mod tests {
         op.set_discardable_attribute("custom", context.string_attribute("value"));
         assert_eq!(op.discardable_attribute_count(), 1);
         assert!(op.has_discardable_attribute("custom"));
-        assert_eq!(op.discardable_attribute("custom"), Some(context.string_attribute("value").as_ref()));
+        assert_eq!(op.discardable_attribute("custom").unwrap(), Some(context.string_attribute("value").as_ref()));
         let attributes = op.discardable_attributes().collect::<Vec<_>>();
         assert_eq!(attributes.len(), 1);
         assert_eq!(attributes[0].name(), context.identifier("custom"));
@@ -1469,12 +1480,12 @@ mod tests {
             .add_attribute("foo", context.string_attribute("bar"))
             .build()
             .unwrap();
-        assert!(op.attribute("foo").is_some());
-        assert_eq!(op.attribute("foo").map(|a| a.to_string()), Some("\"bar\"".into()));
+        assert!(op.attribute("foo").unwrap().is_some());
+        assert_eq!(op.attribute("foo").unwrap().map(|attribute| attribute.to_string()), Some("\"bar\"".into()));
         assert!(op.remove_attribute("foo"));
         assert!(!op.remove_attribute("foo"));
         op.set_attribute("foo", context.string_attribute("foo"));
-        assert_eq!(op.attribute("foo").map(|a| a.to_string()), Some("\"foo\"".into()));
+        assert_eq!(op.attribute("foo").unwrap().map(|attribute| attribute.to_string()), Some("\"foo\"".into()));
         let attribute = op.attributes().next().unwrap();
         assert_eq!(attribute.name(), context.identifier("foo"));
         assert_eq!(attribute.attribute().unwrap(), context.string_attribute("foo"));
@@ -1553,7 +1564,7 @@ mod tests {
 
         let distinct_attribute = context.distinct_attribute(context.integer_attribute(i32_type, 42));
         op.set_attribute("distinct", distinct_attribute);
-        assert_eq!(op.attribute("distinct").unwrap(), distinct_attribute.as_ref());
+        assert_eq!(op.attribute("distinct").unwrap().unwrap(), distinct_attribute.as_ref());
         // The MLIR C API does not expose a distinct-attribute predicate, so this accessor cannot downcast attributes
         // recovered from an operation.
         assert!(op.distinct_attribute("distinct").is_err());
@@ -1819,10 +1830,10 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let op = OperationBuilder::new("foo", location).build().unwrap();
-        assert!(op.parent_block().is_none());
+        assert!(op.parent_block().unwrap().is_none());
         let mut block = context.block_with_no_arguments();
         let op = block.append_operation(op).unwrap();
-        assert_eq!(op.parent_block(), Some(block.as_ref()));
+        assert_eq!(op.parent_block().unwrap(), Some(block.as_ref()));
     }
 
     #[test]
@@ -1841,17 +1852,22 @@ mod tests {
             .build()
             .unwrap();
         let op = block.append_operation(op).unwrap();
-        assert_eq!(op.parent_operation(), None);
+        assert_eq!(op.parent_operation().unwrap(), None);
         assert_eq!(
             op.region(0)
                 .unwrap()
                 .blocks()
+                .unwrap()
                 .next()
+                .unwrap()
                 .unwrap()
                 .operations()
+                .unwrap()
                 .next()
                 .unwrap()
+                .unwrap()
                 .parent_operation()
+                .unwrap()
                 .unwrap(),
             op
         );
@@ -1885,12 +1901,20 @@ mod tests {
         let op_2 = block.append_operation(OperationBuilder::new("op_2", location).build().unwrap()).unwrap();
         unsafe { op_1.move_after(&op_2) };
         assert_eq!(
-            block.operations().map(|op| op.name().as_str().unwrap().to_string()).collect::<Vec<_>>(),
+            block
+                .operations()
+                .unwrap()
+                .map(|op| op.unwrap().name().as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
             vec!["op_0", "op_2", "op_1"],
         );
         unsafe { op_2.move_before(&op_0) };
         assert_eq!(
-            block.operations().map(|op| op.name().as_str().unwrap().to_string()).collect::<Vec<_>>(),
+            block
+                .operations()
+                .unwrap()
+                .map(|op| op.unwrap().name().as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
             vec!["op_2", "op_0", "op_1"],
         );
     }
@@ -2104,7 +2128,7 @@ mod tests {
 
         // Cloned operations should have the same name, attributes, etc.
         assert_eq!(op_0.name(), op_1.name());
-        assert_eq!(op_0.attribute("key").unwrap(), op_1.attribute("key").unwrap());
+        assert_eq!(op_0.attribute("key").unwrap().unwrap(), op_1.attribute("key").unwrap().unwrap());
     }
 
     #[test]
@@ -2171,13 +2195,13 @@ mod tests {
 
         // Parse a good operation.
         let op = context.parse_operation("func.func @test() {\n  func.return\n}", "test.mlir");
-        assert!(op.is_some());
+        assert!(op.is_ok());
         let op = op.unwrap();
         assert!(op.verify());
         assert_eq!(op.name().as_str(), Ok("func.func"));
 
         // Trying parsing a bad operation.
         let op = context.parse_operation("invalid syntax", "invalid.mlir");
-        assert!(op.is_none());
+        assert!(op.is_err());
     }
 }
