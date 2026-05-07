@@ -22,10 +22,9 @@
 //! for more information.
 //!
 //! Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/TensorOps/) for more information.
-
 use ryft_xla_sys::bindings::mlirGetDialectHandle__tensor__;
 
-use crate::DialectHandle;
+use crate::{DialectHandle, Error};
 
 pub mod operations;
 
@@ -33,8 +32,11 @@ pub use operations::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `tensor` [`Dialect`](crate::Dialect).
-    pub fn tensor() -> Self {
-        unsafe { Self::from_c_api(mlirGetDialectHandle__tensor__()).unwrap() }
+    pub fn tensor() -> Result<Self, Error> {
+        unsafe {
+            Self::from_c_api(mlirGetDialectHandle__tensor__())
+                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
+        }
     }
 }
 
@@ -46,7 +48,7 @@ mod tests {
 
     #[test]
     fn test_tensor_dialect() {
-        let handle = DialectHandle::tensor();
+        let handle = DialectHandle::tensor().unwrap();
         assert_eq!(handle.namespace().unwrap(), "tensor");
 
         // Check that registration works (both in the context and in a registry).
@@ -57,12 +59,11 @@ mod tests {
 
         // Check that loading works.
         let context = Context::new();
-        let dialect_1 = context.load_dialect(handle);
-        assert!(dialect_1.is_some());
-        assert_eq!(dialect_1.unwrap().namespace().unwrap(), "tensor");
+        let dialect_1 = context.load_dialect(handle).unwrap();
+        assert_eq!(dialect_1.namespace().unwrap(), "tensor");
 
         // Check that comparison works.
-        let dialect_2 = context.load_dialect(DialectHandle::tensor());
+        let dialect_2 = context.load_dialect(DialectHandle::tensor().unwrap()).unwrap();
         assert_eq!(dialect_1, dialect_2);
     }
 }

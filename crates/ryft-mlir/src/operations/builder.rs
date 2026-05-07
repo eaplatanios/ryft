@@ -249,9 +249,9 @@ mod tests {
         assert_eq!(op.operand_value(1).unwrap(), arg_1);
         assert_eq!(op.operand_value(2).unwrap(), arg_0);
         assert_eq!(op.result_count(), 3);
-        assert_eq!(op.result_type(0).unwrap().unwrap(), i32_type);
-        assert_eq!(op.result_type(1).unwrap().unwrap(), i64_type);
-        assert_eq!(op.result_type(2).unwrap().unwrap(), u64_type);
+        assert_eq!(op.result_type(0).unwrap(), i32_type);
+        assert_eq!(op.result_type(1).unwrap(), i64_type);
+        assert_eq!(op.result_type(2).unwrap(), u64_type);
         assert_eq!(op.region_count(), 3);
         assert_eq!(op.successor_count(), 3);
 

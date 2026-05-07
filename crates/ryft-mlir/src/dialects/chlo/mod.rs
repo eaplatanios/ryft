@@ -5,15 +5,17 @@
 //! patterns to fully materialize into lower level dialects.
 //!
 //! Refer to the [official StableHLO documentation](https://openxla.org/stablehlo/generated/chlo) for more information.
-
 use ryft_xla_sys::bindings::mlirGetDialectHandle__chlo__;
 
-use crate::DialectHandle;
+use crate::{DialectHandle, Error};
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `chlo` [`Dialect`](crate::Dialect).
-    pub fn chlo() -> Self {
-        unsafe { Self::from_c_api(mlirGetDialectHandle__chlo__()).unwrap() }
+    pub fn chlo() -> Result<Self, Error> {
+        unsafe {
+            Self::from_c_api(mlirGetDialectHandle__chlo__())
+                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
+        }
     }
 }
 
@@ -25,7 +27,7 @@ mod tests {
 
     #[test]
     fn test_chlo_dialect() {
-        let handle = DialectHandle::chlo();
+        let handle = DialectHandle::chlo().unwrap();
         assert_eq!(handle.namespace().unwrap(), "chlo");
 
         // Check that registration works (both in the context and in a registry).
@@ -36,12 +38,11 @@ mod tests {
 
         // Check that loading works.
         let context = Context::new();
-        let dialect_1 = context.load_dialect(handle);
-        assert!(dialect_1.is_some());
-        assert_eq!(dialect_1.unwrap().namespace().unwrap(), "chlo");
+        let dialect_1 = context.load_dialect(handle).unwrap();
+        assert_eq!(dialect_1.namespace().unwrap(), "chlo");
 
         // Check that comparison works.
-        let dialect_2 = context.load_dialect(DialectHandle::chlo());
+        let dialect_2 = context.load_dialect(DialectHandle::chlo().unwrap()).unwrap();
         assert_eq!(dialect_1, dialect_2);
     }
 }

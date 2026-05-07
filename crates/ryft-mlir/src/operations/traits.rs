@@ -74,14 +74,14 @@ pub trait Call<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 /// https://mlir.llvm.org/docs/Interfaces/#callinterfaces) for more information.
 pub trait Callable<'o, 'c: 'o, 't: 'c>: HasCallableArgumentAndResultAttributes<'o, 'c, 't> {
     /// Returns `true` if this [`Callable`] is external (i.e., if it has no body).
-    fn is_external_callable(&self) -> bool {
-        self.callable_region().is_none()
+    fn is_external_callable(&self) -> Result<bool, Error> {
+        Ok(self.callable_region()?.is_none())
     }
 
     /// Returns the [`Region`] on this [`Callable`] that is callable or [`None`] if this is an _external_ callable
     /// object (e.g., an external function).
-    fn callable_region(&self) -> Option<RegionRef<'o, 'c, 't>> {
-        self.region(0)
+    fn callable_region(&self) -> Result<Option<RegionRef<'o, 'c, 't>>, Error> {
+        if self.region_count() == 0 { Ok(None) } else { self.region(0).map(Some) }
     }
 }
 
@@ -204,7 +204,7 @@ pub trait Function<'o, 'c: 'o, 't: 'c>: Symbol<'o, 'c, 't> + Callable<'o, 'c, 't
 
     /// Returns the body of this [`Function`].
     fn function_body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
-        self.callable_region().ok_or_else(|| {
+        self.callable_region()?.ok_or_else(|| {
             Error::invalid_argument(format!(
                 "missing callable region in `{}`",
                 self.name().as_str().unwrap_or("<unknown>")
@@ -369,9 +369,7 @@ pub trait NoTerminator<'o, 'c: 'o, 't: 'c>: SingleBlockRegions<'o, 'c, 't> {}
 pub trait OneOperand<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the input of this [`Operation`].
     fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
-        self.operand_value(0).ok_or_else(|| {
-            Error::invalid_argument(format!("missing operand in `{}`", self.name().as_str().unwrap_or("<unknown>")))
-        })
+        self.operand_value(0)
     }
 }
 
@@ -379,9 +377,7 @@ pub trait OneOperand<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 
 pub trait OneRegion<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the _body_ region of this [`Operation`], if it has one.
     fn body_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
-        self.region(0).ok_or_else(|| {
-            Error::invalid_argument(format!("missing region in `{}`", self.name().as_str().unwrap_or("<unknown>")))
-        })
+        self.region(0)
     }
 }
 
@@ -392,12 +388,7 @@ pub trait OneResult<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Note that this function is called `output` and not `result` in order to avoid
     /// a name collision with [`Operation::result`].
     fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
-        self.as_ref()
-            .result(0)
-            .ok_or_else(|| {
-                Error::invalid_argument(format!("missing result in `{}`", self.name().as_str().unwrap_or("<unknown>")))
-            })
-            .map(|result| result.as_ref())
+        self.as_ref().result(0).map(|result| result.as_ref())
     }
 
     /// Returns the [`Type`] of the single result/output of this [`Operation`].
@@ -405,9 +396,7 @@ pub trait OneResult<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Note that this function is called `output_type` and not `result_type` in order to avoid
     /// a name collision with [`Operation::result_type`].
     fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
-        self.result_type(0)?.ok_or_else(|| {
-            Error::invalid_argument(format!("missing result type in `{}`", self.name().as_str().unwrap_or("<unknown>")))
-        })
+        self.result_type(0)
     }
 }
 
@@ -609,7 +598,7 @@ mod tests {
         let location = context.unknown_location();
         let function =
             func::func("external_function", func::FuncAttributes::default(), context.region(), location).unwrap();
-        assert!(!function.is_external_callable());
+        assert!(!function.is_external_callable().unwrap());
     }
 
     #[test]
@@ -722,8 +711,8 @@ mod tests {
         let module = context.module(location).unwrap();
         let module = module.as_operation().unwrap();
         assert_eq!(module.region_count(), 1);
-        assert!(module.region(0).is_some());
-        assert!(module.region(1).is_none());
+        assert!(module.region(0).is_ok());
+        assert!(module.region(1).is_err());
         assert_eq!(module.body_region().unwrap().blocks().count(), 1);
     }
 

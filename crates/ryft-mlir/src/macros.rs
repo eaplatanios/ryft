@@ -397,12 +397,12 @@ macro_rules! mlir_attribute_field {
 /// pub trait AddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 ///     /// Returns the left-hand side input of this [`AddOperation`].
 ///     fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
-///         self.operand_value(0).ok_or_else(|| Error::invalid_argument("missing left-hand side input"))
+///         self.operand_value(0)
 ///     }
 ///
 ///     /// Returns the right-hand side input of this [`AddOperation`].
 ///     fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
-///         self.operand_value(1).ok_or_else(|| Error::invalid_argument("missing right-hand side input"))
+///         self.operand_value(1)
 ///     }
 /// }
 ///
@@ -822,23 +822,13 @@ macro_rules! mlir_binary_op {
                 #[doc = "Returns the left-hand side input (i.e., first operand)"]
                 #[doc = "of this [`" [<$op:camel Operation>] "`]."]
                 fn lhs(&self) -> Result<$crate::ValueRef<'o, 'c, 't>, $crate::errors::Error> {
-                    self.operand_value(0).ok_or_else(|| {
-                        $crate::errors::Error::invalid_argument(format!(
-                            "missing operand in `{}`",
-                            self.name().as_str().unwrap_or("<unknown>"),
-                        ))
-                    })
+                    self.operand_value(0)
                 }
 
                 #[doc = "Returns the right-hand side input (i.e., second operand)"]
                 #[doc = "of this [`" [<$op:camel Operation>] "`]."]
                 fn rhs(&self) -> Result<$crate::ValueRef<'o, 'c, 't>, $crate::errors::Error> {
-                    self.operand_value(1).ok_or_else(|| {
-                        $crate::errors::Error::invalid_argument(format!(
-                            "missing operand in `{}`",
-                            self.name().as_str().unwrap_or("<unknown>"),
-                        ))
-                    })
+                    self.operand_value(1)
                 }
             }
 

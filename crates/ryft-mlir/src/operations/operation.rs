@@ -566,56 +566,60 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
     fn operands(&self) -> impl Iterator<Item = Result<OperandRef<'o, 'c, 't>, Error>> {
         let operand_count = self.operand_count();
-        (0..operand_count).map(|index| {
-            self.operand(index).ok_or_else(|| {
-                Error::internal(format!("expected non-null MLIR operation operand handle at index {index}"))
-            })
-        })
+        (0..operand_count).map(|index| self.operand(index))
     }
 
     /// Returns the operand at the `index`-pth position in the operands list of this [`Operation`],
-    /// and [`None`] if `index` is out of bounds.
-    fn operand(&self, index: usize) -> Option<OperandRef<'o, 'c, 't>> {
-        if index >= self.operand_count() {
-            None
-        } else {
-            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
-            // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
-            // to MLIR internals that we have when working with the MLIR C API.
-            let _guard = self.context().borrow();
-            unsafe {
-                OperandRef::from_c_api(mlirOperationGetOpOperand(self.to_c_api(), index.cast_signed()), self.context())
-            }
+    /// or an [`Error`] if `index` is out of bounds.
+    fn operand(&self, index: usize) -> Result<OperandRef<'o, 'c, 't>, Error> {
+        let operand_count = self.operand_count();
+        if index >= operand_count {
+            return Err(Error::invalid_argument(format!(
+                "operation operand index {index} is out of bounds for length {operand_count}",
+            )));
+        }
+
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+        // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
+        // to MLIR internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        unsafe {
+            OperandRef::from_c_api(mlirOperationGetOpOperand(self.to_c_api(), index.cast_signed()), self.context())
+                .ok_or_else(|| {
+                    Error::internal(format!("expected non-null MLIR operation operand handle at index {index}"))
+                })
         }
     }
 
-    /// Returns an [`Iterator`] over the operand [`Value`](crate::Value)s of this [`Operation`].
+    /// Returns an [`Iterator`] over the operand [`Value`]s of this [`Operation`].
     ///
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
     fn operand_values(&self) -> impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>> {
         let operand_count = self.operand_count();
-        (0..operand_count).map(|index| {
-            self.operand_value(index).ok_or_else(|| {
-                Error::internal(format!("expected non-null MLIR operation operand value handle at index {index}"))
-            })
-        })
+        (0..operand_count).map(|index| self.operand_value(index))
     }
 
-    /// Returns the operand [`Value`](crate::Value) at the `index`-pth position in the operands list of this
-    /// [`Operation`], and [`None`] if `index` is out of bounds.
-    fn operand_value(&self, index: usize) -> Option<ValueRef<'o, 'c, 't>> {
-        if index >= self.operand_count() {
-            None
-        } else {
-            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
-            // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
-            // to MLIR internals that we have when working with the MLIR C API.
-            let _guard = self.context().borrow();
-            unsafe {
-                ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context())
-            }
+    /// Returns the operand [`Value`] at the `index`-pth position in the operands list of this [`Operation`],
+    /// or an [`Error`] if `index` is out of bounds.
+    fn operand_value(&self, index: usize) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let operand_count = self.operand_count();
+        if index >= operand_count {
+            return Err(Error::invalid_argument(format!(
+                "operation operand index {index} is out of bounds for length {operand_count}",
+            )));
+        }
+
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+        // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
+        // to MLIR internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        unsafe {
+            ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context())
+                .ok_or_else(|| {
+                    Error::internal(format!("expected non-null MLIR operation operand value handle at index {index}"))
+                })
         }
     }
 
@@ -629,9 +633,9 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     }
 
     /// Returns the [`Type`](crate::Type) of the operand at the `index`-pth position in the operands list of this
-    /// [`Operation`], and [`None`] if `index` is out of bounds.
-    fn operand_type(&self, index: usize) -> Result<Option<TypeRef<'c, 't>>, Error> {
-        self.operand_value(index).map(|operand| operand.r#type()).transpose()
+    /// [`Operation`], or an [`Error`] if `index` is out of bounds.
+    fn operand_type(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        self.operand_value(index)?.r#type()
     }
 
     /// Replaces the operand at the `index`-pth position in the operands list of this [`Operation`], with the provided
@@ -712,30 +716,28 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
     fn results(&self) -> impl Iterator<Item = Result<OperationResultRef<'o, 'c, 't>, Error>> {
         let result_count = self.result_count();
-        (0..result_count).map(|index| unsafe {
+        (0..result_count).map(|index| self.result(index))
+    }
+
+    /// Returns the result at the `index`-pth position in the results list of this [`Operation`],
+    /// or an [`Error`] if `index` is out of bounds.
+    fn result(&self, index: usize) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        let result_count = self.result_count();
+        if index >= result_count {
+            return Err(Error::invalid_argument(format!(
+                "operation result index {index} is out of bounds for length {result_count}",
+            )));
+        }
+
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+        // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
+        // to MLIR internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        unsafe {
             OperationResultRef::from_c_api(mlirOperationGetResult(self.to_c_api(), index.cast_signed()), self.context())
                 .ok_or_else(|| {
                     Error::internal(format!("expected non-null MLIR operation result handle at index {index}"))
                 })
-        })
-    }
-
-    /// Returns the result at the `index`-pth position in the results list of this [`Operation`],
-    /// and [`None`] if `index` is out of bounds.
-    fn result(&self, index: usize) -> Option<OperationResultRef<'o, 'c, 't>> {
-        if index >= self.result_count() {
-            None
-        } else {
-            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
-            // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
-            // to MLIR internals that we have when working with the MLIR C API.
-            let _guard = self.context().borrow();
-            unsafe {
-                OperationResultRef::from_c_api(
-                    mlirOperationGetResult(self.to_c_api(), index.cast_signed()),
-                    self.context(),
-                )
-            }
         }
     }
 
@@ -749,9 +751,9 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     }
 
     /// Returns the [`Type`](crate::Type) of the result at the `index`-pth position in the results list of this
-    /// [`Operation`], and [`None`] if `index` is out of bounds.
-    fn result_type(&self, index: usize) -> Result<Option<TypeRef<'c, 't>>, Error> {
-        self.result(index).map(|result| result.r#type()).transpose()
+    /// [`Operation`], or an [`Error`] if `index` is out of bounds.
+    fn result_type(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        self.result(index)?.r#type()
     }
 
     /// Returns `true` if this [`Operation`] is empty (i.e., if it contains no [`Region`](crate::Region)s).
@@ -775,27 +777,28 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
     fn regions(&self) -> impl Iterator<Item = Result<RegionRef<'o, 'c, 't>, Error>> {
         let region_count = self.region_count();
-        (0..region_count).map(|index| unsafe {
+        (0..region_count).map(|index| self.region(index))
+    }
+
+    /// Returns the [`Region`](crate::Region) at the `index`-pth position in the [`Region`](crate::Region)s list
+    /// of this [`Operation`], or an [`Error`] if `index` is out of bounds.
+    fn region(&self, index: usize) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        let region_count = self.region_count();
+        if index >= region_count {
+            return Err(Error::invalid_argument(format!(
+                "operation region index {index} is out of bounds for length {region_count}",
+            )));
+        }
+
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+        // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
+        // to MLIR internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        unsafe {
             RegionRef::from_c_api(mlirOperationGetRegion(self.to_c_api(), index.cast_signed()), self.context())
                 .ok_or_else(|| {
                     Error::internal(format!("expected non-null MLIR operation region handle at index {index}"))
                 })
-        })
-    }
-
-    /// Returns the [`Region`](crate::Region) at the `index`-pth position in the [`Region`](crate::Region)s list
-    /// of this [`Operation`], and [`None`] if `index` is out of bounds.
-    fn region(&self, index: usize) -> Option<RegionRef<'o, 'c, 't>> {
-        if index >= self.region_count() {
-            None
-        } else {
-            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
-            // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
-            // to MLIR internals that we have when working with the MLIR C API.
-            let _guard = self.context().borrow();
-            unsafe {
-                RegionRef::from_c_api(mlirOperationGetRegion(self.to_c_api(), index.cast_signed()), self.context())
-            }
         }
     }
 
@@ -817,28 +820,29 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
     fn successors(&self) -> impl Iterator<Item = Result<BlockRef<'o, 'c, 't>, Error>> {
         let successor_count = self.successor_count();
-        (0..successor_count).map(|index| unsafe {
+        (0..successor_count).map(|index| self.successor(index))
+    }
+
+    /// Returns the successor [`Block`] at the `index`-pth position in the successors list of this [`Operation`],
+    /// or an [`Error`] if `index` is out of bounds. Refer to [`Block::successors`] for information
+    /// on how successors are defined.
+    fn successor(&self, index: usize) -> Result<BlockRef<'o, 'c, 't>, Error> {
+        let successor_count = self.successor_count();
+        if index >= successor_count {
+            return Err(Error::invalid_argument(format!(
+                "operation successor index {index} is out of bounds for length {successor_count}",
+            )));
+        }
+
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+        // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
+        // to MLIR internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        unsafe {
             BlockRef::from_c_api(mlirOperationGetSuccessor(self.to_c_api(), index.cast_signed()), self.context())
                 .ok_or_else(|| {
                     Error::internal(format!("expected non-null MLIR operation successor handle at index {index}"))
                 })
-        })
-    }
-
-    /// Returns the successor [`Block`] at the `index`-pth position in the successors list of this [`Operation`],
-    /// and [`None`] if `index` is out of bounds. Refer to [`Block::successors`] for information
-    /// on how successors are defined.
-    fn successor(&self, index: usize) -> Option<BlockRef<'o, 'c, 't>> {
-        if index >= self.successor_count() {
-            None
-        } else {
-            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
-            // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
-            // to MLIR internals that we have when working with the MLIR C API.
-            let _guard = self.context().borrow();
-            unsafe {
-                BlockRef::from_c_api(mlirOperationGetSuccessor(self.to_c_api(), index.cast_signed()), self.context())
-            }
         }
     }
 
@@ -1678,25 +1682,25 @@ mod tests {
             .add_operand(argument_0)
             .build()
             .unwrap();
-        assert_eq!(op.operand(0).map(|operand| operand.value().unwrap()), Some(argument_0));
-        assert_eq!(op.operand(1).map(|operand| operand.value().unwrap()), Some(argument_0));
-        assert_eq!(op.operand(2).map(|operand| operand.value().unwrap()), Some(argument_0));
-        assert_eq!(op.operand(0).map(|operand| operand.operand_index()), Some(0));
-        assert_eq!(op.operand(1).map(|operand| operand.operand_index()), Some(1));
-        assert_eq!(op.operand(2).map(|operand| operand.operand_index()), Some(2));
-        assert!(op.operand(3).is_none());
-        assert_eq!(op.operand_value(0), Some(argument_0));
-        assert_eq!(op.operand_value(1), Some(argument_0));
-        assert_eq!(op.operand_value(2), Some(argument_0));
-        assert!(op.operand_value(3).is_none());
+        assert_eq!(op.operand(0).unwrap().value().unwrap(), argument_0);
+        assert_eq!(op.operand(1).unwrap().value().unwrap(), argument_0);
+        assert_eq!(op.operand(2).unwrap().value().unwrap(), argument_0);
+        assert_eq!(op.operand(0).unwrap().operand_index(), 0);
+        assert_eq!(op.operand(1).unwrap().operand_index(), 1);
+        assert_eq!(op.operand(2).unwrap().operand_index(), 2);
+        assert!(op.operand(3).is_err());
+        assert_eq!(op.operand_value(0).unwrap(), argument_0);
+        assert_eq!(op.operand_value(1).unwrap(), argument_0);
+        assert_eq!(op.operand_value(2).unwrap(), argument_0);
+        assert!(op.operand_value(3).is_err());
         assert_eq!(
             op.operand_values().collect::<Result<Vec<_>, _>>().unwrap().into_iter().skip(1).collect::<Vec<_>>(),
             vec![argument_0.clone(), argument_0]
         );
-        assert_eq!(op.operand_type(0).unwrap(), Some(index_type));
-        assert_eq!(op.operand_type(1).unwrap(), Some(index_type));
-        assert_eq!(op.operand_type(2).unwrap(), Some(index_type));
-        assert!(op.operand_type(3).unwrap().is_none());
+        assert_eq!(op.operand_type(0).unwrap(), index_type);
+        assert_eq!(op.operand_type(1).unwrap(), index_type);
+        assert_eq!(op.operand_type(2).unwrap(), index_type);
+        assert!(op.operand_type(3).is_err());
         assert_eq!(
             op.operand_types().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
             vec![index_type, index_type, index_type]
@@ -1715,8 +1719,8 @@ mod tests {
         // Try replacing all operands of an operation.
         let argument_2 = block.argument(1).unwrap().as_ref();
         assert!(unsafe { op.replace_operands(&[argument_1, argument_2, argument_0]) });
-        assert_eq!(op.operand(0).map(|operand| operand.value().unwrap()), Some(argument_1));
-        assert_eq!(op.operand(1).map(|operand| operand.value().unwrap()), Some(argument_2));
+        assert_eq!(op.operand(0).unwrap().value().unwrap(), argument_1);
+        assert_eq!(op.operand(1).unwrap().value().unwrap(), argument_2);
         assert!(unsafe { !op.replace_operands(&[argument_2]) });
 
         // Try replacing all uses of one value inside an operation.
@@ -1727,9 +1731,9 @@ mod tests {
             .build()
             .unwrap();
         unsafe { op.replace_uses_of_with(argument_0, argument_2) };
-        assert_eq!(op.operand(0).map(|operand| operand.value().unwrap()), Some(argument_2));
-        assert_eq!(op.operand(1).map(|operand| operand.value().unwrap()), Some(argument_2));
-        assert_eq!(op.operand(2).map(|operand| operand.value().unwrap()), Some(argument_2));
+        assert_eq!(op.operand(0).unwrap().value().unwrap(), argument_2);
+        assert_eq!(op.operand(1).unwrap().value().unwrap(), argument_2);
+        assert_eq!(op.operand(2).unwrap().value().unwrap(), argument_2);
     }
 
     #[test]
@@ -1742,17 +1746,17 @@ mod tests {
 
         // Operation with no results.
         let op = OperationBuilder::new("foo", location).build().unwrap();
-        assert_eq!(op.result(0), None);
+        assert!(op.result(0).is_err());
 
         // Operation with two results.
         let op = OperationBuilder::new("test.op", location).add_results(&[i32_type, i64_type]).build().unwrap();
         assert_eq!(op.result_count(), 2);
-        assert!(op.result(0).is_some());
-        assert!(op.result(1).is_some());
-        assert!(op.result(2).is_none());
-        assert_eq!(op.result_type(0).unwrap().unwrap(), i32_type);
-        assert_eq!(op.result_type(1).unwrap().unwrap(), i64_type);
-        assert!(op.result_type(2).unwrap().is_none());
+        assert!(op.result(0).is_ok());
+        assert!(op.result(1).is_ok());
+        assert!(op.result(2).is_err());
+        assert_eq!(op.result_type(0).unwrap(), i32_type);
+        assert_eq!(op.result_type(1).unwrap(), i64_type);
+        assert!(op.result_type(2).is_err());
         assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(), 2);
         assert_eq!(
             op.result_types().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
@@ -1768,7 +1772,7 @@ mod tests {
 
         // Operation with no regions.
         let op = OperationBuilder::new("foo", location).build().unwrap();
-        assert_eq!(op.region(0), None);
+        assert!(op.region(0).is_err());
 
         // Operation with three regions.
         let region_0 = context.region();
@@ -1782,10 +1786,10 @@ mod tests {
             .unwrap();
         assert!(!op.is_empty());
         assert_eq!(op.region_count(), 3);
-        assert!(op.region(0).is_some());
-        assert!(op.region(1).is_some());
-        assert!(op.region(2).is_some());
-        assert!(op.region(3).is_none());
+        assert!(op.region(0).is_ok());
+        assert!(op.region(1).is_ok());
+        assert!(op.region(2).is_ok());
+        assert!(op.region(3).is_err());
         assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(), 3);
     }
 
@@ -1799,9 +1803,9 @@ mod tests {
         let block_2 = context.block_with_no_arguments();
         let op = OperationBuilder::new("test.op", location).add_successors(&[&block_0, &block_1]).build().unwrap();
         assert_eq!(op.successor_count(), 2);
-        assert!(op.successor(0).is_some());
-        assert!(op.successor(1).is_some());
-        assert!(op.successor(2).is_none());
+        assert!(op.successor(0).is_ok());
+        assert!(op.successor(1).is_ok());
+        assert!(op.successor(2).is_err());
         assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(), 2);
         let mut block_3 = context.block_with_no_arguments();
         let mut op = block_3.append_operation(op).unwrap();

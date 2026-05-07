@@ -7,10 +7,9 @@
 //!
 //! Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/SparseTensorOps/)
 //! for more information.
-
 use ryft_xla_sys::bindings::mlirGetDialectHandle__sparse_tensor__;
 
-use crate::DialectHandle;
+use crate::{DialectHandle, Error};
 
 pub mod attributes;
 pub mod operations;
@@ -24,8 +23,11 @@ pub use types::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `sparse_tensor` [`Dialect`](crate::Dialect).
-    pub fn sparse_tensor() -> Self {
-        unsafe { Self::from_c_api(mlirGetDialectHandle__sparse_tensor__()).unwrap() }
+    pub fn sparse_tensor() -> Result<Self, Error> {
+        unsafe {
+            Self::from_c_api(mlirGetDialectHandle__sparse_tensor__())
+                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
+        }
     }
 }
 
@@ -37,7 +39,7 @@ mod tests {
 
     #[test]
     fn test_sparse_tensor_dialect() {
-        let handle = DialectHandle::sparse_tensor();
+        let handle = DialectHandle::sparse_tensor().unwrap();
         assert_eq!(handle.namespace().unwrap(), "sparse_tensor");
 
         // Check that registration works (both in the context and in a registry).
@@ -48,12 +50,11 @@ mod tests {
 
         // Check that loading works.
         let context = Context::new();
-        let dialect_1 = context.load_dialect(handle);
-        assert!(dialect_1.is_some());
-        assert_eq!(dialect_1.unwrap().namespace().unwrap(), "sparse_tensor");
+        let dialect_1 = context.load_dialect(handle).unwrap();
+        assert_eq!(dialect_1.namespace().unwrap(), "sparse_tensor");
 
         // Check that comparison works.
-        let dialect_2 = context.load_dialect(DialectHandle::sparse_tensor());
+        let dialect_2 = context.load_dialect(DialectHandle::sparse_tensor().unwrap()).unwrap();
         assert_eq!(dialect_1, dialect_2);
     }
 }

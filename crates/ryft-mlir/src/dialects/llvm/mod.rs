@@ -12,10 +12,9 @@
 //! where `llvm.` is the dialect namespace prefix).
 //!
 //! Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/LLVM/) for more information.
-
 use ryft_xla_sys::bindings::{mlirGetDialectHandle__llvm__, mlirRegisterAllLLVMTranslations};
 
-use crate::{Context, DialectHandle};
+use crate::{Context, DialectHandle, Error};
 
 pub mod attributes;
 pub mod operations;
@@ -27,8 +26,11 @@ pub use types::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `llvm` [`Dialect`](crate::Dialect).
-    pub fn llvm() -> Self {
-        unsafe { Self::from_c_api(mlirGetDialectHandle__llvm__()).unwrap() }
+    pub fn llvm() -> Result<Self, Error> {
+        unsafe {
+            Self::from_c_api(mlirGetDialectHandle__llvm__())
+                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
+        }
     }
 }
 
@@ -47,7 +49,7 @@ mod tests {
 
     #[test]
     fn test_llvm_dialect() {
-        let handle = DialectHandle::llvm();
+        let handle = DialectHandle::llvm().unwrap();
         assert_eq!(handle.namespace().unwrap(), "llvm");
 
         // Check that registration works (both in the context and in a registry).
@@ -58,12 +60,11 @@ mod tests {
 
         // Check that loading works.
         let context = Context::new();
-        let dialect_1 = context.load_dialect(handle);
-        assert!(dialect_1.is_some());
-        assert_eq!(dialect_1.unwrap().namespace().unwrap(), "llvm");
+        let dialect_1 = context.load_dialect(handle).unwrap();
+        assert_eq!(dialect_1.namespace().unwrap(), "llvm");
 
         // Check that comparison works.
-        let dialect_2 = context.load_dialect(DialectHandle::llvm());
+        let dialect_2 = context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(dialect_1, dialect_2);
     }
 

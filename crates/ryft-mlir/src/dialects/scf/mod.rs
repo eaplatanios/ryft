@@ -9,10 +9,9 @@
 //!
 //! Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/SCFDialect/)
 //! for more information.
-
 use ryft_xla_sys::bindings::mlirGetDialectHandle__scf__;
 
-use crate::DialectHandle;
+use crate::{DialectHandle, Error};
 
 pub mod operations;
 
@@ -20,8 +19,11 @@ pub use operations::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `scf` [`Dialect`](crate::Dialect).
-    pub fn scf() -> Self {
-        unsafe { Self::from_c_api(mlirGetDialectHandle__scf__()).unwrap() }
+    pub fn scf() -> Result<Self, Error> {
+        unsafe {
+            Self::from_c_api(mlirGetDialectHandle__scf__())
+                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
+        }
     }
 }
 
@@ -33,7 +35,7 @@ mod tests {
 
     #[test]
     fn test_scf_dialect() {
-        let handle = DialectHandle::scf();
+        let handle = DialectHandle::scf().unwrap();
         assert_eq!(handle.namespace().unwrap(), "scf");
 
         // Check that registration works (both in the context and in a registry).
@@ -44,12 +46,11 @@ mod tests {
 
         // Check that loading works.
         let context = Context::new();
-        let dialect_1 = context.load_dialect(handle);
-        assert!(dialect_1.is_some());
-        assert_eq!(dialect_1.unwrap().namespace().unwrap(), "scf");
+        let dialect_1 = context.load_dialect(handle).unwrap();
+        assert_eq!(dialect_1.namespace().unwrap(), "scf");
 
         // Check that comparison works.
-        let dialect_2 = context.load_dialect(DialectHandle::scf());
+        let dialect_2 = context.load_dialect(DialectHandle::scf().unwrap()).unwrap();
         assert_eq!(dialect_1, dialect_2);
     }
 }

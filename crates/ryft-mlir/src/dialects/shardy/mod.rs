@@ -3,10 +3,9 @@
 //! and plans for an SPMD partitioner.
 //!
 //! Refer to the [official Shardy documentation](https://openxla.org/shardy) for more information.
-
 use ryft_xla_sys::bindings::mlirGetDialectHandle__sdy__;
 
-use crate::DialectHandle;
+use crate::{DialectHandle, Error};
 
 pub mod attributes;
 pub mod operations;
@@ -18,8 +17,11 @@ pub use passes::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the Shardy [`Dialect`](crate::Dialect).
-    pub fn shardy() -> Self {
-        unsafe { Self::from_c_api(mlirGetDialectHandle__sdy__()).unwrap() }
+    pub fn shardy() -> Result<Self, Error> {
+        unsafe {
+            Self::from_c_api(mlirGetDialectHandle__sdy__())
+                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle"))
+        }
     }
 }
 
@@ -31,7 +33,7 @@ mod tests {
 
     #[test]
     fn test_shardy_dialect() {
-        let handle = DialectHandle::shardy();
+        let handle = DialectHandle::shardy().unwrap();
         assert_eq!(handle.namespace().unwrap(), "sdy");
 
         // Check that registration works (both in the context and in a registry).
@@ -42,12 +44,11 @@ mod tests {
 
         // Check that loading works.
         let context = Context::new();
-        let dialect_1 = context.load_dialect(handle);
-        assert!(dialect_1.is_some());
-        assert_eq!(dialect_1.unwrap().namespace().unwrap(), "sdy");
+        let dialect_1 = context.load_dialect(handle).unwrap();
+        assert_eq!(dialect_1.namespace().unwrap(), "sdy");
 
         // Check that comparison works.
-        let dialect_2 = context.load_dialect(DialectHandle::shardy());
+        let dialect_2 = context.load_dialect(DialectHandle::shardy().unwrap()).unwrap();
         assert_eq!(dialect_1, dialect_2);
     }
 }

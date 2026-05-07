@@ -2,7 +2,7 @@ use ryft_xla_sys::bindings::{
     MlirType, mlirRankedTensorTypeGet, mlirShapedTypeGetDynamicSize, mlirShapedTypeGetElementType,
 };
 
-use crate::{Attribute, Context, Type, TypeRef, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, Type, TypeRef, mlir_subtype_trait_impls};
 
 /// Represents a size quantity (e.g., of a tensor dimension, stride, or offset) that can be
 /// either statically known or dynamically determined.
@@ -64,8 +64,11 @@ impl Size {
 /// specialized using the [`ShapedType::is`](TypeRef::is) and [`ShapedType::cast`](TypeRef::cast) functions.
 pub trait ShapedType<'c, 't: 'c>: Type<'c, 't> {
     /// Returns element [`Type`] of this shaped type.
-    fn element_type(&self) -> TypeRef<'c, 't> {
-        unsafe { TypeRef::from_c_api(mlirShapedTypeGetElementType(self.to_c_api()), self.context()).unwrap() }
+    fn element_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        unsafe {
+            TypeRef::from_c_api(mlirShapedTypeGetElementType(self.to_c_api()), self.context())
+                .ok_or_else(|| Error::internal("expected non-null MLIR shaped element type handle"))
+        }
     }
 }
 
@@ -85,12 +88,12 @@ impl<'c, 't> ShapedType<'c, 't> for ShapedTypeRef<'c, 't> {}
 
 impl<'t> Context<'t> {
     /// Creates a new [`ShapedTypeRef`] owned by this [`Context`]. If any of the arguments are invalid, then this
-    /// function will return [`None`] and will also emit the appropriate diagnostics at the provided location.
+    /// function will return an [`Error`] and will also emit the appropriate diagnostics at the provided location.
     pub fn shaped_type<'c, T: Type<'c, 't>>(
         &'c self,
         element_type: T,
         shape: &[Size],
-    ) -> Option<ShapedTypeRef<'c, 't>> {
+    ) -> Result<ShapedTypeRef<'c, 't>, Error> {
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -108,6 +111,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::shaped_type`"))
         }
     }
 }
@@ -138,7 +142,7 @@ mod tests {
         let tensor_type = context.shaped_type(element_type, &shape).unwrap();
         let shaped_type = tensor_type.cast::<ShapedTypeRef>().unwrap();
         assert_eq!(&context, shaped_type.context());
-        assert_eq!(shaped_type.element_type(), element_type);
+        assert_eq!(shaped_type.element_type().unwrap(), element_type);
     }
 
     #[test]
@@ -148,19 +152,19 @@ mod tests {
         let shape = vec![Size::Static(32), Size::Dynamic];
 
         // Same types from the same context must be equal because they are "uniqued".
-        let type_1 = context.shaped_type(element_type, &shape);
-        let type_2 = context.shaped_type(element_type, &shape);
+        let type_1 = context.shaped_type(element_type, &shape).unwrap();
+        let type_2 = context.shaped_type(element_type, &shape).unwrap();
         assert_eq!(type_1, type_2);
 
         // Different shapes from the same context must not be equal.
         let shape = vec![Size::Static(32), Size::Static(16)];
-        let type_2 = context.shaped_type(element_type, &shape);
+        let type_2 = context.shaped_type(element_type, &shape).unwrap();
         assert_ne!(type_1, type_2);
 
         // Same types from different contexts must not be equal.
         let context = Context::new();
         let element_type = context.bfloat16_type();
-        let type_2 = context.shaped_type(element_type, &shape);
+        let type_2 = context.shaped_type(element_type, &shape).unwrap();
         assert_ne!(type_1, type_2);
     }
 

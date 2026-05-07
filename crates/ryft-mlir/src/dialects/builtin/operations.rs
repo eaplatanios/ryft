@@ -210,7 +210,7 @@ mod tests {
         let op = unrealized_conversion_cast::<ValueRef, _, _>(&[], &[i32_type], location).unwrap();
         assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
         assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-        assert_eq!(op.result_type(0).unwrap().unwrap(), i32_type);
+        assert_eq!(op.result_type(0).unwrap(), i32_type);
         assert!(op.verify());
         assert_eq!(op.to_string(), "%0 = unrealized_conversion_cast to i32\n");
     }
