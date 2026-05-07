@@ -329,7 +329,7 @@ mod tests {
             dependent_dialects: vec![],
             closure: |op| {
                 assert!(op.region_count() > 0);
-                assert!(op.region(0).is_some());
+                assert!(op.region(0).is_ok());
                 *counter_clone.borrow_mut() += 1;
                 LogicalResult::success()
             },
