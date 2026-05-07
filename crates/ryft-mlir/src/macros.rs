@@ -55,13 +55,23 @@ macro_rules! mlir_subtype_trait_impls {
                 unsafe fn from_c_api(
                     handle: ryft_xla_sys::bindings::[<Mlir $mlir_type>],
                     context: &'c $crate::Context<'t>,
-                ) -> Option<Self> {
-                    if !handle.ptr.is_null() && unsafe {
-                        ryft_xla_sys::bindings::[<$mlir_prefix $mlir_type IsA $mlir_subtype>](handle)
-                    } {
-                        Some(Self { handle, context })
+                ) -> Result<Self, $crate::Error> {
+                    if handle.ptr.is_null() {
+                        Err($crate::Error::internal(concat!(
+                            "expected non-null MLIR ",
+                            stringify!($mlir_type),
+                            " handle",
+                        )))
+                    } else if unsafe { ryft_xla_sys::bindings::[<$mlir_prefix $mlir_type IsA $mlir_subtype>](handle) } {
+                        Ok(Self { handle, context })
                     } else {
-                        None
+                        Err($crate::Error::invalid_argument(concat!(
+                            "expected MLIR ",
+                            stringify!($mlir_subtype),
+                            " ",
+                            stringify!($mlir_type),
+                            " handle",
+                        )))
                     }
                 }
 
@@ -280,8 +290,13 @@ macro_rules! mlir_enum_attribute {
                                 $crate::StringRef::from(value).to_c_api(),
                             ),
                             &self,
-                        )
-                        .ok_or_else(|| $crate::errors::Error::invalid_argument(concat!("invalid arguments to `Context::", stringify!([<$($rust_prefix _)? $rust_name:snake>]), "`")))
+                        ).map_err(|_| {
+                            $crate::errors::Error::invalid_argument(concat!(
+                                "invalid arguments to `Context::",
+                                stringify!([<$($rust_prefix _)? $rust_name:snake>]),
+                                "`",
+                            ))
+                        })
                     }
                 }
             }
@@ -333,7 +348,6 @@ macro_rules! mlir_attribute_field {
                         ryft_xla_sys::bindings::[<$mlir_prefix $mlir_name>](self.handle),
                         self.context,
                     )
-                    .ok_or_else(|| $crate::errors::Error::internal("expected non-null MLIR float type handle"))
                 }
             }
         }
@@ -435,8 +449,12 @@ macro_rules! mlir_op {
                 unsafe fn from_c_api(
                     handle: ryft_xla_sys::bindings::MlirOperation,
                     context: &'c $crate::Context<'t>,
-                ) -> Option<Self> {
-                    if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+                ) -> Result<Self, $crate::Error> {
+                    if handle.ptr.is_null() {
+                        Err($crate::Error::internal("expected non-null MLIR operation handle"))
+                    } else {
+                        Ok(Self { handle, context })
+                    }
                 }
 
                 unsafe fn to_c_api(&self) -> ryft_xla_sys::bindings::MlirOperation {
@@ -539,11 +557,11 @@ macro_rules! mlir_op {
                 unsafe fn from_c_api(
                     handle: ryft_xla_sys::bindings::MlirOperation,
                     context: &'c $crate::Context<'t>,
-                ) -> Option<Self> {
+                ) -> Result<Self, $crate::Error> {
                     if handle.ptr.is_null() {
-                        None
+                        Err($crate::Error::internal("expected non-null MLIR operation handle"))
                     } else {
-                        Some(Self { handle, owner: std::marker::PhantomData, context })
+                        Ok(Self { handle, owner: std::marker::PhantomData, context })
                     }
                 }
 
@@ -902,7 +920,7 @@ macro_rules! mlir_pass {
             pub fn [<create_ $rust_name>]() -> Result<$crate::Pass, $crate::errors::Error> {
                 unsafe {
                     $crate::Pass::from_c_api(ryft_xla_sys::bindings::[<mlirCreate $mlir_name>]())
-                        .ok_or_else(|| $crate::errors::Error::internal(concat!(
+                        .map_err(|_| $crate::errors::Error::internal(concat!(
                             "expected non-null MLIR pass handle from `mlirCreate",
                             stringify!($mlir_name),
                             "`",

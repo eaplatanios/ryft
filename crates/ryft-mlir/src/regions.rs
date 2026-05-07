@@ -56,8 +56,13 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
     /// Returns a [`RegionBlockRefIterator`], that enables iteration over references of all [`Block`]s contained
     /// in this [`Region`].
     fn blocks(&self) -> RegionBlockRefIterator<'r, 'c, 't> {
+        let handle = unsafe { mlirRegionGetFirstBlock(self.to_c_api()) };
         RegionBlockRefIterator {
-            current_block: unsafe { BlockRef::from_c_api(mlirRegionGetFirstBlock(self.to_c_api()), self.context()) },
+            current_block: if handle.ptr.is_null() {
+                None
+            } else {
+                unsafe { BlockRef::from_c_api(handle, self.context()).ok() }
+            },
         }
     }
 
@@ -72,7 +77,6 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
             std::mem::forget(block);
             mlirRegionAppendOwnedBlock(self.to_c_api(), handle);
             BlockRef::from_c_api(handle, self.context())
-                .ok_or_else(|| Error::internal("expected non-null appended MLIR block handle"))
         }
     }
 
@@ -90,7 +94,6 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
             std::mem::forget(block);
             mlirRegionInsertOwnedBlock(self.to_c_api(), index.cast_signed(), handle);
             BlockRef::from_c_api(handle, self.context())
-                .ok_or_else(|| Error::internal("expected non-null inserted MLIR block handle"))
         }
     }
 
@@ -112,7 +115,6 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
             std::mem::forget(block);
             mlirRegionInsertOwnedBlockAfter(self.to_c_api(), reference, handle);
             BlockRef::from_c_api(handle, self.context())
-                .ok_or_else(|| Error::internal("expected non-null inserted MLIR block handle"))
         }
     }
 
@@ -134,7 +136,6 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
             std::mem::forget(block);
             mlirRegionInsertOwnedBlockBefore(self.to_c_api(), reference, handle);
             BlockRef::from_c_api(handle, self.context())
-                .ok_or_else(|| Error::internal("expected non-null inserted MLIR block handle"))
         }
     }
 
@@ -257,8 +258,12 @@ impl<'o, 'c, 't> RegionRef<'o, 'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirRegion, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context, owner: PhantomData }) }
+    pub unsafe fn from_c_api(handle: MlirRegion, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR region handle"))
+        } else {
+            Ok(Self { handle, context, owner: PhantomData })
+        }
     }
 }
 
@@ -312,7 +317,7 @@ impl<'r, 'c, 't> Iterator for RegionBlockRefIterator<'r, 'c, 't> {
     fn next(&mut self) -> Option<Self::Item> {
         let item = self.current_block.take();
         self.current_block = item.as_ref().and_then(|block| unsafe {
-            BlockRef::from_c_api(mlirBlockGetNextInRegion(block.to_c_api()), block.context())
+            BlockRef::from_c_api(mlirBlockGetNextInRegion(block.to_c_api()), block.context()).ok()
         });
         item
     }
@@ -347,7 +352,7 @@ mod tests {
         // Test null pointer edge case.
         let bad_handle = MlirRegion { ptr: std::ptr::null_mut() };
         let region = unsafe { RegionRef::from_c_api(bad_handle, &context) };
-        assert!(region.is_none());
+        assert!(region.is_err());
     }
 
     #[test]

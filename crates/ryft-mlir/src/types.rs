@@ -20,7 +20,7 @@ pub trait Type<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + De
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self>;
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error>;
 
     /// Returns the [`MlirType`] that corresponds to this type and which can be passed to functions in the MLIR C API.
     ///
@@ -41,7 +41,7 @@ pub trait Type<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + De
     /// Tries to cast this type to an instance of `T` (e.g., an instance of [`IntegerTypeRef`](crate::IntegerTypeRef)).
     /// If this is not an instance of the specified type, this function will return [`None`].
     fn cast<T: Type<'c, 't>>(&self) -> Option<T> {
-        unsafe { T::from_c_api(self.to_c_api(), self.context()) }
+        unsafe { T::from_c_api(self.to_c_api(), self.context()).ok() }
     }
 
     /// Up-casts this type to an instance of [`Type`].
@@ -58,10 +58,7 @@ pub trait Type<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + De
 
     /// Returns the [`Dialect`] that this type belongs to.
     fn dialect(&self) -> Result<Dialect<'c, 't>, Error> {
-        unsafe {
-            Dialect::from_c_api(mlirTypeGetDialect(self.to_c_api()))
-                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle for type"))
-        }
+        unsafe { Dialect::from_c_api(mlirTypeGetDialect(self.to_c_api())) }
     }
 
     /// Dumps this type to the standard error stream.
@@ -81,8 +78,12 @@ pub struct TypeRef<'c, 't> {
 }
 
 impl<'c, 't> Type<'c, 't> for TypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR type handle"))
+        } else {
+            Ok(Self { handle, context })
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -103,8 +104,12 @@ impl<'t> Context<'t> {
     pub fn parse_type<'c, S: AsRef<str>>(&'c self, source: S) -> Result<TypeRef<'c, 't>, Error> {
         let source = source.as_ref();
         unsafe {
-            TypeRef::from_c_api(mlirTypeParseGet(*self.handle.borrow_mut(), StringRef::from(source).to_c_api()), self)
-                .ok_or_else(|| Error::parsing_error(format!("failed to parse MLIR type `{source}`")))
+            let handle = mlirTypeParseGet(*self.handle.borrow_mut(), StringRef::from(source).to_c_api());
+            if handle.ptr.is_null() {
+                Err(Error::parsing_error(format!("failed to parse MLIR type `{source}`")))
+            } else {
+                TypeRef::from_c_api(handle, self)
+            }
         }
     }
 }
@@ -185,7 +190,7 @@ pub(crate) mod tests {
         // Test null pointer edge case.
         let bad_handle = MlirType { ptr: std::ptr::null_mut() };
         let type_ref = unsafe { TypeRef::from_c_api(bad_handle, &context) };
-        assert!(type_ref.is_none());
+        assert!(type_ref.is_err());
     }
 
     #[test]

@@ -39,8 +39,12 @@ impl<'c, 't> Module<'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirModule, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+    pub unsafe fn from_c_api(handle: MlirModule, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR module handle"))
+        } else {
+            Ok(Self { handle, context })
+        }
     }
 
     /// Returns the [`MlirModule`] that corresponds to this [`Module`] and which can be passed to functions
@@ -62,18 +66,12 @@ impl<'c, 't> Module<'c, 't> {
     /// Returns a reference to the [`Block`](crate::Block) that represents the body of this [`Module`]
     /// (i.e., the only [`Block`](crate::Block) it contains).
     pub fn body<'m>(&'m self) -> Result<BlockRef<'m, 'c, 't>, Error> {
-        unsafe {
-            BlockRef::from_c_api(mlirModuleGetBody(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR module body block handle"))
-        }
+        unsafe { BlockRef::from_c_api(mlirModuleGetBody(self.handle), self.context) }
     }
 
     /// Returns a [`ModuleOperationRef`] that refers to this [`Module`].
     pub fn as_operation<'m>(&'m self) -> Result<ModuleOperationRef<'m, 'c, 't>, Error> {
-        unsafe {
-            ModuleOperationRef::from_c_api(mlirModuleGetOperation(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR module operation handle"))
-        }
+        unsafe { ModuleOperationRef::from_c_api(mlirModuleGetOperation(self.handle), self.context) }
     }
 
     /// Verifies this [`Module`] (as in, checks if it is well-defined) and returns `true` if the verification passes.
@@ -135,8 +133,7 @@ impl<'c, 't> TryFrom<DetachedModuleOperation<'c, 't>> for Module<'c, 't> {
 
     fn try_from(value: DetachedModuleOperation<'c, 't>) -> Result<Self, Self::Error> {
         unsafe {
-            let module = Module::from_c_api(mlirModuleFromOperation(value.to_c_api()), value.context())
-                .ok_or_else(|| Error::internal("expected non-null MLIR module handle from operation"))?;
+            let module = Module::from_c_api(mlirModuleFromOperation(value.to_c_api()), value.context())?;
             std::mem::forget(value);
             Ok(module)
         }
@@ -148,8 +145,7 @@ impl<'c, 't> TryFrom<Module<'c, 't>> for DetachedModuleOperation<'c, 't> {
 
     fn try_from(value: Module<'c, 't>) -> Result<Self, Self::Error> {
         unsafe {
-            let operation = DetachedModuleOperation::from_c_api(mlirModuleGetOperation(value.handle), value.context())
-                .ok_or_else(|| Error::internal("expected non-null MLIR module operation handle"))?;
+            let operation = DetachedModuleOperation::from_c_api(mlirModuleGetOperation(value.handle), value.context())?;
             std::mem::forget(value);
             Ok(operation)
         }
@@ -167,10 +163,7 @@ impl<'m, 'c, 't> TryFrom<&'m Module<'c, 't>> for ModuleOperationRef<'m, 'c, 't> 
 impl<'t> Context<'t> {
     /// Creates a new (empty) [`Module`] at the specified [`Location`].
     pub fn module<'c, L: Location<'c, 't>>(&'c self, location: L) -> Result<Module<'c, 't>, Error> {
-        unsafe {
-            Module::from_c_api(mlirModuleCreateEmpty(location.to_c_api()), self)
-                .ok_or_else(|| Error::internal("expected non-null MLIR module handle"))
-        }
+        unsafe { Module::from_c_api(mlirModuleCreateEmpty(location.to_c_api()), self) }
     }
 
     /// Parses a [`Module`] from the provided string representation.
@@ -185,7 +178,7 @@ impl<'t> Context<'t> {
                 mlirModuleCreateParse(*self.handle.borrow_mut(), StringRef::from(source.as_c_str()).to_c_api()),
                 self,
             );
-            module.ok_or_else(|| Error::parsing_error("failed to parse MLIR module"))
+            module.map_err(|_| Error::parsing_error("failed to parse MLIR module"))
         }
     }
 
@@ -202,7 +195,7 @@ impl<'t> Context<'t> {
                 mlirModuleCreateParseFromFile(*self.handle.borrow_mut(), StringRef::from(path.as_c_str()).to_c_api()),
                 self,
             );
-            module.ok_or_else(|| Error::parsing_error("failed to parse MLIR module from file"))
+            module.map_err(|_| Error::parsing_error("failed to parse MLIR module from file"))
         }
     }
 }

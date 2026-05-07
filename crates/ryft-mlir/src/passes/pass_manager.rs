@@ -90,8 +90,12 @@ impl<'c, 't: 'c> PassManager<'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    unsafe fn from_c_api(handle: MlirPassManager, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+    unsafe fn from_c_api(handle: MlirPassManager, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR pass-manager handle"))
+        } else {
+            Ok(Self { handle, context })
+        }
     }
 
     /// Returns a reference to the [`Context`] that is associated with this [`PassManager`].
@@ -101,10 +105,7 @@ impl<'c, 't: 'c> PassManager<'c, 't> {
 
     /// Casts this [`PassManager`] to an [`OperationPassManager`].
     pub fn as_operation_pass_manager<'p>(&'p self) -> Result<OperationPassManager<'p, 'c, 't>, Error> {
-        unsafe {
-            OperationPassManager::from_c_api(mlirPassManagerGetAsOpPassManager(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR operation pass-manager handle"))
-        }
+        unsafe { OperationPassManager::from_c_api(mlirPassManagerGetAsOpPassManager(self.handle), self.context) }
     }
 
     /// Enables printing the IR (potentially) before and after [`Pass`]es during calls to [`PassManager::run`],
@@ -188,7 +189,6 @@ impl<'c, 't: 'c> PassManager<'c, 't> {
                 mlirPassManagerGetNestedUnder(self.handle, operation_name.into().to_c_api()),
                 self.context,
             )
-            .ok_or_else(|| Error::internal("expected non-null nested MLIR operation pass-manager handle"))
         }
     }
 
@@ -234,7 +234,6 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::internal("expected non-null MLIR pass-manager handle"))
         }
     }
 
@@ -255,7 +254,6 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::internal("expected non-null MLIR pass-manager handle"))
         }
     }
 }
@@ -286,8 +284,12 @@ impl<'p, 'c: 'p, 't: 'c> OperationPassManager<'p, 'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirOpPassManager, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context, owner: PhantomData }) }
+    pub unsafe fn from_c_api(handle: MlirOpPassManager, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR operation pass-manager handle"))
+        } else {
+            Ok(Self { handle, context, owner: PhantomData })
+        }
     }
 
     /// Returns the [`MlirOpPassManager`] that corresponds to this [`OperationPassManager`] and which can be passed
@@ -317,7 +319,6 @@ impl<'p, 'c: 'p, 't: 'c> OperationPassManager<'p, 'c, 't> {
                 mlirOpPassManagerGetNestedUnder(self.handle, operation_name.into().to_c_api()),
                 self.context,
             )
-            .ok_or_else(|| Error::internal("expected non-null nested MLIR operation pass-manager handle"))
         }
     }
 
@@ -487,8 +488,8 @@ mod tests {
         // Test a couple C API edge cases.
         let bad_pass_manager_handle = MlirPassManager { ptr: std::ptr::null_mut() };
         let bad_op_pass_manager_handle = MlirOpPassManager { ptr: std::ptr::null_mut() };
-        assert!(unsafe { PassManager::from_c_api(bad_pass_manager_handle, &context) }.is_none());
-        assert!(unsafe { OperationPassManager::from_c_api(bad_op_pass_manager_handle, &context) }.is_none());
+        assert!(unsafe { PassManager::from_c_api(bad_pass_manager_handle, &context) }.is_err());
+        assert!(unsafe { OperationPassManager::from_c_api(bad_op_pass_manager_handle, &context) }.is_err());
     }
 
     #[test]

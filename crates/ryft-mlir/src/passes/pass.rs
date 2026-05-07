@@ -22,8 +22,12 @@ impl Pass {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirPass) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle }) }
+    pub unsafe fn from_c_api(handle: MlirPass) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR pass handle"))
+        } else {
+            Ok(Self { handle })
+        }
     }
 
     /// Returns the [`MlirPass`] that corresponds to this [`Pass`] and which can be passed to functions
@@ -124,7 +128,7 @@ pub trait ExternalPass<'c, 't: 'c>: Clone + Sized {
             unsafe {
                 if let Some(pass) = (data as *mut P).as_mut() {
                     let context = pass.context();
-                    if let Some(operation) = OperationRef::from_c_api(operation, context) {
+                    if let Ok(operation) = OperationRef::from_c_api(operation, context) {
                         let result = pass.on_run(operation);
                         if result.is_failure() {
                             mlirExternalPassSignalFailure(mlir_pass)
@@ -168,7 +172,6 @@ impl Pass {
                 value.to_c_api(),
                 Box::into_raw(Box::new(value)) as _,
             ))
-            .ok_or_else(|| Error::internal("expected non-null MLIR external pass handle"))
         }
     }
 }

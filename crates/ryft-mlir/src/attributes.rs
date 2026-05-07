@@ -41,7 +41,7 @@ pub trait Attribute<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self>;
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error>;
 
     /// Returns the [`MlirAttribute`] that corresponds to this attribute and which can be passed to functions
     /// in the MLIR C API.
@@ -64,7 +64,7 @@ pub trait Attribute<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display
     /// [`TypeAttributeRef`](crate::TypeAttributeRef)). If this is not an instance of the specified type,
     /// this function will return [`None`].
     fn cast<A: Attribute<'c, 't>>(&self) -> Option<A> {
-        unsafe { A::from_c_api(self.to_c_api(), self.context()) }
+        unsafe { A::from_c_api(self.to_c_api(), self.context()).ok() }
     }
 
     /// Up-casts this attribute to an instance of [`Attribute`].
@@ -82,18 +82,12 @@ pub trait Attribute<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display
 
     /// Returns the [`Type`] of this attribute.
     fn r#type(&self) -> Result<TypeRef<'c, 't>, Error> {
-        unsafe {
-            TypeRef::from_c_api(mlirAttributeGetType(self.to_c_api()), self.context())
-                .ok_or_else(|| Error::internal("expected non-null MLIR attribute type handle"))
-        }
+        unsafe { TypeRef::from_c_api(mlirAttributeGetType(self.to_c_api()), self.context()) }
     }
 
     /// Returns the [`Dialect`] that this attribute belongs to.
     fn dialect(&self) -> Result<Dialect<'c, 't>, Error> {
-        unsafe {
-            Dialect::from_c_api(mlirAttributeGetDialect(self.to_c_api()))
-                .ok_or_else(|| Error::internal("expected non-null MLIR dialect handle for attribute"))
-        }
+        unsafe { Dialect::from_c_api(mlirAttributeGetDialect(self.to_c_api())) }
     }
 
     /// Dumps this attribute to the standard error stream.
@@ -113,8 +107,12 @@ pub struct AttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for AttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR attribute handle"))
+        } else {
+            Ok(Self { handle, context })
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -139,8 +137,11 @@ impl<'t> Context<'t> {
     pub fn parse_attribute<'c>(&'c self, source: &str) -> Result<AttributeRef<'c, 't>, Error> {
         unsafe {
             let handle = mlirAttributeParseGet(*self.handle.borrow_mut(), StringRef::from(source).to_c_api());
-            AttributeRef::from_c_api(handle, self)
-                .ok_or_else(|| Error::parsing_error(format!("failed to parse MLIR attribute `{source}`")))
+            if handle.ptr.is_null() {
+                Err(Error::parsing_error(format!("failed to parse MLIR attribute `{source}`")))
+            } else {
+                AttributeRef::from_c_api(handle, self)
+            }
         }
     }
 }
@@ -190,10 +191,7 @@ impl<'c, 't> NamedAttributeRef<'c, 't> {
 
     /// Returns the underlying [`Attribute`] of this [`NamedAttributeRef`].
     pub fn attribute(&self) -> Result<AttributeRef<'c, 't>, Error> {
-        unsafe {
-            AttributeRef::from_c_api(self.handle.attribute, self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR named attribute value handle"))
-        }
+        unsafe { AttributeRef::from_c_api(self.handle.attribute, self.context) }
     }
 }
 

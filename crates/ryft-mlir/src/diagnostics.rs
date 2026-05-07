@@ -66,8 +66,12 @@ impl<'o, 'c, 't> Diagnostic<'o, 'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirDiagnostic, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context, owner: PhantomData }) }
+    pub unsafe fn from_c_api(handle: MlirDiagnostic, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR diagnostic handle"))
+        } else {
+            Ok(Self { handle, context, owner: PhantomData })
+        }
     }
 
     /// Returns a reference to the [`Context`] that owns this [`Diagnostic`].
@@ -82,10 +86,7 @@ impl<'o, 'c, 't> Diagnostic<'o, 'c, 't> {
 
     /// Returns the [`Location`] at which this [`Diagnostic`] was reported.
     pub fn location(&self) -> Result<LocationRef<'c, 't>, Error> {
-        unsafe {
-            LocationRef::from_c_api(mlirDiagnosticGetLocation(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR diagnostic location handle"))
-        }
+        unsafe { LocationRef::from_c_api(mlirDiagnosticGetLocation(self.handle), self.context) }
     }
 
     /// Returns the number of notes attached to this [`Diagnostic`].
@@ -97,7 +98,6 @@ impl<'o, 'c, 't> Diagnostic<'o, 'c, 't> {
     pub fn notes(&self) -> impl Iterator<Item = Result<Self, Error>> {
         (0..self.note_count()).map(|index| unsafe {
             Self::from_c_api(mlirDiagnosticGetNote(self.handle, index.cast_signed()), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR diagnostic note handle"))
         })
     }
 
@@ -105,7 +105,7 @@ impl<'o, 'c, 't> Diagnostic<'o, 'c, 't> {
     /// [`Diagnostic::note_count`], then this function will return [`None`].
     pub fn note(&self, index: usize) -> Option<Self> {
         if index < self.note_count() {
-            unsafe { Self::from_c_api(mlirDiagnosticGetNote(self.handle, index.cast_signed()), self.context) }
+            unsafe { Self::from_c_api(mlirDiagnosticGetNote(self.handle, index.cast_signed()), self.context).ok() }
         } else {
             None
         }
@@ -159,7 +159,7 @@ impl<'t> Context<'t> {
                 if let Some((handler, context)) = user_data.as_mut() {
                     Diagnostic::from_c_api(diagnostic, context)
                         .map(|diagnostic| LogicalResult::from((*handler)(diagnostic)).to_c_api())
-                        .unwrap_or_else(|| LogicalResult::failure().to_c_api())
+                        .unwrap_or_else(|_| LogicalResult::failure().to_c_api())
                 } else {
                     LogicalResult::failure().to_c_api()
                 }
@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn test_null_diagnostic() {
         let context = Context::new();
-        assert!(unsafe { Diagnostic::from_c_api(MlirDiagnostic { ptr: std::ptr::null_mut() }, &context) }.is_none());
+        assert!(unsafe { Diagnostic::from_c_api(MlirDiagnostic { ptr: std::ptr::null_mut() }, &context) }.is_err());
     }
 
     #[test]

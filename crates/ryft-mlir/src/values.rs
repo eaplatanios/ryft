@@ -39,7 +39,7 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Option<Self>;
+    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Result<Self, Error>;
 
     /// Returns the [`MlirValue`] that corresponds to this [`Value`] and which can be passed to functions
     /// in the MLIR C API.
@@ -61,7 +61,7 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
     /// Tries to cast this [`Value`] to an instance of `V` (e.g., an instance of [`OperationResultRef`]).
     /// If it is not an instance of `V`, this function will return [`None`].
     fn cast<V: Value<'v, 'c, 't>>(&self) -> Option<V> {
-        unsafe { V::from_c_api(self.to_c_api(), self.context()) }
+        unsafe { V::from_c_api(self.to_c_api(), self.context()).ok() }
     }
 
     /// Up-casts this [`Value`] to an instance of [`ValueRef`] (i.e., the most generic value reference type).
@@ -118,10 +118,7 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe {
-            LocationRef::from_c_api(mlirValueGetLocation(self.to_c_api()), self.context())
-                .ok_or_else(|| Error::internal("expected non-null MLIR value location handle"))
-        }
+        unsafe { LocationRef::from_c_api(mlirValueGetLocation(self.to_c_api()), self.context()) }
     }
 
     /// Returns the [`Type`] of this value.
@@ -130,10 +127,7 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe {
-            TypeRef::from_c_api(mlirValueGetType(self.to_c_api()), self.context())
-                .ok_or_else(|| Error::internal("expected non-null MLIR value type handle"))
-        }
+        unsafe { TypeRef::from_c_api(mlirValueGetType(self.to_c_api()), self.context()) }
     }
 
     /// Sets the [`Type`] of this value to the provided [`Type`].
@@ -152,10 +146,8 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let context = self.context().borrow();
-        OperandRefIterator {
-            current_operand: unsafe { OperandRef::from_c_api(mlirValueGetFirstUse(self.to_c_api()), self.context()) },
-            _context: context,
-        }
+        let current_operand = unsafe { OperandRef::from_c_api(mlirValueGetFirstUse(self.to_c_api()), self.context()) };
+        OperandRefIterator { current_operand: current_operand.ok(), _context: context }
     }
 
     /// Replaces all uses of this [`Value`] in the current [`Context`] intermediate representation (IR) with the
@@ -224,8 +216,12 @@ pub struct ValueRef<'o, 'c: 'o, 't: 'c> {
 }
 
 impl<'v, 'o: 'v, 'c, 't> Value<'v, 'c, 't> for ValueRef<'o, 'c, 't> {
-    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context, owner: PhantomData }) }
+    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR value handle"))
+        } else {
+            Ok(Self { handle, context, owner: PhantomData })
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirValue {
@@ -260,10 +256,7 @@ impl<'b, 'c, 't> BlockArgumentRef<'b, 'c, 't> {
     /// Returns a reference to the [`Block`](crate::Block) in which this value is defined as an argument.
     pub fn block(&self) -> Result<BlockRef<'b, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe {
-            BlockRef::from_c_api(mlirBlockArgumentGetOwner(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR block argument owner handle"))
-        }
+        unsafe { BlockRef::from_c_api(mlirBlockArgumentGetOwner(self.handle), self.context) }
     }
 
     /// Returns the index of this value in the argument list of its owning [`Block`](crate::Block).
@@ -292,11 +285,13 @@ impl<'b, 'c, 't> BlockArgumentRef<'b, 'c, 't> {
 }
 
 impl<'v, 'b: 'v, 'c, 't> Value<'v, 'c, 't> for BlockArgumentRef<'b, 'c, 't> {
-    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirValueIsABlockArgument(handle) } {
-            Some(Self { handle, context, owner: PhantomData })
+    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR value handle"))
+        } else if unsafe { mlirValueIsABlockArgument(handle) } {
+            Ok(Self { handle, context, owner: PhantomData })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR block argument value handle"))
         }
     }
 
@@ -338,10 +333,7 @@ impl<'o, 'c, 't> OperationResultRef<'o, 'c, 't> {
     /// Returns a [`OperationRef`] referencing the [`Operation`] that produced this value as its result.
     pub fn operation(&self) -> Result<OperationRef<'o, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe {
-            OperationRef::from_c_api(mlirOpResultGetOwner(self.handle), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR operation result owner handle"))
-        }
+        unsafe { OperationRef::from_c_api(mlirOpResultGetOwner(self.handle), self.context) }
     }
 
     /// Returns the index of this value in the results of its owning [`Operation`].
@@ -352,11 +344,13 @@ impl<'o, 'c, 't> OperationResultRef<'o, 'c, 't> {
 }
 
 impl<'o, 'c, 't> Value<'o, 'c, 't> for OperationResultRef<'o, 'c, 't> {
-    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirValueIsAOpResult(handle) } {
-            Some(Self { handle, context, owner: PhantomData })
+    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR value handle"))
+        } else if unsafe { mlirValueIsAOpResult(handle) } {
+            Ok(Self { handle, context, owner: PhantomData })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR operation result value handle"))
         }
     }
 
@@ -402,8 +396,14 @@ impl<'o, 'c, 't> OperandRef<'o, 'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirOpOperand, context: &'c Context<'t>) -> Option<Self> {
-        unsafe { if mlirOpOperandIsNull(handle) { None } else { Some(Self { handle, context, owner: PhantomData }) } }
+    pub unsafe fn from_c_api(handle: MlirOpOperand, context: &'c Context<'t>) -> Result<Self, Error> {
+        unsafe {
+            if mlirOpOperandIsNull(handle) {
+                Err(Error::internal("expected non-null MLIR operand handle"))
+            } else {
+                Ok(Self { handle, context, owner: PhantomData })
+            }
+        }
     }
 
     /// Returns the [`MlirOpOperand`] that corresponds to this [`OperandRef`] and which can be passed to functions
@@ -425,19 +425,13 @@ impl<'o, 'c, 't> OperandRef<'o, 'c, 't> {
     /// Returns a reference to the underlying [`Value`] of this [`OperandRef`].
     pub fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe {
-            ValueRef::from_c_api(mlirOpOperandGetValue(self.to_c_api()), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR operand value handle"))
-        }
+        unsafe { ValueRef::from_c_api(mlirOpOperandGetValue(self.to_c_api()), self.context) }
     }
 
     /// Returns a reference to the [`Operation`] that takes this [`OperandRef`] as one of its inputs/operands.
     pub fn operation(&self) -> Result<OperationRef<'o, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe {
-            OperationRef::from_c_api(mlirOpOperandGetOwner(self.to_c_api()), self.context)
-                .ok_or_else(|| Error::internal("expected non-null MLIR operand owner handle"))
-        }
+        unsafe { OperationRef::from_c_api(mlirOpOperandGetOwner(self.to_c_api()), self.context) }
     }
 
     /// Returns the index of this [`OperandRef`] in the [`Operation`] where it is being used.
@@ -465,7 +459,7 @@ impl<'o, 'c, 't> Iterator for OperandRefIterator<'o, 'c, 't> {
     fn next(&mut self) -> Option<Self::Item> {
         let current_operand = self.current_operand.take();
         self.current_operand = current_operand.as_ref().and_then(|operand| unsafe {
-            OperandRef::from_c_api(mlirOpOperandGetNextUse(operand.to_c_api()), operand.context())
+            OperandRef::from_c_api(mlirOpOperandGetNextUse(operand.to_c_api()), operand.context()).ok()
         });
         current_operand
     }
@@ -532,7 +526,7 @@ mod tests {
         // Test null pointer edge case.
         let bad_handle = MlirValue { ptr: std::ptr::null_mut() };
         let value = unsafe { ValueRef::from_c_api(bad_handle, &context) };
-        assert!(value.is_none());
+        assert!(value.is_err());
 
         // We are also checking that [`Value::dump`] runs successfully without crashing.
         // Ideally, we would want a way to capture the standard error stream and verify that it printed the right thing.

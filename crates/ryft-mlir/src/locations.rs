@@ -31,7 +31,7 @@ pub trait Location<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display 
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    unsafe fn from_c_api(handle: MlirLocation, context: &'c Context<'t>) -> Option<Self>;
+    unsafe fn from_c_api(handle: MlirLocation, context: &'c Context<'t>) -> Result<Self, Error>;
 
     /// Returns the [`MlirLocation`] that corresponds to this [`Location`]
     /// and which can be passed to functions in the MLIR C API.
@@ -54,7 +54,7 @@ pub trait Location<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display 
     /// [`FileLocationRef`](crate::FileLocationRef)). If this is not an instance of the specified location type,
     /// this function will return [`None`].
     fn cast<L: Location<'c, 't>>(&self) -> Option<L> {
-        unsafe { L::from_c_api(self.to_c_api(), self.context()) }
+        unsafe { L::from_c_api(self.to_c_api(), self.context()).ok() }
     }
 
     /// Up-casts this [`Location`] to an instance of [`LocationRef`].
@@ -85,8 +85,12 @@ pub struct LocationRef<'c, 't> {
 }
 
 impl<'c, 't> Location<'c, 't> for LocationRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirLocation, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+    unsafe fn from_c_api(handle: MlirLocation, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR location handle"))
+        } else {
+            Ok(Self { handle, context })
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirLocation {
