@@ -1,6 +1,6 @@
 use crate::{
-    DetachedOp, DetachedRegion, IntoWithContext, Location, Operation, OperationBuilder, SYMBOL_NAME_ATTRIBUTE,
-    SYMBOL_VISIBILITY_ATTRIBUTE, SymbolVisibility, Type, Value, mlir_op, mlir_op_trait,
+    DetachedOp, DetachedRegion, Error, Location, Operation, OperationBuilder, SYMBOL_NAME_ATTRIBUTE,
+    SYMBOL_VISIBILITY_ATTRIBUTE, SymbolVisibility, TryIntoWithContext, Type, Value, mlir_op, mlir_op_trait,
 };
 
 use super::StringAttributeRef;
@@ -48,27 +48,33 @@ mlir_op_trait!(Module, SymbolTable);
 pub fn module<'c, 't: 'c, L: Location<'c, 't>>(
     region: DetachedRegion<'c, 't>,
     location: L,
-) -> Option<DetachedModuleOperation<'c, 't>> {
+) -> Result<DetachedModuleOperation<'c, 't>, Error> {
     OperationBuilder::new("builtin.module", location)
         .add_region(region)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `builtin::module`"))
+        })
 }
 
 /// Creates a named [`ModuleOperation`] at the specified [`Location`].
-pub fn named_module<'c, 't: 'c, S: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
+pub fn named_module<'c, 't: 'c, S: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
     name: S,
     visibility: SymbolVisibility,
     region: DetachedRegion<'c, 't>,
     location: L,
-) -> Option<DetachedModuleOperation<'c, 't>> {
+) -> Result<DetachedModuleOperation<'c, 't>, Error> {
     let context = location.context();
     let mut builder = OperationBuilder::new("builtin.module", location);
-    builder = builder.add_attribute(SYMBOL_NAME_ATTRIBUTE, name.into_with_context(context));
+    builder = builder.add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?);
     if visibility != SymbolVisibility::default() {
         builder = builder.add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.symbol_visibility_attribute(visibility));
     }
-    builder.add_region(region).build().and_then(|operation| unsafe { operation.cast() })
+    builder.add_region(region).build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `builtin::named_module`"))
+    })
 }
 
 /// Represents an unrealized conversion from one set of types to another, that is used to enable the inter-mixing of
@@ -113,12 +119,16 @@ pub fn unrealized_conversion_cast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: T
     arguments: &[V],
     result_types: &[T],
     location: L,
-) -> Option<DetachedUnrealizedConversionCastOperation<'c, 't>> {
+) -> Result<DetachedUnrealizedConversionCastOperation<'c, 't>, Error> {
     OperationBuilder::new("builtin.unrealized_conversion_cast", location)
         .add_operands(arguments)
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `builtin::unrealized_conversion_cast`"))
+        })
 }
 
 #[cfg(test)]
@@ -134,10 +144,10 @@ mod tests {
         let context = Context::new();
         let location = context.unknown_location();
         let mut region = context.region();
-        region.append_block(context.block_with_no_arguments());
+        region.append_block(context.block_with_no_arguments()).unwrap();
         let module = module(region, location).unwrap();
         assert_eq!(&context, module.context());
-        assert_eq!(module.regions().count(), 1);
+        assert_eq!(module.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
         assert!(module.verify());
         assert_eq!(module.to_string(), "module {\n}\n");
     }
@@ -155,10 +165,10 @@ mod tests {
         let context = Context::new();
         let location = context.unknown_location();
         let mut region = context.region();
-        region.append_block(context.block_with_no_arguments());
+        region.append_block(context.block_with_no_arguments()).unwrap();
         let module = named_module("test_module", SymbolVisibility::Public, region, location).unwrap();
         assert_eq!(&context, module.context());
-        assert_eq!(module.regions().count(), 1);
+        assert_eq!(module.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
         assert!(module.verify());
         assert_eq!(module.to_string(), "module @test_module {\n}\n");
     }
@@ -176,7 +186,7 @@ mod tests {
         let context = Context::new();
         let location = context.unknown_location();
         let mut region = context.region();
-        region.append_block(context.block_with_no_arguments());
+        region.append_block(context.block_with_no_arguments()).unwrap();
         let module = named_module("private_module", SymbolVisibility::Private, region, location).unwrap();
         assert!(module.verify());
         assert_eq!(module.to_string(), "module @private_module attributes {sym_visibility = \"private\"} {\n}\n");
@@ -198,9 +208,9 @@ mod tests {
         let location = context.unknown_location();
         let i32_type = context.signless_integer_type(32);
         let op = unrealized_conversion_cast::<ValueRef, _, _>(&[], &[i32_type], location).unwrap();
-        assert_eq!(op.operands().count(), 0);
-        assert_eq!(op.results().count(), 1);
-        assert_eq!(op.result_type(0).unwrap(), i32_type);
+        assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+        assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+        assert_eq!(op.result_type(0).unwrap().unwrap(), i32_type);
         assert!(op.verify());
         assert_eq!(op.to_string(), "%0 = unrealized_conversion_cast to i32\n");
     }
