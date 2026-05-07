@@ -1161,7 +1161,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::dialects::{func as func_dialect, index};
+    use crate::dialects::{func, index};
     use crate::{Block, Context, Operation, TryIntoWithContext, Type};
 
     use super::*;
@@ -1183,7 +1183,7 @@ mod tests {
                 let return_op = r#return(&[constant.as_ref().result(0).unwrap()], location).unwrap();
                 assert_eq!(return_op.values().unwrap(), vec![constant.as_ref().result(0).unwrap().as_ref()]);
                 block.append_operation(return_op).unwrap();
-                func(
+                super::func(
                     "producer",
                     FuncAttributes { results: vec![async_index_type.into()], ..Default::default() },
                     block.try_into().unwrap(),
@@ -1215,7 +1215,7 @@ mod tests {
                 block
                     .append_operation(r#return(&[await_op.as_ref().result(0).unwrap()], location).unwrap())
                     .unwrap();
-                func(
+                super::func(
                     "caller",
                     FuncAttributes { results: vec![async_index_type.into()], ..Default::default() },
                     block.try_into().unwrap(),
@@ -1280,11 +1280,11 @@ mod tests {
                 assert_eq!(execute_op.result_type(1).unwrap(), async_index_type);
                 let execute_op = block.append_operation(execute_op).unwrap();
                 block
-                    .append_operation(func_dialect::r#return(&[execute_op.result(1).unwrap()], location).unwrap())
+                    .append_operation(func::r#return(&[execute_op.result(1).unwrap()], location).unwrap())
                     .unwrap();
-                func_dialect::func(
+                func::func(
                     "execute_test",
-                    func_dialect::FuncAttributes {
+                    func::FuncAttributes {
                         arguments: vec![token_type.into(), async_index_type.into()],
                         results: vec![async_index_type.into()],
                         ..Default::default()
@@ -1315,10 +1315,10 @@ mod tests {
                 let await_all_op = await_all(group, location).unwrap();
                 assert_eq!(await_all_op.operand_value(0).unwrap(), group.as_ref());
                 block.append_operation(await_all_op).unwrap();
-                block.append_operation(func_dialect::r#return(&[rank], location).unwrap()).unwrap();
-                func_dialect::func(
+                block.append_operation(func::r#return(&[rank], location).unwrap()).unwrap();
+                func::func(
                     "group_test",
-                    func_dialect::FuncAttributes {
+                    func::FuncAttributes {
                         arguments: vec![index_type.into(), token_type.into()],
                         results: vec![index_type.into()],
                         ..Default::default()
@@ -1410,10 +1410,10 @@ mod tests {
                 block.append_operation(runtime_resume(handle, location).unwrap()).unwrap();
                 block.append_operation(runtime_await_and_resume(created_token, handle, location).unwrap()).unwrap();
                 block.append_operation(runtime_num_worker_threads(location).unwrap()).unwrap();
-                block.append_operation(func_dialect::r#return(&[loaded], location).unwrap()).unwrap();
-                func_dialect::func(
+                block.append_operation(func::r#return(&[loaded], location).unwrap()).unwrap();
+                func::func(
                     "runtime_test",
-                    func_dialect::FuncAttributes {
+                    func::FuncAttributes {
                         arguments: vec![index_type.into(), handle_type.into()],
                         results: vec![index_type.into()],
                         ..Default::default()
@@ -1475,18 +1475,18 @@ mod tests {
                 let mut suspend_block = context.block_with_no_arguments();
                 suspend_block.append_operation(coro_end(handle, location).unwrap()).unwrap();
                 suspend_block
-                    .append_operation(func_dialect::r#return::<ValueRef, _>(&[], location).unwrap())
+                    .append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap())
                     .unwrap();
 
                 let mut resume_block = context.block_with_no_arguments();
                 resume_block.append_operation(coro_free(id, handle, location).unwrap()).unwrap();
                 resume_block
-                    .append_operation(func_dialect::r#return::<ValueRef, _>(&[], location).unwrap())
+                    .append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap())
                     .unwrap();
 
                 let mut cleanup_block = context.block_with_no_arguments();
                 cleanup_block
-                    .append_operation(func_dialect::r#return::<ValueRef, _>(&[], location).unwrap())
+                    .append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap())
                     .unwrap();
 
                 let suspend_op = coro_suspend(state, &suspend_block, &resume_block, &cleanup_block, location).unwrap();
@@ -1496,9 +1496,9 @@ mod tests {
                 assert_eq!(suspend_op.cleanup_destination().unwrap(), cleanup_block.as_ref());
                 entry_block.append_operation(suspend_op).unwrap();
 
-                func_dialect::func(
+                func::func(
                     "coro_test",
-                    func_dialect::FuncAttributes::default(),
+                    func::FuncAttributes::default(),
                     vec![entry_block, suspend_block, resume_block, cleanup_block]
                         .try_into_with_context(&context)
                         .unwrap(),
