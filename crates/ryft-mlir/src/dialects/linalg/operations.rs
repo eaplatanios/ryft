@@ -1,10 +1,9 @@
 use ryft_xla_sys::bindings::mlirLinalgFillBuiltinNamedOpRegion;
 
 use crate::{
-    ArrayAttributeRef, Attribute, AttributeRef, DenseInteger32ArrayAttributeRef, DenseInteger64ArrayAttributeRef,
-    DenseIntegerElementsAttributeRef, DetachedOp, DetachedRegion, DialectHandle, Location, MemRefTypeRef, Operation,
-    OperationBuilder, RegionRef, StringAttributeRef, TensorTypeRef, Type, TypeRef, Value, ValueRef, mlir_op,
-    mlir_op_trait,
+    ArrayAttributeRef, Attribute, AttributeRef, DenseInteger64ArrayAttributeRef, DenseIntegerElementsAttributeRef,
+    DetachedOp, DetachedRegion, DialectHandle, Error, Location, MemRefTypeRef, Operation, OperationBuilder, RegionRef,
+    StringAttributeRef, TensorTypeRef, Type, TypeRef, Value, ValueRef, mlir_op, mlir_op_trait,
 };
 
 use super::{
@@ -18,49 +17,36 @@ pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operandSegmentSizes";
 /// Common API for Linalg named structured operations.
 pub trait LinalgNamedStructuredOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns this operation's input operands.
-    fn inputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .values()
-            .map(|value| value as usize)
-            .collect::<Vec<_>>();
-        (0..segment_sizes[0]).map(|index| self.operand_value(index).unwrap()).collect()
+    fn inputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let input_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        (0..input_count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns this operation's output operands.
-    fn outputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .values()
-            .map(|value| value as usize)
-            .collect::<Vec<_>>();
-        let start = segment_sizes[0];
-        let end = start + segment_sizes[1];
-        (start..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn outputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let input_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        let output_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        (input_count..input_count + output_count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns this operation's result tensors.
-    fn result_tensors(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.result_count()).map(|index| self.result(index).unwrap().as_ref()).collect()
+    fn result_tensors(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (0..self.result_count())
+            .map(|index| self.as_ref().result(index).map(|result| result.as_ref()))
+            .collect()
     }
 
     /// Returns this operation's payload region.
-    fn region(&self) -> RegionRef<'o, 'c, 't> {
-        Operation::region(self, 0).unwrap()
+    fn region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.as_ref().region(0)
     }
 }
 
 /// Operation trait for `linalg.yield`.
 pub trait YieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the values yielded to the enclosing Linalg operation.
-    fn values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (0..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 }
 
@@ -73,13 +59,14 @@ mlir_op_trait!(Yield, ZeroSuccessors);
 pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     values: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedYieldOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::linalg());
+) -> Result<DetachedYieldOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.yield", location)
         .add_operands(values)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::yield`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::yield`"))
+        })
 }
 
 /// Name of the Linalg index dimension attribute.
@@ -88,12 +75,8 @@ pub const DIM_ATTRIBUTE: &str = "dim";
 /// Operation trait for `linalg.index`.
 pub trait IndexOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the accessed loop dimension.
-    fn dimension(&self) -> i64 {
-        self.attribute(DIM_ATTRIBUTE)
-            .unwrap()
-            .cast::<crate::IntegerAttributeRef>()
-            .unwrap()
-            .signless_value()
+    fn dimension(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(DIM_ATTRIBUTE)?.signless_value())
     }
 }
 
@@ -104,15 +87,19 @@ mlir_op_trait!(Index, ZeroRegions);
 mlir_op_trait!(Index, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`IndexOperation`] at the specified [`Location`].
-pub fn index<'c, 't: 'c, L: Location<'c, 't>>(dimension: i64, location: L) -> DetachedIndexOperation<'c, 't> {
+pub fn index<'c, 't: 'c, L: Location<'c, 't>>(
+    dimension: i64,
+    location: L,
+) -> Result<DetachedIndexOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.index", location)
         .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), dimension))
         .add_result(context.index_type())
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::index`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::index`"))
+        })
 }
 
 /// Name of the Linalg indexing maps attribute.
@@ -130,51 +117,40 @@ pub const LIBRARY_CALL_ATTRIBUTE: &str = "library_call";
 /// Operation trait for `linalg.generic`.
 pub trait GenericOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns this operation's input operands.
-    fn inputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .values()
-            .map(|value| value as usize)
-            .collect::<Vec<_>>();
-        (0..segment_sizes[0]).map(|index| self.operand_value(index).unwrap()).collect()
+    fn inputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let input_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        (0..input_count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns this operation's output operands.
-    fn outputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .values()
-            .map(|value| value as usize)
-            .collect::<Vec<_>>();
-        let start = segment_sizes[0];
-        let end = start + segment_sizes[1];
-        (start..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn outputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let input_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        let output_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        (input_count..input_count + output_count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns this operation's indexing maps.
-    fn indexing_maps(&self) -> ArrayAttributeRef<'c, 't> {
-        self.attribute(INDEXING_MAPS_ATTRIBUTE).unwrap().cast().unwrap()
+    fn indexing_maps(&self) -> Result<ArrayAttributeRef<'c, 't>, Error> {
+        self.array_attribute(INDEXING_MAPS_ATTRIBUTE)
     }
 
     /// Returns this operation's iterator types.
-    fn iterator_types(&self) -> ArrayAttributeRef<'c, 't> {
-        self.attribute(ITERATOR_TYPES_ATTRIBUTE).unwrap().cast().unwrap()
+    fn iterator_types(&self) -> Result<ArrayAttributeRef<'c, 't>, Error> {
+        self.array_attribute(ITERATOR_TYPES_ATTRIBUTE)
     }
 
     /// Returns the optional documentation attribute.
-    fn doc(&self) -> Option<StringAttributeRef<'c, 't>> {
-        self.attribute(DOC_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn doc(&self) -> Result<Option<StringAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(DOC_ATTRIBUTE) { self.string_attribute(DOC_ATTRIBUTE).map(Some) } else { Ok(None) }
     }
 
     /// Returns the optional external library call attribute.
-    fn library_call(&self) -> Option<StringAttributeRef<'c, 't>> {
-        self.attribute(LIBRARY_CALL_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn library_call(&self) -> Result<Option<StringAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(LIBRARY_CALL_ATTRIBUTE) {
+            self.string_attribute(LIBRARY_CALL_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -194,12 +170,12 @@ pub fn generic<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     region: DetachedRegion<'c, 't>,
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedGenericOperation<'c, 't> {
+) -> Result<DetachedGenericOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.generic", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_attribute(INDEXING_MAPS_ATTRIBUTE, indexing_maps)
         .add_attribute(ITERATOR_TYPES_ATTRIBUTE, iterator_types)
         .add_operands(inputs)
@@ -215,22 +191,29 @@ pub fn generic<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::generic`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::generic`"))
+    })
 }
 
 /// Operation trait for `linalg.map`.
 pub trait MapOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns this operation's inputs.
-    fn inputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.operand_count() - 1).map(|index| self.operand_value(index).unwrap()).collect()
+    fn inputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let input_count = self
+            .operand_count()
+            .checked_sub(1)
+            .ok_or_else(|| Error::invalid_argument("missing init operand in `linalg.map`"))?;
+        (0..input_count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns this operation's initial output.
-    fn init(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(self.operand_count() - 1).unwrap()
+    fn init(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let index = self
+            .operand_count()
+            .checked_sub(1)
+            .ok_or_else(|| Error::invalid_argument("missing init operand in `linalg.map`"))?;
+        self.operand_value(index)
     }
 }
 
@@ -246,8 +229,8 @@ pub fn map<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     region: DetachedRegion<'c, 't>,
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedMapOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::linalg());
+) -> Result<DetachedMapOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::linalg()?)?;
     let mut builder = OperationBuilder::new("linalg.map", location)
         .add_operands(inputs)
         .add_operand(init)
@@ -256,10 +239,9 @@ pub fn map<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::map`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::map`"))
+    })
 }
 
 /// Name of the Linalg dimensions attribute.
@@ -268,20 +250,20 @@ pub const DIMENSIONS_ATTRIBUTE: &str = "dimensions";
 /// Operation trait for `linalg.reduce`.
 pub trait ReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns this operation's inputs.
-    fn inputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn inputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let half = self.operand_count() / 2;
-        (0..half).map(|index| self.operand_value(index).unwrap()).collect()
+        (0..half).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns this operation's initial values.
-    fn inits(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn inits(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let half = self.operand_count() / 2;
-        (half..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+        (half..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns this operation's reduction dimensions.
-    fn dimensions(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(DIMENSIONS_ATTRIBUTE).unwrap().cast().unwrap()
+    fn dimensions(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(DIMENSIONS_ATTRIBUTE)
     }
 }
 
@@ -298,11 +280,11 @@ pub fn reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     region: DetachedRegion<'c, 't>,
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedReduceOperation<'c, 't> {
+) -> Result<DetachedReduceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let mut builder = OperationBuilder::new("linalg.reduce", location)
-        .add_attribute(DIMENSIONS_ATTRIBUTE, context.dense_i64_array_attribute(dimensions).unwrap())
+        .add_attribute(DIMENSIONS_ATTRIBUTE, context.dense_i64_array_attribute(dimensions)?)
         .add_operands(inputs)
         .add_operands(inits)
         .add_results(result_types)
@@ -310,10 +292,9 @@ pub fn reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::reduce`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::reduce`"))
+    })
 }
 
 /// Name of the Linalg permutation attribute.
@@ -322,18 +303,18 @@ pub const PERMUTATION_ATTRIBUTE: &str = "permutation";
 /// Operation trait for `linalg.transpose`.
 pub trait TransposeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the initial output operand.
-    fn init(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn init(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the permutation attribute.
-    fn permutation(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(PERMUTATION_ATTRIBUTE).unwrap().cast().unwrap()
+    fn permutation(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(PERMUTATION_ATTRIBUTE)
     }
 }
 
@@ -349,37 +330,37 @@ pub fn transpose<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     permutation: &[i64],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedTransposeOperation<'c, 't> {
+) -> Result<DetachedTransposeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let mut builder = OperationBuilder::new("linalg.transpose", location)
-        .add_attribute(PERMUTATION_ATTRIBUTE, context.dense_i64_array_attribute(permutation).unwrap())
+        .add_attribute(PERMUTATION_ATTRIBUTE, context.dense_i64_array_attribute(permutation)?)
         .add_operands(&[input, init])
         .add_results(result_types)
         .add_region(context.region());
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::transpose`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::transpose` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::transpose` operation cast"))
 }
 
 /// Operation trait for `linalg.broadcast`.
 pub trait BroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the initial output operand.
-    fn init(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn init(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the broadcast dimensions.
-    fn dimensions(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(DIMENSIONS_ATTRIBUTE).unwrap().cast().unwrap()
+    fn dimensions(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(DIMENSIONS_ATTRIBUTE)
     }
 }
 
@@ -395,20 +376,20 @@ pub fn broadcast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     dimensions: &[i64],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedBroadcastOperation<'c, 't> {
+) -> Result<DetachedBroadcastOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let mut builder = OperationBuilder::new("linalg.broadcast", location)
-        .add_attribute(DIMENSIONS_ATTRIBUTE, context.dense_i64_array_attribute(dimensions).unwrap())
+        .add_attribute(DIMENSIONS_ATTRIBUTE, context.dense_i64_array_attribute(dimensions)?)
         .add_operands(&[input, init])
         .add_results(result_types)
         .add_region(context.region());
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::broadcast`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::broadcast` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::broadcast` operation cast"))
 }
 
 /// Name of the Linalg elementwise kind attribute.
@@ -417,13 +398,26 @@ pub const KIND_ATTRIBUTE: &str = "kind";
 /// Operation trait for `linalg.elementwise`.
 pub trait ElementwiseOperation<'o, 'c: 'o, 't: 'c>: LinalgNamedStructuredOperation<'o, 'c, 't> {
     /// Returns the elementwise operation kind.
-    fn kind(&self) -> ElementwiseKind {
-        self.attribute(KIND_ATTRIBUTE).unwrap().cast::<ElementwiseKindAttributeRef>().unwrap().value()
+    fn kind(&self) -> Result<ElementwiseKind, Error> {
+        self.attribute(KIND_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<ElementwiseKindAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    KIND_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns the optional explicit indexing maps.
-    fn indexing_maps(&self) -> Option<ArrayAttributeRef<'c, 't>> {
-        self.attribute(INDEXING_MAPS_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn indexing_maps(&self) -> Result<Option<ArrayAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(INDEXING_MAPS_ATTRIBUTE) {
+            self.array_attribute(INDEXING_MAPS_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -441,31 +435,34 @@ pub fn elementwise<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     indexing_maps: Option<ArrayAttributeRef<'c, 't>>,
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedElementwiseOperation<'c, 't> {
+) -> Result<DetachedElementwiseOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
-    let indexing_maps = indexing_maps.unwrap_or_else(|| {
+    let indexing_maps = if let Some(indexing_maps) = indexing_maps {
+        indexing_maps
+    } else {
         let rank = outputs
             .first()
             .map(|output| {
-                let r#type = output.r#type();
+                let r#type = output.r#type()?;
                 if let Some(tensor_type) = r#type.cast::<TensorTypeRef>() {
-                    tensor_type.rank()
+                    Ok(tensor_type.rank())
                 } else if let Some(memref_type) = r#type.cast::<MemRefTypeRef>() {
-                    memref_type.rank()
+                    Ok(memref_type.rank())
                 } else {
-                    panic!("expected shaped output type for `linalg::elementwise`")
+                    Err(Error::invalid_argument("expected shaped output type for `linalg::elementwise`"))
                 }
             })
+            .transpose()?
             .unwrap_or(0);
         let identity_map = context.affine_map_attribute(context.identity_affine_map(rank));
         let maps = vec![identity_map; inputs.len() + outputs.len()];
         context.array_attribute(&maps)
-    });
+    };
     let mut builder = OperationBuilder::new("linalg.elementwise", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
-        .add_attribute(KIND_ATTRIBUTE, context.linalg_elementwise_kind_attribute(kind))
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
+        .add_attribute(KIND_ATTRIBUTE, context.linalg_elementwise_kind_attribute(kind)?)
         .add_attribute(INDEXING_MAPS_ATTRIBUTE, indexing_maps)
         .add_operands(inputs)
         .add_operands(outputs)
@@ -474,9 +471,9 @@ pub fn elementwise<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::elementwise`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::elementwise` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::elementwise` operation cast"))
 }
 
 /// Name of the Linalg numeric cast attribute.
@@ -485,11 +482,23 @@ pub const CAST_ATTRIBUTE: &str = "cast";
 /// Common API for Linalg operations with numeric cast behavior.
 pub trait LinalgCastedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the numeric cast behavior.
-    fn cast(&self) -> TypeFn {
-        self.attribute(CAST_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<TypeFnAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or(TypeFn::CastSigned)
+    fn cast(&self) -> Result<TypeFn, Error> {
+        ({
+            let attribute_name = CAST_ATTRIBUTE;
+            self.attribute(attribute_name)?
+                .map(|attribute| {
+                    attribute.cast::<TypeFnAttributeRef>().ok_or_else(|| {
+                        Error::invalid_argument(format!(
+                            "invalid `{}` attribute in `{}`",
+                            attribute_name,
+                            self.name().as_str().unwrap_or("<unknown>"),
+                        ))
+                    })
+                })
+                .transpose()
+        }?)
+        .map(|attribute| attribute.value())
+        .unwrap_or(Ok(TypeFn::CastSigned))
     }
 }
 
@@ -498,8 +507,12 @@ pub trait LinalgCoreStructuredOperation<'o, 'c: 'o, 't: 'c>:
     LinalgNamedStructuredOperation<'o, 'c, 't> + LinalgCastedOperation<'o, 'c, 't>
 {
     /// Returns the optional explicit indexing maps.
-    fn indexing_maps(&self) -> Option<ArrayAttributeRef<'c, 't>> {
-        self.attribute(INDEXING_MAPS_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn indexing_maps(&self) -> Result<Option<ArrayAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(INDEXING_MAPS_ATTRIBUTE) {
+            self.array_attribute(INDEXING_MAPS_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -520,12 +533,12 @@ pub fn matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedMatmulOperation<'c, 't> {
+) -> Result<DetachedMatmulOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.matmul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -533,9 +546,9 @@ pub fn matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::matmul`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::matmul` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::matmul` operation cast"))
 }
 
 /// Operation trait for `linalg.contract`.
@@ -555,12 +568,12 @@ pub fn contract<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedContractOperation<'c, 't> {
+) -> Result<DetachedContractOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.contract", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -568,9 +581,9 @@ pub fn contract<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::contract`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::contract` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::contract` operation cast"))
 }
 
 /// Operation trait for `linalg.batch_matmul`.
@@ -590,12 +603,12 @@ pub fn batch_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedBatchMatmulOperation<'c, 't> {
+) -> Result<DetachedBatchMatmulOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.batch_matmul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -603,9 +616,9 @@ pub fn batch_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::batch_matmul`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::batch_matmul` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::batch_matmul` operation cast"))
 }
 
 /// Operation trait for `linalg.batch_reduce_matmul`.
@@ -625,12 +638,12 @@ pub fn batch_reduce_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedBatchReduceMatmulOperation<'c, 't> {
+) -> Result<DetachedBatchReduceMatmulOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.batch_reduce_matmul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -638,9 +651,9 @@ pub fn batch_reduce_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::batch_reduce_matmul`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::batch_reduce_matmul` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::batch_reduce_matmul` operation cast"))
 }
 
 /// Name of the Linalg dimension attribute.
@@ -649,22 +662,18 @@ pub const DIMENSION_ATTRIBUTE: &str = "dimension";
 /// Operation trait for `linalg.softmax`.
 pub trait SoftmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the output operand.
-    fn output_operand(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn output_operand(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the softmax dimension.
-    fn dimension(&self) -> i64 {
-        self.attribute(DIMENSION_ATTRIBUTE)
-            .unwrap()
-            .cast::<crate::IntegerAttributeRef>()
-            .unwrap()
-            .signless_value()
+    fn dimension(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(DIMENSION_ATTRIBUTE)?.signless_value())
     }
 }
 
@@ -679,16 +688,17 @@ pub fn softmax<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     dimension: i64,
     location: L,
-) -> DetachedSoftmaxOperation<'c, 't> {
+) -> Result<DetachedSoftmaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.softmax", location)
         .add_attribute(DIMENSION_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), dimension))
         .add_operands(&[input, output])
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::softmax`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::softmax`"))
+        })
 }
 
 /// Name of the Linalg Winograd FMR attribute.
@@ -697,18 +707,27 @@ pub const FMR_ATTRIBUTE: &str = "fmr";
 /// Operation trait for `linalg.winograd_filter_transform`.
 pub trait WinogradFilterTransformOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the filter operand.
-    fn filter(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn filter(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the output operand.
-    fn output_operand(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn output_operand(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the Winograd FMR value.
-    fn fmr(&self) -> WinogradConv2DFmr {
-        self.attribute(FMR_ATTRIBUTE).unwrap().cast::<WinogradConv2DFmrAttributeRef>().unwrap().value()
+    fn fmr(&self) -> Result<WinogradConv2DFmr, Error> {
+        self.attribute(FMR_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<WinogradConv2DFmrAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    FMR_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 }
 
@@ -723,33 +742,45 @@ pub fn winograd_filter_transform<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     fmr: WinogradConv2DFmr,
     location: L,
-) -> DetachedWinogradFilterTransformOperation<'c, 't> {
+) -> Result<DetachedWinogradFilterTransformOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.winograd_filter_transform", location)
-        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr))
+        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr)?)
         .add_operands(&[input, output])
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::winograd_filter_transform`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::winograd_filter_transform`"))
+        })
 }
 
 /// Operation trait for `linalg.winograd_input_transform`.
 pub trait WinogradInputTransformOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the output operand.
-    fn output_operand(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn output_operand(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the Winograd FMR value.
-    fn fmr(&self) -> WinogradConv2DFmr {
-        self.attribute(FMR_ATTRIBUTE).unwrap().cast::<WinogradConv2DFmrAttributeRef>().unwrap().value()
+    fn fmr(&self) -> Result<WinogradConv2DFmr, Error> {
+        self.attribute(FMR_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<WinogradConv2DFmrAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    FMR_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 }
 
@@ -764,33 +795,45 @@ pub fn winograd_input_transform<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     fmr: WinogradConv2DFmr,
     location: L,
-) -> DetachedWinogradInputTransformOperation<'c, 't> {
+) -> Result<DetachedWinogradInputTransformOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.winograd_input_transform", location)
-        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr))
+        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr)?)
         .add_operands(&[input, output])
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::winograd_input_transform`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::winograd_input_transform`"))
+        })
 }
 
 /// Operation trait for `linalg.winograd_output_transform`.
 pub trait WinogradOutputTransformOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the value operand.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the output operand.
-    fn output_operand(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn output_operand(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the Winograd FMR value.
-    fn fmr(&self) -> WinogradConv2DFmr {
-        self.attribute(FMR_ATTRIBUTE).unwrap().cast::<WinogradConv2DFmrAttributeRef>().unwrap().value()
+    fn fmr(&self) -> Result<WinogradConv2DFmr, Error> {
+        self.attribute(FMR_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<WinogradConv2DFmrAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    FMR_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 }
 
@@ -805,16 +848,19 @@ pub fn winograd_output_transform<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     fmr: WinogradConv2DFmr,
     location: L,
-) -> DetachedWinogradOutputTransformOperation<'c, 't> {
+) -> Result<DetachedWinogradOutputTransformOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.winograd_output_transform", location)
-        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr))
+        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr)?)
         .add_operands(&[input, output])
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::winograd_output_transform`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::winograd_output_transform`"))
+        })
 }
 
 /// Name of the Linalg outer-dimension permutation attribute.
@@ -829,57 +875,50 @@ pub const STATIC_INNER_TILES_ATTRIBUTE: &str = "static_inner_tiles";
 /// Operation trait for `linalg.pack`.
 pub trait PackOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source operand.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the destination operand.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the optional padding value.
-    fn padding_value(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .values()
-            .map(|value| value as usize)
-            .collect::<Vec<_>>();
-        let start = segment_sizes.iter().take(2).sum::<usize>();
-        (start..start + segment_sizes[2]).map(|index| self.operand_value(index).unwrap()).next()
+    fn padding_value(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        let source_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        let destination_count =
+            self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        let padding_value_count =
+            self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
+        if padding_value_count == 0 { Ok(None) } else { self.operand_value(source_count + destination_count).map(Some) }
     }
 
     /// Returns the dynamic inner tile operands.
-    fn inner_tiles(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .values()
-            .map(|value| value as usize)
-            .collect::<Vec<_>>();
-        let start = segment_sizes.iter().take(3).sum::<usize>();
-        let end = start + segment_sizes[3];
-        (start..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn inner_tiles(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let source_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        let destination_count =
+            self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        let padding_value_count =
+            self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
+        let inner_tile_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)?;
+        let start = source_count + destination_count + padding_value_count;
+        (start..start + inner_tile_count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the outer-dimension permutation attribute.
-    fn outer_dims_perm(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(OUTER_DIMS_PERM_ATTRIBUTE).unwrap().cast().unwrap()
+    fn outer_dims_perm(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(OUTER_DIMS_PERM_ATTRIBUTE)
     }
 
     /// Returns the inner-dimension positions attribute.
-    fn inner_dims_pos(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(INNER_DIMS_POS_ATTRIBUTE).unwrap().cast().unwrap()
+    fn inner_dims_pos(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(INNER_DIMS_POS_ATTRIBUTE)
     }
 
     /// Returns the static inner tile sizes attribute.
-    fn static_inner_tiles(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(STATIC_INNER_TILES_ATTRIBUTE).unwrap().cast().unwrap()
+    fn static_inner_tiles(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(STATIC_INNER_TILES_ATTRIBUTE)
     }
 }
 
@@ -898,67 +937,59 @@ pub fn pack<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     inner_dims_pos: &[i64],
     static_inner_tiles: &[i64],
     location: L,
-) -> DetachedPackOperation<'c, 't> {
+) -> Result<DetachedPackOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [1, 1, i32::from(padding_value.is_some()), inner_tiles.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pack", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
-        .add_attribute(OUTER_DIMS_PERM_ATTRIBUTE, context.dense_i64_array_attribute(outer_dims_perm).unwrap())
-        .add_attribute(INNER_DIMS_POS_ATTRIBUTE, context.dense_i64_array_attribute(inner_dims_pos).unwrap())
-        .add_attribute(STATIC_INNER_TILES_ATTRIBUTE, context.dense_i64_array_attribute(static_inner_tiles).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
+        .add_attribute(OUTER_DIMS_PERM_ATTRIBUTE, context.dense_i64_array_attribute(outer_dims_perm)?)
+        .add_attribute(INNER_DIMS_POS_ATTRIBUTE, context.dense_i64_array_attribute(inner_dims_pos)?)
+        .add_attribute(STATIC_INNER_TILES_ATTRIBUTE, context.dense_i64_array_attribute(static_inner_tiles)?)
         .add_operands(&[source, destination]);
     if let Some(padding_value) = padding_value {
         builder = builder.add_operand(padding_value);
     }
-    builder
-        .add_operands(inner_tiles)
-        .add_results(result_types)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::pack`")
+    builder.add_operands(inner_tiles).add_results(result_types).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::pack`"))
+    })
 }
 
 /// Operation trait for `linalg.unpack`.
 pub trait UnpackOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source operand.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the destination operand.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the dynamic inner tile operands.
-    fn inner_tiles(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute"))
-            .values()
-            .map(|value| value as usize)
-            .collect::<Vec<_>>();
-        let start = segment_sizes.iter().take(2).sum::<usize>();
-        let end = start + segment_sizes[2];
-        (start..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn inner_tiles(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let source_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        let destination_count =
+            self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        let inner_tile_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
+        let start = source_count + destination_count;
+        (start..start + inner_tile_count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the outer-dimension permutation attribute.
-    fn outer_dims_perm(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(OUTER_DIMS_PERM_ATTRIBUTE).unwrap().cast().unwrap()
+    fn outer_dims_perm(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(OUTER_DIMS_PERM_ATTRIBUTE)
     }
 
     /// Returns the inner-dimension positions attribute.
-    fn inner_dims_pos(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(INNER_DIMS_POS_ATTRIBUTE).unwrap().cast().unwrap()
+    fn inner_dims_pos(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(INNER_DIMS_POS_ATTRIBUTE)
     }
 
     /// Returns the static inner tile sizes attribute.
-    fn static_inner_tiles(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(STATIC_INNER_TILES_ATTRIBUTE).unwrap().cast().unwrap()
+    fn static_inner_tiles(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(STATIC_INNER_TILES_ATTRIBUTE)
     }
 }
 
@@ -976,21 +1007,22 @@ pub fn unpack<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     inner_dims_pos: &[i64],
     static_inner_tiles: &[i64],
     location: L,
-) -> DetachedUnpackOperation<'c, 't> {
+) -> Result<DetachedUnpackOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [1, 1, inner_tiles.len() as i32];
     OperationBuilder::new("linalg.unpack", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
-        .add_attribute(OUTER_DIMS_PERM_ATTRIBUTE, context.dense_i64_array_attribute(outer_dims_perm).unwrap())
-        .add_attribute(INNER_DIMS_POS_ATTRIBUTE, context.dense_i64_array_attribute(inner_dims_pos).unwrap())
-        .add_attribute(STATIC_INNER_TILES_ATTRIBUTE, context.dense_i64_array_attribute(static_inner_tiles).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
+        .add_attribute(OUTER_DIMS_PERM_ATTRIBUTE, context.dense_i64_array_attribute(outer_dims_perm)?)
+        .add_attribute(INNER_DIMS_POS_ATTRIBUTE, context.dense_i64_array_attribute(inner_dims_pos)?)
+        .add_attribute(STATIC_INNER_TILES_ATTRIBUTE, context.dense_i64_array_attribute(static_inner_tiles)?)
         .add_operands(&[source, destination])
         .add_operands(inner_tiles)
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `linalg::unpack`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::unpack`"))
+        })
 }
 
 /// Operation trait for `linalg.copy`.
@@ -1012,12 +1044,12 @@ pub fn copy<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedCopyOperation<'c, 't> {
+) -> Result<DetachedCopyOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.copy", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1025,9 +1057,9 @@ pub fn copy<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::copy`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::copy` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::copy` operation cast"))
 }
 
 /// Operation trait for `linalg.exp`.
@@ -1045,12 +1077,12 @@ pub fn exp<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedExpOperation<'c, 't> {
+) -> Result<DetachedExpOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.exp", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1058,9 +1090,9 @@ pub fn exp<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::exp`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::exp` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::exp` operation cast"))
 }
 
 /// Operation trait for `linalg.log`.
@@ -1078,12 +1110,12 @@ pub fn log<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedLogOperation<'c, 't> {
+) -> Result<DetachedLogOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.log", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1091,9 +1123,9 @@ pub fn log<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::log`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::log` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::log` operation cast"))
 }
 
 /// Operation trait for `linalg.abs`.
@@ -1111,12 +1143,12 @@ pub fn abs<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedAbsOperation<'c, 't> {
+) -> Result<DetachedAbsOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.abs", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1124,9 +1156,9 @@ pub fn abs<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::abs`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::abs` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::abs` operation cast"))
 }
 
 /// Operation trait for `linalg.ceil`.
@@ -1144,12 +1176,12 @@ pub fn ceil<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedCeilOperation<'c, 't> {
+) -> Result<DetachedCeilOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.ceil", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1157,9 +1189,9 @@ pub fn ceil<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::ceil`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::ceil` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::ceil` operation cast"))
 }
 
 /// Operation trait for `linalg.floor`.
@@ -1177,12 +1209,12 @@ pub fn floor<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedFloorOperation<'c, 't> {
+) -> Result<DetachedFloorOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.floor", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1190,9 +1222,9 @@ pub fn floor<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::floor`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::floor` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::floor` operation cast"))
 }
 
 /// Operation trait for `linalg.negf`.
@@ -1210,12 +1242,12 @@ pub fn negf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedNegFOperation<'c, 't> {
+) -> Result<DetachedNegFOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.negf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1223,9 +1255,9 @@ pub fn negf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::negf`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::negf` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::negf` operation cast"))
 }
 
 /// Operation trait for `linalg.reciprocal`.
@@ -1243,12 +1275,12 @@ pub fn reciprocal<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedReciprocalOperation<'c, 't> {
+) -> Result<DetachedReciprocalOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.reciprocal", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1256,9 +1288,9 @@ pub fn reciprocal<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::reciprocal`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::reciprocal` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::reciprocal` operation cast"))
 }
 
 /// Operation trait for `linalg.round`.
@@ -1276,12 +1308,12 @@ pub fn round<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedRoundOperation<'c, 't> {
+) -> Result<DetachedRoundOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.round", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1289,9 +1321,9 @@ pub fn round<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::round`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::round` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::round` operation cast"))
 }
 
 /// Operation trait for `linalg.sqrt`.
@@ -1309,12 +1341,12 @@ pub fn sqrt<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedSqrtOperation<'c, 't> {
+) -> Result<DetachedSqrtOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.sqrt", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1322,9 +1354,9 @@ pub fn sqrt<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::sqrt`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::sqrt` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::sqrt` operation cast"))
 }
 
 /// Operation trait for `linalg.rsqrt`.
@@ -1342,12 +1374,12 @@ pub fn rsqrt<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedRsqrtOperation<'c, 't> {
+) -> Result<DetachedRsqrtOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.rsqrt", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1355,9 +1387,9 @@ pub fn rsqrt<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::rsqrt`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::rsqrt` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::rsqrt` operation cast"))
 }
 
 /// Operation trait for `linalg.square`.
@@ -1375,12 +1407,12 @@ pub fn square<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedSquareOperation<'c, 't> {
+) -> Result<DetachedSquareOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.square", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1388,9 +1420,9 @@ pub fn square<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::square`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::square` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::square` operation cast"))
 }
 
 /// Operation trait for `linalg.tanh`.
@@ -1408,12 +1440,12 @@ pub fn tanh<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedTanhOperation<'c, 't> {
+) -> Result<DetachedTanhOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.tanh", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1421,9 +1453,9 @@ pub fn tanh<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::tanh`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::tanh` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::tanh` operation cast"))
 }
 
 /// Operation trait for `linalg.erf`.
@@ -1441,12 +1473,12 @@ pub fn erf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedErfOperation<'c, 't> {
+) -> Result<DetachedErfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.erf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1454,9 +1486,9 @@ pub fn erf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::erf`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::erf` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::erf` operation cast"))
 }
 
 /// Operation trait for `linalg.add`.
@@ -1474,12 +1506,12 @@ pub fn add<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedAddOperation<'c, 't> {
+) -> Result<DetachedAddOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.add", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1487,9 +1519,9 @@ pub fn add<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::add`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::add` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::add` operation cast"))
 }
 
 /// Operation trait for `linalg.sub`.
@@ -1507,12 +1539,12 @@ pub fn sub<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedSubOperation<'c, 't> {
+) -> Result<DetachedSubOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.sub", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1520,9 +1552,9 @@ pub fn sub<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::sub`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::sub` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::sub` operation cast"))
 }
 
 /// Operation trait for `linalg.mul`.
@@ -1540,12 +1572,12 @@ pub fn mul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedMulOperation<'c, 't> {
+) -> Result<DetachedMulOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.mul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1553,9 +1585,9 @@ pub fn mul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::mul`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::mul` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::mul` operation cast"))
 }
 
 /// Operation trait for `linalg.div`.
@@ -1573,12 +1605,12 @@ pub fn div<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDivOperation<'c, 't> {
+) -> Result<DetachedDivOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.div", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1586,9 +1618,9 @@ pub fn div<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::div`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::div` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::div` operation cast"))
 }
 
 /// Operation trait for `linalg.div_unsigned`.
@@ -1606,12 +1638,12 @@ pub fn div_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDivUnsignedOperation<'c, 't> {
+) -> Result<DetachedDivUnsignedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.div_unsigned", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1619,9 +1651,9 @@ pub fn div_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::div_unsigned`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::div_unsigned` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::div_unsigned` operation cast"))
 }
 
 /// Operation trait for `linalg.max`.
@@ -1639,12 +1671,12 @@ pub fn max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedMaxOperation<'c, 't> {
+) -> Result<DetachedMaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1652,9 +1684,9 @@ pub fn max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::max`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::max` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::max` operation cast"))
 }
 
 /// Operation trait for `linalg.min`.
@@ -1672,12 +1704,12 @@ pub fn min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedMinOperation<'c, 't> {
+) -> Result<DetachedMinOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.min", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1685,9 +1717,9 @@ pub fn min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::min`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::min` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::min` operation cast"))
 }
 
 /// Operation trait for `linalg.powf`.
@@ -1705,12 +1737,12 @@ pub fn powf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPowFOperation<'c, 't> {
+) -> Result<DetachedPowFOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.powf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1718,9 +1750,9 @@ pub fn powf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::powf`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::powf` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::powf` operation cast"))
 }
 
 /// Operation trait for `linalg.select`.
@@ -1738,12 +1770,12 @@ pub fn select<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedSelectOperation<'c, 't> {
+) -> Result<DetachedSelectOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.select", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1751,9 +1783,9 @@ pub fn select<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::select`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::select` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::select` operation cast"))
 }
 
 /// Operation trait for `linalg.quantized_matmul`.
@@ -1771,12 +1803,12 @@ pub fn quantized_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedQuantizedMatmulOperation<'c, 't> {
+) -> Result<DetachedQuantizedMatmulOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.quantized_matmul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1784,9 +1816,9 @@ pub fn quantized_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::quantized_matmul`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::quantized_matmul` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::quantized_matmul` operation cast"))
 }
 
 /// Operation trait for `linalg.mmt4d`.
@@ -1804,12 +1836,12 @@ pub fn mmt4d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedMmt4DOperation<'c, 't> {
+) -> Result<DetachedMmt4DOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.mmt4d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1817,9 +1849,9 @@ pub fn mmt4d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::mmt4d`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::mmt4d` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::mmt4d` operation cast"))
 }
 
 /// Operation trait for `linalg.batch_mmt4d`.
@@ -1837,12 +1869,12 @@ pub fn batch_mmt4d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedBatchMmt4DOperation<'c, 't> {
+) -> Result<DetachedBatchMmt4DOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.batch_mmt4d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1850,9 +1882,9 @@ pub fn batch_mmt4d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::batch_mmt4d`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::batch_mmt4d` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::batch_mmt4d` operation cast"))
 }
 
 /// Operation trait for `linalg.quantized_batch_matmul`.
@@ -1870,12 +1902,12 @@ pub fn quantized_batch_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedQuantizedBatchMatmulOperation<'c, 't> {
+) -> Result<DetachedQuantizedBatchMatmulOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.quantized_batch_matmul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1883,9 +1915,10 @@ pub fn quantized_batch_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::quantized_batch_matmul`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::quantized_batch_matmul` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::quantized_batch_matmul` operation cast"))
 }
 
 /// Operation trait for `linalg.matvec`.
@@ -1903,12 +1936,12 @@ pub fn matvec<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedMatvecOperation<'c, 't> {
+) -> Result<DetachedMatvecOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.matvec", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1916,9 +1949,9 @@ pub fn matvec<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::matvec`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::matvec` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::matvec` operation cast"))
 }
 
 /// Operation trait for `linalg.vecmat`.
@@ -1936,12 +1969,12 @@ pub fn vecmat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedVecmatOperation<'c, 't> {
+) -> Result<DetachedVecmatOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.vecmat", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1949,9 +1982,9 @@ pub fn vecmat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::vecmat`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::vecmat` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::vecmat` operation cast"))
 }
 
 /// Operation trait for `linalg.batch_matvec`.
@@ -1969,12 +2002,12 @@ pub fn batch_matvec<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedBatchMatvecOperation<'c, 't> {
+) -> Result<DetachedBatchMatvecOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.batch_matvec", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -1982,9 +2015,9 @@ pub fn batch_matvec<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::batch_matvec`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::batch_matvec` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::batch_matvec` operation cast"))
 }
 
 /// Operation trait for `linalg.batch_vecmat`.
@@ -2002,12 +2035,12 @@ pub fn batch_vecmat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedBatchVecmatOperation<'c, 't> {
+) -> Result<DetachedBatchVecmatOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.batch_vecmat", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2015,9 +2048,9 @@ pub fn batch_vecmat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::batch_vecmat`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::batch_vecmat` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::batch_vecmat` operation cast"))
 }
 
 /// Operation trait for `linalg.dot`.
@@ -2035,12 +2068,12 @@ pub fn dot<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDotOperation<'c, 't> {
+) -> Result<DetachedDotOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.dot", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2048,9 +2081,9 @@ pub fn dot<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::dot`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::dot` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::dot` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_1d`.
@@ -2068,12 +2101,12 @@ pub fn conv_1d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv1DOperation<'c, 't> {
+) -> Result<DetachedConv1DOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_1d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2081,9 +2114,9 @@ pub fn conv_1d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_1d`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_1d` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_1d` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d`.
@@ -2101,12 +2134,12 @@ pub fn conv_2d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DOperation<'c, 't> {
+) -> Result<DetachedConv2DOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2114,9 +2147,9 @@ pub fn conv_2d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_3d`.
@@ -2134,12 +2167,12 @@ pub fn conv_3d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv3DOperation<'c, 't> {
+) -> Result<DetachedConv3DOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_3d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2147,9 +2180,9 @@ pub fn conv_3d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_3d`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_3d` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_3d` operation cast"))
 }
 
 /// Name of the Linalg strides attribute.
@@ -2161,13 +2194,21 @@ pub const DILATIONS_ATTRIBUTE: &str = "dilations";
 /// Common API for Linalg named structured operations with stride and dilation attributes.
 pub trait LinalgStridedDilatedOperation<'o, 'c: 'o, 't: 'c>: LinalgNamedStructuredOperation<'o, 'c, 't> {
     /// Returns the optional stride values.
-    fn strides(&self) -> Option<DenseIntegerElementsAttributeRef<'c, 't>> {
-        self.attribute(STRIDES_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn strides(&self) -> Result<Option<DenseIntegerElementsAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(STRIDES_ATTRIBUTE) {
+            self.dense_integer_elements_attribute(STRIDES_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the optional dilation values.
-    fn dilations(&self) -> Option<DenseIntegerElementsAttributeRef<'c, 't>> {
-        self.attribute(DILATIONS_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn dilations(&self) -> Result<Option<DenseIntegerElementsAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(DILATIONS_ATTRIBUTE) {
+            self.dense_integer_elements_attribute(DILATIONS_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -2187,12 +2228,12 @@ pub fn conv_1d_nwc_wcf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv1DNwcWcfOperation<'c, 't> {
+) -> Result<DetachedConv1DNwcWcfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_1d_nwc_wcf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2200,9 +2241,9 @@ pub fn conv_1d_nwc_wcf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_1d_nwc_wcf`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_1d_nwc_wcf` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_1d_nwc_wcf` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_1d_ncw_fcw`.
@@ -2221,12 +2262,12 @@ pub fn conv_1d_ncw_fcw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv1DNcwFcwOperation<'c, 't> {
+) -> Result<DetachedConv1DNcwFcwOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_1d_ncw_fcw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2234,9 +2275,9 @@ pub fn conv_1d_ncw_fcw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_1d_ncw_fcw`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_1d_ncw_fcw` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_1d_ncw_fcw` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d_nhwc_hwcf`.
@@ -2255,12 +2296,12 @@ pub fn conv_2d_nhwc_hwcf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DNhwcHwcfOperation<'c, 't> {
+) -> Result<DetachedConv2DNhwcHwcfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwc_hwcf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2268,9 +2309,9 @@ pub fn conv_2d_nhwc_hwcf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d_nhwc_hwcf`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d_nhwc_hwcf` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d_nhwc_hwcf` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d_nhwc_fhwc`.
@@ -2289,12 +2330,12 @@ pub fn conv_2d_nhwc_fhwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DNhwcFhwcOperation<'c, 't> {
+) -> Result<DetachedConv2DNhwcFhwcOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwc_fhwc", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2302,9 +2343,9 @@ pub fn conv_2d_nhwc_fhwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d_nhwc_fhwc`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d_nhwc_fhwc` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d_nhwc_fhwc` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d_nhwc_hwcf_q`.
@@ -2323,12 +2364,12 @@ pub fn conv_2d_nhwc_hwcf_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DNhwcHwcfQOperation<'c, 't> {
+) -> Result<DetachedConv2DNhwcHwcfQOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwc_hwcf_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2336,9 +2377,9 @@ pub fn conv_2d_nhwc_hwcf_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d_nhwc_hwcf_q`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d_nhwc_hwcf_q` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d_nhwc_hwcf_q` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d_nhwc_fhwc_q`.
@@ -2357,12 +2398,12 @@ pub fn conv_2d_nhwc_fhwc_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DNhwcFhwcQOperation<'c, 't> {
+) -> Result<DetachedConv2DNhwcFhwcQOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwc_fhwc_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2370,9 +2411,9 @@ pub fn conv_2d_nhwc_fhwc_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d_nhwc_fhwc_q`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d_nhwc_fhwc_q` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d_nhwc_fhwc_q` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d_nchw_fchw_q`.
@@ -2391,12 +2432,12 @@ pub fn conv_2d_nchw_fchw_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DNchwFchwQOperation<'c, 't> {
+) -> Result<DetachedConv2DNchwFchwQOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nchw_fchw_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2404,9 +2445,9 @@ pub fn conv_2d_nchw_fchw_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d_nchw_fchw_q`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d_nchw_fchw_q` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d_nchw_fchw_q` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d_nchw_fchw`.
@@ -2425,12 +2466,12 @@ pub fn conv_2d_nchw_fchw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DNchwFchwOperation<'c, 't> {
+) -> Result<DetachedConv2DNchwFchwOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nchw_fchw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2438,9 +2479,9 @@ pub fn conv_2d_nchw_fchw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d_nchw_fchw`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d_nchw_fchw` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d_nchw_fchw` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d_ngchw_fgchw`.
@@ -2459,12 +2500,12 @@ pub fn conv_2d_ngchw_fgchw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DNgchwFgchwOperation<'c, 't> {
+) -> Result<DetachedConv2DNgchwFgchwOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_ngchw_fgchw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2472,9 +2513,9 @@ pub fn conv_2d_ngchw_fgchw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d_ngchw_fgchw`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d_ngchw_fgchw` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d_ngchw_fgchw` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d_ngchw_gfchw`.
@@ -2493,12 +2534,12 @@ pub fn conv_2d_ngchw_gfchw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DNgchwGfchwOperation<'c, 't> {
+) -> Result<DetachedConv2DNgchwGfchwOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_ngchw_gfchw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2506,9 +2547,9 @@ pub fn conv_2d_ngchw_gfchw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d_ngchw_gfchw`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d_ngchw_gfchw` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d_ngchw_gfchw` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d_nhwgc_gfhwc`.
@@ -2527,12 +2568,12 @@ pub fn conv_2d_nhwgc_gfhwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DNhwgcGfhwcOperation<'c, 't> {
+) -> Result<DetachedConv2DNhwgcGfhwcOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwgc_gfhwc", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2540,9 +2581,9 @@ pub fn conv_2d_nhwgc_gfhwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d_nhwgc_gfhwc`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d_nhwgc_gfhwc` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d_nhwgc_gfhwc` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d_nhwgc_gfhwc_q`.
@@ -2561,12 +2602,12 @@ pub fn conv_2d_nhwgc_gfhwc_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DNhwgcGfhwcQOperation<'c, 't> {
+) -> Result<DetachedConv2DNhwgcGfhwcQOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwgc_gfhwc_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2574,9 +2615,9 @@ pub fn conv_2d_nhwgc_gfhwc_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d_nhwgc_gfhwc_q`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d_nhwgc_gfhwc_q` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d_nhwgc_gfhwc_q` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_2d_ngchw_gfchw_q`.
@@ -2595,12 +2636,12 @@ pub fn conv_2d_ngchw_gfchw_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv2DNgchwGfchwQOperation<'c, 't> {
+) -> Result<DetachedConv2DNgchwGfchwQOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_ngchw_gfchw_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2608,9 +2649,9 @@ pub fn conv_2d_ngchw_gfchw_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_2d_ngchw_gfchw_q`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_2d_ngchw_gfchw_q` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_2d_ngchw_gfchw_q` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_3d_ndhwc_dhwcf`.
@@ -2629,12 +2670,12 @@ pub fn conv_3d_ndhwc_dhwcf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv3DNdhwcDhwcfOperation<'c, 't> {
+) -> Result<DetachedConv3DNdhwcDhwcfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_3d_ndhwc_dhwcf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2642,9 +2683,9 @@ pub fn conv_3d_ndhwc_dhwcf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_3d_ndhwc_dhwcf`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_3d_ndhwc_dhwcf` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_3d_ndhwc_dhwcf` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_3d_ndhwc_dhwcf_q`.
@@ -2663,12 +2704,12 @@ pub fn conv_3d_ndhwc_dhwcf_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv3DNdhwcDhwcfQOperation<'c, 't> {
+) -> Result<DetachedConv3DNdhwcDhwcfQOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_3d_ndhwc_dhwcf_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2676,9 +2717,9 @@ pub fn conv_3d_ndhwc_dhwcf_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_3d_ndhwc_dhwcf_q`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_3d_ndhwc_dhwcf_q` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_3d_ndhwc_dhwcf_q` operation cast"))
 }
 
 /// Operation trait for `linalg.conv_3d_ncdhw_fcdhw`.
@@ -2697,12 +2738,12 @@ pub fn conv_3d_ncdhw_fcdhw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedConv3DNcdhwFcdhwOperation<'c, 't> {
+) -> Result<DetachedConv3DNcdhwFcdhwOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_3d_ncdhw_fcdhw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2710,9 +2751,9 @@ pub fn conv_3d_ncdhw_fcdhw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::conv_3d_ncdhw_fcdhw`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::conv_3d_ncdhw_fcdhw` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::conv_3d_ncdhw_fcdhw` operation cast"))
 }
 
 /// Operation trait for `linalg.depthwise_conv_1d_nwc_wc`.
@@ -2731,12 +2772,12 @@ pub fn depthwise_conv_1d_nwc_wc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDepthwiseConv1DNwcWcOperation<'c, 't> {
+) -> Result<DetachedDepthwiseConv1DNwcWcOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_1d_nwc_wc", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2744,9 +2785,10 @@ pub fn depthwise_conv_1d_nwc_wc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::depthwise_conv_1d_nwc_wc`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::depthwise_conv_1d_nwc_wc` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::depthwise_conv_1d_nwc_wc` operation cast"))
 }
 
 /// Operation trait for `linalg.depthwise_conv_1d_ncw_cw`.
@@ -2765,12 +2807,12 @@ pub fn depthwise_conv_1d_ncw_cw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDepthwiseConv1DNcwCwOperation<'c, 't> {
+) -> Result<DetachedDepthwiseConv1DNcwCwOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_1d_ncw_cw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2778,9 +2820,10 @@ pub fn depthwise_conv_1d_ncw_cw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::depthwise_conv_1d_ncw_cw`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::depthwise_conv_1d_ncw_cw` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::depthwise_conv_1d_ncw_cw` operation cast"))
 }
 
 /// Operation trait for `linalg.depthwise_conv_1d_nwc_wcm`.
@@ -2799,12 +2842,12 @@ pub fn depthwise_conv_1d_nwc_wcm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDepthwiseConv1DNwcWcmOperation<'c, 't> {
+) -> Result<DetachedDepthwiseConv1DNwcWcmOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_1d_nwc_wcm", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2812,9 +2855,10 @@ pub fn depthwise_conv_1d_nwc_wcm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::depthwise_conv_1d_nwc_wcm`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::depthwise_conv_1d_nwc_wcm` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::depthwise_conv_1d_nwc_wcm` operation cast"))
 }
 
 /// Operation trait for `linalg.depthwise_conv_2d_nhwc_hwc`.
@@ -2833,12 +2877,12 @@ pub fn depthwise_conv_2d_nhwc_hwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDepthwiseConv2DNhwcHwcOperation<'c, 't> {
+) -> Result<DetachedDepthwiseConv2DNhwcHwcOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_2d_nhwc_hwc", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2846,9 +2890,10 @@ pub fn depthwise_conv_2d_nhwc_hwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::depthwise_conv_2d_nhwc_hwc`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::depthwise_conv_2d_nhwc_hwc` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::depthwise_conv_2d_nhwc_hwc` operation cast"))
 }
 
 /// Operation trait for `linalg.depthwise_conv_2d_nchw_chw`.
@@ -2867,12 +2912,12 @@ pub fn depthwise_conv_2d_nchw_chw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDepthwiseConv2DNchwChwOperation<'c, 't> {
+) -> Result<DetachedDepthwiseConv2DNchwChwOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_2d_nchw_chw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2880,9 +2925,10 @@ pub fn depthwise_conv_2d_nchw_chw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::depthwise_conv_2d_nchw_chw`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::depthwise_conv_2d_nchw_chw` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::depthwise_conv_2d_nchw_chw` operation cast"))
 }
 
 /// Operation trait for `linalg.depthwise_conv_2d_nhwc_hwc_q`.
@@ -2901,12 +2947,12 @@ pub fn depthwise_conv_2d_nhwc_hwc_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDepthwiseConv2DNhwcHwcQOperation<'c, 't> {
+) -> Result<DetachedDepthwiseConv2DNhwcHwcQOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_2d_nhwc_hwc_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2914,9 +2960,10 @@ pub fn depthwise_conv_2d_nhwc_hwc_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::depthwise_conv_2d_nhwc_hwc_q`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::depthwise_conv_2d_nhwc_hwc_q` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::depthwise_conv_2d_nhwc_hwc_q` operation cast"))
 }
 
 /// Operation trait for `linalg.depthwise_conv_2d_nhwc_hwcm`.
@@ -2935,12 +2982,12 @@ pub fn depthwise_conv_2d_nhwc_hwcm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDepthwiseConv2DNhwcHwcmOperation<'c, 't> {
+) -> Result<DetachedDepthwiseConv2DNhwcHwcmOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_2d_nhwc_hwcm", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2948,9 +2995,10 @@ pub fn depthwise_conv_2d_nhwc_hwcm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::depthwise_conv_2d_nhwc_hwcm`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::depthwise_conv_2d_nhwc_hwcm` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::depthwise_conv_2d_nhwc_hwcm` operation cast"))
 }
 
 /// Operation trait for `linalg.depthwise_conv_2d_nhwc_hwcm_q`.
@@ -2969,12 +3017,12 @@ pub fn depthwise_conv_2d_nhwc_hwcm_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDepthwiseConv2DNhwcHwcmQOperation<'c, 't> {
+) -> Result<DetachedDepthwiseConv2DNhwcHwcmQOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_2d_nhwc_hwcm_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -2982,9 +3030,10 @@ pub fn depthwise_conv_2d_nhwc_hwcm_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::depthwise_conv_2d_nhwc_hwcm_q`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::depthwise_conv_2d_nhwc_hwcm_q` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::depthwise_conv_2d_nhwc_hwcm_q` operation cast"))
 }
 
 /// Operation trait for `linalg.depthwise_conv_3d_ndhwc_dhwc`.
@@ -3003,12 +3052,12 @@ pub fn depthwise_conv_3d_ndhwc_dhwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDepthwiseConv3DNdhwcDhwcOperation<'c, 't> {
+) -> Result<DetachedDepthwiseConv3DNdhwcDhwcOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_3d_ndhwc_dhwc", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3016,9 +3065,10 @@ pub fn depthwise_conv_3d_ndhwc_dhwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::depthwise_conv_3d_ndhwc_dhwc`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::depthwise_conv_3d_ndhwc_dhwc` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::depthwise_conv_3d_ndhwc_dhwc` operation cast"))
 }
 
 /// Operation trait for `linalg.depthwise_conv_3d_ncdhw_cdhw`.
@@ -3037,12 +3087,12 @@ pub fn depthwise_conv_3d_ncdhw_cdhw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDepthwiseConv3DNcdhwCdhwOperation<'c, 't> {
+) -> Result<DetachedDepthwiseConv3DNcdhwCdhwOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_3d_ncdhw_cdhw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3050,9 +3100,10 @@ pub fn depthwise_conv_3d_ncdhw_cdhw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::depthwise_conv_3d_ncdhw_cdhw`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::depthwise_conv_3d_ncdhw_cdhw` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::depthwise_conv_3d_ncdhw_cdhw` operation cast"))
 }
 
 /// Operation trait for `linalg.depthwise_conv_3d_ndhwc_dhwcm`.
@@ -3071,12 +3122,12 @@ pub fn depthwise_conv_3d_ndhwc_dhwcm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedDepthwiseConv3DNdhwcDhwcmOperation<'c, 't> {
+) -> Result<DetachedDepthwiseConv3DNdhwcDhwcmOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_3d_ndhwc_dhwcm", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3084,9 +3135,10 @@ pub fn depthwise_conv_3d_ndhwc_dhwcm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::depthwise_conv_3d_ndhwc_dhwcm`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::depthwise_conv_3d_ndhwc_dhwcm` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::depthwise_conv_3d_ndhwc_dhwcm` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nhwc_sum`.
@@ -3105,12 +3157,12 @@ pub fn pooling_nhwc_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNhwcSumOperation<'c, 't> {
+) -> Result<DetachedPoolingNhwcSumOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nhwc_sum", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3118,9 +3170,9 @@ pub fn pooling_nhwc_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nhwc_sum`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nhwc_sum` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_nhwc_sum` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nchw_sum`.
@@ -3139,12 +3191,12 @@ pub fn pooling_nchw_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNchwSumOperation<'c, 't> {
+) -> Result<DetachedPoolingNchwSumOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nchw_sum", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3152,9 +3204,9 @@ pub fn pooling_nchw_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nchw_sum`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nchw_sum` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_nchw_sum` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nhwc_max`.
@@ -3173,12 +3225,12 @@ pub fn pooling_nhwc_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNhwcMaxOperation<'c, 't> {
+) -> Result<DetachedPoolingNhwcMaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nhwc_max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3186,9 +3238,9 @@ pub fn pooling_nhwc_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nhwc_max`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nhwc_max` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_nhwc_max` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nhwc_max_unsigned`.
@@ -3207,12 +3259,12 @@ pub fn pooling_nhwc_max_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNhwcMaxUnsignedOperation<'c, 't> {
+) -> Result<DetachedPoolingNhwcMaxUnsignedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nhwc_max_unsigned", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3220,9 +3272,10 @@ pub fn pooling_nhwc_max_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nhwc_max_unsigned`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nhwc_max_unsigned` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::pooling_nhwc_max_unsigned` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nchw_max`.
@@ -3241,12 +3294,12 @@ pub fn pooling_nchw_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNchwMaxOperation<'c, 't> {
+) -> Result<DetachedPoolingNchwMaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nchw_max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3254,9 +3307,9 @@ pub fn pooling_nchw_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nchw_max`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nchw_max` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_nchw_max` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nhwc_min`.
@@ -3275,12 +3328,12 @@ pub fn pooling_nhwc_min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNhwcMinOperation<'c, 't> {
+) -> Result<DetachedPoolingNhwcMinOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nhwc_min", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3288,9 +3341,9 @@ pub fn pooling_nhwc_min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nhwc_min`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nhwc_min` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_nhwc_min` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nhwc_min_unsigned`.
@@ -3309,12 +3362,12 @@ pub fn pooling_nhwc_min_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNhwcMinUnsignedOperation<'c, 't> {
+) -> Result<DetachedPoolingNhwcMinUnsignedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nhwc_min_unsigned", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3322,9 +3375,10 @@ pub fn pooling_nhwc_min_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nhwc_min_unsigned`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nhwc_min_unsigned` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::pooling_nhwc_min_unsigned` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nwc_sum`.
@@ -3343,12 +3397,12 @@ pub fn pooling_nwc_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNwcSumOperation<'c, 't> {
+) -> Result<DetachedPoolingNwcSumOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nwc_sum", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3356,9 +3410,9 @@ pub fn pooling_nwc_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nwc_sum`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nwc_sum` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_nwc_sum` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_ncw_sum`.
@@ -3377,12 +3431,12 @@ pub fn pooling_ncw_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNcwSumOperation<'c, 't> {
+) -> Result<DetachedPoolingNcwSumOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_ncw_sum", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3390,9 +3444,9 @@ pub fn pooling_ncw_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_ncw_sum`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_ncw_sum` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_ncw_sum` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nwc_max`.
@@ -3411,12 +3465,12 @@ pub fn pooling_nwc_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNwcMaxOperation<'c, 't> {
+) -> Result<DetachedPoolingNwcMaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nwc_max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3424,9 +3478,9 @@ pub fn pooling_nwc_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nwc_max`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nwc_max` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_nwc_max` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nwc_max_unsigned`.
@@ -3445,12 +3499,12 @@ pub fn pooling_nwc_max_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNwcMaxUnsignedOperation<'c, 't> {
+) -> Result<DetachedPoolingNwcMaxUnsignedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nwc_max_unsigned", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3458,9 +3512,10 @@ pub fn pooling_nwc_max_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nwc_max_unsigned`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nwc_max_unsigned` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::pooling_nwc_max_unsigned` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_ncw_max`.
@@ -3479,12 +3534,12 @@ pub fn pooling_ncw_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNcwMaxOperation<'c, 't> {
+) -> Result<DetachedPoolingNcwMaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_ncw_max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3492,9 +3547,9 @@ pub fn pooling_ncw_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_ncw_max`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_ncw_max` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_ncw_max` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nwc_min`.
@@ -3513,12 +3568,12 @@ pub fn pooling_nwc_min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNwcMinOperation<'c, 't> {
+) -> Result<DetachedPoolingNwcMinOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nwc_min", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3526,9 +3581,9 @@ pub fn pooling_nwc_min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nwc_min`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nwc_min` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_nwc_min` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_nwc_min_unsigned`.
@@ -3547,12 +3602,12 @@ pub fn pooling_nwc_min_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNwcMinUnsignedOperation<'c, 't> {
+) -> Result<DetachedPoolingNwcMinUnsignedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nwc_min_unsigned", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3560,9 +3615,10 @@ pub fn pooling_nwc_min_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_nwc_min_unsigned`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_nwc_min_unsigned` operation cast")
+    unsafe { operation.cast() }
+        .ok_or_else(|| Error::internal("invalid `linalg::pooling_nwc_min_unsigned` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_ndhwc_sum`.
@@ -3581,12 +3637,12 @@ pub fn pooling_ndhwc_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNdhwcSumOperation<'c, 't> {
+) -> Result<DetachedPoolingNdhwcSumOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_ndhwc_sum", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3594,9 +3650,9 @@ pub fn pooling_ndhwc_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_ndhwc_sum`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_ndhwc_sum` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_ndhwc_sum` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_ndhwc_max`.
@@ -3615,12 +3671,12 @@ pub fn pooling_ndhwc_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNdhwcMaxOperation<'c, 't> {
+) -> Result<DetachedPoolingNdhwcMaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_ndhwc_max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3628,9 +3684,9 @@ pub fn pooling_ndhwc_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_ndhwc_max`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_ndhwc_max` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_ndhwc_max` operation cast"))
 }
 
 /// Operation trait for `linalg.pooling_ndhwc_min`.
@@ -3649,12 +3705,12 @@ pub fn pooling_ndhwc_min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedPoolingNdhwcMinOperation<'c, 't> {
+) -> Result<DetachedPoolingNdhwcMinOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_ndhwc_min", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3662,9 +3718,9 @@ pub fn pooling_ndhwc_min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::pooling_ndhwc_min`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::pooling_ndhwc_min` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::pooling_ndhwc_min` operation cast"))
 }
 
 /// Operation trait for `linalg.fill`.
@@ -3682,12 +3738,12 @@ pub fn fill<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedFillOperation<'c, 't> {
+) -> Result<DetachedFillOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.fill", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3695,9 +3751,9 @@ pub fn fill<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::fill`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::fill` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::fill` operation cast"))
 }
 
 /// Operation trait for `linalg.fill_rng_2d`.
@@ -3715,12 +3771,12 @@ pub fn fill_rng_2d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     attributes: &[(&str, AttributeRef<'c, 't>)],
     location: L,
-) -> DetachedFillRng2DOperation<'c, 't> {
+) -> Result<DetachedFillRng2DOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::linalg());
+    context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.fill_rng_2d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes).unwrap())
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
         .add_operands(inputs)
         .add_operands(outputs)
         .add_results(result_types)
@@ -3728,9 +3784,9 @@ pub fn fill_rng_2d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     for (name, attribute) in attributes {
         builder = builder.add_attribute(*name, *attribute);
     }
-    let operation = builder.build().expect("invalid arguments to `linalg::fill_rng_2d`");
+    let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
-    unsafe { operation.cast() }.expect("invalid `linalg::fill_rng_2d` operation cast")
+    unsafe { operation.cast() }.ok_or_else(|| Error::internal("invalid `linalg::fill_rng_2d` operation cast"))
 }
 
 #[cfg(test)]
@@ -3749,51 +3805,57 @@ mod tests {
     fn test_yield() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Dynamic], None, location).unwrap();
         let indexing_map = context.affine_map_attribute(context.identity_affine_map(1));
         let indexing_maps = context.array_attribute(&[indexing_map]);
-        let iterator_type = context.linalg_iterator_type_attribute(IteratorType::Parallel);
+        let iterator_type = context.linalg_iterator_type_attribute(IteratorType::Parallel).unwrap();
         let iterator_types = context.array_attribute(&[iterator_type]);
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let output = block.argument(0).unwrap().as_ref();
-            let mut region = context.region();
-            let mut body = context.block(&[(f32_type, location)]);
-            let value = body.argument(0).unwrap().as_ref();
-            let yield_op = r#yield(&[value], location);
-            assert_eq!(yield_op.values(), vec![value]);
-            body.append_operation(yield_op);
-            region.append_block(body);
-            let result_types = [tensor_type.as_ref()];
-            let op = generic(
-                &[],
-                &[output],
-                &result_types,
-                indexing_maps,
-                iterator_types,
-                None,
-                None,
-                region,
-                &[],
-                location,
-            );
-            assert_eq!(op.outputs(), vec![output]);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "yield_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let output = block.argument(0).unwrap().as_ref();
+                let mut region = context.region();
+                let mut body = context.block(&[(f32_type, location)]);
+                let value = body.argument(0).unwrap().as_ref();
+                let yield_op = r#yield(&[value], location).unwrap();
+                assert_eq!(yield_op.values().unwrap(), vec![value]);
+                body.append_operation(yield_op).unwrap();
+                region.append_block(body).unwrap();
+                let result_types = [tensor_type.as_ref()];
+                let op = generic(
+                    &[],
+                    &[output],
+                    &result_types,
+                    indexing_maps,
+                    iterator_types,
+                    None,
+                    None,
+                    region,
+                    &[],
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.outputs().unwrap(), vec![output]);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "yield_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3815,51 +3877,57 @@ mod tests {
     fn test_index() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let tensor_type = context.tensor_type(index_type, &[Size::Dynamic], None, location).unwrap();
         let indexing_map = context.affine_map_attribute(context.identity_affine_map(1));
         let indexing_maps = context.array_attribute(&[indexing_map]);
-        let iterator_type = context.linalg_iterator_type_attribute(IteratorType::Parallel);
+        let iterator_type = context.linalg_iterator_type_attribute(IteratorType::Parallel).unwrap();
         let iterator_types = context.array_attribute(&[iterator_type]);
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let output = block.argument(0).unwrap().as_ref();
-            let mut region = context.region();
-            let mut body = context.block(&[(index_type, location)]);
-            let op = index(0, location);
-            assert_eq!(op.dimension(), 0);
-            assert_eq!(op.result(0).unwrap().r#type(), index_type.as_ref());
-            let op = body.append_operation(op);
-            body.append_operation(r#yield(&[op.result(0).unwrap().as_ref()], location));
-            region.append_block(body);
-            let result_types = [tensor_type.as_ref()];
-            let op = generic(
-                &[],
-                &[output],
-                &result_types,
-                indexing_maps,
-                iterator_types,
-                None,
-                None,
-                region,
-                &[],
-                location,
-            );
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "index_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let output = block.argument(0).unwrap().as_ref();
+                let mut region = context.region();
+                let mut body = context.block(&[(index_type, location)]);
+                let op = index(0, location).unwrap();
+                assert_eq!(op.dimension().unwrap(), 0);
+                assert_eq!(op.dimension().unwrap(), 0);
+                let op = body.append_operation(op).unwrap();
+                body.append_operation(r#yield(&[op.result(0).unwrap().as_ref()], location).unwrap()).unwrap();
+                region.append_block(body).unwrap();
+                let result_types = [tensor_type.as_ref()];
+                let op = generic(
+                    &[],
+                    &[output],
+                    &result_types,
+                    indexing_maps,
+                    iterator_types,
+                    None,
+                    None,
+                    region,
+                    &[],
+                    location,
+                )
+                .unwrap();
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "index_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3882,57 +3950,63 @@ mod tests {
     fn test_generic() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Dynamic], None, location).unwrap();
         let indexing_map = context.affine_map_attribute(context.identity_affine_map(1));
         let indexing_maps = context.array_attribute(&[indexing_map, indexing_map]);
-        let iterator_type = context.linalg_iterator_type_attribute(IteratorType::Parallel);
+        let iterator_type = context.linalg_iterator_type_attribute(IteratorType::Parallel).unwrap();
         let iterator_types = context.array_attribute(&[iterator_type]);
         let doc = context.string_attribute("generic test");
         let library_call = context.string_attribute("linalg_generic_test");
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let output = block.argument(1).unwrap().as_ref();
-            let mut region = context.region();
-            let mut body = context.block(&[(f32_type, location), (f32_type, location)]);
-            let value = body.argument(0).unwrap().as_ref();
-            body.append_operation(r#yield(&[value], location));
-            region.append_block(body);
-            let result_types = [tensor_type.as_ref()];
-            let op = generic(
-                &[input],
-                &[output],
-                &result_types,
-                indexing_maps,
-                iterator_types,
-                Some(doc),
-                Some(library_call),
-                region,
-                &[],
-                location,
-            );
-            assert_eq!(op.inputs(), vec![input]);
-            assert_eq!(op.outputs(), vec![output]);
-            assert_eq!(op.indexing_maps(), indexing_maps);
-            assert_eq!(op.iterator_types(), iterator_types);
-            assert_eq!(op.doc(), Some(doc));
-            assert_eq!(op.library_call(), Some(library_call));
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "generic_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let output = block.argument(1).unwrap().as_ref();
+                let mut region = context.region();
+                let mut body = context.block(&[(f32_type, location), (f32_type, location)]);
+                let value = body.argument(0).unwrap().as_ref();
+                body.append_operation(r#yield(&[value], location).unwrap()).unwrap();
+                region.append_block(body).unwrap();
+                let result_types = [tensor_type.as_ref()];
+                let op = generic(
+                    &[input],
+                    &[output],
+                    &result_types,
+                    indexing_maps,
+                    iterator_types,
+                    Some(doc),
+                    Some(library_call),
+                    region,
+                    &[],
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.inputs().unwrap(), vec![input]);
+                assert_eq!(op.outputs().unwrap(), vec![output]);
+                assert_eq!(op.indexing_maps().unwrap(), indexing_maps);
+                assert_eq!(op.iterator_types().unwrap(), iterator_types);
+                assert_eq!(op.doc().unwrap(), Some(doc));
+                assert_eq!(op.library_call().unwrap(), Some(library_call));
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "generic_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3954,40 +4028,46 @@ mod tests {
     fn test_map() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Dynamic], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
-            let lhs = block.argument(0).unwrap().as_ref();
-            let rhs = block.argument(1).unwrap().as_ref();
-            let init = block.argument(2).unwrap().as_ref();
-            let mut region = context.region();
-            let mut body = context.block(&[(f32_type, location), (f32_type, location), (f32_type, location)]);
-            let lhs_element = body.argument(0).unwrap().as_ref();
-            body.append_operation(r#yield(&[lhs_element], location));
-            region.append_block(body);
-            let result_types = [tensor_type.as_ref()];
-            let op = map(&[lhs, rhs], init, &result_types, region, &[], location);
-            assert_eq!(op.inputs(), vec![lhs, rhs]);
-            assert_eq!(op.init(), init);
-            assert_eq!(op.result(0).unwrap().r#type(), tensor_type.as_ref());
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "map_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
+                let lhs = block.argument(0).unwrap().as_ref();
+                let rhs = block.argument(1).unwrap().as_ref();
+                let init = block.argument(2).unwrap().as_ref();
+                let mut region = context.region();
+                let mut body = context.block(&[(f32_type, location), (f32_type, location), (f32_type, location)]);
+                let lhs_element = body.argument(0).unwrap().as_ref();
+                body.append_operation(r#yield(&[lhs_element], location).unwrap()).unwrap();
+                region.append_block(body).unwrap();
+                let result_types = [tensor_type.as_ref()];
+                let op = map(&[lhs, rhs], init, &result_types, region, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), vec![lhs, rhs]);
+                assert_eq!(op.init().unwrap(), init);
+                assert_eq!(op.inputs().unwrap(), vec![lhs, rhs]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "map_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4008,41 +4088,46 @@ mod tests {
     fn test_reduce() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let input_type = context.tensor_type(f32_type, &[Size::Dynamic, Size::Dynamic], None, location).unwrap();
         let output_type = context.tensor_type(f32_type, &[Size::Dynamic], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (output_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let init = block.argument(1).unwrap().as_ref();
-            let mut region = context.region();
-            let mut body = context.block(&[(f32_type, location), (f32_type, location)]);
-            let input_element = body.argument(0).unwrap().as_ref();
-            body.append_operation(r#yield(&[input_element], location));
-            region.append_block(body);
-            let result_types = [output_type.as_ref()];
-            let op = reduce(&[input], &[init], &result_types, &[1], region, &[], location);
-            assert_eq!(op.inputs(), vec![input]);
-            assert_eq!(op.inits(), vec![init]);
-            assert_eq!(op.dimensions().values().collect::<Vec<_>>(), vec![1]);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type.as_ref());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "reduce_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), output_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (output_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let init = block.argument(1).unwrap().as_ref();
+                let mut region = context.region();
+                let mut body = context.block(&[(f32_type, location), (f32_type, location)]);
+                let input_element = body.argument(0).unwrap().as_ref();
+                body.append_operation(r#yield(&[input_element], location).unwrap()).unwrap();
+                region.append_block(body).unwrap();
+                let result_types = [output_type.as_ref()];
+                let op = reduce(&[input], &[init], &result_types, &[1], region, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), vec![input]);
+                assert_eq!(op.inits().unwrap(), vec![init]);
+                assert_eq!(op.dimensions().unwrap().values().collect::<Vec<_>>(), vec![1]);
+                assert_eq!(op.inputs().unwrap(), vec![input]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "reduce_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), output_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4064,36 +4149,41 @@ mod tests {
     fn test_transpose() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let tensor_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let init = block.argument(1).unwrap().as_ref();
-            let result_types = [tensor_type.as_ref()];
-            let op = transpose(input, init, &result_types, &[1, 0], &[], location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.init(), init);
-            assert_eq!(op.permutation().values().collect::<Vec<_>>(), vec![1, 0]);
-            assert_eq!(op.result(0).unwrap().r#type(), tensor_type.as_ref());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "transpose_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let init = block.argument(1).unwrap().as_ref();
+                let result_types = [tensor_type.as_ref()];
+                let op = transpose(input, init, &result_types, &[1, 0], &[], location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.init().unwrap(), init);
+                assert_eq!(op.permutation().unwrap().values().collect::<Vec<_>>(), vec![1, 0]);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "transpose_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4112,36 +4202,41 @@ mod tests {
     fn test_broadcast() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let input_type = context.tensor_type(f32_type, &[Size::Dynamic], None, location).unwrap();
         let output_type = context.tensor_type(f32_type, &[Size::Dynamic, Size::Dynamic], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (output_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let init = block.argument(1).unwrap().as_ref();
-            let result_types = [output_type.as_ref()];
-            let op = broadcast(input, init, &result_types, &[1], &[], location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.init(), init);
-            assert_eq!(op.dimensions().values().collect::<Vec<_>>(), vec![1]);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type.as_ref());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "broadcast_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), output_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (output_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let init = block.argument(1).unwrap().as_ref();
+                let result_types = [output_type.as_ref()];
+                let op = broadcast(input, init, &result_types, &[1], &[], location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.init().unwrap(), init);
+                assert_eq!(op.dimensions().unwrap().values().collect::<Vec<_>>(), vec![1]);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "broadcast_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), output_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4160,38 +4255,45 @@ mod tests {
     fn test_elementwise() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let tensor_type = context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
-            let lhs = block.argument(0).unwrap().as_ref();
-            let rhs = block.argument(1).unwrap().as_ref();
-            let output = block.argument(2).unwrap().as_ref();
-            let inputs = [lhs, rhs];
-            let outputs = [output];
-            let result_types = [tensor_type.as_ref()];
-            let op = elementwise(&inputs, &outputs, &result_types, ElementwiseKind::Add, None, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(op.kind(), ElementwiseKind::Add);
-            assert_eq!(op.indexing_maps().unwrap().len(), 3);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), tensor_type.as_ref());
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "elementwise_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
+                let lhs = block.argument(0).unwrap().as_ref();
+                let rhs = block.argument(1).unwrap().as_ref();
+                let output = block.argument(2).unwrap().as_ref();
+                let inputs = [lhs, rhs];
+                let outputs = [output];
+                let result_types = [tensor_type.as_ref()];
+                let op =
+                    elementwise(&inputs, &outputs, &result_types, ElementwiseKind::Add, None, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.kind().unwrap(), ElementwiseKind::Add);
+                assert_eq!(op.indexing_maps().unwrap().unwrap().len(), 3);
+                assert_eq!(op.result_tensors().unwrap()[0].r#type().unwrap(), tensor_type.as_ref(),);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "elementwise_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4209,40 +4311,46 @@ mod tests {
     fn test_matmul() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let tensor_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
-            let lhs = block.argument(0).unwrap().as_ref();
-            let rhs = block.argument(1).unwrap().as_ref();
-            let output = block.argument(2).unwrap().as_ref();
-            let inputs = [lhs, rhs];
-            let outputs = [output];
-            let result_types = [tensor_type.as_ref()];
-            let op = matmul(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), vec![lhs, rhs]);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), vec![output]);
-            assert_eq!(LinalgCoreStructuredOperation::indexing_maps(&op), None);
-            assert_eq!(LinalgCastedOperation::cast(&op), TypeFn::CastSigned);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), tensor_type.as_ref());
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "matmul_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
+                let lhs = block.argument(0).unwrap().as_ref();
+                let rhs = block.argument(1).unwrap().as_ref();
+                let output = block.argument(2).unwrap().as_ref();
+                let inputs = [lhs, rhs];
+                let outputs = [output];
+                let result_types = [tensor_type.as_ref()];
+                let op = matmul(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), vec![lhs, rhs]);
+                assert_eq!(op.outputs().unwrap(), vec![output]);
+                assert_eq!(op.indexing_maps().unwrap(), None);
+                assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
+                assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "matmul_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4260,7 +4368,7 @@ mod tests {
     fn test_contract() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let tensor_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap();
@@ -4271,37 +4379,43 @@ mod tests {
             .unwrap()
             .cast::<ArrayAttributeRef>()
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
-            let lhs = block.argument(0).unwrap().as_ref();
-            let rhs = block.argument(1).unwrap().as_ref();
-            let output = block.argument(2).unwrap().as_ref();
-            let inputs = [lhs, rhs];
-            let outputs = [output];
-            let result_types = [tensor_type.as_ref()];
-            let attributes = [(INDEXING_MAPS_ATTRIBUTE, indexing_maps.as_ref())];
-            let op = contract(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), vec![lhs, rhs]);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), vec![output]);
-            assert_eq!(LinalgCoreStructuredOperation::indexing_maps(&op), Some(indexing_maps));
-            assert_eq!(LinalgCastedOperation::cast(&op), TypeFn::CastSigned);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), tensor_type.as_ref());
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "contract_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
+                let lhs = block.argument(0).unwrap().as_ref();
+                let rhs = block.argument(1).unwrap().as_ref();
+                let output = block.argument(2).unwrap().as_ref();
+                let inputs = [lhs, rhs];
+                let outputs = [output];
+                let result_types = [tensor_type.as_ref()];
+                let attributes = [(INDEXING_MAPS_ATTRIBUTE, indexing_maps.as_ref())];
+                let op = contract(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), vec![lhs, rhs]);
+                assert_eq!(op.outputs().unwrap(), vec![output]);
+                assert_eq!(op.indexing_maps().unwrap(), Some(indexing_maps));
+                assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
+                assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "contract_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4322,40 +4436,46 @@ mod tests {
     fn test_batch_matmul() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let tensor_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
-            let lhs = block.argument(0).unwrap().as_ref();
-            let rhs = block.argument(1).unwrap().as_ref();
-            let output = block.argument(2).unwrap().as_ref();
-            let inputs = [lhs, rhs];
-            let outputs = [output];
-            let result_types = [tensor_type.as_ref()];
-            let op = batch_matmul(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), vec![lhs, rhs]);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), vec![output]);
-            assert_eq!(LinalgCoreStructuredOperation::indexing_maps(&op), None);
-            assert_eq!(LinalgCastedOperation::cast(&op), TypeFn::CastSigned);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), tensor_type.as_ref());
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "batch_matmul_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
+                let lhs = block.argument(0).unwrap().as_ref();
+                let rhs = block.argument(1).unwrap().as_ref();
+                let output = block.argument(2).unwrap().as_ref();
+                let inputs = [lhs, rhs];
+                let outputs = [output];
+                let result_types = [tensor_type.as_ref()];
+                let op = batch_matmul(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), vec![lhs, rhs]);
+                assert_eq!(op.outputs().unwrap(), vec![output]);
+                assert_eq!(op.indexing_maps().unwrap(), None);
+                assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
+                assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "batch_matmul_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4373,43 +4493,49 @@ mod tests {
     fn test_batch_reduce_matmul() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let input_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap();
         let output_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (input_type, location), (output_type, location)]);
-            let lhs = block.argument(0).unwrap().as_ref();
-            let rhs = block.argument(1).unwrap().as_ref();
-            let output = block.argument(2).unwrap().as_ref();
-            let inputs = [lhs, rhs];
-            let outputs = [output];
-            let result_types = [output_type.as_ref()];
-            let op = batch_reduce_matmul(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), vec![lhs, rhs]);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), vec![output]);
-            assert_eq!(LinalgCoreStructuredOperation::indexing_maps(&op), None);
-            assert_eq!(LinalgCastedOperation::cast(&op), TypeFn::CastSigned);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), output_type.as_ref());
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "batch_reduce_matmul_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), input_type.into(), output_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(input_type, location), (input_type, location), (output_type, location)]);
+                let lhs = block.argument(0).unwrap().as_ref();
+                let rhs = block.argument(1).unwrap().as_ref();
+                let output = block.argument(2).unwrap().as_ref();
+                let inputs = [lhs, rhs];
+                let outputs = [output];
+                let result_types = [output_type.as_ref()];
+                let op = batch_reduce_matmul(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), vec![lhs, rhs]);
+                assert_eq!(op.outputs().unwrap(), vec![output]);
+                assert_eq!(op.indexing_maps().unwrap(), None);
+                assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
+                assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "batch_reduce_matmul_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), input_type.into(), output_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4427,36 +4553,41 @@ mod tests {
     fn test_softmax() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let tensor_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let output = block.argument(1).unwrap().as_ref();
-            let result_types = [tensor_type.as_ref()];
-            let op = softmax(input, output, &result_types, 1, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output_operand(), output);
-            assert_eq!(op.dimension(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), tensor_type.as_ref());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "softmax_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let output = block.argument(1).unwrap().as_ref();
+                let result_types = [tensor_type.as_ref()];
+                let op = softmax(input, output, &result_types, 1, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.output_operand().unwrap(), output);
+                assert_eq!(op.dimension().unwrap(), 1);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "softmax_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4474,7 +4605,7 @@ mod tests {
     fn test_winograd_filter_transform() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let filter_type = context
             .tensor_type(
                 context.float32_type(),
@@ -4491,32 +4622,38 @@ mod tests {
                 location,
             )
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(filter_type, location), (output_type, location)]);
-            let filter = block.argument(0).unwrap().as_ref();
-            let output = block.argument(1).unwrap().as_ref();
-            let result_types = [output_type.as_ref()];
-            let op = winograd_filter_transform(filter, output, &result_types, WinogradConv2DFmr::F2R3, location);
-            assert_eq!(op.filter(), filter);
-            assert_eq!(op.output_operand(), output);
-            assert_eq!(op.fmr(), WinogradConv2DFmr::F2R3);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type.as_ref());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "winograd_filter_transform_test",
-                func::FuncAttributes {
-                    arguments: vec![filter_type.into(), output_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(filter_type, location), (output_type, location)]);
+                let filter = block.argument(0).unwrap().as_ref();
+                let output = block.argument(1).unwrap().as_ref();
+                let result_types = [output_type.as_ref()];
+                let op = winograd_filter_transform(filter, output, &result_types, WinogradConv2DFmr::F2R3, location)
+                    .unwrap();
+                assert_eq!(op.filter().unwrap(), filter);
+                assert_eq!(op.output_operand().unwrap(), output);
+                assert_eq!(op.fmr().unwrap(), WinogradConv2DFmr::F2R3);
+                assert_eq!(op.filter().unwrap(), filter);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "winograd_filter_transform_test",
+                    func::FuncAttributes {
+                        arguments: vec![filter_type.into(), output_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4534,7 +4671,7 @@ mod tests {
     fn test_winograd_input_transform() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let input_type = context
             .tensor_type(
                 context.float32_type(),
@@ -4551,32 +4688,38 @@ mod tests {
                 location,
             )
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (output_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let output = block.argument(1).unwrap().as_ref();
-            let result_types = [output_type.as_ref()];
-            let op = winograd_input_transform(input, output, &result_types, WinogradConv2DFmr::F2R3, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output_operand(), output);
-            assert_eq!(op.fmr(), WinogradConv2DFmr::F2R3);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type.as_ref());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "winograd_input_transform_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), output_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (output_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let output = block.argument(1).unwrap().as_ref();
+                let result_types = [output_type.as_ref()];
+                let op =
+                    winograd_input_transform(input, output, &result_types, WinogradConv2DFmr::F2R3, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.output_operand().unwrap(), output);
+                assert_eq!(op.fmr().unwrap(), WinogradConv2DFmr::F2R3);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "winograd_input_transform_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), output_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4594,7 +4737,7 @@ mod tests {
     fn test_winograd_output_transform() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let value_type = context
             .tensor_type(
                 context.float32_type(),
@@ -4611,32 +4754,38 @@ mod tests {
                 location,
             )
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(value_type, location), (output_type, location)]);
-            let value = block.argument(0).unwrap().as_ref();
-            let output = block.argument(1).unwrap().as_ref();
-            let result_types = [output_type.as_ref()];
-            let op = winograd_output_transform(value, output, &result_types, WinogradConv2DFmr::F2R3, location);
-            assert_eq!(op.value(), value);
-            assert_eq!(op.output_operand(), output);
-            assert_eq!(op.fmr(), WinogradConv2DFmr::F2R3);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type.as_ref());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "winograd_output_transform_test",
-                func::FuncAttributes {
-                    arguments: vec![value_type.into(), output_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(value_type, location), (output_type, location)]);
+                let value = block.argument(0).unwrap().as_ref();
+                let output = block.argument(1).unwrap().as_ref();
+                let result_types = [output_type.as_ref()];
+                let op =
+                    winograd_output_transform(value, output, &result_types, WinogradConv2DFmr::F2R3, location).unwrap();
+                assert_eq!(op.value().unwrap(), value);
+                assert_eq!(op.output_operand().unwrap(), output);
+                assert_eq!(op.fmr().unwrap(), WinogradConv2DFmr::F2R3);
+                assert_eq!(op.value().unwrap(), value);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "winograd_output_transform_test",
+                    func::FuncAttributes {
+                        arguments: vec![value_type.into(), output_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4654,7 +4803,7 @@ mod tests {
     fn test_pack() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let source_type = context
             .tensor_type(context.float32_type(), &[Size::Static(8), Size::Static(16)], None, location)
             .unwrap();
@@ -4666,36 +4815,41 @@ mod tests {
                 location,
             )
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type, location), (destination_type, location)]);
-            let source = block.argument(0).unwrap().as_ref();
-            let destination = block.argument(1).unwrap().as_ref();
-            let result_types = [destination_type.as_ref()];
-            let op = pack(source, destination, None, &[], &result_types, &[], &[0, 1], &[4, 8], location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.destination(), destination);
-            assert_eq!(op.padding_value(), None);
-            assert!(op.inner_tiles().is_empty());
-            assert_eq!(op.outer_dims_perm().values().collect::<Vec<_>>(), Vec::<i64>::new());
-            assert_eq!(op.inner_dims_pos().values().collect::<Vec<_>>(), vec![0, 1]);
-            assert_eq!(op.static_inner_tiles().values().collect::<Vec<_>>(), vec![4, 8]);
-            assert_eq!(op.result(0).unwrap().r#type(), destination_type.as_ref());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pack_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into(), destination_type.into()],
-                    results: vec![destination_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type, location), (destination_type, location)]);
+                let source = block.argument(0).unwrap().as_ref();
+                let destination = block.argument(1).unwrap().as_ref();
+                let result_types = [destination_type.as_ref()];
+                let op = pack(source, destination, None, &[], &result_types, &[], &[0, 1], &[4, 8], location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.destination().unwrap(), destination);
+                assert_eq!(op.padding_value().unwrap(), None);
+                assert!(op.inner_tiles().unwrap().is_empty());
+                assert_eq!(op.outer_dims_perm().unwrap().values().collect::<Vec<_>>(), Vec::<i64>::new());
+                assert_eq!(op.inner_dims_pos().unwrap().values().collect::<Vec<_>>(), vec![0, 1]);
+                assert_eq!(op.static_inner_tiles().unwrap().values().collect::<Vec<_>>(), vec![4, 8]);
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pack_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into(), destination_type.into()],
+                        results: vec![destination_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4713,7 +4867,7 @@ mod tests {
     fn test_unpack() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let source_type = context
             .tensor_type(
                 context.float32_type(),
@@ -4725,35 +4879,40 @@ mod tests {
         let destination_type = context
             .tensor_type(context.float32_type(), &[Size::Static(8), Size::Static(16)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type, location), (destination_type, location)]);
-            let source = block.argument(0).unwrap().as_ref();
-            let destination = block.argument(1).unwrap().as_ref();
-            let result_types = [destination_type.as_ref()];
-            let op = unpack(source, destination, &[], &result_types, &[], &[0, 1], &[4, 8], location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.destination(), destination);
-            assert!(op.inner_tiles().is_empty());
-            assert_eq!(op.outer_dims_perm().values().collect::<Vec<_>>(), Vec::<i64>::new());
-            assert_eq!(op.inner_dims_pos().values().collect::<Vec<_>>(), vec![0, 1]);
-            assert_eq!(op.static_inner_tiles().values().collect::<Vec<_>>(), vec![4, 8]);
-            assert_eq!(op.result(0).unwrap().r#type(), destination_type.as_ref());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "unpack_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into(), destination_type.into()],
-                    results: vec![destination_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type, location), (destination_type, location)]);
+                let source = block.argument(0).unwrap().as_ref();
+                let destination = block.argument(1).unwrap().as_ref();
+                let result_types = [destination_type.as_ref()];
+                let op = unpack(source, destination, &[], &result_types, &[], &[0, 1], &[4, 8], location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.destination().unwrap(), destination);
+                assert!(op.inner_tiles().unwrap().is_empty());
+                assert_eq!(op.outer_dims_perm().unwrap().values().collect::<Vec<_>>(), Vec::<i64>::new());
+                assert_eq!(op.inner_dims_pos().unwrap().values().collect::<Vec<_>>(), vec![0, 1]);
+                assert_eq!(op.static_inner_tiles().unwrap().values().collect::<Vec<_>>(), vec![4, 8]);
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "unpack_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into(), destination_type.into()],
+                        results: vec![destination_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4771,38 +4930,43 @@ mod tests {
     fn test_copy() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let tensor_type = context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap();
-        let cast = context.linalg_type_fn_attribute(TypeFn::CastUnsigned);
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let output = block.argument(1).unwrap().as_ref();
-            let inputs = [input];
-            let outputs = [output];
-            let result_types = [tensor_type.as_ref()];
-            let attributes = [(CAST_ATTRIBUTE, cast.as_ref())];
-            let op = copy(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), vec![input]);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), vec![output]);
-            assert_eq!(LinalgCastedOperation::cast(&op), TypeFn::CastUnsigned);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), tensor_type.as_ref());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "copy_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let cast = context.linalg_type_fn_attribute(TypeFn::CastUnsigned).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let output = block.argument(1).unwrap().as_ref();
+                let inputs = [input];
+                let outputs = [output];
+                let result_types = [tensor_type.as_ref()];
+                let attributes = [(CAST_ATTRIBUTE, cast.as_ref())];
+                let op = copy(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), vec![input]);
+                assert_eq!(op.outputs().unwrap(), vec![output]);
+                assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastUnsigned);
+                assert_eq!(op.inputs().unwrap(), vec![input]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "copy_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4820,38 +4984,49 @@ mod tests {
     fn test_exp() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = exp(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "exp_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = exp(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "exp_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4869,38 +5044,49 @@ mod tests {
     fn test_log() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = log(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "log_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = log(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "log_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4918,38 +5104,49 @@ mod tests {
     fn test_abs() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = abs(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "abs_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = abs(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "abs_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4967,38 +5164,49 @@ mod tests {
     fn test_ceil() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = ceil(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "ceil_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = ceil(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "ceil_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5016,38 +5224,49 @@ mod tests {
     fn test_floor() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = floor(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "floor_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = floor(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "floor_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5065,38 +5284,49 @@ mod tests {
     fn test_negf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = negf(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "negf_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = negf(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "negf_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5114,38 +5344,49 @@ mod tests {
     fn test_reciprocal() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = reciprocal(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "reciprocal_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = reciprocal(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "reciprocal_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5163,38 +5404,49 @@ mod tests {
     fn test_round() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = round(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "round_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = round(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "round_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5212,38 +5464,49 @@ mod tests {
     fn test_sqrt() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = sqrt(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "sqrt_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = sqrt(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "sqrt_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5261,38 +5524,49 @@ mod tests {
     fn test_rsqrt() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = rsqrt(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "rsqrt_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = rsqrt(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "rsqrt_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5310,38 +5584,49 @@ mod tests {
     fn test_square() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = square(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "square_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = square(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "square_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5359,38 +5644,49 @@ mod tests {
     fn test_tanh() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = tanh(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "tanh_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = tanh(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "tanh_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5408,38 +5704,49 @@ mod tests {
     fn test_erf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = erf(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "erf_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = erf(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "erf_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5457,42 +5764,56 @@ mod tests {
     fn test_add() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_2_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = add(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "add_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = add(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "add_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5510,42 +5831,56 @@ mod tests {
     fn test_sub() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_2_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = sub(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "sub_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = sub(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "sub_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5563,42 +5898,56 @@ mod tests {
     fn test_mul() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_2_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = mul(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "mul_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = mul(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "mul_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5616,42 +5965,56 @@ mod tests {
     fn test_div() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_2_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = div(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "div_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = div(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "div_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5669,7 +6032,7 @@ mod tests {
     fn test_div_unsigned() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.signless_integer_type(32), &[Size::Dynamic], None, location)
             .unwrap()
@@ -5682,35 +6045,49 @@ mod tests {
             .tensor_type(context.signless_integer_type(32), &[Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = div_unsigned(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "div_unsigned_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = div_unsigned(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "div_unsigned_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5728,42 +6105,56 @@ mod tests {
     fn test_max() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_2_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = max(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "max_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = max(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "max_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5781,42 +6172,56 @@ mod tests {
     fn test_min() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_2_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = min(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "min_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = min(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "min_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5834,42 +6239,56 @@ mod tests {
     fn test_powf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_2_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = powf(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "powf_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = powf(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "powf_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5887,7 +6306,7 @@ mod tests {
     fn test_select() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.signless_integer_type(1), &[Size::Dynamic], None, location)
             .unwrap()
@@ -5898,45 +6317,56 @@ mod tests {
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_3_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2];
-            let outputs = vec![argument_3];
-            let result_types = vec![argument_3_type];
-            let op = select(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "select_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                    ],
-                    results: vec![argument_3_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2];
+                let outputs = vec![argument_3];
+                let result_types = vec![argument_3_type];
+                let op = select(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "select_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                        ],
+                        results: vec![argument_3_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -5954,7 +6384,7 @@ mod tests {
     fn test_quantized_matmul() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.signless_integer_type(32), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -5969,48 +6399,59 @@ mod tests {
             .tensor_type(context.signless_integer_type(32), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-                (argument_4_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let argument_4 = block.argument(4).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2, argument_3];
-            let outputs = vec![argument_4];
-            let result_types = vec![argument_4_type];
-            let op = quantized_matmul(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "quantized_matmul_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                        argument_4_type.into(),
-                    ],
-                    results: vec![argument_4_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                    (argument_4_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let argument_4 = block.argument(4).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2, argument_3];
+                let outputs = vec![argument_4];
+                let result_types = vec![argument_4_type];
+                let op = quantized_matmul(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "quantized_matmul_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                            argument_4_type.into(),
+                        ],
+                        results: vec![argument_4_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6028,7 +6469,7 @@ mod tests {
     fn test_mmt4d() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -6056,35 +6497,49 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = mmt4d(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "mmt4d_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = mmt4d(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "mmt4d_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6102,7 +6557,7 @@ mod tests {
     fn test_batch_mmt4d() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -6130,35 +6585,49 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = batch_mmt4d(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "batch_mmt4d_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = batch_mmt4d(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "batch_mmt4d_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6176,7 +6645,7 @@ mod tests {
     fn test_quantized_batch_matmul() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -6206,48 +6675,59 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-                (argument_4_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let argument_4 = block.argument(4).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2, argument_3];
-            let outputs = vec![argument_4];
-            let result_types = vec![argument_4_type];
-            let op = quantized_batch_matmul(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "quantized_batch_matmul_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                        argument_4_type.into(),
-                    ],
-                    results: vec![argument_4_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                    (argument_4_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let argument_4 = block.argument(4).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2, argument_3];
+                let outputs = vec![argument_4];
+                let result_types = vec![argument_4_type];
+                let op = quantized_batch_matmul(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "quantized_batch_matmul_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                            argument_4_type.into(),
+                        ],
+                        results: vec![argument_4_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6265,7 +6745,7 @@ mod tests {
     fn test_matvec() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -6274,35 +6754,49 @@ mod tests {
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_2_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = matvec(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "matvec_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = matvec(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "matvec_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6320,7 +6814,7 @@ mod tests {
     fn test_vecmat() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type = context
@@ -6329,35 +6823,49 @@ mod tests {
             .as_ref();
         let argument_2_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = vecmat(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "vecmat_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = vecmat(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "vecmat_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6375,7 +6883,7 @@ mod tests {
     fn test_batch_matvec() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -6388,35 +6896,49 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = batch_matvec(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "batch_matvec_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = batch_matvec(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "batch_matvec_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6434,7 +6956,7 @@ mod tests {
     fn test_batch_vecmat() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -6447,35 +6969,49 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = batch_vecmat(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "batch_vecmat_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = batch_vecmat(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "batch_vecmat_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6493,41 +7029,55 @@ mod tests {
     fn test_dot() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_2_type = context.tensor_type(context.float32_type(), &[], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = dot(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "dot_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = dot(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "dot_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6545,42 +7095,56 @@ mod tests {
     fn test_conv_1d() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
         let argument_2_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = conv_1d(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_1d_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = conv_1d(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_1d_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6598,7 +7162,7 @@ mod tests {
     fn test_conv_2d() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -6611,35 +7175,49 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = conv_2d(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = conv_2d(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6657,7 +7235,7 @@ mod tests {
     fn test_conv_3d() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -6670,35 +7248,49 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let op = conv_3d(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_3d_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let op = conv_3d(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_3d_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6716,7 +7308,7 @@ mod tests {
     fn test_conv_1d_nwc_wcf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -6729,50 +7321,64 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_1d_nwc_wcf(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_1d_nwc_wcf_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_1d_nwc_wcf(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_1d_nwc_wcf_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6790,7 +7396,7 @@ mod tests {
     fn test_conv_1d_ncw_fcw() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -6803,50 +7409,64 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_1d_ncw_fcw(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_1d_ncw_fcw_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_1d_ncw_fcw(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_1d_ncw_fcw_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6864,7 +7484,7 @@ mod tests {
     fn test_conv_2d_nhwc_hwcf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -6892,50 +7512,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_2d_nhwc_hwcf(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_nhwc_hwcf_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_2d_nhwc_hwcf(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_nhwc_hwcf_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -6953,7 +7587,7 @@ mod tests {
     fn test_conv_2d_nhwc_fhwc() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -6981,50 +7615,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_2d_nhwc_fhwc(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_nhwc_fhwc_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_2d_nhwc_fhwc(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_nhwc_fhwc_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -7042,7 +7690,7 @@ mod tests {
     fn test_conv_2d_nhwc_hwcf_q() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -7072,63 +7720,74 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-                (argument_4_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let argument_4 = block.argument(4).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2, argument_3];
-            let outputs = vec![argument_4];
-            let result_types = vec![argument_4_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_2d_nhwc_hwcf_q(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_nhwc_hwcf_q_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                        argument_4_type.into(),
-                    ],
-                    results: vec![argument_4_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                    (argument_4_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let argument_4 = block.argument(4).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2, argument_3];
+                let outputs = vec![argument_4];
+                let result_types = vec![argument_4_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_2d_nhwc_hwcf_q(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_nhwc_hwcf_q_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                            argument_4_type.into(),
+                        ],
+                        results: vec![argument_4_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -7146,7 +7805,7 @@ mod tests {
     fn test_conv_2d_nhwc_fhwc_q() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -7176,63 +7835,74 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-                (argument_4_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let argument_4 = block.argument(4).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2, argument_3];
-            let outputs = vec![argument_4];
-            let result_types = vec![argument_4_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_2d_nhwc_fhwc_q(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_nhwc_fhwc_q_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                        argument_4_type.into(),
-                    ],
-                    results: vec![argument_4_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                    (argument_4_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let argument_4 = block.argument(4).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2, argument_3];
+                let outputs = vec![argument_4];
+                let result_types = vec![argument_4_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_2d_nhwc_fhwc_q(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_nhwc_fhwc_q_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                            argument_4_type.into(),
+                        ],
+                        results: vec![argument_4_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -7250,7 +7920,7 @@ mod tests {
     fn test_conv_2d_nchw_fchw_q() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -7280,63 +7950,74 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-                (argument_4_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let argument_4 = block.argument(4).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2, argument_3];
-            let outputs = vec![argument_4];
-            let result_types = vec![argument_4_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_2d_nchw_fchw_q(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_nchw_fchw_q_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                        argument_4_type.into(),
-                    ],
-                    results: vec![argument_4_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                    (argument_4_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let argument_4 = block.argument(4).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2, argument_3];
+                let outputs = vec![argument_4];
+                let result_types = vec![argument_4_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_2d_nchw_fchw_q(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_nchw_fchw_q_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                            argument_4_type.into(),
+                        ],
+                        results: vec![argument_4_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -7354,7 +8035,7 @@ mod tests {
     fn test_conv_2d_nchw_fchw() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -7382,50 +8063,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_2d_nchw_fchw(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_nchw_fchw_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_2d_nchw_fchw(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_nchw_fchw_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -7443,7 +8138,7 @@ mod tests {
     fn test_conv_2d_ngchw_fgchw() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -7471,50 +8166,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_2d_ngchw_fgchw(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_ngchw_fgchw_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_2d_ngchw_fgchw(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_ngchw_fgchw_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -7532,7 +8241,7 @@ mod tests {
     fn test_conv_2d_ngchw_gfchw() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -7560,50 +8269,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_2d_ngchw_gfchw(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_ngchw_gfchw_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_2d_ngchw_gfchw(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_ngchw_gfchw_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -7621,7 +8344,7 @@ mod tests {
     fn test_conv_2d_nhwgc_gfhwc() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -7649,50 +8372,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_2d_nhwgc_gfhwc(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_nhwgc_gfhwc_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_2d_nhwgc_gfhwc(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_nhwgc_gfhwc_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -7710,7 +8447,7 @@ mod tests {
     fn test_conv_2d_nhwgc_gfhwc_q() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -7740,63 +8477,74 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-                (argument_4_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let argument_4 = block.argument(4).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2, argument_3];
-            let outputs = vec![argument_4];
-            let result_types = vec![argument_4_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_2d_nhwgc_gfhwc_q(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_nhwgc_gfhwc_q_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                        argument_4_type.into(),
-                    ],
-                    results: vec![argument_4_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                    (argument_4_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let argument_4 = block.argument(4).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2, argument_3];
+                let outputs = vec![argument_4];
+                let result_types = vec![argument_4_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_2d_nhwgc_gfhwc_q(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_nhwgc_gfhwc_q_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                            argument_4_type.into(),
+                        ],
+                        results: vec![argument_4_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -7814,7 +8562,7 @@ mod tests {
     fn test_conv_2d_ngchw_gfchw_q() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -7844,63 +8592,74 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-                (argument_4_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let argument_4 = block.argument(4).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2, argument_3];
-            let outputs = vec![argument_4];
-            let result_types = vec![argument_4_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_2d_ngchw_gfchw_q(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_2d_ngchw_gfchw_q_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                        argument_4_type.into(),
-                    ],
-                    results: vec![argument_4_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                    (argument_4_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let argument_4 = block.argument(4).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2, argument_3];
+                let outputs = vec![argument_4];
+                let result_types = vec![argument_4_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_2d_ngchw_gfchw_q(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_2d_ngchw_gfchw_q_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                            argument_4_type.into(),
+                        ],
+                        results: vec![argument_4_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -7918,7 +8677,7 @@ mod tests {
     fn test_conv_3d_ndhwc_dhwcf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -7946,50 +8705,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
-                .unwrap();
-            let values = vec![1; 3];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_3d_ndhwc_dhwcf(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_3d_ndhwc_dhwcf_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
+                    .unwrap();
+                let values = vec![1; 3];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_3d_ndhwc_dhwcf(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_3d_ndhwc_dhwcf_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8007,7 +8780,7 @@ mod tests {
     fn test_conv_3d_ndhwc_dhwcf_q() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -8037,63 +8810,74 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-                (argument_4_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let argument_4 = block.argument(4).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2, argument_3];
-            let outputs = vec![argument_4];
-            let result_types = vec![argument_4_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
-                .unwrap();
-            let values = vec![1; 3];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_3d_ndhwc_dhwcf_q(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_3d_ndhwc_dhwcf_q_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                        argument_4_type.into(),
-                    ],
-                    results: vec![argument_4_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                    (argument_4_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let argument_4 = block.argument(4).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2, argument_3];
+                let outputs = vec![argument_4];
+                let result_types = vec![argument_4_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
+                    .unwrap();
+                let values = vec![1; 3];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_3d_ndhwc_dhwcf_q(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_3d_ndhwc_dhwcf_q_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                            argument_4_type.into(),
+                        ],
+                        results: vec![argument_4_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8111,7 +8895,7 @@ mod tests {
     fn test_conv_3d_ncdhw_fcdhw() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -8139,50 +8923,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
-                .unwrap();
-            let values = vec![1; 3];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = conv_3d_ncdhw_fcdhw(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "conv_3d_ncdhw_fcdhw_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
+                    .unwrap();
+                let values = vec![1; 3];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = conv_3d_ncdhw_fcdhw(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "conv_3d_ncdhw_fcdhw_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8200,7 +8998,7 @@ mod tests {
     fn test_depthwise_conv_1d_nwc_wc() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -8213,50 +9011,64 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = depthwise_conv_1d_nwc_wc(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "depthwise_conv_1d_nwc_wc_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = depthwise_conv_1d_nwc_wc(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "depthwise_conv_1d_nwc_wc_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8274,7 +9086,7 @@ mod tests {
     fn test_depthwise_conv_1d_ncw_cw() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -8287,50 +9099,64 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = depthwise_conv_1d_ncw_cw(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "depthwise_conv_1d_ncw_cw_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = depthwise_conv_1d_ncw_cw(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "depthwise_conv_1d_ncw_cw_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8348,7 +9174,7 @@ mod tests {
     fn test_depthwise_conv_1d_nwc_wcm() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -8366,50 +9192,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = depthwise_conv_1d_nwc_wcm(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "depthwise_conv_1d_nwc_wcm_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = depthwise_conv_1d_nwc_wcm(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "depthwise_conv_1d_nwc_wcm_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8427,7 +9267,7 @@ mod tests {
     fn test_depthwise_conv_2d_nhwc_hwc() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -8450,50 +9290,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = depthwise_conv_2d_nhwc_hwc(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "depthwise_conv_2d_nhwc_hwc_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = depthwise_conv_2d_nhwc_hwc(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "depthwise_conv_2d_nhwc_hwc_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8511,7 +9365,7 @@ mod tests {
     fn test_depthwise_conv_2d_nchw_chw() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -8534,50 +9388,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = depthwise_conv_2d_nchw_chw(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "depthwise_conv_2d_nchw_chw_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = depthwise_conv_2d_nchw_chw(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "depthwise_conv_2d_nchw_chw_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8595,7 +9463,7 @@ mod tests {
     fn test_depthwise_conv_2d_nhwc_hwc_q() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -8625,63 +9493,74 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-                (argument_4_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let argument_4 = block.argument(4).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2, argument_3];
-            let outputs = vec![argument_4];
-            let result_types = vec![argument_4_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = depthwise_conv_2d_nhwc_hwc_q(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "depthwise_conv_2d_nhwc_hwc_q_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                        argument_4_type.into(),
-                    ],
-                    results: vec![argument_4_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                    (argument_4_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let argument_4 = block.argument(4).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2, argument_3];
+                let outputs = vec![argument_4];
+                let result_types = vec![argument_4_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = depthwise_conv_2d_nhwc_hwc_q(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "depthwise_conv_2d_nhwc_hwc_q_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                            argument_4_type.into(),
+                        ],
+                        results: vec![argument_4_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8699,7 +9578,7 @@ mod tests {
     fn test_depthwise_conv_2d_nhwc_hwcm() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -8727,50 +9606,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = depthwise_conv_2d_nhwc_hwcm(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "depthwise_conv_2d_nhwc_hwcm_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = depthwise_conv_2d_nhwc_hwcm(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "depthwise_conv_2d_nhwc_hwcm_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8788,7 +9681,7 @@ mod tests {
     fn test_depthwise_conv_2d_nhwc_hwcm_q() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -8818,63 +9711,75 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-                (argument_4_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let argument_4 = block.argument(4).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2, argument_3];
-            let outputs = vec![argument_4];
-            let result_types = vec![argument_4_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = depthwise_conv_2d_nhwc_hwcm_q(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "depthwise_conv_2d_nhwc_hwcm_q_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                        argument_4_type.into(),
-                    ],
-                    results: vec![argument_4_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                    (argument_4_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let argument_4 = block.argument(4).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2, argument_3];
+                let outputs = vec![argument_4];
+                let result_types = vec![argument_4_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op =
+                    depthwise_conv_2d_nhwc_hwcm_q(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "depthwise_conv_2d_nhwc_hwcm_q_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                            argument_4_type.into(),
+                        ],
+                        results: vec![argument_4_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8892,7 +9797,7 @@ mod tests {
     fn test_depthwise_conv_3d_ndhwc_dhwc() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -8920,50 +9825,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
-                .unwrap();
-            let values = vec![1; 3];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = depthwise_conv_3d_ndhwc_dhwc(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "depthwise_conv_3d_ndhwc_dhwc_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
+                    .unwrap();
+                let values = vec![1; 3];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = depthwise_conv_3d_ndhwc_dhwc(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "depthwise_conv_3d_ndhwc_dhwc_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -8981,7 +9900,7 @@ mod tests {
     fn test_depthwise_conv_3d_ncdhw_cdhw() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -9009,50 +9928,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
-                .unwrap();
-            let values = vec![1; 3];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = depthwise_conv_3d_ncdhw_cdhw(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "depthwise_conv_3d_ncdhw_cdhw_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
+                    .unwrap();
+                let values = vec![1; 3];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = depthwise_conv_3d_ncdhw_cdhw(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "depthwise_conv_3d_ncdhw_cdhw_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9070,7 +10003,7 @@ mod tests {
     fn test_depthwise_conv_3d_ndhwc_dhwcm() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -9098,50 +10031,65 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
-                .unwrap();
-            let values = vec![1; 3];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = depthwise_conv_3d_ndhwc_dhwcm(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "depthwise_conv_3d_ndhwc_dhwcm_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
+                    .unwrap();
+                let values = vec![1; 3];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op =
+                    depthwise_conv_3d_ndhwc_dhwcm(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "depthwise_conv_3d_ndhwc_dhwcm_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9159,7 +10107,7 @@ mod tests {
     fn test_pooling_nhwc_sum() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -9182,50 +10130,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nhwc_sum(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nhwc_sum_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nhwc_sum(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nhwc_sum_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9243,7 +10205,7 @@ mod tests {
     fn test_pooling_nchw_sum() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -9266,50 +10228,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nchw_sum(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nchw_sum_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nchw_sum(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nchw_sum_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9327,7 +10303,7 @@ mod tests {
     fn test_pooling_nhwc_max() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -9350,50 +10326,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nhwc_max(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nhwc_max_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nhwc_max(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nhwc_max_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9411,7 +10401,7 @@ mod tests {
     fn test_pooling_nhwc_max_unsigned() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -9434,50 +10424,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nhwc_max_unsigned(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nhwc_max_unsigned_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nhwc_max_unsigned(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nhwc_max_unsigned_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9495,7 +10499,7 @@ mod tests {
     fn test_pooling_nchw_max() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -9518,50 +10522,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nchw_max(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nchw_max_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nchw_max(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nchw_max_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9579,7 +10597,7 @@ mod tests {
     fn test_pooling_nhwc_min() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -9602,50 +10620,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nhwc_min(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nhwc_min_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nhwc_min(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nhwc_min_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9663,7 +10695,7 @@ mod tests {
     fn test_pooling_nhwc_min_unsigned() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -9686,50 +10718,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
-                .unwrap();
-            let values = vec![1; 2];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nhwc_min_unsigned(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 2],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nhwc_min_unsigned_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(2)], location)
+                    .unwrap();
+                let values = vec![1; 2];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nhwc_min_unsigned(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 2],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nhwc_min_unsigned_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9747,7 +10793,7 @@ mod tests {
     fn test_pooling_nwc_sum() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -9758,50 +10804,64 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nwc_sum(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nwc_sum_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nwc_sum(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nwc_sum_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9819,7 +10879,7 @@ mod tests {
     fn test_pooling_ncw_sum() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -9830,50 +10890,64 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_ncw_sum(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_ncw_sum_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_ncw_sum(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_ncw_sum_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9891,7 +10965,7 @@ mod tests {
     fn test_pooling_nwc_max() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -9902,50 +10976,64 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nwc_max(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nwc_max_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nwc_max(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nwc_max_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -9963,7 +11051,7 @@ mod tests {
     fn test_pooling_nwc_max_unsigned() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -9986,50 +11074,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nwc_max_unsigned(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nwc_max_unsigned_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nwc_max_unsigned(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nwc_max_unsigned_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -10047,7 +11149,7 @@ mod tests {
     fn test_pooling_ncw_max() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -10058,50 +11160,64 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_ncw_max(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_ncw_max_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_ncw_max(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_ncw_max_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -10119,7 +11235,7 @@ mod tests {
     fn test_pooling_nwc_min() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
@@ -10130,50 +11246,64 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nwc_min(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nwc_min_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nwc_min(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nwc_min_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -10191,7 +11321,7 @@ mod tests {
     fn test_pooling_nwc_min_unsigned() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.signless_integer_type(32),
@@ -10214,50 +11344,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
-                .unwrap();
-            let values = vec![1; 1];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_nwc_min_unsigned(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 1],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_nwc_min_unsigned_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(1)], location)
+                    .unwrap();
+                let values = vec![1; 1];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_nwc_min_unsigned(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 1],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_nwc_min_unsigned_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -10275,7 +11419,7 @@ mod tests {
     fn test_pooling_ndhwc_sum() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -10298,50 +11442,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
-                .unwrap();
-            let values = vec![1; 3];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_ndhwc_sum(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_ndhwc_sum_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
+                    .unwrap();
+                let values = vec![1; 3];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_ndhwc_sum(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_ndhwc_sum_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -10359,7 +11517,7 @@ mod tests {
     fn test_pooling_ndhwc_max() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -10382,50 +11540,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
-                .unwrap();
-            let values = vec![1; 3];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_ndhwc_max(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_ndhwc_max_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
+                    .unwrap();
+                let values = vec![1; 3];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_ndhwc_max(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_ndhwc_max_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -10443,7 +11615,7 @@ mod tests {
     fn test_pooling_ndhwc_min() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context
             .tensor_type(
                 context.float32_type(),
@@ -10466,50 +11638,64 @@ mod tests {
             )
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(argument_0_type, location), (argument_1_type, location), (argument_2_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1];
-            let outputs = vec![argument_2];
-            let result_types = vec![argument_2_type];
-            let attribute_type = context
-                .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
-                .unwrap();
-            let values = vec![1; 3];
-            let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
-            let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
-            let op = pooling_ndhwc_min(&inputs, &outputs, &result_types, &attributes, location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::strides(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(
-                unsafe { LinalgStridedDilatedOperation::dilations(&op).unwrap().i64_elements().collect::<Vec<_>>() },
-                vec![1; 3],
-            );
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pooling_ndhwc_min_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
-                    results: vec![argument_2_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1];
+                let outputs = vec![argument_2];
+                let result_types = vec![argument_2_type];
+                let attribute_type = context
+                    .vector_type(context.signless_integer_type(64), &[VectorTypeDimension::Fixed(3)], location)
+                    .unwrap();
+                let values = vec![1; 3];
+                let strides = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let dilations = context.dense_i64_elements_attribute(attribute_type, &values).unwrap();
+                let attributes = [(STRIDES_ATTRIBUTE, strides.as_ref()), (DILATIONS_ATTRIBUTE, dilations.as_ref())];
+                let op = pooling_ndhwc_min(&inputs, &outputs, &result_types, &attributes, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    unsafe { op.strides().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+                    vec![1; 3],
+                );
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pooling_ndhwc_min_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into(), argument_2_type.into()],
+                        results: vec![argument_2_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -10527,37 +11713,48 @@ mod tests {
     fn test_fill() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context.float32_type().as_ref();
         let argument_1_type =
             context.tensor_type(context.float32_type(), &[Size::Dynamic], None, location).unwrap().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let inputs = vec![argument_0];
-            let outputs = vec![argument_1];
-            let result_types = vec![argument_1_type];
-            let op = fill(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "fill_test",
-                func::FuncAttributes {
-                    arguments: vec![argument_0_type.into(), argument_1_type.into()],
-                    results: vec![argument_1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(argument_0_type, location), (argument_1_type, location)]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let inputs = vec![argument_0];
+                let outputs = vec![argument_1];
+                let result_types = vec![argument_1_type];
+                let op = fill(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "fill_test",
+                    func::FuncAttributes {
+                        arguments: vec![argument_0_type.into(), argument_1_type.into()],
+                        results: vec![argument_1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -10575,7 +11772,7 @@ mod tests {
     fn test_fill_rng_2d() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let argument_0_type = context.float64_type().as_ref();
         let argument_1_type = context.float64_type().as_ref();
         let argument_2_type = context.signless_integer_type(32).as_ref();
@@ -10583,45 +11780,56 @@ mod tests {
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap()
             .as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (argument_0_type, location),
-                (argument_1_type, location),
-                (argument_2_type, location),
-                (argument_3_type, location),
-            ]);
-            let argument_0 = block.argument(0).unwrap().as_ref();
-            let argument_1 = block.argument(1).unwrap().as_ref();
-            let argument_2 = block.argument(2).unwrap().as_ref();
-            let argument_3 = block.argument(3).unwrap().as_ref();
-            let inputs = vec![argument_0, argument_1, argument_2];
-            let outputs = vec![argument_3];
-            let result_types = vec![argument_3_type];
-            let op = fill_rng_2d(&inputs, &outputs, &result_types, &[], location);
-            assert_eq!(LinalgNamedStructuredOperation::inputs(&op), inputs);
-            assert_eq!(LinalgNamedStructuredOperation::outputs(&op), outputs);
-            assert_eq!(LinalgNamedStructuredOperation::result_tensors(&op)[0].r#type(), result_types[0]);
-            assert_eq!(op.operands().count(), inputs.len() + outputs.len());
-            assert_eq!(op.results().count(), result_types.len());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "fill_rng_2d_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        argument_0_type.into(),
-                        argument_1_type.into(),
-                        argument_2_type.into(),
-                        argument_3_type.into(),
-                    ],
-                    results: vec![argument_3_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (argument_0_type, location),
+                    (argument_1_type, location),
+                    (argument_2_type, location),
+                    (argument_3_type, location),
+                ]);
+                let argument_0 = block.argument(0).unwrap().as_ref();
+                let argument_1 = block.argument(1).unwrap().as_ref();
+                let argument_2 = block.argument(2).unwrap().as_ref();
+                let argument_3 = block.argument(3).unwrap().as_ref();
+                let inputs = vec![argument_0, argument_1, argument_2];
+                let outputs = vec![argument_3];
+                let result_types = vec![argument_3_type];
+                let op = fill_rng_2d(&inputs, &outputs, &result_types, &[], location).unwrap();
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(op.outputs().unwrap(), outputs);
+                assert_eq!(op.inputs().unwrap(), inputs);
+                assert_eq!(
+                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    inputs.len() + outputs.len()
+                );
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    result_types.len()
+                );
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "fill_rng_2d_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            argument_0_type.into(),
+                            argument_1_type.into(),
+                            argument_2_type.into(),
+                            argument_3_type.into(),
+                        ],
+                        results: vec![argument_3_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

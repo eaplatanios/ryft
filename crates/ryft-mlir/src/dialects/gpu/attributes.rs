@@ -739,9 +739,7 @@ impl<'c, 't> MemorySpaceMappingAttributeRef<'c, 't> {
     /// Returns the memory space stored in this mapping attribute.
     pub fn address_space(&self) -> Result<AddressSpace, Error> {
         let value = unsafe { StringRef::from_c_api(mlirGpuMemorySpaceMappingAttrGetAddressSpace(self.handle)) };
-        let Ok(value) = value.as_str() else {
-            return Err(Error::invalid_argument("invalid `#gpu.memory_space` attribute"));
-        };
+        let value = value.as_str().map_err(|_| Error::invalid_argument("invalid `#gpu.memory_space` attribute"))?;
         AddressSpace::from_str(value).ok_or_else(|| Error::invalid_argument("invalid `#gpu.memory_space` attribute"))
     }
 }

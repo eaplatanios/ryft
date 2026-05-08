@@ -68,18 +68,18 @@ mod tests {
     #[test]
     fn test_create_linalg_passes() {
         // Verify that pass creation does not crash for the various `linalg` dialect passes.
-        let _ = create_linalg_convert_elementwise_to_linalg_pass();
-        let _ = create_linalg_to_affine_loops_pass();
-        let _ = create_linalg_to_loops_pass();
-        let _ = create_linalg_to_parallel_loops_pass();
-        let _ = create_linalg_block_pack_matmul_pass();
-        let _ = create_linalg_elementwise_op_fusion_pass();
-        let _ = create_linalg_fold_into_elementwise_pass();
-        let _ = create_linalg_fold_unit_extent_dims_pass();
-        let _ = create_linalg_generalize_named_ops_pass();
-        let _ = create_linalg_inline_scalar_operands_pass();
-        let _ = create_linalg_morph_ops_pass();
-        let _ = create_linalg_specialize_generic_ops_pass();
-        let _ = create_linalg_simplify_depthwise_conv_pass();
+        let _ = create_linalg_convert_elementwise_to_linalg_pass().unwrap();
+        let _ = create_linalg_to_affine_loops_pass().unwrap();
+        let _ = create_linalg_to_loops_pass().unwrap();
+        let _ = create_linalg_to_parallel_loops_pass().unwrap();
+        let _ = create_linalg_block_pack_matmul_pass().unwrap();
+        let _ = create_linalg_elementwise_op_fusion_pass().unwrap();
+        let _ = create_linalg_fold_into_elementwise_pass().unwrap();
+        let _ = create_linalg_fold_unit_extent_dims_pass().unwrap();
+        let _ = create_linalg_generalize_named_ops_pass().unwrap();
+        let _ = create_linalg_inline_scalar_operands_pass().unwrap();
+        let _ = create_linalg_morph_ops_pass().unwrap();
+        let _ = create_linalg_specialize_generic_ops_pass().unwrap();
+        let _ = create_linalg_simplify_depthwise_conv_pass().unwrap();
     }
 }
