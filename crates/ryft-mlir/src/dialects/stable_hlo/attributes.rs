@@ -11,8 +11,8 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::{
-    ArrayAttributeRef, Attribute, AttributeRef, Context, DenseIntegerElementsAttributeRef, DialectHandle, StringRef,
-    mlir_subtype_trait_impls,
+    ArrayAttributeRef, Attribute, AttributeRef, Context, DenseIntegerElementsAttributeRef, DialectHandle, Error,
+    StringRef, mlir_subtype_trait_impls,
 };
 
 /// StableHLO [`Attribute`] that is used to extend the built-in MLIR [`TensorTypeRef`](crate::TensorTypeRef) with
@@ -49,11 +49,11 @@ impl<'c, 't> TensorTypeExtensionsAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for TensorTypeExtensionsAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { stablehloAttributeIsTypeExtensions(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -76,9 +76,9 @@ impl<'t> Context<'t> {
     pub fn stable_hlo_tensor_type_extensions<'c>(
         &'c self,
         bounds: &[Option<usize>],
-    ) -> TensorTypeExtensionsAttributeRef<'c, 't> {
+    ) -> Result<TensorTypeExtensionsAttributeRef<'c, 't>, Error> {
         // Make sure that the StableHLO dialect is loaded into the current context to prevent segmentation faults.
-        self.load_dialect(DialectHandle::stable_hlo());
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -96,7 +96,7 @@ impl<'t> Context<'t> {
                 stablehloTypeExtensionsGet(*self.handle.borrow(), bounds.len().cast_signed(), bounds.as_ptr()),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_tensor_type_extensions`"))
         }
     }
 }
@@ -124,11 +124,11 @@ impl<'c, 't> SubAxisInfoAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for SubAxisInfoAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { stablehloAttributeIsASubAxisInfoAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -160,17 +160,22 @@ impl<'c, 't> AxisRefAttributeRef<'c, 't> {
     }
 
     /// Returns split metadata when this references a sub-axis.
-    pub fn sub_axis_info(&self) -> Option<SubAxisInfoAttributeRef<'c, 't>> {
-        unsafe { SubAxisInfoAttributeRef::from_c_api(stablehloAxisRefAttrGetSubAxisInfo(self.handle), self.context) }
+    pub fn sub_axis_info(&self) -> Result<Option<SubAxisInfoAttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { stablehloAxisRefAttrGetSubAxisInfo(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { SubAxisInfoAttributeRef::from_c_api(handle, self.context).map(Some) }
+        }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for AxisRefAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { stablehloAttributeIsAnAxisRefAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -197,28 +202,24 @@ pub struct ReplicaGroupMeshAxesAttributeRef<'c, 't> {
 
 impl<'c, 't> ReplicaGroupMeshAxesAttributeRef<'c, 't> {
     /// Returns the mesh attribute, which may be a symbol reference or an inline mesh.
-    pub fn mesh(&self) -> AttributeRef<'c, 't> {
-        unsafe {
-            AttributeRef::from_c_api(stablehloReplicaGroupMeshAxesAttrGetMesh(self.handle), self.context)
-                .expect("invalid StableHLO replica-group mesh")
-        }
+    pub fn mesh(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        unsafe { AttributeRef::from_c_api(stablehloReplicaGroupMeshAxesAttrGetMesh(self.handle), self.context) }
+            .map_err(|_| Error::invalid_argument("invalid mesh in `stablehlo.replica_group_mesh_axes`"))
     }
 
     /// Returns the array of axes used to form replica groups.
-    pub fn axes(&self) -> ArrayAttributeRef<'c, 't> {
-        unsafe {
-            ArrayAttributeRef::from_c_api(stablehloReplicaGroupMeshAxesAttrGetAxes(self.handle), self.context)
-                .expect("invalid StableHLO replica-group axes")
-        }
+    pub fn axes(&self) -> Result<ArrayAttributeRef<'c, 't>, Error> {
+        unsafe { ArrayAttributeRef::from_c_api(stablehloReplicaGroupMeshAxesAttrGetAxes(self.handle), self.context) }
+            .map_err(|_| Error::invalid_argument("invalid axes in `stablehlo.replica_group_mesh_axes`"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for ReplicaGroupMeshAxesAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { stablehloAttributeIsAReplicaGroupMeshAxesAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -256,11 +257,11 @@ impl<'c, 't> MeshAxisAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for MeshAxisAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { stablehloAttributeIsAMeshAxisAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -287,27 +288,28 @@ pub struct MeshAttributeRef<'c, 't> {
 
 impl<'c, 't> MeshAttributeRef<'c, 't> {
     /// Returns the array of mesh axis attributes.
-    pub fn axes(&self) -> ArrayAttributeRef<'c, 't> {
-        unsafe {
-            ArrayAttributeRef::from_c_api(stablehloMeshAttrGetAxes(self.handle), self.context)
-                .expect("invalid StableHLO mesh axes")
-        }
+    pub fn axes(&self) -> Result<ArrayAttributeRef<'c, 't>, Error> {
+        unsafe { ArrayAttributeRef::from_c_api(stablehloMeshAttrGetAxes(self.handle), self.context) }
+            .map_err(|_| Error::invalid_argument("invalid axes in `stablehlo.mesh`"))
     }
 
     /// Returns the optional dense device-id tensor for this mesh.
-    pub fn device_ids(&self) -> Option<DenseIntegerElementsAttributeRef<'c, 't>> {
-        unsafe {
-            DenseIntegerElementsAttributeRef::from_c_api(stablehloMeshAttrGetDeviceIds(self.handle), self.context)
+    pub fn device_ids(&self) -> Result<Option<DenseIntegerElementsAttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { stablehloMeshAttrGetDeviceIds(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { DenseIntegerElementsAttributeRef::from_c_api(handle, self.context).map(Some) }
         }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for MeshAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { stablehloAttributeIsAMeshAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -324,14 +326,18 @@ mlir_subtype_trait_impls!(MeshAttributeRef<'c, 't> as Attribute, mlir_type = Att
 
 impl<'t> Context<'t> {
     /// Creates a new StableHLO [`SubAxisInfoAttributeRef`] owned by this [`Context`].
-    pub fn stable_hlo_sub_axis_info<'c>(&'c self, pre_size: i64, size: i64) -> SubAxisInfoAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::stable_hlo());
+    pub fn stable_hlo_sub_axis_info<'c>(
+        &'c self,
+        pre_size: i64,
+        size: i64,
+    ) -> Result<SubAxisInfoAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         unsafe {
             SubAxisInfoAttributeRef::from_c_api(
                 stablehloSubAxisInfoAttrGet(*self.handle.borrow(), pre_size, size),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_sub_axis_info`"))
         }
     }
 
@@ -340,8 +346,8 @@ impl<'t> Context<'t> {
         &'c self,
         name: N,
         sub_axis_info: Option<SubAxisInfoAttributeRef<'c, 't>>,
-    ) -> AxisRefAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::stable_hlo());
+    ) -> Result<AxisRefAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         unsafe {
             AxisRefAttributeRef::from_c_api(
                 stablehloAxisRefAttrGet(
@@ -351,7 +357,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_axis_ref`"))
         }
     }
 
@@ -360,26 +366,30 @@ impl<'t> Context<'t> {
         &'c self,
         mesh: M,
         axes: ArrayAttributeRef<'c, 't>,
-    ) -> ReplicaGroupMeshAxesAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::stable_hlo());
+    ) -> Result<ReplicaGroupMeshAxesAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         unsafe {
             ReplicaGroupMeshAxesAttributeRef::from_c_api(
                 stablehloReplicaGroupMeshAxesAttrGet(*self.handle.borrow(), mesh.to_c_api(), axes.to_c_api()),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_replica_group_mesh_axes`"))
         }
     }
 
     /// Creates a new StableHLO [`MeshAxisAttributeRef`] owned by this [`Context`].
-    pub fn stable_hlo_mesh_axis<'c, N: AsRef<str>>(&'c self, name: N, size: i64) -> MeshAxisAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::stable_hlo());
+    pub fn stable_hlo_mesh_axis<'c, N: AsRef<str>>(
+        &'c self,
+        name: N,
+        size: i64,
+    ) -> Result<MeshAxisAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         unsafe {
             MeshAxisAttributeRef::from_c_api(
                 stablehloMeshAxisAttrGet(*self.handle.borrow(), StringRef::from(name.as_ref()).to_c_api(), size),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_mesh_axis`"))
         }
     }
 
@@ -388,8 +398,8 @@ impl<'t> Context<'t> {
         &'c self,
         axes: ArrayAttributeRef<'c, 't>,
         device_ids: Option<DenseIntegerElementsAttributeRef<'c, 't>>,
-    ) -> MeshAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::stable_hlo());
+    ) -> Result<MeshAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         unsafe {
             MeshAttributeRef::from_c_api(
                 stablehloMeshAttrGet(
@@ -399,7 +409,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_mesh`"))
         }
     }
 }
@@ -414,7 +424,7 @@ mod tests {
     fn test_tensor_type_extensions_attribute() {
         let context = Context::new();
         let bounds = vec![Some(10), None, Some(20), None];
-        let attribute = context.stable_hlo_tensor_type_extensions(&bounds);
+        let attribute = context.stable_hlo_tensor_type_extensions(&bounds).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.bounds(), bounds);
     }
@@ -424,38 +434,38 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_tensor_type_extensions(&[Some(10), None, Some(20), None]);
-        let attribute_2 = context.stable_hlo_tensor_type_extensions(&[Some(10), None, Some(20), None]);
+        let attribute_1 = context.stable_hlo_tensor_type_extensions(&[Some(10), None, Some(20), None]).unwrap();
+        let attribute_2 = context.stable_hlo_tensor_type_extensions(&[Some(10), None, Some(20), None]).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_tensor_type_extensions(&[None, None, Some(20)]);
+        let attribute_2 = context.stable_hlo_tensor_type_extensions(&[None, None, Some(20)]).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_tensor_type_extensions(&[Some(10), None, Some(20), None]);
+        let attribute_2 = context.stable_hlo_tensor_type_extensions(&[Some(10), None, Some(20), None]).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_tensor_type_extensions_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_tensor_type_extensions(&[Some(10), None, Some(20), None]);
+        let attribute = context.stable_hlo_tensor_type_extensions(&[Some(10), None, Some(20), None]).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo.bounds<10, ?, 20, ?>");
     }
 
     #[test]
     fn test_tensor_type_extensions_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_tensor_type_extensions(&[Some(10), None, Some(20), None]);
+        let attribute = context.stable_hlo_tensor_type_extensions(&[Some(10), None, Some(20), None]).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_sub_axis_info_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_sub_axis_info(2, 4);
+        let attribute = context.stable_hlo_sub_axis_info(2, 4).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.pre_size(), 2);
         assert_eq!(attribute.size(), 4);
@@ -466,82 +476,82 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_sub_axis_info(2, 4);
-        let attribute_2 = context.stable_hlo_sub_axis_info(2, 4);
+        let attribute_1 = context.stable_hlo_sub_axis_info(2, 4).unwrap();
+        let attribute_2 = context.stable_hlo_sub_axis_info(2, 4).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_sub_axis_info(1, 4);
+        let attribute_2 = context.stable_hlo_sub_axis_info(1, 4).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_sub_axis_info(2, 4);
+        let attribute_2 = context.stable_hlo_sub_axis_info(2, 4).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_sub_axis_info_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_sub_axis_info(2, 4);
+        let attribute = context.stable_hlo_sub_axis_info(2, 4).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo<sub_axis_info(2)4>");
     }
 
     #[test]
     fn test_sub_axis_info_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_sub_axis_info(2, 4);
+        let attribute = context.stable_hlo_sub_axis_info(2, 4).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_axis_ref_attribute() {
         let context = Context::new();
-        let sub_axis_info = context.stable_hlo_sub_axis_info(2, 4);
-        let attribute = context.stable_hlo_axis_ref("x", Some(sub_axis_info));
+        let sub_axis_info = context.stable_hlo_sub_axis_info(2, 4).unwrap();
+        let attribute = context.stable_hlo_axis_ref("x", Some(sub_axis_info)).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.name().as_str().unwrap(), "x");
-        assert_eq!(attribute.sub_axis_info(), Some(sub_axis_info));
+        assert_eq!(attribute.sub_axis_info().unwrap(), Some(sub_axis_info));
 
-        let attribute = context.stable_hlo_axis_ref("y", None);
+        let attribute = context.stable_hlo_axis_ref("y", None).unwrap();
         assert_eq!(attribute.name().as_str().unwrap(), "y");
-        assert_eq!(attribute.sub_axis_info(), None);
+        assert_eq!(attribute.sub_axis_info().unwrap(), None);
     }
 
     #[test]
     fn test_axis_ref_attribute_equality() {
         let context = Context::new();
-        let sub_axis_info = context.stable_hlo_sub_axis_info(2, 4);
+        let sub_axis_info = context.stable_hlo_sub_axis_info(2, 4).unwrap();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_axis_ref("x", Some(sub_axis_info));
-        let attribute_2 = context.stable_hlo_axis_ref("x", Some(sub_axis_info));
+        let attribute_1 = context.stable_hlo_axis_ref("x", Some(sub_axis_info)).unwrap();
+        let attribute_2 = context.stable_hlo_axis_ref("x", Some(sub_axis_info)).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_axis_ref("y", Some(sub_axis_info));
+        let attribute_2 = context.stable_hlo_axis_ref("y", Some(sub_axis_info)).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let sub_axis_info = context.stable_hlo_sub_axis_info(2, 4);
-        let attribute_2 = context.stable_hlo_axis_ref("x", Some(sub_axis_info));
+        let sub_axis_info = context.stable_hlo_sub_axis_info(2, 4).unwrap();
+        let attribute_2 = context.stable_hlo_axis_ref("x", Some(sub_axis_info)).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_axis_ref_attribute_display_and_debug() {
         let context = Context::new();
-        let sub_axis_info = context.stable_hlo_sub_axis_info(2, 4);
-        let attribute = context.stable_hlo_axis_ref("x", Some(sub_axis_info));
+        let sub_axis_info = context.stable_hlo_sub_axis_info(2, 4).unwrap();
+        let attribute = context.stable_hlo_axis_ref("x", Some(sub_axis_info)).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo.axis_ref<name = \"x\", sub_axis_info = (2)4>");
     }
 
     #[test]
     fn test_axis_ref_attribute_casting() {
         let context = Context::new();
-        let sub_axis_info = context.stable_hlo_sub_axis_info(2, 4);
-        let attribute = context.stable_hlo_axis_ref("x", Some(sub_axis_info));
+        let sub_axis_info = context.stable_hlo_sub_axis_info(2, 4).unwrap();
+        let attribute = context.stable_hlo_axis_ref("x", Some(sub_axis_info)).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -549,40 +559,40 @@ mod tests {
     fn test_replica_group_mesh_axes_attribute() {
         let context = Context::new();
         let mesh = context.flat_symbol_ref_attribute("mesh");
-        let axis_x = context.stable_hlo_axis_ref("x", Some(context.stable_hlo_sub_axis_info(2, 4)));
-        let axis_y = context.stable_hlo_axis_ref("y", None);
+        let axis_x = context.stable_hlo_axis_ref("x", Some(context.stable_hlo_sub_axis_info(2, 4).unwrap())).unwrap();
+        let axis_y = context.stable_hlo_axis_ref("y", None).unwrap();
         let axes = context.array_attribute(&[axis_x, axis_y]);
-        let attribute = context.stable_hlo_replica_group_mesh_axes(mesh, axes);
+        let attribute = context.stable_hlo_replica_group_mesh_axes(mesh, axes).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.mesh(), mesh.as_ref());
-        assert_eq!(attribute.axes(), axes);
+        assert_eq!(attribute.mesh().unwrap(), mesh.as_ref());
+        assert_eq!(attribute.axes().unwrap(), axes);
     }
 
     #[test]
     fn test_replica_group_mesh_axes_attribute_equality() {
         let context = Context::new();
         let mesh = context.flat_symbol_ref_attribute("mesh");
-        let axis_x = context.stable_hlo_axis_ref("x", None);
-        let axis_y = context.stable_hlo_axis_ref("y", None);
+        let axis_x = context.stable_hlo_axis_ref("x", None).unwrap();
+        let axis_y = context.stable_hlo_axis_ref("y", None).unwrap();
         let axes = context.array_attribute(&[axis_x, axis_y]);
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_replica_group_mesh_axes(mesh, axes);
-        let attribute_2 = context.stable_hlo_replica_group_mesh_axes(mesh, axes);
+        let attribute_1 = context.stable_hlo_replica_group_mesh_axes(mesh, axes).unwrap();
+        let attribute_2 = context.stable_hlo_replica_group_mesh_axes(mesh, axes).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
         let axes = context.array_attribute(&[axis_x]);
-        let attribute_2 = context.stable_hlo_replica_group_mesh_axes(mesh, axes);
+        let attribute_2 = context.stable_hlo_replica_group_mesh_axes(mesh, axes).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
         let mesh = context.flat_symbol_ref_attribute("mesh");
-        let axis_x = context.stable_hlo_axis_ref("x", None);
-        let axis_y = context.stable_hlo_axis_ref("y", None);
+        let axis_x = context.stable_hlo_axis_ref("x", None).unwrap();
+        let axis_y = context.stable_hlo_axis_ref("y", None).unwrap();
         let axes = context.array_attribute(&[axis_x, axis_y]);
-        let attribute_2 = context.stable_hlo_replica_group_mesh_axes(mesh, axes);
+        let attribute_2 = context.stable_hlo_replica_group_mesh_axes(mesh, axes).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
@@ -590,10 +600,10 @@ mod tests {
     fn test_replica_group_mesh_axes_attribute_display_and_debug() {
         let context = Context::new();
         let mesh = context.flat_symbol_ref_attribute("mesh");
-        let axis_x = context.stable_hlo_axis_ref("x", Some(context.stable_hlo_sub_axis_info(2, 4)));
-        let axis_y = context.stable_hlo_axis_ref("y", None);
+        let axis_x = context.stable_hlo_axis_ref("x", Some(context.stable_hlo_sub_axis_info(2, 4).unwrap())).unwrap();
+        let axis_y = context.stable_hlo_axis_ref("y", None).unwrap();
         let axes = context.array_attribute(&[axis_x, axis_y]);
-        let attribute = context.stable_hlo_replica_group_mesh_axes(mesh, axes);
+        let attribute = context.stable_hlo_replica_group_mesh_axes(mesh, axes).unwrap();
         test_attribute_display_and_debug(
             attribute,
             "#stablehlo.replica_group_mesh_axes<mesh = @mesh, axes = \
@@ -605,16 +615,16 @@ mod tests {
     fn test_replica_group_mesh_axes_attribute_casting() {
         let context = Context::new();
         let mesh = context.flat_symbol_ref_attribute("mesh");
-        let axis = context.stable_hlo_axis_ref("x", None);
+        let axis = context.stable_hlo_axis_ref("x", None).unwrap();
         let axes = context.array_attribute(&[axis]);
-        let attribute = context.stable_hlo_replica_group_mesh_axes(mesh, axes);
+        let attribute = context.stable_hlo_replica_group_mesh_axes(mesh, axes).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_mesh_axis_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_mesh_axis("x", 2);
+        let attribute = context.stable_hlo_mesh_axis("x", 2).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.name().as_str().unwrap(), "x");
         assert_eq!(attribute.size(), 2);
@@ -625,79 +635,79 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_mesh_axis("x", 2);
-        let attribute_2 = context.stable_hlo_mesh_axis("x", 2);
+        let attribute_1 = context.stable_hlo_mesh_axis("x", 2).unwrap();
+        let attribute_2 = context.stable_hlo_mesh_axis("x", 2).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_mesh_axis("y", 2);
+        let attribute_2 = context.stable_hlo_mesh_axis("y", 2).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_mesh_axis("x", 2);
+        let attribute_2 = context.stable_hlo_mesh_axis("x", 2).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_mesh_axis_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_mesh_axis("x", 2);
+        let attribute = context.stable_hlo_mesh_axis("x", 2).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo.mesh_axis<name = \"x\", size = 2>");
     }
 
     #[test]
     fn test_mesh_axis_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_mesh_axis("x", 2);
+        let attribute = context.stable_hlo_mesh_axis("x", 2).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_mesh_attribute() {
         let context = Context::new();
-        let axis_x = context.stable_hlo_mesh_axis("x", 2);
-        let axis_y = context.stable_hlo_mesh_axis("y", 4);
+        let axis_x = context.stable_hlo_mesh_axis("x", 2).unwrap();
+        let axis_y = context.stable_hlo_mesh_axis("y", 4).unwrap();
         let axes = context.array_attribute(&[axis_x, axis_y]);
-        let attribute = context.stable_hlo_mesh(axes, None);
+        let attribute = context.stable_hlo_mesh(axes, None).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.axes(), axes);
-        assert_eq!(attribute.device_ids(), None);
+        assert_eq!(attribute.axes().unwrap(), axes);
+        assert_eq!(attribute.device_ids().unwrap(), None);
     }
 
     #[test]
     fn test_mesh_attribute_equality() {
         let context = Context::new();
-        let axis_x = context.stable_hlo_mesh_axis("x", 2);
-        let axis_y = context.stable_hlo_mesh_axis("y", 4);
+        let axis_x = context.stable_hlo_mesh_axis("x", 2).unwrap();
+        let axis_y = context.stable_hlo_mesh_axis("y", 4).unwrap();
         let axes = context.array_attribute(&[axis_x, axis_y]);
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_mesh(axes, None);
-        let attribute_2 = context.stable_hlo_mesh(axes, None);
+        let attribute_1 = context.stable_hlo_mesh(axes, None).unwrap();
+        let attribute_2 = context.stable_hlo_mesh(axes, None).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
         let axes = context.array_attribute(&[axis_x]);
-        let attribute_2 = context.stable_hlo_mesh(axes, None);
+        let attribute_2 = context.stable_hlo_mesh(axes, None).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let axis_x = context.stable_hlo_mesh_axis("x", 2);
-        let axis_y = context.stable_hlo_mesh_axis("y", 4);
+        let axis_x = context.stable_hlo_mesh_axis("x", 2).unwrap();
+        let axis_y = context.stable_hlo_mesh_axis("y", 4).unwrap();
         let axes = context.array_attribute(&[axis_x, axis_y]);
-        let attribute_2 = context.stable_hlo_mesh(axes, None);
+        let attribute_2 = context.stable_hlo_mesh(axes, None).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_mesh_attribute_display_and_debug() {
         let context = Context::new();
-        let axis_x = context.stable_hlo_mesh_axis("x", 2);
-        let axis_y = context.stable_hlo_mesh_axis("y", 4);
+        let axis_x = context.stable_hlo_mesh_axis("x", 2).unwrap();
+        let axis_y = context.stable_hlo_mesh_axis("y", 4).unwrap();
         let axes = context.array_attribute(&[axis_x, axis_y]);
-        let attribute = context.stable_hlo_mesh(axes, None);
+        let attribute = context.stable_hlo_mesh(axes, None).unwrap();
         test_attribute_display_and_debug(
             attribute,
             "#stablehlo.mesh<axes=[<name = \"x\", size = 2>, <name = \"y\", size = 4>]>",
@@ -707,9 +717,9 @@ mod tests {
     #[test]
     fn test_mesh_attribute_casting() {
         let context = Context::new();
-        let axis = context.stable_hlo_mesh_axis("x", 2);
+        let axis = context.stable_hlo_mesh_axis("x", 2).unwrap();
         let axes = context.array_attribute(&[axis]);
-        let attribute = context.stable_hlo_mesh(axes, None);
+        let attribute = context.stable_hlo_mesh(axes, None).unwrap();
         test_attribute_casting(attribute);
     }
 }
