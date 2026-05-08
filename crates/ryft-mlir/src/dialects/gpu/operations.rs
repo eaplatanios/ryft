@@ -49,7 +49,7 @@ macro_rules! gpu_dimension_operation {
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 /// Returns the GPU dimension queried by this operation.
                 fn dimension(&self) -> Result<Dimension, Error> {
-                    self.attribute(DIMENSION_ATTRIBUTE)
+                    self.attribute(DIMENSION_ATTRIBUTE)?
                         .and_then(|attribute| attribute.cast::<DimensionAttributeRef>())
                         .ok_or_else(|| {
                             Error::invalid_argument(format!(
@@ -84,7 +84,7 @@ macro_rules! gpu_dimension_operation {
                 location: L,
             ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 let context = location.context();
-                context.load_dialect(DialectHandle::gpu()?);
+                context.load_dialect(DialectHandle::gpu()?)?;
                 let builder = OperationBuilder::new($operation_name, location)
                     .add_attribute(DIMENSION_ATTRIBUTE, context.gpu_dimension_attribute(dimension)?)
                     .add_result(context.index_type());
@@ -142,7 +142,7 @@ macro_rules! gpu_upper_bound_index_operation {
                 location: L,
             ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 let context = location.context();
-                context.load_dialect(DialectHandle::gpu()?);
+                context.load_dialect(DialectHandle::gpu()?)?;
                 let builder = OperationBuilder::new($operation_name, location).add_result(context.index_type());
                 let builder = if let Some(upper_bound) = upper_bound {
                     builder.add_attribute(
@@ -282,7 +282,7 @@ pub const WORKGROUP_ATTRIBUTIONS_ATTRIBUTE: &str = "workgroup_attributions";
 pub trait FuncOperation<'o, 'c: 'o, 't: 'c>: Function<'o, 'c, 't> + OneRegion<'o, 'c, 't> {
     /// Returns `true` if this GPU function is a kernel.
     fn is_kernel(&self) -> bool {
-        self.attribute(KERNEL_ATTRIBUTE).is_some()
+        self.has_attribute(KERNEL_ATTRIBUTE)
     }
 
     /// Returns the optional known block size hint.
@@ -375,7 +375,7 @@ pub fn func<'c, 't: 'c, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>
     location: L,
 ) -> Result<DetachedFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.func", location)
         .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
         .add_attribute(
@@ -427,7 +427,7 @@ pub fn dynamic_shared_memory<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     memref_type: T,
     location: L,
 ) -> Result<DetachedDynamicSharedMemoryOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::gpu()?);
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.dynamic_shared_memory", location)
         .add_result(memref_type)
         .build()
@@ -596,7 +596,7 @@ pub fn launch_func<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedLaunchFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let cluster_size = properties.cluster_size.map(|size| size.values());
     let mut segment_sizes = vec![
         properties.async_dependencies.len(),
@@ -815,7 +815,7 @@ pub fn launch<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedLaunchOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let cluster_size = properties.cluster_size.map(|size| size.values());
     let segment_sizes = vec![
         properties.async_dependencies.len(),
@@ -893,7 +893,7 @@ pub fn printf<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedPrintfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.printf", location)
         .add_attribute(FORMAT_ATTRIBUTE, context.string_attribute(format))
         .add_operands(arguments)
@@ -923,7 +923,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     values: &[V],
     location: L,
 ) -> Result<DetachedReturnOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::gpu()?);
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.return", location)
         .add_operands(values)
         .build()
@@ -944,7 +944,7 @@ mlir_op_trait!(Terminator, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`TerminatorOperation`] at the specified [`Location`].
 pub fn terminator<'c, 't: 'c, L: Location<'c, 't>>(location: L) -> Result<DetachedTerminatorOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::gpu()?);
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.terminator", location).build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::terminator`"))
     })
@@ -970,7 +970,7 @@ pub fn r#yield<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     values: &[V],
     location: L,
 ) -> Result<DetachedYieldOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::gpu()?);
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.yield", location)
         .add_operands(values)
         .build()
@@ -996,7 +996,7 @@ pub trait AllReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneReg
     fn operation_kind(&self) -> Result<Option<AllReduceOperationKind>, Error> {
         ({
             let attribute_name = OP_ATTRIBUTE;
-            self.attribute(attribute_name)
+            self.attribute(attribute_name)?
                 .map(|attribute| {
                     attribute.cast::<AllReduceOperationKindAttributeRef>().ok_or_else(|| {
                         Error::invalid_argument(format!(
@@ -1007,14 +1007,14 @@ pub trait AllReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneReg
                     })
                 })
                 .transpose()
-        })?
+        }?)
         .map(|attribute| attribute.value())
         .transpose()
     }
 
     /// Returns `true` if the collective is marked uniform.
     fn is_uniform(&self) -> bool {
-        self.attribute(UNIFORM_ATTRIBUTE).is_some()
+        self.has_attribute(UNIFORM_ATTRIBUTE)
     }
 
     /// Returns the reduction body region.
@@ -1040,7 +1040,7 @@ pub fn all_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
     location: L,
 ) -> Result<DetachedAllReduceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.all_reduce", location).add_operand(value).add_result(result_type);
     if let Some(operation_kind) = operation_kind {
         builder = builder.add_attribute(OP_ATTRIBUTE, context.gpu_all_reduce_operation_kind_attribute(operation_kind)?);
@@ -1068,7 +1068,7 @@ pub trait SubgroupReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the built-in reduction operation kind.
     fn operation_kind(&self) -> Result<AllReduceOperationKind, Error> {
-        self.attribute(OP_ATTRIBUTE)
+        self.attribute(OP_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<AllReduceOperationKindAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -1082,7 +1082,7 @@ pub trait SubgroupReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns `true` if the reduction is marked uniform.
     fn is_uniform(&self) -> bool {
-        self.attribute(UNIFORM_ATTRIBUTE).is_some()
+        self.has_attribute(UNIFORM_ATTRIBUTE)
     }
 
     /// Returns the optional subgroup cluster size.
@@ -1116,7 +1116,7 @@ pub fn subgroup_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c,
     location: L,
 ) -> Result<DetachedSubgroupReduceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_reduce", location)
         .add_operand(value)
         .add_attribute(OP_ATTRIBUTE, context.gpu_all_reduce_operation_kind_attribute(operation_kind)?)
@@ -1163,7 +1163,7 @@ pub trait ShuffleOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the shuffle mode.
     fn mode(&self) -> Result<ShuffleMode, Error> {
-        self.attribute(MODE_ATTRIBUTE)
+        self.attribute(MODE_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<ShuffleModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -1209,7 +1209,7 @@ pub fn shuffle<
     location: L,
 ) -> Result<DetachedShuffleOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.shuffle", location)
         .add_operand(value)
         .add_operand(offset)
@@ -1269,7 +1269,7 @@ pub fn rotate<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedRotateOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.rotate", location)
         .add_operand(value)
         .add_attribute(OFFSET_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), offset as i64))
@@ -1316,7 +1316,7 @@ pub fn barrier<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedBarrierOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.barrier", location);
     if let Some(address_spaces) = address_spaces {
         let address_spaces = address_spaces
@@ -1346,7 +1346,7 @@ pub trait ModuleOperation<'o, 'c: 'o, 't: 'c>:
     }
 
     /// Returns the optional offloading handler attribute.
-    fn offloading_handler(&self) -> Option<AttributeRef<'c, 't>> {
+    fn offloading_handler(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute(OFFLOADING_HANDLER_ATTRIBUTE)
     }
 }
@@ -1373,7 +1373,7 @@ pub fn module<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedModuleOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.module", location)
         .add_attribute(crate::SYMBOL_NAME_ATTRIBUTE, context.string_attribute(name));
     if let Some(targets) = targets {
@@ -1393,7 +1393,7 @@ pub const OBJECTS_ATTRIBUTE: &str = "objects";
 /// GPU binary operation storing serialized GPU object attributes.
 pub trait BinaryOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + Symbol<'o, 'c, 't> {
     /// Returns the optional offloading handler attribute.
-    fn offloading_handler(&self) -> Option<AttributeRef<'c, 't>> {
+    fn offloading_handler(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute(OFFLOADING_HANDLER_ATTRIBUTE)
     }
 
@@ -1417,7 +1417,7 @@ pub fn binary<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedBinaryOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.binary", location)
         .add_attribute(crate::SYMBOL_NAME_ATTRIBUTE, context.string_attribute(name))
         .add_attribute(OBJECTS_ATTRIBUTE, objects);
@@ -1451,7 +1451,7 @@ macro_rules! gpu_one_memref_operand_operation {
                 value: V,
                 location: L,
             ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
-                location.context().load_dialect(DialectHandle::gpu()?);
+                location.context().load_dialect(DialectHandle::gpu()?)?;
                 OperationBuilder::new($operation_name, location)
                     .add_operand(value)
                     .build()
@@ -1509,7 +1509,7 @@ pub fn wait<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedWaitOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.wait", location).add_operands(async_dependencies);
     if is_async {
         builder = builder.add_result(context.gpu_async_token_type()?);
@@ -1546,7 +1546,7 @@ pub trait AllocOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns `true` if the allocation is host shared.
     fn host_shared(&self) -> bool {
-        self.attribute(HOST_SHARED_ATTRIBUTE).is_some()
+        self.has_attribute(HOST_SHARED_ATTRIBUTE)
     }
 
     /// Returns the allocated memref result.
@@ -1575,7 +1575,7 @@ pub fn alloc<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedAllocOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.alloc", location)
         .add_operands(async_dependencies)
         .add_operands(dynamic_sizes)
@@ -1681,7 +1681,7 @@ pub fn dealloc<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedDeallocOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder =
         OperationBuilder::new("gpu.dealloc", location).add_operands(async_dependencies).add_operand(memref);
     if is_async {
@@ -1701,7 +1701,7 @@ pub fn memcpy<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMemcpyOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.memcpy", location)
         .add_operands(async_dependencies)
         .add_operand(destination)
@@ -1723,7 +1723,7 @@ pub fn memset<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMemsetOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.memset", location)
         .add_operands(async_dependencies)
         .add_operand(destination)
@@ -1753,7 +1753,7 @@ pub fn set_default_device<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     device_index: V,
     location: L,
 ) -> Result<DetachedSetDefaultDeviceOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::gpu()?);
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.set_default_device", location)
         .add_operand(device_index)
         .build()
@@ -1789,7 +1789,7 @@ pub trait SubgroupMmaLoadMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 
 
     /// Returns `true` if the load is transposed.
     fn transpose(&self) -> bool {
-        self.attribute(TRANSPOSE_ATTRIBUTE).is_some()
+        self.has_attribute(TRANSPOSE_ATTRIBUTE)
     }
 
     /// Returns the loaded MMA matrix result.
@@ -1813,7 +1813,7 @@ pub fn subgroup_mma_load_matrix<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location
     location: L,
 ) -> Result<DetachedSubgroupMmaLoadMatrixOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_mma_load_matrix", location)
         .add_operand(source_memref)
         .add_operands(indices)
@@ -1853,7 +1853,7 @@ pub trait SubgroupMmaStoreMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c,
 
     /// Returns `true` if the store is transposed.
     fn transpose(&self) -> bool {
-        self.attribute(TRANSPOSE_ATTRIBUTE).is_some()
+        self.has_attribute(TRANSPOSE_ATTRIBUTE)
     }
 }
 
@@ -1871,7 +1871,7 @@ pub fn subgroup_mma_store_matrix<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSubgroupMmaStoreMatrixOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_mma_store_matrix", location)
         .add_operand(source)
         .add_operand(destination_memref)
@@ -1912,12 +1912,12 @@ pub trait SubgroupMmaComputeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't>
 
     /// Returns `true` if operand A is transposed.
     fn a_transpose(&self) -> bool {
-        self.attribute(A_TRANSPOSE_ATTRIBUTE).is_some()
+        self.has_attribute(A_TRANSPOSE_ATTRIBUTE)
     }
 
     /// Returns `true` if operand B is transposed.
     fn b_transpose(&self) -> bool {
-        self.attribute(B_TRANSPOSE_ATTRIBUTE).is_some()
+        self.has_attribute(B_TRANSPOSE_ATTRIBUTE)
     }
 
     /// Returns the result matrix.
@@ -1942,7 +1942,7 @@ pub fn subgroup_mma_compute<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c,
     location: L,
 ) -> Result<DetachedSubgroupMmaComputeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_mma_compute", location)
         .add_operand(a)
         .add_operand(b)
@@ -1986,7 +1986,7 @@ pub fn subgroup_mma_constant_matrix<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Loca
     result_type: T,
     location: L,
 ) -> Result<DetachedSubgroupMmaConstantMatrixOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::gpu()?);
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_constant_matrix", location)
         .add_operand(value)
         .add_result(result_type)
@@ -2028,7 +2028,7 @@ pub fn subgroup_mma_extract_thread_local<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L:
     result_type: T,
     location: L,
 ) -> Result<DetachedSubgroupMmaExtractThreadLocalOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::gpu()?);
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_extract_thread_local", location)
         .add_operand(matrix)
         .add_operands(indices)
@@ -2077,7 +2077,7 @@ pub fn subgroup_mma_insert_thread_local<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: 
     result_type: T,
     location: L,
 ) -> Result<DetachedSubgroupMmaInsertThreadLocalOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::gpu()?);
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_insert_thread_local", location)
         .add_operand(value)
         .add_operand(matrix)
@@ -2103,7 +2103,7 @@ pub trait SubgroupMmaElementwiseOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c,
 
     /// Returns the elementwise operation kind.
     fn operation(&self) -> Result<MmaElementwiseOperation, Error> {
-        self.attribute(OP_TYPE_ATTRIBUTE)
+        self.attribute(OP_TYPE_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MmaElementwiseOperationAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -2134,7 +2134,7 @@ pub fn subgroup_mma_elementwise<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location
     location: L,
 ) -> Result<DetachedSubgroupMmaElementwiseOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_elementwise", location)
         .add_operands(arguments)
         .add_attribute(OP_TYPE_ATTRIBUTE, context.gpu_mma_elementwise_operation_attribute(operation)?)
@@ -2199,7 +2199,7 @@ macro_rules! gpu_sparse_async_operation {
                 location: L,
             ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 let context = location.context();
-                context.load_dialect(DialectHandle::gpu()?);
+                context.load_dialect(DialectHandle::gpu()?)?;
                 let mut builder = OperationBuilder::new($operation_name, location).add_operands(async_dependencies);
                 $(builder = builder.add_operand($method);)*
                 if is_async {
@@ -2274,7 +2274,7 @@ macro_rules! gpu_sparse_create_sp_mat_operation {
                 location: L,
             ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 let context = location.context();
-                context.load_dialect(DialectHandle::gpu()?);
+                context.load_dialect(DialectHandle::gpu()?)?;
                 let mut builder = OperationBuilder::new($operation_name, location)
                     .add_operands(async_dependencies)
                     $(.add_operand($method))+
@@ -2348,7 +2348,7 @@ pub fn create_dn_tensor<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedCreateDnTensorOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.create_dn_tensor", location)
         .add_operands(async_dependencies)
         .add_operand(memref)
@@ -2456,7 +2456,7 @@ pub trait Create2To4SpMatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the pruning flag.
     fn prune_flag(&self) -> Result<Prune2To4SparseMatrixFlag, Error> {
-        self.attribute(PRUNE_FLAG_ATTRIBUTE)
+        self.attribute(PRUNE_FLAG_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<Prune2To4SparseMatrixFlagAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -2499,7 +2499,7 @@ pub fn create_2_to_4_sp_mat<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedCreate2To4SpMatOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.create_2to4_spmat", location)
         .add_operands(async_dependencies)
         .add_operand(rows)
@@ -2552,7 +2552,7 @@ pub trait SpmvBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_A_ATTRIBUTE)
+        self.attribute(MODE_A_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -2611,7 +2611,7 @@ pub fn spmv_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>
     location: L,
 ) -> Result<DetachedSpmvBufferSizeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmv_buffer_size", location)
         .add_operands(async_dependencies)
         .add_operand(sparse_matrix_a)
@@ -2648,7 +2648,7 @@ pub trait SpmvOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_A_ATTRIBUTE)
+        self.attribute(MODE_A_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -2708,7 +2708,7 @@ pub fn spmv<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSpmvOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmv", location)
         .add_operands(async_dependencies)
         .add_operand(sparse_matrix_a)
@@ -2746,7 +2746,7 @@ pub trait SpmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_A_ATTRIBUTE)
+        self.attribute(MODE_A_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -2760,7 +2760,7 @@ pub trait SpmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns dense matrix B transpose mode.
     fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_B_ATTRIBUTE)
+        self.attribute(MODE_B_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -2832,7 +2832,7 @@ pub fn spmm_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>
     location: L,
 ) -> Result<DetachedSpmmBufferSizeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmm_buffer_size", location)
         .add_operands(async_dependencies)
         .add_operand(sparse_matrix_a)
@@ -2868,7 +2868,7 @@ pub trait SpmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_A_ATTRIBUTE)
+        self.attribute(MODE_A_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -2882,7 +2882,7 @@ pub trait SpmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns dense matrix B transpose mode.
     fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_B_ATTRIBUTE)
+        self.attribute(MODE_B_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -2969,7 +2969,7 @@ pub fn spmm<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSpmmOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmm", location)
         .add_operands(async_dependencies)
         .add_operand(sparse_matrix_a)
@@ -3009,7 +3009,7 @@ pub trait SddmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns dense matrix A transpose mode.
     fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_A_ATTRIBUTE)
+        self.attribute(MODE_A_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -3023,7 +3023,7 @@ pub trait SddmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns dense matrix B transpose mode.
     fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_B_ATTRIBUTE)
+        self.attribute(MODE_B_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -3083,7 +3083,7 @@ pub fn sddmm_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't
     location: L,
 ) -> Result<DetachedSddmmBufferSizeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.sddmm_buffer_size", location)
         .add_operands(async_dependencies)
         .add_operand(dense_matrix_a)
@@ -3121,7 +3121,7 @@ pub trait SddmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns dense matrix A transpose mode.
     fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_A_ATTRIBUTE)
+        self.attribute(MODE_A_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -3135,7 +3135,7 @@ pub trait SddmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns dense matrix B transpose mode.
     fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_B_ATTRIBUTE)
+        self.attribute(MODE_B_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -3196,7 +3196,7 @@ pub fn sddmm<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSddmmOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.sddmm", location)
         .add_operands(async_dependencies)
         .add_operand(dense_matrix_a)
@@ -3252,7 +3252,7 @@ pub fn sp_gemm_create_descr<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSpGemmCreateDescrOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spgemm_create_descr", location)
         .add_operands(async_dependencies)
         .add_result(context.gpu_sparse_sp_gemm_operation_handle_type()?);
@@ -3300,7 +3300,7 @@ pub trait SpGemmWorkEstimationOrComputeOperation<'o, 'c: 'o, 't: 'c>: Operation<
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_A_ATTRIBUTE)
+        self.attribute(MODE_A_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -3314,7 +3314,7 @@ pub trait SpGemmWorkEstimationOrComputeOperation<'o, 'c: 'o, 't: 'c>: Operation<
 
     /// Returns sparse matrix B transpose mode.
     fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_B_ATTRIBUTE)
+        self.attribute(MODE_B_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -3358,7 +3358,7 @@ pub trait SpGemmWorkEstimationOrComputeOperation<'o, 'c: 'o, 't: 'c>: Operation<
 
     /// Returns the SpGEMM work kind.
     fn kind(&self) -> Result<SpGemmWorkKind, Error> {
-        self.attribute(KIND_ATTRIBUTE)
+        self.attribute(KIND_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<SpGemmWorkKindAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -3402,7 +3402,7 @@ pub fn sp_gemm_work_estimation_or_compute<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L
     location: L,
 ) -> Result<DetachedSpGemmWorkEstimationOrComputeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spgemm_work_estimation_or_compute", location)
         .add_operands(async_dependencies)
         .add_operand(descriptor)
@@ -3444,7 +3444,7 @@ pub trait SpGemmCopyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix A transpose mode.
     fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_A_ATTRIBUTE)
+        self.attribute(MODE_A_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -3458,7 +3458,7 @@ pub trait SpGemmCopyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix B transpose mode.
     fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
-        self.attribute(MODE_B_ATTRIBUTE)
+        self.attribute(MODE_B_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -3519,7 +3519,7 @@ pub fn sp_gemm_copy<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSpGemmCopyOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spgemm_copy", location)
         .add_operands(async_dependencies)
         .add_operand(descriptor)
@@ -3591,7 +3591,7 @@ pub fn sp_mat_get_size<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSpMatGetSizeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmat_get_size", location)
         .add_operands(async_dependencies)
         .add_operand(sparse_matrix)
@@ -3662,7 +3662,7 @@ pub fn warp_execute_on_lane_0<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedWarpExecuteOnLane0Operation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.warp_execute_on_lane_0", location)
         .add_operand(lane_id)
         .add_operands(arguments)
@@ -3694,7 +3694,7 @@ pub trait SubgroupBroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> 
 
     /// Returns the broadcast type.
     fn broadcast_type(&self) -> Result<BroadcastType, Error> {
-        self.attribute(BROADCAST_TYPE_ATTRIBUTE)
+        self.attribute(BROADCAST_TYPE_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<BroadcastTypeAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
@@ -3725,7 +3725,7 @@ pub fn subgroup_broadcast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSubgroupBroadcastOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu()?);
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_broadcast", location)
         .add_operand(source)
         .add_attribute(BROADCAST_TYPE_ATTRIBUTE, context.gpu_broadcast_type_attribute(broadcast_type)?)
@@ -3765,7 +3765,7 @@ pub fn ballot<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Loca
     result_type: T,
     location: L,
 ) -> Result<DetachedBallotOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::gpu()?);
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.ballot", location)
         .add_operand(predicate)
         .add_result(result_type)
@@ -3933,7 +3933,7 @@ mod tests {
         assert_eq!(operation.known_grid_size().unwrap(), Some(vec![4, 5, 6]));
         assert_eq!(operation.known_cluster_size().unwrap(), Some(vec![7, 8, 9]));
         assert_eq!(operation.workgroup_attribution_count().unwrap(), 2);
-        assert_eq!(operation.body().unwrap().blocks().count(), 0);
+        assert_eq!(operation.body().unwrap().blocks().unwrap().count(), 0);
     }
 
     #[test]
@@ -4038,7 +4038,7 @@ mod tests {
         assert_eq!(operation.module_symbol().unwrap(), Some(module));
         assert_eq!(operation.function_symbol().unwrap(), Some(function));
         assert_eq!(operation.workgroup_attribution_count().unwrap(), 2);
-        assert_eq!(operation.body().unwrap().blocks().count(), 0);
+        assert_eq!(operation.body().unwrap().blocks().unwrap().count(), 0);
         assert!(operation.async_token().unwrap().is_some());
     }
 
@@ -4111,7 +4111,7 @@ mod tests {
         assert_eq!(operation.value().unwrap(), value);
         assert_eq!(operation.operation_kind().unwrap(), Some(AllReduceOperationKind::Add));
         assert!(operation.is_uniform());
-        assert_eq!(operation.body().unwrap().blocks().count(), 0);
+        assert_eq!(operation.body().unwrap().blocks().unwrap().count(), 0);
         assert_eq!(operation.result_count(), 1);
     }
 
@@ -4194,8 +4194,8 @@ mod tests {
 
         assert_eq!(operation.name().as_str(), Ok("gpu.module"));
         assert_eq!(operation.targets().unwrap(), Some(targets));
-        assert_eq!(operation.offloading_handler(), Some(offloading_handler));
-        assert_eq!(operation.region(0).unwrap().blocks().count(), 0);
+        assert_eq!(operation.offloading_handler().unwrap(), Some(offloading_handler));
+        assert_eq!(operation.region(0).unwrap().blocks().unwrap().count(), 0);
     }
 
     #[test]
@@ -4210,7 +4210,7 @@ mod tests {
 
         assert_eq!(operation.name().as_str(), Ok("gpu.binary"));
         assert_eq!(operation.objects().unwrap(), objects);
-        assert_eq!(operation.offloading_handler(), Some(offloading_handler));
+        assert_eq!(operation.offloading_handler().unwrap(), Some(offloading_handler));
     }
 
     #[test]
@@ -5077,7 +5077,7 @@ mod tests {
         assert_eq!(operation.warp_size().unwrap().signless_value(), 32);
         assert_eq!(operation.arguments().unwrap(), vec![argument_0, argument_1]);
         assert_eq!(operation.outputs().unwrap().len(), 2);
-        assert_eq!(operation.as_ref().region(0).unwrap().blocks().count(), 0);
+        assert_eq!(operation.as_ref().region(0).unwrap().blocks().unwrap().count(), 0);
     }
 
     #[test]

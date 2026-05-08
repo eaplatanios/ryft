@@ -36,7 +36,7 @@ pub fn file<'c, 't: 'c, I: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>
     location: L,
 ) -> Result<DetachedFileOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.file", location)
         .add_attribute(FILE_ID_ATTRIBUTE, id.try_into_with_context(context)?)
         .add_region(body)
@@ -101,7 +101,7 @@ pub fn address_of<
     location: L,
 ) -> Result<DetachedAddressOfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.address_of", location)
         .add_operand(reference)
         .add_result(result_type)
@@ -137,7 +137,7 @@ pub fn add<
     location: L,
 ) -> Result<DetachedAddOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.add", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
@@ -181,7 +181,7 @@ pub fn apply<
     location: L,
 ) -> Result<DetachedApplyOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.apply", location)
         .add_attribute(APPLICABLE_OPERATOR_ATTRIBUTE, applicable_operator.try_into_with_context(context)?)
         .add_operand(operand)
@@ -218,7 +218,7 @@ pub fn bitwise_and<
     location: L,
 ) -> Result<DetachedBitwiseAndOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_and", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
@@ -256,7 +256,7 @@ pub fn bitwise_left_shift<
     location: L,
 ) -> Result<DetachedBitwiseLeftShiftOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_left_shift", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
@@ -292,7 +292,7 @@ pub fn bitwise_not<
     location: L,
 ) -> Result<DetachedBitwiseNotOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_not", location)
         .add_operand(operand)
         .add_result(result_type)
@@ -330,7 +330,7 @@ pub fn bitwise_or<
     location: L,
 ) -> Result<DetachedBitwiseOrOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_or", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
@@ -366,7 +366,7 @@ pub fn bitwise_right_shift<
     location: L,
 ) -> Result<DetachedBitwiseRightShiftOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_right_shift", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
@@ -404,7 +404,7 @@ pub fn bitwise_xor<
     location: L,
 ) -> Result<DetachedBitwiseXorOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_xor", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
@@ -477,7 +477,7 @@ pub fn call_opaque<
     location: L,
 ) -> Result<DetachedCallOpaqueOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.call_opaque", location)
         .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)
         .add_operands(operands)
@@ -519,7 +519,7 @@ pub fn cast<
     location: L,
 ) -> Result<DetachedCastOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.cast", location)
         .add_operand(source)
         .add_result(result_type)
@@ -536,13 +536,13 @@ pub const CMP_PREDICATE_ATTRIBUTE: &str = "predicate";
 pub trait CmpOperation<'o, 'c: 'o, 't: 'c>: BinaryExpressionOperation<'o, 'c, 't> {
     /// Returns the comparison predicate.
     fn predicate(&self) -> Result<CmpPredicate, Error> {
-        self.attribute(CMP_PREDICATE_ATTRIBUTE)
+        self.attribute(CMP_PREDICATE_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<CmpPredicateAttributeRef>())
             .ok_or_else(|| {
                 Error::invalid_argument(format!(
                     "missing or invalid `{}` attribute in `{}`",
                     CMP_PREDICATE_ATTRIBUTE,
-                    self.name().as_str().unwrap_or("<unknown>")
+                    self.name().as_str().unwrap_or("<unknown>"),
                 ))
             })?
             .value()
@@ -573,7 +573,7 @@ pub fn cmp<
     location: L,
 ) -> Result<DetachedCmpOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.cmp", location)
         .add_attribute(CMP_PREDICATE_ATTRIBUTE, context.emit_c_cmp_predicate_attribute(predicate)?)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
@@ -591,11 +591,11 @@ pub const VALUE_ATTRIBUTE: &str = "value";
 pub trait ConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the constant value attribute.
     fn value(&self) -> Result<AttributeRef<'c, 't>, Error> {
-        self.attribute(VALUE_ATTRIBUTE).and_then(|attribute| attribute.cast()).ok_or_else(|| {
+        self.attribute(VALUE_ATTRIBUTE)?.ok_or_else(|| {
             Error::invalid_argument(format!(
-                "missing or invalid `{}` attribute in `{}`",
+                "missing `{}` attribute in `{}`",
                 VALUE_ATTRIBUTE,
-                self.name().as_str().unwrap_or("<unknown>")
+                self.name().as_str().unwrap_or("<unknown>"),
             ))
         })
     }
@@ -620,7 +620,7 @@ pub fn constant<'c, 't: 'c, A: Attribute<'c, 't>, ResultType: Type<'c, 't>, L: L
     location: L,
 ) -> Result<DetachedConstantOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.constant", location)
         .add_attribute(VALUE_ATTRIBUTE, value)
         .add_result(result_type)
@@ -654,7 +654,7 @@ pub fn dereference<
     location: L,
 ) -> Result<DetachedDereferenceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.dereference", location)
         .add_operand(pointer)
         .add_result(result_type)
@@ -692,7 +692,7 @@ pub fn div<
     location: L,
 ) -> Result<DetachedDivOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.div", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
@@ -744,7 +744,7 @@ pub fn expression<'definition, 'c: 'definition, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedExpressionOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.expression", location)
         .add_operands(definitions)
         .add_result(result_type)
@@ -803,7 +803,7 @@ pub fn r#for<
     location: L,
 ) -> Result<DetachedForOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.for", location)
         .add_operands(&[lower_bound.as_ref(), upper_bound.as_ref(), step.as_ref()])
         .add_region(region)
@@ -851,7 +851,7 @@ pub fn call<
     location: L,
 ) -> Result<DetachedCallOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.call", location)
         .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)
         .add_operands(operands)
@@ -890,7 +890,7 @@ pub fn declare_func<
     location: L,
 ) -> Result<DetachedDeclareFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.declare_func", location)
         .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
         .build()
@@ -963,7 +963,7 @@ pub fn func<'c, 't: 'c, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>
     location: L,
 ) -> Result<DetachedFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.func", location)
         .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
         .add_attribute(FUNCTION_TYPE_ATTRIBUTE, context.type_attribute(function_type))
@@ -1001,7 +1001,7 @@ pub fn r#return<'value, 'c: 'value, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedReturnOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.return", location);
     if let Some(value) = value {
         builder = builder.add_operand(value);
@@ -1041,7 +1041,7 @@ pub fn include<'c, 't: 'c, I: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 
     location: L,
 ) -> Result<DetachedIncludeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.include", location)
         .add_attribute(INCLUDE_ATTRIBUTE, include.try_into_with_context(context)?);
     if is_standard_include {
@@ -1084,7 +1084,7 @@ pub fn literal<
     location: L,
 ) -> Result<DetachedLiteralOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.literal", location)
         .add_attribute(VALUE_ATTRIBUTE, value.try_into_with_context(context)?)
         .add_result(result_type)
@@ -1118,7 +1118,7 @@ pub fn logical_and<
     location: L,
 ) -> Result<DetachedLogicalAndOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let result_type = context.signless_integer_type(1);
     OperationBuilder::new("emitc.logical_and", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
@@ -1147,7 +1147,7 @@ pub fn logical_not<'operand, 'c: 'operand, 't: 'c, Operand: Value<'operand, 'c, 
     location: L,
 ) -> Result<DetachedLogicalNotOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let result_type = context.signless_integer_type(1);
     OperationBuilder::new("emitc.logical_not", location)
         .add_operand(operand)
@@ -1184,7 +1184,7 @@ pub fn logical_or<
     location: L,
 ) -> Result<DetachedLogicalOrOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let result_type = context.signless_integer_type(1);
     OperationBuilder::new("emitc.logical_or", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
@@ -1219,7 +1219,7 @@ pub fn load<
     location: L,
 ) -> Result<DetachedLoadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.load", location)
         .add_operand(operand)
         .add_result(result_type)
@@ -1255,7 +1255,7 @@ pub fn mul<
     location: L,
 ) -> Result<DetachedMulOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.mul", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
@@ -1291,7 +1291,7 @@ pub fn rem<
     location: L,
 ) -> Result<DetachedRemOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.rem", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
@@ -1327,7 +1327,7 @@ pub fn sub<
     location: L,
 ) -> Result<DetachedSubOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.sub", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
@@ -1371,7 +1371,7 @@ pub fn member<
     location: L,
 ) -> Result<DetachedMemberOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.member", location)
         .add_attribute(MEMBER_ATTRIBUTE, member.try_into_with_context(context)?)
         .add_operand(operand)
@@ -1413,7 +1413,7 @@ pub fn member_of_ptr<
     location: L,
 ) -> Result<DetachedMemberOfPtrOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.member_of_ptr", location)
         .add_attribute(MEMBER_ATTRIBUTE, member.try_into_with_context(context)?)
         .add_operand(operand)
@@ -1474,7 +1474,7 @@ pub fn conditional<
     location: L,
 ) -> Result<DetachedConditionalOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.conditional", location)
         .add_operands(&[condition.as_ref(), true_value.as_ref(), false_value.as_ref()])
         .add_result(result_type)
@@ -1510,7 +1510,7 @@ pub fn unary_minus<
     location: L,
 ) -> Result<DetachedUnaryMinusOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.unary_minus", location)
         .add_operand(operand)
         .add_result(result_type)
@@ -1546,7 +1546,7 @@ pub fn unary_plus<
     location: L,
 ) -> Result<DetachedUnaryPlusOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.unary_plus", location)
         .add_operand(operand)
         .add_result(result_type)
@@ -1560,11 +1560,11 @@ pub fn unary_plus<
 pub trait VariableOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the initial value attribute.
     fn value(&self) -> Result<AttributeRef<'c, 't>, Error> {
-        self.attribute(VALUE_ATTRIBUTE).and_then(|attribute| attribute.cast()).ok_or_else(|| {
+        self.attribute(VALUE_ATTRIBUTE)?.ok_or_else(|| {
             Error::invalid_argument(format!(
-                "missing or invalid `{}` attribute in `{}`",
+                "missing `{}` attribute in `{}`",
                 VALUE_ATTRIBUTE,
-                self.name().as_str().unwrap_or("<unknown>")
+                self.name().as_str().unwrap_or("<unknown>"),
             ))
         })
     }
@@ -1588,7 +1588,7 @@ pub fn variable<'c, 't: 'c, A: Attribute<'c, 't>, ResultType: Type<'c, 't>, L: L
     location: L,
 ) -> Result<DetachedVariableOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.variable", location)
         .add_attribute(VALUE_ATTRIBUTE, value)
         .add_result(result_type)
@@ -1626,7 +1626,7 @@ pub trait GlobalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the optional initial value.
-    fn initial_value(&self) -> Option<AttributeRef<'c, 't>> {
+    fn initial_value(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute(INITIAL_VALUE_ATTRIBUTE)
     }
 
@@ -1669,7 +1669,7 @@ pub fn global<
     location: L,
 ) -> Result<DetachedGlobalOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.global", location)
         .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
         .add_attribute(TYPE_ATTRIBUTE, context.type_attribute(r#type));
@@ -1725,7 +1725,7 @@ pub fn get_global<
     location: L,
 ) -> Result<DetachedGetGlobalOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.get_global", location)
         .add_attribute(NAME_ATTRIBUTE, name.try_into_with_context(context)?)
         .add_result(result_type)
@@ -1765,7 +1765,7 @@ pub fn verbatim<
     location: L,
 ) -> Result<DetachedVerbatimOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.verbatim", location)
         .add_attribute(VALUE_ATTRIBUTE, value.try_into_with_context(context)?)
         .add_operands(format_arguments)
@@ -1807,7 +1807,7 @@ pub fn assign<
     location: L,
 ) -> Result<DetachedAssignOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.assign", location)
         .add_operands(&[variable.as_ref(), value.as_ref()])
         .build()
@@ -1834,7 +1834,7 @@ pub fn r#yield<'value, 'c: 'value, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedYieldOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.yield", location);
     if let Some(value) = value {
         builder = builder.add_operand(value);
@@ -1873,7 +1873,7 @@ pub fn r#if<'condition, 'c: 'condition, 't: 'c, Condition: Value<'condition, 'c,
     location: L,
 ) -> Result<DetachedIfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.if", location)
         .add_operand(condition)
         .add_regions(vec![then_region, else_region])
@@ -1922,7 +1922,7 @@ pub fn subscript<
     location: L,
 ) -> Result<DetachedSubscriptOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.subscript", location)
         .add_operand(value)
         .add_operands(indices)
@@ -1971,7 +1971,7 @@ pub fn switch<'argument, 'c: 'argument, 't: 'c, Argument: Value<'argument, 'c, '
     location: L,
 ) -> Result<DetachedSwitchOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut regions = vec![default_region];
     regions.extend(case_regions);
     OperationBuilder::new("emitc.switch", location)
@@ -2021,7 +2021,7 @@ pub fn class<'c, 't: 'c, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't
     location: L,
 ) -> Result<DetachedClassOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.class", location)
         .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
         .add_region(body);
@@ -2046,7 +2046,7 @@ pub trait FieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the optional initial value.
-    fn initial_value(&self) -> Option<AttributeRef<'c, 't>> {
+    fn initial_value(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute(INITIAL_VALUE_ATTRIBUTE)
     }
 }
@@ -2071,7 +2071,7 @@ pub fn field<
     location: L,
 ) -> Result<DetachedFieldOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.field", location)
         .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
         .add_attribute(TYPE_ATTRIBUTE, context.type_attribute(r#type));
@@ -2118,7 +2118,7 @@ pub fn get_field<
     location: L,
 ) -> Result<DetachedGetFieldOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.get_field", location)
         .add_attribute(FIELD_NAME_ATTRIBUTE, field_name.try_into_with_context(context)?)
         .add_result(result_type)
@@ -2151,7 +2151,7 @@ pub fn r#do<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedDoOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?);
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.do", location).add_regions(vec![body, condition]).build().and_then(
         |operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::do`"))
@@ -2177,7 +2177,7 @@ mod tests {
         body.append_operation(include("stdint.h", true, location).unwrap()).unwrap();
         let op = file("generated.cc", body.try_into().unwrap(), location).unwrap();
         assert_eq!(op.id().unwrap().as_str().unwrap(), "generated.cc");
-        assert_eq!(op.body().unwrap().blocks().count(), 1);
+        assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
         module.body().unwrap().append_operation(op).unwrap();
         assert!(module.verify().unwrap());
         assert_eq!(
@@ -2846,7 +2846,7 @@ mod tests {
                 assert_eq!(op.definitions().unwrap(), vec![lhs.as_ref(), rhs.as_ref()]);
                 assert!(op.do_not_inline());
                 assert_eq!(op.output().unwrap().r#type().unwrap(), i32_type.as_ref());
-                assert_eq!(op.body().unwrap().blocks().count(), 1);
+                assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
                 let op = block.append_operation(op).unwrap();
                 block
                     .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
@@ -2898,7 +2898,7 @@ mod tests {
                 assert_eq!(op.lower_bound().unwrap(), lower_bound);
                 assert_eq!(op.upper_bound().unwrap(), upper_bound);
                 assert_eq!(op.step().unwrap(), step);
-                assert_eq!(op.body().unwrap().blocks().count(), 1);
+                assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
                 block.append_operation(op).unwrap();
                 block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
                 func("for", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
@@ -3018,7 +3018,7 @@ mod tests {
         assert_eq!(op.symbol_name().unwrap().as_str().unwrap(), "empty");
         assert_eq!(op.function_type().unwrap(), function_type);
         assert_eq!(op.specifiers().unwrap().unwrap().len(), 1);
-        assert_eq!(op.body().unwrap().blocks().count(), 1);
+        assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
         module.body().unwrap().append_operation(op).unwrap();
         assert!(module.verify().unwrap());
         assert_eq!(
@@ -3683,7 +3683,7 @@ mod tests {
         let op = global("counter", i32_type, Some(initial_value), false, true, true, location).unwrap();
         assert_eq!(op.symbol_name().unwrap().as_str().unwrap(), "counter");
         assert_eq!(op.r#type().unwrap(), i32_type.as_ref());
-        assert_eq!(op.initial_value(), Some(initial_value));
+        assert_eq!(op.initial_value().unwrap(), Some(initial_value));
         assert!(!op.extern_specifier());
         assert!(op.static_specifier());
         assert!(op.const_specifier());
@@ -3903,8 +3903,8 @@ mod tests {
                 let op = r#if(condition, then_region.try_into().unwrap(), else_region.try_into().unwrap(), location)
                     .unwrap();
                 assert_eq!(op.condition().unwrap(), condition);
-                assert_eq!(op.then_region().unwrap().blocks().count(), 1);
-                assert_eq!(op.else_region().unwrap().blocks().count(), 1);
+                assert_eq!(op.then_region().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.else_region().unwrap().blocks().unwrap().count(), 1);
                 block.append_operation(op).unwrap();
                 block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
                 func("if", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
@@ -4004,7 +4004,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(op.argument().unwrap(), argument);
                 assert_eq!(op.cases().unwrap().values().collect::<Vec<_>>(), vec![1]);
-                assert_eq!(op.default_region().unwrap().blocks().count(), 1);
+                assert_eq!(op.default_region().unwrap().blocks().unwrap().count(), 1);
                 assert_eq!(op.case_regions().unwrap().len(), 1);
                 block.append_operation(op).unwrap();
                 block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
@@ -4042,7 +4042,7 @@ mod tests {
         let op = class("Box", true, body.try_into().unwrap(), location).unwrap();
         assert_eq!(op.symbol_name().unwrap().as_str().unwrap(), "Box");
         assert!(op.final_specifier());
-        assert_eq!(op.body().unwrap().blocks().count(), 1);
+        assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
         module.body().unwrap().append_operation(op).unwrap();
         assert!(module.verify().unwrap());
         assert_eq!(
@@ -4068,7 +4068,7 @@ mod tests {
         let op = field("value", i32_type, Some(initial_value), location).unwrap();
         assert_eq!(op.symbol_name().unwrap().as_str().unwrap(), "value");
         assert_eq!(op.r#type().unwrap(), i32_type.as_ref());
-        assert_eq!(op.initial_value(), Some(initial_value));
+        assert_eq!(op.initial_value().unwrap(), Some(initial_value));
         body.append_operation(op).unwrap();
         module
             .body()
@@ -4167,8 +4167,8 @@ mod tests {
                     .unwrap();
 
                 let op = r#do(body.try_into().unwrap(), condition.try_into().unwrap(), location).unwrap();
-                assert_eq!(op.body().unwrap().blocks().count(), 1);
-                assert_eq!(op.condition().unwrap().blocks().count(), 1);
+                assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.condition().unwrap().blocks().unwrap().count(), 1);
                 block.append_operation(op).unwrap();
                 block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
                 func("do", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()

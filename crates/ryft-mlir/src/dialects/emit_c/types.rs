@@ -64,17 +64,21 @@ impl ArrayTypeRef<'_, '_> {
     pub fn element_type(&self) -> Result<TypeRef<'_, '_>, Error> {
         unsafe {
             TypeRef::from_c_api(mlirShapedTypeGetElementType(self.handle), self.context)
-                .ok_or_else(|| Error::internal("invalid EmitC array element type"))
+                .map_err(|_| Error::internal("invalid EmitC array element type"))
         }
     }
 }
 
 impl<'c, 't> Type<'c, 't> for ArrayTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
-        if unsafe { mlirTypeIsAEmitCArrayType(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirTypeIsAEmitCArrayType(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR type handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -113,11 +117,15 @@ impl LValueTypeRef<'_, '_> {
 }
 
 impl<'c, 't> Type<'c, 't> for LValueTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
-        if unsafe { mlirTypeIsAEmitCLValueType(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirTypeIsAEmitCLValueType(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR type handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -152,11 +160,15 @@ impl OpaqueTypeRef<'_, '_> {
 }
 
 impl<'c, 't> Type<'c, 't> for OpaqueTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
-        if unsafe { mlirTypeIsAEmitCOpaqueType(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirTypeIsAEmitCOpaqueType(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR type handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -191,11 +203,15 @@ impl PointerTypeRef<'_, '_> {
 }
 
 impl<'c, 't> Type<'c, 't> for PointerTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
-        if unsafe { mlirTypeIsAEmitCPointerType(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirTypeIsAEmitCPointerType(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR type handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -234,11 +250,11 @@ macro_rules! emit_c_context_type {
         }
 
         impl<'c, 't> Type<'c, 't> for $name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR type handle"));
                 }
-                if unsafe { $is_a(handle) } { Some(Self { handle, context }) } else { None }
+                if unsafe { $is_a(handle) } { Ok(Self { handle, context }) } else { Err(Error::invalid_argument("expected MLIR type handle")) }
             }
 
             unsafe fn to_c_api(&self) -> MlirType {
@@ -288,7 +304,7 @@ impl<'t> Context<'t> {
         element_type: T,
         shape: &[usize],
     ) -> Result<ArrayTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::emit_c()?);
+        self.load_dialect(DialectHandle::emit_c()?)?;
         let mut shape = shape
             .iter()
             .map(|dimension| {
@@ -301,64 +317,64 @@ impl<'t> Context<'t> {
                 mlirEmitCArrayTypeGet(shape.len().cast_signed(), shape.as_mut_ptr(), element_type.to_c_api()),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::emit_c_array_type`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::emit_c_array_type`"))
         }
     }
 
     /// Creates a new Emit-C [`LValueTypeRef`] owned by this [`Context`].
     pub fn emit_c_lvalue_type<'c, T: Type<'c, 't>>(&'c self, value_type: T) -> Result<LValueTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::emit_c()?);
+        self.load_dialect(DialectHandle::emit_c()?)?;
         unsafe {
             LValueTypeRef::from_c_api(mlirEmitCLValueTypeGet(value_type.to_c_api()), self)
-                .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::emit_c_lvalue_type`"))
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::emit_c_lvalue_type`"))
         }
     }
 
     /// Creates a new Emit-C [`OpaqueTypeRef`] owned by this [`Context`].
     pub fn emit_c_opaque_type<'c, S: AsRef<str>>(&'c self, value: S) -> Result<OpaqueTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::emit_c()?);
+        self.load_dialect(DialectHandle::emit_c()?)?;
         unsafe {
             OpaqueTypeRef::from_c_api(
                 mlirEmitCOpaqueTypeGet(*self.handle.borrow(), StringRef::from(value.as_ref()).to_c_api()),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::emit_c_opaque_type`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::emit_c_opaque_type`"))
         }
     }
 
     /// Creates a new Emit-C [`PointerTypeRef`] owned by this [`Context`].
     pub fn emit_c_pointer_type<'c, T: Type<'c, 't>>(&'c self, pointee: T) -> Result<PointerTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::emit_c()?);
+        self.load_dialect(DialectHandle::emit_c()?)?;
         unsafe {
             PointerTypeRef::from_c_api(mlirEmitCPointerTypeGet(pointee.to_c_api()), self)
-                .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::emit_c_pointer_type`"))
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::emit_c_pointer_type`"))
         }
     }
 
     /// Creates a new Emit-C [`SignedSizeTTypeRef`] owned by this [`Context`].
     pub fn emit_c_signed_size_t_type<'c>(&'c self) -> Result<SignedSizeTTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::emit_c()?);
+        self.load_dialect(DialectHandle::emit_c()?)?;
         unsafe {
             SignedSizeTTypeRef::from_c_api(mlirEmitCSignedSizeTTypeGet(*self.handle.borrow()), self)
-                .ok_or_else(|| Error::internal("invalid EmitC signed size type"))
+                .map_err(|_| Error::internal("invalid EmitC signed size type"))
         }
     }
 
     /// Creates a new Emit-C [`PtrDiffTTypeRef`] owned by this [`Context`].
     pub fn emit_c_ptrdiff_t_type<'c>(&'c self) -> Result<PtrDiffTTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::emit_c()?);
+        self.load_dialect(DialectHandle::emit_c()?)?;
         unsafe {
             PtrDiffTTypeRef::from_c_api(mlirEmitCPtrDiffTTypeGet(*self.handle.borrow()), self)
-                .ok_or_else(|| Error::internal("invalid EmitC pointer difference type"))
+                .map_err(|_| Error::internal("invalid EmitC pointer difference type"))
         }
     }
 
     /// Creates a new Emit-C [`SizeTTypeRef`] owned by this [`Context`].
     pub fn emit_c_size_t_type<'c>(&'c self) -> Result<SizeTTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::emit_c()?);
+        self.load_dialect(DialectHandle::emit_c()?)?;
         unsafe {
             SizeTTypeRef::from_c_api(mlirEmitCSizeTTypeGet(*self.handle.borrow()), self)
-                .ok_or_else(|| Error::internal("invalid EmitC size type"))
+                .map_err(|_| Error::internal("invalid EmitC size type"))
         }
     }
 }

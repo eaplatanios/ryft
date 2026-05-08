@@ -51,23 +51,23 @@ impl CmpPredicate {
     }
 
     /// Constructs a [`CmpPredicate`] from its MLIR C API representation.
-    pub fn from_c_api(value: MlirEmitCCmpPredicate) -> Option<Self> {
+    pub fn from_c_api(value: MlirEmitCCmpPredicate) -> Result<Self, Error> {
         if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_EQ {
-            Some(Self::Equal)
+            Ok(Self::Equal)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_NE {
-            Some(Self::NotEqual)
+            Ok(Self::NotEqual)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_LT {
-            Some(Self::LessThan)
+            Ok(Self::LessThan)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_LE {
-            Some(Self::LessThanOrEqual)
+            Ok(Self::LessThanOrEqual)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_GT {
-            Some(Self::GreaterThan)
+            Ok(Self::GreaterThan)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_GE {
-            Some(Self::GreaterThanOrEqual)
+            Ok(Self::GreaterThanOrEqual)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_THREE_WAY {
-            Some(Self::ThreeWay)
+            Ok(Self::ThreeWay)
         } else {
-            None
+            Err(Error::invalid_argument("invalid MLIR Emit-C comparison predicate value"))
         }
     }
 
@@ -99,16 +99,20 @@ impl CmpPredicateAttributeRef<'_, '_> {
     /// Returns the comparison predicate stored by this attribute.
     pub fn value(&self) -> Result<CmpPredicate, Error> {
         CmpPredicate::from_c_api(unsafe { mlirEmitCCmpPredicateAttrGetValue(self.handle) })
-            .ok_or_else(|| Error::internal("invalid EmitC comparison predicate"))
+            .map_err(|_| Error::internal("invalid EmitC comparison predicate"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for CmpPredicateAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAEmitCCmpPredicate(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAEmitCCmpPredicate(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -148,11 +152,15 @@ impl OpaqueAttributeRef<'_, '_> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for OpaqueAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAEmitCOpaque(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAEmitCOpaque(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -172,25 +180,25 @@ impl<'t> Context<'t> {
         &'c self,
         predicate: CmpPredicate,
     ) -> Result<CmpPredicateAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::emit_c()?);
+        self.load_dialect(DialectHandle::emit_c()?)?;
         unsafe {
             CmpPredicateAttributeRef::from_c_api(
                 mlirEmitCCmpPredicateAttrGet(*self.handle.borrow(), predicate.to_c_api()),
                 self,
             )
-            .ok_or_else(|| Error::internal("invalid EmitC comparison predicate attribute"))
+            .map_err(|_| Error::internal("invalid EmitC comparison predicate attribute"))
         }
     }
 
     /// Creates a new Emit-C [`OpaqueAttributeRef`] owned by this [`Context`].
     pub fn emit_c_opaque_attribute<'c, S: AsRef<str>>(&'c self, value: S) -> Result<OpaqueAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::emit_c()?);
+        self.load_dialect(DialectHandle::emit_c()?)?;
         unsafe {
             OpaqueAttributeRef::from_c_api(
                 mlirEmitCOpaqueAttrGet(*self.handle.borrow(), StringRef::from(value.as_ref()).to_c_api()),
                 self,
             )
-            .ok_or_else(|| Error::internal("invalid EmitC opaque attribute"))
+            .map_err(|_| Error::internal("invalid EmitC opaque attribute"))
         }
     }
 }
@@ -212,8 +220,8 @@ mod tests {
         assert_eq!(CmpPredicate::GreaterThan.as_str(), "gt");
         assert_eq!(CmpPredicate::GreaterThanOrEqual.as_str(), "ge");
         assert_eq!(CmpPredicate::ThreeWay.as_str(), "three_way");
-        assert_eq!(CmpPredicate::from_c_api(CmpPredicate::Equal.to_c_api()), Some(CmpPredicate::Equal));
-        assert_eq!(CmpPredicate::from_c_api(u64::MAX), None);
+        assert_eq!(CmpPredicate::from_c_api(CmpPredicate::Equal.to_c_api()).unwrap(), CmpPredicate::Equal);
+        assert!(CmpPredicate::from_c_api(u64::MAX).is_err());
     }
 
     #[test]

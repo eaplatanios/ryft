@@ -49,13 +49,13 @@ impl ObjectFormat {
     }
 
     /// Constructs an [`ObjectFormat`] from the integer value used by the MLIR C API.
-    pub fn from_c_api(value: u32) -> Option<Self> {
+    pub fn from_c_api(value: u32) -> Result<Self, Error> {
         match value {
-            1 => Some(Self::Offload),
-            2 => Some(Self::Assembly),
-            3 => Some(Self::Binary),
-            4 => Some(Self::FatBinary),
-            _ => None,
+            1 => Ok(Self::Offload),
+            2 => Ok(Self::Assembly),
+            3 => Ok(Self::Binary),
+            4 => Ok(Self::FatBinary),
+            _ => Err(Error::invalid_argument("invalid MLIR GPU object format value")),
         }
     }
 }
@@ -81,14 +81,14 @@ impl<'c, 't> ObjectAttributeRef<'c, 't> {
     pub fn target(&self) -> Result<AttributeRef<'c, 't>, Error> {
         unsafe {
             AttributeRef::from_c_api(mlirGPUObjectAttrGetTarget(self.handle), self.context)
-                .ok_or_else(|| Error::invalid_argument("invalid `target` field in `#gpu.object` attribute"))
+                .map_err(|_| Error::invalid_argument("invalid `target` field in `#gpu.object` attribute"))
         }
     }
 
     /// Returns the object format.
     pub fn format(&self) -> Result<ObjectFormat, Error> {
         ObjectFormat::from_c_api(unsafe { mlirGPUObjectAttrGetFormat(self.handle) })
-            .ok_or_else(|| Error::invalid_argument("invalid GPU object format"))
+            .map_err(|_| Error::invalid_argument("invalid GPU object format"))
     }
 
     /// Returns the serialized object payload.
@@ -97,30 +97,30 @@ impl<'c, 't> ObjectAttributeRef<'c, 't> {
     }
 
     /// Returns the optional properties dictionary.
-    pub fn properties(&self) -> Option<AttributeRef<'c, 't>> {
+    pub fn properties(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         if unsafe { mlirGPUObjectAttrHasProperties(self.handle) } {
-            unsafe { AttributeRef::from_c_api(mlirGPUObjectAttrGetProperties(self.handle), self.context) }
+            unsafe { AttributeRef::from_c_api(mlirGPUObjectAttrGetProperties(self.handle), self.context).map(Some) }
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Returns the optional kernel table attribute.
-    pub fn kernels(&self) -> Option<AttributeRef<'c, 't>> {
+    pub fn kernels(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         if unsafe { mlirGPUObjectAttrHasKernels(self.handle) } {
-            unsafe { AttributeRef::from_c_api(mlirGPUObjectAttrGetKernels(self.handle), self.context) }
+            unsafe { AttributeRef::from_c_api(mlirGPUObjectAttrGetKernels(self.handle), self.context).map(Some) }
         } else {
-            None
+            Ok(None)
         }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for ObjectAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirAttributeIsAGPUObjectAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -150,11 +150,15 @@ pub struct KernelMetadataAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for KernelMetadataAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAGpuKernelMetadataAttr(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAGpuKernelMetadataAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -182,11 +186,15 @@ pub struct KernelTableAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for KernelTableAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAGpuKernelTableAttr(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAGpuKernelTableAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -214,11 +222,15 @@ pub struct SelectObjectAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for SelectObjectAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAGpuSelectObjectAttr(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAGpuSelectObjectAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -292,14 +304,14 @@ macro_rules! gpu_enum_attribute {
         }
 
         impl<'c, 't> Attribute<'c, 't> for $attribute_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR attribute handle"));
                 }
                 if unsafe { mlirAttributeIsAGpuEnumAttr(handle, $ffi_kind) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR attribute handle"))
                 }
             }
 
@@ -319,14 +331,14 @@ macro_rules! gpu_enum_attribute {
             #[doc = $description]
             #[doc = " attribute owned by this [`Context`]."]
             pub fn $context_method<'c>(&'c self, value: $enum_name) -> Result<$attribute_name<'c, 't>, Error> {
-                self.load_dialect(DialectHandle::gpu()?);
+                self.load_dialect(DialectHandle::gpu()?)?;
                 let value = StringRef::from(value.as_str());
                 unsafe {
                     $attribute_name::from_c_api(
                         mlirGpuEnumAttrGet(*self.handle.borrow_mut(), $ffi_kind, value.to_c_api()),
                         self,
                     )
-                    .ok_or_else(|| Error::invalid_argument(concat!("invalid arguments to `Context::", stringify!($context_method), "`")))
+                    .map_err(|_| Error::invalid_argument(concat!("invalid arguments to `Context::", stringify!($context_method), "`")))
                 }
             }
         }
@@ -592,14 +604,14 @@ macro_rules! gpu_mapping_id_attribute {
         }
 
         impl<'c, 't> Attribute<'c, 't> for $attribute_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR attribute handle"));
                 }
                 if unsafe { mlirAttributeIsAGpuMappingAttr(handle, $ffi_kind) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR attribute handle"))
                 }
             }
 
@@ -619,14 +631,14 @@ macro_rules! gpu_mapping_id_attribute {
             #[doc = $description]
             #[doc = " device mapping attribute owned by this [`Context`]."]
             pub fn $context_method<'c>(&'c self, value: MappingId) -> Result<$attribute_name<'c, 't>, Error> {
-                self.load_dialect(DialectHandle::gpu()?);
+                self.load_dialect(DialectHandle::gpu()?)?;
                 let value = StringRef::from(value.as_str());
                 unsafe {
                     $attribute_name::from_c_api(
                         mlirGpuMappingAttrGet(*self.handle.borrow_mut(), $ffi_kind, value.to_c_api()),
                         self,
                     )
-                    .ok_or_else(|| Error::invalid_argument(concat!("invalid arguments to `Context::", stringify!($context_method), "`")))
+                    .map_err(|_| Error::invalid_argument(concat!("invalid arguments to `Context::", stringify!($context_method), "`")))
                 }
             }
         }
@@ -691,11 +703,15 @@ impl<'c, 't> MappingMaskAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for MappingMaskAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAGpuMappingMaskAttr(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAGpuMappingMaskAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -731,11 +747,15 @@ impl<'c, 't> MemorySpaceMappingAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for MemorySpaceMappingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAGpuMemorySpaceMappingAttr(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAGpuMemorySpaceMappingAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -828,7 +848,7 @@ impl<'c, 't> ParallelLoopDimMappingAttributeRef<'c, 't> {
     pub fn map(&self) -> Result<AffineMap<'c, 't>, Error> {
         unsafe {
             AffineMap::from_c_api(mlirGpuParallelLoopDimMappingAttrGetMap(self.handle), self.context)
-                .ok_or_else(|| Error::invalid_argument("invalid `map` field in `#gpu.loop_dim_map` attribute"))
+                .map_err(|_| Error::invalid_argument("invalid `map` field in `#gpu.loop_dim_map` attribute"))
         }
     }
 
@@ -836,20 +856,20 @@ impl<'c, 't> ParallelLoopDimMappingAttributeRef<'c, 't> {
     pub fn bound(&self) -> Result<AffineMap<'c, 't>, Error> {
         unsafe {
             AffineMap::from_c_api(mlirGpuParallelLoopDimMappingAttrGetBound(self.handle), self.context)
-                .ok_or_else(|| Error::invalid_argument("invalid `bound` field in `#gpu.loop_dim_map` attribute"))
+                .map_err(|_| Error::invalid_argument("invalid `bound` field in `#gpu.loop_dim_map` attribute"))
         }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for ParallelLoopDimMappingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
         if unsafe { mlirAttributeIsAGpuParallelLoopDimMappingAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -867,10 +887,10 @@ mlir_subtype_trait_impls!(ParallelLoopDimMappingAttributeRef<'c, 't> as Attribut
 impl<'t> Context<'t> {
     /// Creates a GPU [`MappingMaskAttributeRef`] owned by this [`Context`].
     pub fn gpu_mapping_mask_attribute<'c>(&'c self, mask: u64) -> Result<MappingMaskAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         unsafe {
             MappingMaskAttributeRef::from_c_api(mlirGpuMappingMaskAttrGet(*self.handle.borrow_mut(), mask), self)
-                .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::gpu_mapping_mask_attribute`"))
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::gpu_mapping_mask_attribute`"))
         }
     }
 
@@ -879,16 +899,14 @@ impl<'t> Context<'t> {
         &'c self,
         address_space: AddressSpace,
     ) -> Result<MemorySpaceMappingAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         let address_space = StringRef::from(address_space.as_str());
         unsafe {
             MemorySpaceMappingAttributeRef::from_c_api(
                 mlirGpuMemorySpaceMappingAttrGet(*self.handle.borrow_mut(), address_space.to_c_api()),
                 self,
             )
-            .ok_or_else(|| {
-                Error::invalid_argument("invalid arguments to `Context::gpu_memory_space_mapping_attribute`")
-            })
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::gpu_memory_space_mapping_attribute`"))
         }
     }
 
@@ -905,7 +923,7 @@ impl<'t> Context<'t> {
         map: AffineMap<'c, 't>,
         bound: AffineMap<'c, 't>,
     ) -> Result<ParallelLoopDimMappingAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         let processor = StringRef::from(processor.as_str());
         unsafe {
             ParallelLoopDimMappingAttributeRef::from_c_api(
@@ -917,7 +935,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| {
+            .map_err(|_| {
                 Error::invalid_argument("invalid arguments to `Context::gpu_parallel_loop_dim_mapping_attribute`")
             })
         }
@@ -948,7 +966,7 @@ impl<'t> Context<'t> {
         argument_attributes: Option<ArrayAttributeRef<'c, 't>>,
         metadata: Option<DictionaryAttributeRef<'c, 't>>,
     ) -> Result<KernelMetadataAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         let name = StringRef::from(name);
         Ok(unsafe {
             let argument_attributes = argument_attributes
@@ -977,7 +995,7 @@ impl<'t> Context<'t> {
         &'c self,
         kernels: &[KernelMetadataAttributeRef<'c, 't>],
     ) -> Result<KernelTableAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         Ok(unsafe {
             let kernels = kernels.iter().map(|kernel| kernel.to_c_api()).collect::<Vec<_>>();
             KernelTableAttributeRef {
@@ -1000,7 +1018,7 @@ impl<'t> Context<'t> {
         &'c self,
         target: Option<AttributeRef<'c, 't>>,
     ) -> Result<SelectObjectAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         Ok(unsafe {
             let target = target.unwrap_or_else(|| self.null_attribute());
             SelectObjectAttributeRef {
@@ -1027,7 +1045,7 @@ impl<'t> Context<'t> {
         properties: Option<AttributeRef<'c, 't>>,
         kernels: Option<AttributeRef<'c, 't>>,
     ) -> Result<ObjectAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         Ok(unsafe {
             let properties = properties.unwrap_or_else(|| self.null_attribute());
             let kernels = kernels.unwrap_or_else(|| self.null_attribute());
@@ -1069,11 +1087,11 @@ mod tests {
         assert_eq!(ObjectFormat::Assembly.as_str(), "assembly");
         assert_eq!(ObjectFormat::Binary.as_str(), "bin");
         assert_eq!(ObjectFormat::FatBinary.as_str(), "fatbin");
-        assert_eq!(ObjectFormat::from_c_api(1), Some(ObjectFormat::Offload));
-        assert_eq!(ObjectFormat::from_c_api(2), Some(ObjectFormat::Assembly));
-        assert_eq!(ObjectFormat::from_c_api(3), Some(ObjectFormat::Binary));
-        assert_eq!(ObjectFormat::from_c_api(4), Some(ObjectFormat::FatBinary));
-        assert_eq!(ObjectFormat::from_c_api(0), None);
+        assert_eq!(ObjectFormat::from_c_api(1).unwrap(), ObjectFormat::Offload);
+        assert_eq!(ObjectFormat::from_c_api(2).unwrap(), ObjectFormat::Assembly);
+        assert_eq!(ObjectFormat::from_c_api(3).unwrap(), ObjectFormat::Binary);
+        assert_eq!(ObjectFormat::from_c_api(4).unwrap(), ObjectFormat::FatBinary);
+        assert!(ObjectFormat::from_c_api(0).is_err());
     }
 
     #[test]
@@ -1088,8 +1106,8 @@ mod tests {
         assert_eq!(attribute.target().unwrap(), target);
         assert_eq!(attribute.format().unwrap(), ObjectFormat::FatBinary);
         assert_eq!(attribute.object().as_str(), Ok("payload"));
-        assert_eq!(attribute.properties(), Some(properties.as_ref()));
-        assert_eq!(attribute.kernels(), None);
+        assert_eq!(attribute.properties().unwrap(), Some(properties.as_ref()));
+        assert_eq!(attribute.kernels().unwrap(), None);
     }
 
     #[test]

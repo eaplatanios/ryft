@@ -85,7 +85,7 @@ impl<'c, 't> MmaMatrixTypeRef<'c, 't> {
     pub fn element_type(&self) -> Result<TypeRef<'c, 't>, Error> {
         unsafe {
             TypeRef::from_c_api(mlirGpuMmaMatrixTypeGetElementType(self.handle), self.context)
-                .ok_or_else(|| Error::invalid_argument("invalid `!gpu.mma_matrix` element type"))
+                .map_err(|_| Error::invalid_argument("invalid `!gpu.mma_matrix` element type"))
         }
     }
 
@@ -102,11 +102,15 @@ impl<'c, 't> MmaMatrixTypeRef<'c, 't> {
 }
 
 impl<'c, 't> Type<'c, 't> for MmaMatrixTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
-        if unsafe { mlirTypeIsAGpuMmaMatrixType(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirTypeIsAGpuMmaMatrixType(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR type handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -135,14 +139,14 @@ macro_rules! gpu_sparse_handle_type {
         }
 
         impl<'c, 't> Type<'c, 't> for $name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR type handle"));
                 }
                 if unsafe { mlirTypeIsAGpuSparseHandleType(handle, $kind) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR type handle"))
                 }
             }
 
@@ -183,10 +187,10 @@ gpu_sparse_handle_type!(
 impl<'t> Context<'t> {
     /// Creates a new GPU [`AsyncTokenTypeRef`] owned by this [`Context`].
     pub fn gpu_async_token_type<'c>(&'c self) -> Result<AsyncTokenTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         unsafe {
             AsyncTokenTypeRef::from_c_api(mlirGPUAsyncTokenTypeGet(*self.handle.borrow()), self)
-                .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::gpu_async_token_type`"))
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::gpu_async_token_type`"))
         }
     }
 
@@ -197,7 +201,7 @@ impl<'t> Context<'t> {
         element_type: T,
         operand: MmaMatrixOperand,
     ) -> Result<MmaMatrixTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         unsafe {
             let shape = [
                 i64::try_from(shape[0])
@@ -215,13 +219,13 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::gpu_mma_matrix_type`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::gpu_mma_matrix_type`"))
         }
     }
 
     /// Creates a new GPU dense tensor sparse handle type owned by this [`Context`].
     pub fn gpu_sparse_dn_tensor_handle_type<'c>(&'c self) -> Result<SparseDnTensorHandleTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         unsafe {
             SparseDnTensorHandleTypeRef::from_c_api(
                 mlirGpuSparseHandleTypeGet(
@@ -230,13 +234,13 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::gpu_sparse_dn_tensor_handle_type`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::gpu_sparse_dn_tensor_handle_type`"))
         }
     }
 
     /// Creates a new GPU sparse matrix handle type owned by this [`Context`].
     pub fn gpu_sparse_sp_mat_handle_type<'c>(&'c self) -> Result<SparseSpMatHandleTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         unsafe {
             SparseSpMatHandleTypeRef::from_c_api(
                 mlirGpuSparseHandleTypeGet(
@@ -245,7 +249,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `Context::gpu_sparse_sp_mat_handle_type`"))
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::gpu_sparse_sp_mat_handle_type`"))
         }
     }
 
@@ -253,7 +257,7 @@ impl<'t> Context<'t> {
     pub fn gpu_sparse_sp_gemm_operation_handle_type<'c>(
         &'c self,
     ) -> Result<SparseSpGemmOperationHandleTypeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::gpu()?);
+        self.load_dialect(DialectHandle::gpu()?)?;
         unsafe {
             SparseSpGemmOperationHandleTypeRef::from_c_api(
                 mlirGpuSparseHandleTypeGet(
@@ -262,7 +266,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .ok_or_else(|| {
+            .map_err(|_| {
                 Error::invalid_argument("invalid arguments to `Context::gpu_sparse_sp_gemm_operation_handle_type`")
             })
         }
