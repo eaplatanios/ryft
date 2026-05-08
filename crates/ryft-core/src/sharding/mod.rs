@@ -233,10 +233,17 @@ impl LogicalMesh {
     /// Creates a new [`shardy::DetachedMeshOperation`] that corresponds to this [`LogicalMesh`].
     /// The mesh in the returned operation will be named `"mesh"`.
     #[inline]
-    pub fn to_shardy<'c, 't: 'c, L: Location<'c, 't>>(&self, location: L) -> shardy::DetachedMeshOperation<'c, 't> {
+    pub fn to_shardy<'c, 't: 'c, L: Location<'c, 't>>(
+        &self,
+        location: L,
+    ) -> Result<shardy::DetachedMeshOperation<'c, 't>, ryft_mlir::Error> {
         let context = location.context();
-        let attribute = context
-            .shardy_mesh(self.axes.iter().map(|axis| context.shardy_mesh_axis(axis.name.as_str(), axis.size)), &[]);
+        let axes = self
+            .axes
+            .iter()
+            .map(|axis| context.shardy_mesh_axis(axis.name.as_str(), axis.size))
+            .collect::<Result<Vec<_>, _>>()?;
+        let attribute = context.shardy_mesh(axes, &[])?;
         shardy::mesh(SHARDY_MESH_SYMBOL_NAME, attribute, location)
     }
 }
@@ -349,7 +356,10 @@ impl DeviceMesh {
     /// Creates a new [`shardy::DetachedMeshOperation`] that corresponds to this [`DeviceMesh`].
     /// The mesh in the returned operation will be named `"mesh"`.
     #[inline]
-    pub fn to_shardy<'c, 't: 'c, L: Location<'c, 't>>(&self, location: L) -> shardy::DetachedMeshOperation<'c, 't> {
+    pub fn to_shardy<'c, 't: 'c, L: Location<'c, 't>>(
+        &self,
+        location: L,
+    ) -> Result<shardy::DetachedMeshOperation<'c, 't>, ryft_mlir::Error> {
         self.logical_mesh.to_shardy(location)
     }
 }
@@ -782,7 +792,7 @@ impl Sharding {
     pub fn to_shardy<'c, 't: 'c, L: Location<'c, 't>>(
         &self,
         location: L,
-    ) -> shardy::TensorShardingAttributeRef<'c, 't> {
+    ) -> Result<shardy::TensorShardingAttributeRef<'c, 't>, ryft_mlir::Error> {
         let context = location.context();
         let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
         let dimensions = self
@@ -791,23 +801,26 @@ impl Sharding {
             .map(|dimension| match dimension {
                 ShardingDimension::Replicated => context.shardy_dimension_sharding([], true, None),
                 ShardingDimension::Sharded(axis_names) => context.shardy_dimension_sharding(
-                    axis_names.iter().map(|axis_name| context.shardy_axis_ref(axis_name, None)),
+                    axis_names
+                        .iter()
+                        .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
+                        .collect::<Result<Vec<_>, _>>()?,
                     true,
                     None,
                 ),
                 ShardingDimension::Unconstrained => context.shardy_dimension_sharding([], false, None),
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let replicated_axes = self
             .replicated_axes()
             .iter()
-            .map(|axis_name| context.shardy_axis_ref(axis_name, None))
-            .collect::<Vec<_>>();
+            .map(|axis_name| context.shardy_axis_ref(*axis_name, None))
+            .collect::<Result<Vec<_>, _>>()?;
         let unreduced_axes = self
             .unreduced_axes
             .iter()
-            .map(|axis_name| context.shardy_axis_ref(axis_name, None))
-            .collect::<Vec<_>>();
+            .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
+            .collect::<Result<Vec<_>, _>>()?;
         context.shardy_tensor_sharding(
             mesh_symbol_ref,
             dimensions.as_slice(),
@@ -916,9 +929,14 @@ mod tests {
         ])
         .unwrap();
         let context = MlirContext::new();
-        let module = context.module(context.unknown_location());
+        let module = context.module(context.unknown_location()).unwrap();
         assert_eq!(
-            module.body().append_operation(mesh.to_shardy(context.unknown_location())).to_string(),
+            module
+                .body()
+                .unwrap()
+                .append_operation(mesh.to_shardy(context.unknown_location()).unwrap())
+                .unwrap()
+                .to_string(),
             format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = <[\"x\"=2, \"y\"=3, \"z\"=1]>"),
         );
     }
@@ -975,9 +993,14 @@ mod tests {
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
         let context = MlirContext::new();
-        let module = context.module(context.unknown_location());
+        let module = context.module(context.unknown_location()).unwrap();
         assert_eq!(
-            module.body().append_operation(mesh.to_shardy(context.unknown_location())).to_string(),
+            module
+                .body()
+                .unwrap()
+                .append_operation(mesh.to_shardy(context.unknown_location()).unwrap())
+                .unwrap()
+                .to_string(),
             format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = <[\"x\"=2, \"y\"=2]>"),
         );
     }
@@ -1154,7 +1177,7 @@ mod tests {
         .unwrap();
         let context = MlirContext::new();
         assert_eq!(
-            sharding.to_shardy(context.unknown_location()).to_string(),
+            sharding.to_shardy(context.unknown_location()).unwrap().to_string(),
             "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced={\"y\"}>",
         );
     }
