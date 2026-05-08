@@ -43,7 +43,7 @@ impl<F> JacFwd<F> {
             -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
         <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
             InterpretableOperation<ArrayType, E::Tangent>,
-        E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+        E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
     {
         jacfwd_at::<E, F, Input, Output, V>(engine, self.function, primals)
     }
@@ -464,7 +464,7 @@ where
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
     <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
         InterpretableOperation<ArrayType, E::Tangent>,
-    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -513,7 +513,7 @@ where
                 E::Tangent,
                 <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
             > + crate::operations::constants::SupportsZero<ArrayType, E::Tangent>,
-    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();

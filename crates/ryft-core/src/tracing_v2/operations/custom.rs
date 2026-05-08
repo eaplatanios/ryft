@@ -9,11 +9,10 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
 use crate::tracing::engines::{Tracer, TracingContext};
 use crate::tracing::transposition::LinearOperation;
-use crate::tracing::{AtomId, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing::{Traceable, TracingError, Value};
+use crate::tracing_v2::differentiation::{Differentiable, JvpTracer};
 use crate::tracing_v2::{
-    DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,
-    LinearizableEngine,
+    DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, LinearizableEngine,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -97,63 +96,6 @@ where
 {
     fn rule(&self) -> &dyn DifferentiableOperation<E> {
         self.0.as_ref()
-    }
-}
-
-/// Adapter that lets an engine-specific custom JVP rule run while tracing through
-/// [`DifferentiableOperationTracingEngine`].
-struct DifferentiableOperationTracingJvpRule<E, Rule> {
-    /// Underlying rule registered for the real engine.
-    rule: Rule,
-
-    /// Marker tying this adapter to the engine whose tracing view is being linearized.
-    _engine: std::marker::PhantomData<fn() -> E>,
-}
-
-impl<E, Rule> DifferentiableOperationTracingJvpRule<E, Rule> {
-    /// Creates one tracing-view adapter for `rule`.
-    fn new(rule: Rule) -> Self {
-        Self { rule, _engine: std::marker::PhantomData }
-    }
-}
-
-impl<E, Rule: Debug> Debug for DifferentiableOperationTracingJvpRule<E, Rule> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Debug::fmt(&self.rule, formatter)
-    }
-}
-
-impl<E, Rule: Operation<ArrayType>> Operation<ArrayType> for DifferentiableOperationTracingJvpRule<E, Rule> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        self.rule.name()
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        self.rule.infer_output_types(input_types)
-    }
-
-    #[inline]
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.rule.render(formatter, indentation)
-    }
-}
-
-impl<E, Rule> DifferentiableOperation<DifferentiableOperationTracingEngine<E>>
-    for DifferentiableOperationTracingJvpRule<E, Rule>
-where
-    E: DifferentiableEngine<Type = ArrayType> + 'static,
-    E::Value: Differentiable<ArrayType>,
-    Rule: DifferentiableOperation<E>,
-{
-    fn jvp(
-        &self,
-        context: &mut JvpContext<'_, DifferentiableOperationTracingEngine<E>>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
-        let mut inner_context = JvpContext::new(context.engine.inner(), context.builder.clone());
-        self.rule.jvp(&mut inner_context, inputs)
     }
 }
 
@@ -352,12 +294,7 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
             + 'static,
         Rule: Clone + DifferentiableOperation<E> + CustomTracedLinearizationRule<V, E> + 'static,
     {
-        self.with_jvp_rule::<E, _>(rule.clone())
-            .with_jvp_rule_for::<DifferentiableOperationTracingEngine<E>, _>(DifferentiableOperationTracingJvpRule::<
-                E,
-                _,
-            >::new(rule.clone()))
-            .with_traced_linearization_rule::<E, _>(rule)
+        self.with_jvp_rule::<E, _>(rule.clone()).with_traced_linearization_rule::<E, _>(rule)
     }
 }
 

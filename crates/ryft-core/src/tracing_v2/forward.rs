@@ -105,7 +105,7 @@ impl<
         >,
 > JvpDispatch<'engine, E, Input, Output, JvpDispatchValueMarker> for V
 where
-    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
     <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: InterpretableOperation<E::Type, E::Tangent>
         + SupportsNeg<E::Type, E::Tangent>
         + SupportsAdd<E::Type, E::Tangent>

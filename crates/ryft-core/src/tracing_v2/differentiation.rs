@@ -56,8 +56,8 @@ pub enum DifferentiationError {
     InvalidJacobianColumnHeight { expected: usize, got: usize },
 }
 
-// `TangentValue<T, Infallible>` is the zero-only tangent representation described in the
-// `TangentValue` docs: `NonZero(Infallible)` cannot be constructed, but the generic enum still
+// `Tangent<T, Infallible>` is the zero-only tangent representation described in the
+// `Tangent` docs: `NonZero(Infallible)` cannot be constructed, but the generic enum still
 // requires its payload type to satisfy the ordinary trace leaf contracts. These impls are vacuous
 // because there is no `Infallible` value to inspect or print.
 impl<T: Type> Typed<T> for Infallible {
@@ -74,11 +74,11 @@ impl<T: Type> Traceable<T> for Infallible {}
 /// Tangent leaf that can represent either a concrete tangent payload or a symbolic zero.
 ///
 /// Engines that need tangent programs containing both concrete tangent leaves and symbolic zero leaves can use this as
-/// their tangent value type. Fully zero tangent spaces use `TangentValue<T, Infallible>`, where
-/// [`TangentValue::NonZero`] is statically unconstructible. `NonZero` means "not the symbolic zero branch"; its payload
-/// may still be a concrete value whose numeric contents are all zero. Operation semantics stay centralized in the
-/// linear operation interpreters: the enum itself only stores the representation and deliberately does not implement
-/// arithmetic or array operation traits.
+/// their tangent value type. Fully zero tangent spaces use `Tangent<T, Infallible>`, where
+/// [`Tangent::NonZero`] is statically unconstructible. `NonZero` means "not the symbolic zero branch"; its payload may
+/// still be a concrete value whose numeric contents are all zero. Operation semantics stay centralized in the linear
+/// operation interpreters: the enum itself only stores the representation and deliberately does not implement arithmetic
+/// or array operation traits.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 pub enum Tangent<T: Type, V: Traceable<T>> {
     /// Symbolic zero with abstract type metadata and no concrete payload.
@@ -225,7 +225,9 @@ pub trait DifferentiableEngine: LinearizableEngine {
     /// This carrier may be narrower than the ordinary [`TracingEngine::OperationCarrier`]. Every
     /// operation it stores must be interpretable for primal execution and must provide a
     /// [`DifferentiableOperation`] rule for linearization.
-    type DifferentiableOperationCarrier: Clone + InterpretableOperation<Self::Type, Self::Value>;
+    type DifferentiableOperationCarrier: Clone
+        + InterpretableOperation<Self::Type, Self::Value>
+        + DifferentiableOperation<Self>;
 
     /// Returns the linearizable engine used for tangent and cotangent programs.
     fn linear_engine(&self) -> &Self::LinearEngine;
@@ -315,7 +317,7 @@ pub trait DifferentiableEngine: LinearizableEngine {
             -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>, TracingError>,
         <Self::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
             InterpretableOperation<ArrayType, Self::Tangent>,
-        Self::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<Self>>,
+        Self::DifferentiableOperationCarrier: DifferentiableOperation<Self>,
     {
         crate::tracing_v2::linear::JacFwd::new(function).evaluate::<Self, Input, Output, V>(self, primals)
     }
@@ -418,13 +420,7 @@ pub struct JvpContext<'a, E: DifferentiableEngine> {
     /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::tracing::Program) that is currently being
     /// traced.
     pub builder: Rc<
-        RefCell<
-            ProgramBuilder<
-                E::Type,
-                E::Tangent,
-                <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
-            >,
-        >,
+        RefCell<ProgramBuilder<E::Type, E::Tangent, <E::LinearEngine as LinearizableEngine>::LinearOperationCarrier>>,
     >,
 }
 
@@ -661,8 +657,8 @@ pub trait DifferentiableTracingEngine: TracingEngine {
 /// [`DifferentiableEngine::DifferentiableOperationCarrier`] rather than the ordinary
 /// [`TracingEngine::OperationCarrier`] selected by the backend. Those carriers may intentionally differ:
 /// an engine can support a broad ordinary tracing universe while exposing a narrower
-/// differentiable carrier whose variants all have differentiation rules. This adapter is the small
-/// bridge between those two contracts.
+/// differentiable carrier whose variants all have differentiation rules under the real engine. This adapter
+/// only selects that carrier while tracing; the resulting program is still linearized with the wrapped engine.
 ///
 /// [`DifferentiableOperationTracingEngine::new`] reborrows an `E: DifferentiableEngine` as a
 /// [`TracingEngine`] without allocation or ownership. AD entry points construct this view at trace
@@ -723,21 +719,6 @@ impl<E: DifferentiableEngine> Engine for DifferentiableOperationTracingEngine<E>
 
 impl<E: DifferentiableEngine> TracingEngine for DifferentiableOperationTracingEngine<E> {
     type OperationCarrier = E::DifferentiableOperationCarrier;
-}
-
-impl<E: DifferentiableEngine> LinearizableEngine for DifferentiableOperationTracingEngine<E> {
-    type LinearOperationCarrier = E::LinearOperationCarrier;
-}
-
-impl<E: DifferentiableEngine> DifferentiableEngine for DifferentiableOperationTracingEngine<E> {
-    type Tangent = E::Tangent;
-    type LinearEngine = E::LinearEngine;
-    type DifferentiableOperationCarrier = E::DifferentiableOperationCarrier;
-
-    #[inline]
-    fn linear_engine(&self) -> &Self::LinearEngine {
-        self.inner().linear_engine()
-    }
 }
 
 impl<'engine, E> LinearizableEngine for TracingContext<'engine, E>

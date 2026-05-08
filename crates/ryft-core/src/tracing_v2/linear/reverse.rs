@@ -89,7 +89,7 @@ pub fn linearize<
 where
     Input::Family: ParameterizedFamily<E::Tangent>,
     Output::Family: ParameterizedFamily<E::Tangent>,
-    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
 {
     let input_structure = primals.parameter_structure();
     let input_primals: Vec<V> = primals.into_parameters().collect();
@@ -97,14 +97,7 @@ where
     let differentiable_tracing_engine = DifferentiableOperationTracingEngine::new(engine);
     let (primal_output, program): (Output, Program<E::Type, V, E::DifferentiableOperationCarrier, Input, Output>) =
         differentiable_tracing_engine.interpret_and_trace(function, reconstructed_primals)?;
-    Ok((
-        primal_output,
-        Program::linearize::<DifferentiableOperationTracingEngine<E>>(
-            &program,
-            differentiable_tracing_engine,
-            input_primals,
-        )?,
-    ))
+    Ok((primal_output, Program::linearize::<E>(&program, engine, input_primals)?))
 }
 
 /// Returns the primal output together with a pullback produced by transposing the staged pushforward.
@@ -161,7 +154,7 @@ where
         + SupportsAdd<E::Type, E::Tangent>,
     Input::Family: ParameterizedFamily<E::Tangent>,
     Output::Family: ParameterizedFamily<E::Tangent>,
-    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
 {
     let (output, pushforward) = linearize::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().map(Differentiable::tangent_type).collect::<Result<Vec<_>, _>>()?;
@@ -293,7 +286,7 @@ where
         + SupportsAdd<E::Type, E::Tangent>,
     V::Family: ParameterizedFamily<E::Tangent>,
     Input::Family: ParameterizedFamily<E::Tangent>,
-    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
 {
     type Value = V;
     type Gradient = Input::To<E::Tangent>;
@@ -484,7 +477,7 @@ where
     V::Family: ParameterizedFamily<E::Tangent>,
     Input::Family: ParameterizedFamily<E::Tangent>,
     Aux::Family: ParameterizedFamily<E::Tangent>,
-    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
 {
     let ((output, aux), pullback) = vjp(engine, |input| Ok(function(input)), primals)?;
     let output_cotangent_structure = (output.parameter_structure(), aux.parameter_structure());
@@ -583,7 +576,7 @@ where
     V::Family: ParameterizedFamily<E::Tangent>,
     Input::Family: ParameterizedFamily<E::Tangent>,
     Aux::Family: ParameterizedFamily<E::Tangent>,
-    E::DifferentiableOperationCarrier: DifferentiableOperation<DifferentiableOperationTracingEngine<E>>,
+    E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
 {
     value_and_grad_with_aux(engine, function, primals).map(|((_, aux), gradient)| (gradient, aux))
 }
