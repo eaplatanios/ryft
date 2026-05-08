@@ -1,6 +1,6 @@
 use crate::{
-    AttributeRef, DetachedOp, DialectHandle, Location, Operation, OperationBuilder, Type, TypeRef, Value, ValueRef,
-    mlir_op,
+    AttributeRef, DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Type, TypeRef, Value,
+    ValueRef, mlir_op,
 };
 
 /// Canonical MLIR operation name for [`ConstrainedFaddOperation`].
@@ -14,28 +14,40 @@ pub trait ConstrainedFaddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `argument_0` operand.
-    fn argument_0(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument_0(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `argument_1` operand.
-    fn argument_1(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn argument_1(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `roundingmode` attribute.
-    fn roundingmode(&self) -> AttributeRef<'c, 't> {
-        self.attribute("roundingmode").unwrap()
+    fn roundingmode(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("roundingmode")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "roundingmode",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `fpExceptionBehavior` attribute.
-    fn fp_exception_behavior(&self) -> AttributeRef<'c, 't> {
-        self.attribute("fpExceptionBehavior").unwrap()
+    fn fp_exception_behavior(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("fpExceptionBehavior")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "fpExceptionBehavior",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -57,19 +69,20 @@ pub fn intr_experimental_constrained_fadd<
     roundingmode: AttributeRef<'c, 't>,
     fp_exception_behavior: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedConstrainedFaddOperation<'c, 't> {
+) -> Result<DetachedConstrainedFaddOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FADD_OPERATION_NAME, location);
     builder = builder.add_operand(argument_0);
     builder = builder.add_operand(argument_1);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("roundingmode", roundingmode);
     builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_experimental_constrained_fadd`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_fadd`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`ConstrainedFdivOperation`].
@@ -83,28 +96,40 @@ pub trait ConstrainedFdivOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `argument_0` operand.
-    fn argument_0(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument_0(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `argument_1` operand.
-    fn argument_1(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn argument_1(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `roundingmode` attribute.
-    fn roundingmode(&self) -> AttributeRef<'c, 't> {
-        self.attribute("roundingmode").unwrap()
+    fn roundingmode(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("roundingmode")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "roundingmode",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `fpExceptionBehavior` attribute.
-    fn fp_exception_behavior(&self) -> AttributeRef<'c, 't> {
-        self.attribute("fpExceptionBehavior").unwrap()
+    fn fp_exception_behavior(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("fpExceptionBehavior")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "fpExceptionBehavior",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -126,19 +151,20 @@ pub fn intr_experimental_constrained_fdiv<
     roundingmode: AttributeRef<'c, 't>,
     fp_exception_behavior: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedConstrainedFdivOperation<'c, 't> {
+) -> Result<DetachedConstrainedFdivOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FDIV_OPERATION_NAME, location);
     builder = builder.add_operand(argument_0);
     builder = builder.add_operand(argument_1);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("roundingmode", roundingmode);
     builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_experimental_constrained_fdiv`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_fdiv`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`ConstrainedFmaOperation`].
@@ -152,33 +178,45 @@ pub trait ConstrainedFmaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `argument_0` operand.
-    fn argument_0(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument_0(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `argument_1` operand.
-    fn argument_1(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn argument_1(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `argument_2` operand.
-    fn argument_2(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn argument_2(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the `roundingmode` attribute.
-    fn roundingmode(&self) -> AttributeRef<'c, 't> {
-        self.attribute("roundingmode").unwrap()
+    fn roundingmode(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("roundingmode")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "roundingmode",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `fpExceptionBehavior` attribute.
-    fn fp_exception_behavior(&self) -> AttributeRef<'c, 't> {
-        self.attribute("fpExceptionBehavior").unwrap()
+    fn fp_exception_behavior(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("fpExceptionBehavior")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "fpExceptionBehavior",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -202,9 +240,9 @@ pub fn intr_experimental_constrained_fma<
     roundingmode: AttributeRef<'c, 't>,
     fp_exception_behavior: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedConstrainedFmaOperation<'c, 't> {
+) -> Result<DetachedConstrainedFmaOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FMA_OPERATION_NAME, location);
     builder = builder.add_operand(argument_0);
     builder = builder.add_operand(argument_1);
@@ -212,10 +250,11 @@ pub fn intr_experimental_constrained_fma<
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("roundingmode", roundingmode);
     builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_experimental_constrained_fma`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_fma`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`ConstrainedFmulAddOperation`].
@@ -229,33 +268,45 @@ pub trait ConstrainedFmulAddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't>
     }
 
     /// Returns the `argument_0` operand.
-    fn argument_0(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument_0(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `argument_1` operand.
-    fn argument_1(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn argument_1(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `argument_2` operand.
-    fn argument_2(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn argument_2(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the `roundingmode` attribute.
-    fn roundingmode(&self) -> AttributeRef<'c, 't> {
-        self.attribute("roundingmode").unwrap()
+    fn roundingmode(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("roundingmode")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "roundingmode",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `fpExceptionBehavior` attribute.
-    fn fp_exception_behavior(&self) -> AttributeRef<'c, 't> {
-        self.attribute("fpExceptionBehavior").unwrap()
+    fn fp_exception_behavior(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("fpExceptionBehavior")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "fpExceptionBehavior",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -279,9 +330,9 @@ pub fn intr_experimental_constrained_fmuladd<
     roundingmode: AttributeRef<'c, 't>,
     fp_exception_behavior: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedConstrainedFmulAddOperation<'c, 't> {
+) -> Result<DetachedConstrainedFmulAddOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FMUL_ADD_OPERATION_NAME, location);
     builder = builder.add_operand(argument_0);
     builder = builder.add_operand(argument_1);
@@ -289,10 +340,11 @@ pub fn intr_experimental_constrained_fmuladd<
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("roundingmode", roundingmode);
     builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_experimental_constrained_fmuladd`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| {
+            Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_fmuladd`")
+        })
+    })
 }
 
 /// Canonical MLIR operation name for [`ConstrainedFmulOperation`].
@@ -306,28 +358,40 @@ pub trait ConstrainedFmulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `argument_0` operand.
-    fn argument_0(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument_0(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `argument_1` operand.
-    fn argument_1(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn argument_1(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `roundingmode` attribute.
-    fn roundingmode(&self) -> AttributeRef<'c, 't> {
-        self.attribute("roundingmode").unwrap()
+    fn roundingmode(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("roundingmode")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "roundingmode",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `fpExceptionBehavior` attribute.
-    fn fp_exception_behavior(&self) -> AttributeRef<'c, 't> {
-        self.attribute("fpExceptionBehavior").unwrap()
+    fn fp_exception_behavior(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("fpExceptionBehavior")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "fpExceptionBehavior",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -349,19 +413,20 @@ pub fn intr_experimental_constrained_fmul<
     roundingmode: AttributeRef<'c, 't>,
     fp_exception_behavior: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedConstrainedFmulOperation<'c, 't> {
+) -> Result<DetachedConstrainedFmulOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FMUL_OPERATION_NAME, location);
     builder = builder.add_operand(argument_0);
     builder = builder.add_operand(argument_1);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("roundingmode", roundingmode);
     builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_experimental_constrained_fmul`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_fmul`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`ConstrainedFpextOperation`].
@@ -375,18 +440,24 @@ pub trait ConstrainedFpextOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `argument_0` operand.
-    fn argument_0(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument_0(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `fpExceptionBehavior` attribute.
-    fn fp_exception_behavior(&self) -> AttributeRef<'c, 't> {
-        self.attribute("fpExceptionBehavior").unwrap()
+    fn fp_exception_behavior(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("fpExceptionBehavior")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "fpExceptionBehavior",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -405,17 +476,18 @@ pub fn intr_experimental_constrained_fpext<
     result_type: T0,
     fp_exception_behavior: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedConstrainedFpextOperation<'c, 't> {
+) -> Result<DetachedConstrainedFpextOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FPEXT_OPERATION_NAME, location);
     builder = builder.add_operand(argument_0);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_experimental_constrained_fpext`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_fpext`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`ConstrainedFptruncOperation`].
@@ -429,23 +501,35 @@ pub trait ConstrainedFptruncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't>
     }
 
     /// Returns the `argument_0` operand.
-    fn argument_0(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument_0(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `roundingmode` attribute.
-    fn roundingmode(&self) -> AttributeRef<'c, 't> {
-        self.attribute("roundingmode").unwrap()
+    fn roundingmode(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("roundingmode")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "roundingmode",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `fpExceptionBehavior` attribute.
-    fn fp_exception_behavior(&self) -> AttributeRef<'c, 't> {
-        self.attribute("fpExceptionBehavior").unwrap()
+    fn fp_exception_behavior(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("fpExceptionBehavior")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "fpExceptionBehavior",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -465,18 +549,19 @@ pub fn intr_experimental_constrained_fptrunc<
     roundingmode: AttributeRef<'c, 't>,
     fp_exception_behavior: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedConstrainedFptruncOperation<'c, 't> {
+) -> Result<DetachedConstrainedFptruncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FPTRUNC_OPERATION_NAME, location);
     builder = builder.add_operand(argument_0);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("roundingmode", roundingmode);
     builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_experimental_constrained_fptrunc`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| {
+            Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_fptrunc`")
+        })
+    })
 }
 
 /// Canonical MLIR operation name for [`ConstrainedFremOperation`].
@@ -490,28 +575,40 @@ pub trait ConstrainedFremOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `argument_0` operand.
-    fn argument_0(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument_0(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `argument_1` operand.
-    fn argument_1(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn argument_1(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `roundingmode` attribute.
-    fn roundingmode(&self) -> AttributeRef<'c, 't> {
-        self.attribute("roundingmode").unwrap()
+    fn roundingmode(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("roundingmode")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "roundingmode",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `fpExceptionBehavior` attribute.
-    fn fp_exception_behavior(&self) -> AttributeRef<'c, 't> {
-        self.attribute("fpExceptionBehavior").unwrap()
+    fn fp_exception_behavior(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("fpExceptionBehavior")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "fpExceptionBehavior",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -533,19 +630,20 @@ pub fn intr_experimental_constrained_frem<
     roundingmode: AttributeRef<'c, 't>,
     fp_exception_behavior: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedConstrainedFremOperation<'c, 't> {
+) -> Result<DetachedConstrainedFremOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FREM_OPERATION_NAME, location);
     builder = builder.add_operand(argument_0);
     builder = builder.add_operand(argument_1);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("roundingmode", roundingmode);
     builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_experimental_constrained_frem`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_frem`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`ConstrainedFsubOperation`].
@@ -559,28 +657,40 @@ pub trait ConstrainedFsubOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `argument_0` operand.
-    fn argument_0(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument_0(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `argument_1` operand.
-    fn argument_1(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn argument_1(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `roundingmode` attribute.
-    fn roundingmode(&self) -> AttributeRef<'c, 't> {
-        self.attribute("roundingmode").unwrap()
+    fn roundingmode(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("roundingmode")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "roundingmode",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `fpExceptionBehavior` attribute.
-    fn fp_exception_behavior(&self) -> AttributeRef<'c, 't> {
-        self.attribute("fpExceptionBehavior").unwrap()
+    fn fp_exception_behavior(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("fpExceptionBehavior")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "fpExceptionBehavior",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -602,19 +712,20 @@ pub fn intr_experimental_constrained_fsub<
     roundingmode: AttributeRef<'c, 't>,
     fp_exception_behavior: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedConstrainedFsubOperation<'c, 't> {
+) -> Result<DetachedConstrainedFsubOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FSUB_OPERATION_NAME, location);
     builder = builder.add_operand(argument_0);
     builder = builder.add_operand(argument_1);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("roundingmode", roundingmode);
     builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_experimental_constrained_fsub`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_fsub`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`ConstrainedSitoFpOperation`].
@@ -628,23 +739,35 @@ pub trait ConstrainedSitoFpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> 
     }
 
     /// Returns the `argument_0` operand.
-    fn argument_0(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument_0(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `roundingmode` attribute.
-    fn roundingmode(&self) -> AttributeRef<'c, 't> {
-        self.attribute("roundingmode").unwrap()
+    fn roundingmode(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("roundingmode")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "roundingmode",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `fpExceptionBehavior` attribute.
-    fn fp_exception_behavior(&self) -> AttributeRef<'c, 't> {
-        self.attribute("fpExceptionBehavior").unwrap()
+    fn fp_exception_behavior(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("fpExceptionBehavior")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "fpExceptionBehavior",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -664,18 +787,19 @@ pub fn intr_experimental_constrained_sito_fp<
     roundingmode: AttributeRef<'c, 't>,
     fp_exception_behavior: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedConstrainedSitoFpOperation<'c, 't> {
+) -> Result<DetachedConstrainedSitoFpOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_SITO_FP_OPERATION_NAME, location);
     builder = builder.add_operand(argument_0);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("roundingmode", roundingmode);
     builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_experimental_constrained_sito_fp`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| {
+            Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_sito_fp`")
+        })
+    })
 }
 
 /// Canonical MLIR operation name for [`ConstrainedUitoFpOperation`].
@@ -689,23 +813,35 @@ pub trait ConstrainedUitoFpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> 
     }
 
     /// Returns the `argument_0` operand.
-    fn argument_0(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument_0(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `roundingmode` attribute.
-    fn roundingmode(&self) -> AttributeRef<'c, 't> {
-        self.attribute("roundingmode").unwrap()
+    fn roundingmode(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("roundingmode")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "roundingmode",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `fpExceptionBehavior` attribute.
-    fn fp_exception_behavior(&self) -> AttributeRef<'c, 't> {
-        self.attribute("fpExceptionBehavior").unwrap()
+    fn fp_exception_behavior(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("fpExceptionBehavior")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "fpExceptionBehavior",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -725,18 +861,19 @@ pub fn intr_experimental_constrained_uito_fp<
     roundingmode: AttributeRef<'c, 't>,
     fp_exception_behavior: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedConstrainedUitoFpOperation<'c, 't> {
+) -> Result<DetachedConstrainedUitoFpOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_UITO_FP_OPERATION_NAME, location);
     builder = builder.add_operand(argument_0);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("roundingmode", roundingmode);
     builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_experimental_constrained_uito_fp`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| {
+            Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_uito_fp`")
+        })
+    })
 }
 
 #[cfg(test)]
@@ -752,47 +889,53 @@ mod tests {
     #[test]
     fn test_intr_experimental_constrained_fadd() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let f32_type = context.float32_type();
         let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
         let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let arg_1 = block.argument(1).unwrap();
-            let op = intr_experimental_constrained_fadd(
-                arg_0,
-                arg_1,
-                f32_type,
-                roundingmode,
-                fp_exception_behavior,
-                location,
-            );
-            assert_eq!(op.argument_0(), arg_0);
-            assert_eq!(op.argument_1(), arg_1);
-            assert_eq!(op.roundingmode(), roundingmode);
-            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fadd");
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_experimental_constrained_fadd_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let arg_1 = block.argument(1).unwrap();
+                let op = intr_experimental_constrained_fadd(
+                    arg_0,
+                    arg_1,
+                    f32_type,
+                    roundingmode,
+                    fp_exception_behavior,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.argument_0().unwrap(), arg_0);
+                assert_eq!(op.argument_1().unwrap(), arg_1);
+                assert_eq!(op.roundingmode().unwrap(), roundingmode);
+                assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fadd");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_experimental_constrained_fadd_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -809,47 +952,53 @@ mod tests {
     #[test]
     fn test_intr_experimental_constrained_fdiv() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let f32_type = context.float32_type();
         let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
         let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let arg_1 = block.argument(1).unwrap();
-            let op = intr_experimental_constrained_fdiv(
-                arg_0,
-                arg_1,
-                f32_type,
-                roundingmode,
-                fp_exception_behavior,
-                location,
-            );
-            assert_eq!(op.argument_0(), arg_0);
-            assert_eq!(op.argument_1(), arg_1);
-            assert_eq!(op.roundingmode(), roundingmode);
-            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fdiv");
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_experimental_constrained_fdiv_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let arg_1 = block.argument(1).unwrap();
+                let op = intr_experimental_constrained_fdiv(
+                    arg_0,
+                    arg_1,
+                    f32_type,
+                    roundingmode,
+                    fp_exception_behavior,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.argument_0().unwrap(), arg_0);
+                assert_eq!(op.argument_1().unwrap(), arg_1);
+                assert_eq!(op.roundingmode().unwrap(), roundingmode);
+                assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fdiv");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_experimental_constrained_fdiv_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -866,54 +1015,60 @@ mod tests {
     #[test]
     fn test_intr_experimental_constrained_fma() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let f32_type = context.float32_type();
         let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
         let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (f32_type.as_ref(), location),
-                (f32_type.as_ref(), location),
-                (f32_type.as_ref(), location),
-            ]);
-            let arg_0 = block.argument(0).unwrap();
-            let arg_1 = block.argument(1).unwrap();
-            let arg_2 = block.argument(2).unwrap();
-            let op = intr_experimental_constrained_fma(
-                arg_0,
-                arg_1,
-                arg_2,
-                f32_type,
-                roundingmode,
-                fp_exception_behavior,
-                location,
-            );
-            assert_eq!(op.argument_0(), arg_0);
-            assert_eq!(op.argument_1(), arg_1);
-            assert_eq!(op.argument_2(), arg_2);
-            assert_eq!(op.roundingmode(), roundingmode);
-            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fma");
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_experimental_constrained_fma_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (f32_type.as_ref(), location),
+                    (f32_type.as_ref(), location),
+                    (f32_type.as_ref(), location),
+                ]);
+                let arg_0 = block.argument(0).unwrap();
+                let arg_1 = block.argument(1).unwrap();
+                let arg_2 = block.argument(2).unwrap();
+                let op = intr_experimental_constrained_fma(
+                    arg_0,
+                    arg_1,
+                    arg_2,
+                    f32_type,
+                    roundingmode,
+                    fp_exception_behavior,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.argument_0().unwrap(), arg_0);
+                assert_eq!(op.argument_1().unwrap(), arg_1);
+                assert_eq!(op.argument_2().unwrap(), arg_2);
+                assert_eq!(op.roundingmode().unwrap(), roundingmode);
+                assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fma");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_experimental_constrained_fma_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -930,54 +1085,60 @@ mod tests {
     #[test]
     fn test_intr_experimental_constrained_fmuladd() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let f32_type = context.float32_type();
         let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
         let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (f32_type.as_ref(), location),
-                (f32_type.as_ref(), location),
-                (f32_type.as_ref(), location),
-            ]);
-            let arg_0 = block.argument(0).unwrap();
-            let arg_1 = block.argument(1).unwrap();
-            let arg_2 = block.argument(2).unwrap();
-            let op = intr_experimental_constrained_fmuladd(
-                arg_0,
-                arg_1,
-                arg_2,
-                f32_type,
-                roundingmode,
-                fp_exception_behavior,
-                location,
-            );
-            assert_eq!(op.argument_0(), arg_0);
-            assert_eq!(op.argument_1(), arg_1);
-            assert_eq!(op.argument_2(), arg_2);
-            assert_eq!(op.roundingmode(), roundingmode);
-            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fmuladd");
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_experimental_constrained_fmuladd_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (f32_type.as_ref(), location),
+                    (f32_type.as_ref(), location),
+                    (f32_type.as_ref(), location),
+                ]);
+                let arg_0 = block.argument(0).unwrap();
+                let arg_1 = block.argument(1).unwrap();
+                let arg_2 = block.argument(2).unwrap();
+                let op = intr_experimental_constrained_fmuladd(
+                    arg_0,
+                    arg_1,
+                    arg_2,
+                    f32_type,
+                    roundingmode,
+                    fp_exception_behavior,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.argument_0().unwrap(), arg_0);
+                assert_eq!(op.argument_1().unwrap(), arg_1);
+                assert_eq!(op.argument_2().unwrap(), arg_2);
+                assert_eq!(op.roundingmode().unwrap(), roundingmode);
+                assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fmuladd");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_experimental_constrained_fmuladd_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -994,47 +1155,53 @@ mod tests {
     #[test]
     fn test_intr_experimental_constrained_fmul() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let f32_type = context.float32_type();
         let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
         let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let arg_1 = block.argument(1).unwrap();
-            let op = intr_experimental_constrained_fmul(
-                arg_0,
-                arg_1,
-                f32_type,
-                roundingmode,
-                fp_exception_behavior,
-                location,
-            );
-            assert_eq!(op.argument_0(), arg_0);
-            assert_eq!(op.argument_1(), arg_1);
-            assert_eq!(op.roundingmode(), roundingmode);
-            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fmul");
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_experimental_constrained_fmul_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let arg_1 = block.argument(1).unwrap();
+                let op = intr_experimental_constrained_fmul(
+                    arg_0,
+                    arg_1,
+                    f32_type,
+                    roundingmode,
+                    fp_exception_behavior,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.argument_0().unwrap(), arg_0);
+                assert_eq!(op.argument_1().unwrap(), arg_1);
+                assert_eq!(op.roundingmode().unwrap(), roundingmode);
+                assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fmul");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_experimental_constrained_fmul_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1051,37 +1218,42 @@ mod tests {
     #[test]
     fn test_intr_experimental_constrained_fpext() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let f32_type = context.float32_type();
         let f64_type = context.float64_type();
         let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_experimental_constrained_fpext(arg_0, f64_type, fp_exception_behavior, location);
-            assert_eq!(op.argument_0(), arg_0);
-            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
-            assert_eq!(op.output_type(), f64_type);
-            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fpext");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_experimental_constrained_fpext_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_experimental_constrained_fpext(arg_0, f64_type, fp_exception_behavior, location).unwrap();
+                assert_eq!(op.argument_0().unwrap(), arg_0);
+                assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
+                assert_eq!(op.output_type().unwrap(), f64_type);
+                assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fpext");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_experimental_constrained_fpext_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into()],
+                        results: vec![f64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1098,39 +1270,50 @@ mod tests {
     #[test]
     fn test_intr_experimental_constrained_fptrunc() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let f32_type = context.float32_type();
         let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
         let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op =
-                intr_experimental_constrained_fptrunc(arg_0, f32_type, roundingmode, fp_exception_behavior, location);
-            assert_eq!(op.argument_0(), arg_0);
-            assert_eq!(op.roundingmode(), roundingmode);
-            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fptrunc");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_experimental_constrained_fptrunc_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_experimental_constrained_fptrunc(
+                    arg_0,
+                    f32_type,
+                    roundingmode,
+                    fp_exception_behavior,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.argument_0().unwrap(), arg_0);
+                assert_eq!(op.roundingmode().unwrap(), roundingmode);
+                assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fptrunc");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_experimental_constrained_fptrunc_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1147,47 +1330,53 @@ mod tests {
     #[test]
     fn test_intr_experimental_constrained_frem() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let f32_type = context.float32_type();
         let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
         let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let arg_1 = block.argument(1).unwrap();
-            let op = intr_experimental_constrained_frem(
-                arg_0,
-                arg_1,
-                f32_type,
-                roundingmode,
-                fp_exception_behavior,
-                location,
-            );
-            assert_eq!(op.argument_0(), arg_0);
-            assert_eq!(op.argument_1(), arg_1);
-            assert_eq!(op.roundingmode(), roundingmode);
-            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.frem");
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_experimental_constrained_frem_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let arg_1 = block.argument(1).unwrap();
+                let op = intr_experimental_constrained_frem(
+                    arg_0,
+                    arg_1,
+                    f32_type,
+                    roundingmode,
+                    fp_exception_behavior,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.argument_0().unwrap(), arg_0);
+                assert_eq!(op.argument_1().unwrap(), arg_1);
+                assert_eq!(op.roundingmode().unwrap(), roundingmode);
+                assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.frem");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_experimental_constrained_frem_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1204,47 +1393,53 @@ mod tests {
     #[test]
     fn test_intr_experimental_constrained_fsub() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let f32_type = context.float32_type();
         let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
         let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let arg_1 = block.argument(1).unwrap();
-            let op = intr_experimental_constrained_fsub(
-                arg_0,
-                arg_1,
-                f32_type,
-                roundingmode,
-                fp_exception_behavior,
-                location,
-            );
-            assert_eq!(op.argument_0(), arg_0);
-            assert_eq!(op.argument_1(), arg_1);
-            assert_eq!(op.roundingmode(), roundingmode);
-            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fsub");
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_experimental_constrained_fsub_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type.as_ref(), location), (f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let arg_1 = block.argument(1).unwrap();
+                let op = intr_experimental_constrained_fsub(
+                    arg_0,
+                    arg_1,
+                    f32_type,
+                    roundingmode,
+                    fp_exception_behavior,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.argument_0().unwrap(), arg_0);
+                assert_eq!(op.argument_1().unwrap(), arg_1);
+                assert_eq!(op.roundingmode().unwrap(), roundingmode);
+                assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fsub");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_experimental_constrained_fsub_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1261,40 +1456,51 @@ mod tests {
     #[test]
     fn test_intr_experimental_constrained_sito_fp() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
         let f32_type = context.float32_type();
         let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
         let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op =
-                intr_experimental_constrained_sito_fp(arg_0, f32_type, roundingmode, fp_exception_behavior, location);
-            assert_eq!(op.argument_0(), arg_0);
-            assert_eq!(op.roundingmode(), roundingmode);
-            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.sitofp");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_experimental_constrained_sitofp_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_experimental_constrained_sito_fp(
+                    arg_0,
+                    f32_type,
+                    roundingmode,
+                    fp_exception_behavior,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.argument_0().unwrap(), arg_0);
+                assert_eq!(op.roundingmode().unwrap(), roundingmode);
+                assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.sitofp");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_experimental_constrained_sitofp_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1311,40 +1517,51 @@ mod tests {
     #[test]
     fn test_intr_experimental_constrained_uito_fp() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
         let f32_type = context.float32_type();
         let roundingmode = context.integer_attribute(i64_type, 1).as_ref();
         let fp_exception_behavior = context.integer_attribute(i64_type, 0).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op =
-                intr_experimental_constrained_uito_fp(arg_0, f32_type, roundingmode, fp_exception_behavior, location);
-            assert_eq!(op.argument_0(), arg_0);
-            assert_eq!(op.roundingmode(), roundingmode);
-            assert_eq!(op.fp_exception_behavior(), fp_exception_behavior);
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.uitofp");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_experimental_constrained_uitofp_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_experimental_constrained_uito_fp(
+                    arg_0,
+                    f32_type,
+                    roundingmode,
+                    fp_exception_behavior,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.argument_0().unwrap(), arg_0);
+                assert_eq!(op.roundingmode().unwrap(), roundingmode);
+                assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.uitofp");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_experimental_constrained_uitofp_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

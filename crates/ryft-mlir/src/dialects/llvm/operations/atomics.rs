@@ -1,5 +1,6 @@
 use crate::{
-    AttributeRef, DetachedOp, DialectHandle, Location, Operation, OperationBuilder, TypeRef, Value, ValueRef, mlir_op,
+    AttributeRef, DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, TypeRef, Value, ValueRef,
+    mlir_op,
 };
 
 /// Canonical MLIR operation name for [`AtomicCmpXchgOperation`].
@@ -13,37 +14,49 @@ pub trait AtomicCmpXchgOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `pointer` operand.
-    fn pointer(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn pointer(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `compare_value` operand.
-    fn compare_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn compare_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `new_value` operand.
-    fn new_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn new_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the `success_ordering` attribute.
-    fn success_ordering(&self) -> AttributeRef<'c, 't> {
-        self.attribute("success_ordering").unwrap()
+    fn success_ordering(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("success_ordering")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "success_ordering",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `failure_ordering` attribute.
-    fn failure_ordering(&self) -> AttributeRef<'c, 't> {
-        self.attribute("failure_ordering").unwrap()
+    fn failure_ordering(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("failure_ordering")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "failure_ordering",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the optional `syncscope` attribute.
-    fn syncscope(&self) -> Option<AttributeRef<'c, 't>> {
+    fn syncscope(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("syncscope")
     }
 
     /// Returns the optional `alignment` attribute.
-    fn alignment(&self) -> Option<AttributeRef<'c, 't>> {
+    fn alignment(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("alignment")
     }
 
@@ -58,8 +71,8 @@ pub trait AtomicCmpXchgOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns this operation's first result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -85,9 +98,9 @@ pub fn cmp_xchg<
     weak: bool,
     is_volatile: bool,
     location: L,
-) -> DetachedAtomicCmpXchgOperation<'c, 't> {
+) -> Result<DetachedAtomicCmpXchgOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ATOMIC_CMP_XCHG_OPERATION_NAME, location);
     builder = builder.add_operand(pointer);
     builder = builder.add_operand(compare_value);
@@ -107,10 +120,9 @@ pub fn cmp_xchg<
     if is_volatile {
         builder = builder.add_attribute("volatile_", context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::cmp_xchg`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::cmp_xchg`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`AtomicRmwOperation`].
@@ -124,32 +136,44 @@ pub trait AtomicRmwOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `pointer` operand.
-    fn pointer(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn pointer(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `value` operand.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `bin_op` attribute.
-    fn bin_op(&self) -> AttributeRef<'c, 't> {
-        self.attribute("bin_op").unwrap()
+    fn bin_op(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("bin_op")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "bin_op",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `ordering` attribute.
-    fn ordering(&self) -> AttributeRef<'c, 't> {
-        self.attribute("ordering").unwrap()
+    fn ordering(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("ordering")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "ordering",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the optional `syncscope` attribute.
-    fn syncscope(&self) -> Option<AttributeRef<'c, 't>> {
+    fn syncscope(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("syncscope")
     }
 
     /// Returns the optional `alignment` attribute.
-    fn alignment(&self) -> Option<AttributeRef<'c, 't>> {
+    fn alignment(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("alignment")
     }
 
@@ -159,8 +183,8 @@ pub trait AtomicRmwOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns this operation's first result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -177,9 +201,9 @@ pub fn atomic_rmw<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>, L: L
     alignment: Option<AttributeRef<'c, 't>>,
     is_volatile: bool,
     location: L,
-) -> DetachedAtomicRmwOperation<'c, 't> {
+) -> Result<DetachedAtomicRmwOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ATOMIC_RMW_OPERATION_NAME, location);
     builder = builder.add_operand(pointer);
     builder = builder.add_operand(value);
@@ -195,10 +219,9 @@ pub fn atomic_rmw<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>, L: L
     if is_volatile {
         builder = builder.add_attribute("volatile_", context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::atomic_rmw`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::atomic_rmw`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`FenceOperation`].
@@ -212,12 +235,18 @@ pub trait FenceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `ordering` attribute.
-    fn ordering(&self) -> AttributeRef<'c, 't> {
-        self.attribute("ordering").unwrap()
+    fn ordering(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("ordering")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "ordering",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the optional `syncscope` attribute.
-    fn syncscope(&self) -> Option<AttributeRef<'c, 't>> {
+    fn syncscope(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("syncscope")
     }
 }
@@ -229,18 +258,17 @@ pub fn fence<'c, 't: 'c, L: Location<'c, 't>>(
     ordering: AttributeRef<'c, 't>,
     syncscope: Option<AttributeRef<'c, 't>>,
     location: L,
-) -> DetachedFenceOperation<'c, 't> {
+) -> Result<DetachedFenceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FENCE_OPERATION_NAME, location);
     builder = builder.add_attribute("ordering", ordering);
     if let Some(syncscope) = syncscope {
         builder = builder.add_attribute("syncscope", syncscope);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::fence`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::fence`"))
+    })
 }
 
 #[cfg(test)]
@@ -257,53 +285,59 @@ mod tests {
     fn test_cmp_xchg() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let pointer_type = context.llvm_pointer_type(0);
+        let module = context.module(location).unwrap();
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
         let i1_type = context.signless_integer_type(1);
         let i32_type = context.signless_integer_type(32);
-        let result_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i1_type.as_ref()], false);
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (pointer_type.as_ref(), location),
-                (i32_type.as_ref(), location),
-                (i32_type.as_ref(), location),
-            ]);
-            let op = cmp_xchg(
-                block.argument(0).unwrap(),
-                block.argument(1).unwrap(),
-                block.argument(2).unwrap(),
-                result_type.as_ref(),
-                context.integer_attribute(context.signless_integer_type(64), 4).as_ref(),
-                context.integer_attribute(context.signless_integer_type(64), 2).as_ref(),
-                Some(context.string_attribute("singlethread").as_ref()),
-                Some(context.integer_attribute(context.signless_integer_type(64), 4).as_ref()),
-                true,
-                true,
-                location,
-            );
-            assert_eq!(op.operation_name(), "llvm.cmpxchg");
-            assert_eq!(op.pointer(), block.argument(0).unwrap());
-            assert_eq!(op.compare_value(), block.argument(1).unwrap());
-            assert_eq!(op.new_value(), block.argument(2).unwrap());
-            assert_eq!(op.output_type(), result_type);
-            assert!(op.weak());
-            assert!(op.is_volatile());
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_cmpxchg_test",
-                func::FuncAttributes {
-                    arguments: vec![pointer_type.into(), i32_type.into(), i32_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let result_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i1_type.as_ref()], false).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (pointer_type.as_ref(), location),
+                    (i32_type.as_ref(), location),
+                    (i32_type.as_ref(), location),
+                ]);
+                let op = cmp_xchg(
+                    block.argument(0).unwrap(),
+                    block.argument(1).unwrap(),
+                    block.argument(2).unwrap(),
+                    result_type.as_ref(),
+                    context.integer_attribute(context.signless_integer_type(64), 4).as_ref(),
+                    context.integer_attribute(context.signless_integer_type(64), 2).as_ref(),
+                    Some(context.string_attribute("singlethread").as_ref()),
+                    Some(context.integer_attribute(context.signless_integer_type(64), 4).as_ref()),
+                    true,
+                    true,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.cmpxchg");
+                assert_eq!(op.pointer().unwrap(), block.argument(0).unwrap());
+                assert_eq!(op.compare_value().unwrap(), block.argument(1).unwrap());
+                assert_eq!(op.new_value().unwrap(), block.argument(2).unwrap());
+                assert_eq!(op.output_type().unwrap(), result_type);
+                assert!(op.weak());
+                assert!(op.is_volatile());
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_cmpxchg_test",
+                    func::FuncAttributes {
+                        arguments: vec![pointer_type.into(), i32_type.into(), i32_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -321,43 +355,49 @@ mod tests {
     fn test_atomic_rmw() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let pointer_type = context.llvm_pointer_type(0);
+        let module = context.module(location).unwrap();
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(pointer_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let op = atomic_rmw(
-                block.argument(0).unwrap(),
-                block.argument(1).unwrap(),
-                i32_type.as_ref(),
-                context.integer_attribute(context.signless_integer_type(64), 1).as_ref(),
-                context.integer_attribute(context.signless_integer_type(64), 2).as_ref(),
-                None,
-                Some(context.integer_attribute(context.signless_integer_type(64), 4).as_ref()),
-                true,
-                location,
-            );
-            assert_eq!(op.operation_name(), "llvm.atomicrmw");
-            assert_eq!(op.pointer(), block.argument(0).unwrap());
-            assert_eq!(op.value(), block.argument(1).unwrap());
-            assert_eq!(op.output_type(), i32_type);
-            assert!(op.is_volatile());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_atomicrmw_test",
-                func::FuncAttributes {
-                    arguments: vec![pointer_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(pointer_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let op = atomic_rmw(
+                    block.argument(0).unwrap(),
+                    block.argument(1).unwrap(),
+                    i32_type.as_ref(),
+                    context.integer_attribute(context.signless_integer_type(64), 1).as_ref(),
+                    context.integer_attribute(context.signless_integer_type(64), 2).as_ref(),
+                    None,
+                    Some(context.integer_attribute(context.signless_integer_type(64), 4).as_ref()),
+                    true,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.atomicrmw");
+                assert_eq!(op.pointer().unwrap(), block.argument(0).unwrap());
+                assert_eq!(op.value().unwrap(), block.argument(1).unwrap());
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert!(op.is_volatile());
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_atomicrmw_test",
+                    func::FuncAttributes {
+                        arguments: vec![pointer_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -375,28 +415,34 @@ mod tests {
     fn test_fence() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = fence(
-                context.integer_attribute(context.signless_integer_type(64), 7).as_ref(),
-                Some(context.string_attribute("singlethread").as_ref()),
-                location,
-            );
-            assert_eq!(op.operation_name(), "llvm.fence");
-            assert!(op.syncscope().is_some());
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 0);
-            block.append_operation(op);
-            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-            func::func(
-                "llvm_fence_test",
-                func::FuncAttributes { arguments: vec![], results: vec![], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let module = context.module(location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = fence(
+                    context.integer_attribute(context.signless_integer_type(64), 7).as_ref(),
+                    Some(context.string_attribute("singlethread").as_ref()),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.fence");
+                assert!(op.syncscope().unwrap().is_some());
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_fence_test",
+                    func::FuncAttributes { arguments: vec![], results: vec![], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
