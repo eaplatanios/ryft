@@ -24,6 +24,20 @@ error[E0392]: type parameter `P` is never used
    |
    = help: consider removing `P`, referring to it in a field, or using a marker such as `PhantomData`
 
+error[E0277]: the trait bound `StructWithUnusedParameterType<Placeholder>: Clone` is not satisfied
+ --> tests/parameters/error_structs.rs:9:10
+  |
+9 | #[derive(Parameterized)]
+  |          ^^^^^^^^^^^^^ the trait `Clone` is not implemented for `StructWithUnusedParameterType<Placeholder>`
+  |
+  = help: see issue #48214
+  = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider annotating `StructWithUnusedParameterType<Placeholder>` with `#[derive(Clone)]`
+  |
+10+ #[derive(Clone)]
+11| struct StructWithUnusedParameterType<P: Parameter> {
+  |
+
 error[E0283]: type annotations needed
   --> tests/parameters/error_structs.rs:10:8
    |

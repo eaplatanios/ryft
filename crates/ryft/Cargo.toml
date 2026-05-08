@@ -33,14 +33,17 @@ pre-release-replacements = [
 ryft-core.workspace = true
 ryft-macros.workspace = true
 ryft-mlir = { workspace = true, optional = true }
+ryft-ndarray = { workspace = true, optional = true }
 ryft-pjrt = { workspace = true, optional = true }
+ryft-xla = { workspace = true, optional = true }
 
 [features]
-default = ["xla"]
-xla = ["ryft-mlir", "ryft-pjrt", "ryft-core/xla"]
-cuda-12 = ["ryft-core/cuda-12"]
-cuda-13 = ["ryft-core/cuda-13"]
-rocm-7 = ["ryft-core/rocm-7"]
-tpu = ["ryft-core/tpu"]
-neuron = ["ryft-core/neuron"]
-metal = ["ryft-core/metal"]
+default = ["ndarray", "xla"]
+ndarray = ["ryft-ndarray"]
+xla = ["ryft-mlir", "ryft-pjrt", "ryft-xla"]
+cuda-12 = ["ryft-xla/cuda-12"]
+cuda-13 = ["ryft-xla/cuda-13"]
+rocm-7 = ["ryft-xla/rocm-7"]
+tpu = ["ryft-xla/tpu"]
+neuron = ["ryft-xla/neuron"]
+metal = ["ryft-xla/metal"]

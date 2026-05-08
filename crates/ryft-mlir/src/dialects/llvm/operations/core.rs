@@ -673,10 +673,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::{
-        Block, Context, OneOperand, Operation, OperationBuilder, Region, Type, ValueRef,
-        dialects::{func, llvm::attributes::Linkage},
-    };
+    use crate::dialects::func;
+    use crate::dialects::llvm::attributes::Linkage;
+    use crate::{Block, Context, OneOperand, Operation, OperationBuilder, Region, Type, ValueRef};
 
     use super::*;
 

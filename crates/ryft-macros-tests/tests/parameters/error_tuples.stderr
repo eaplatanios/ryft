@@ -22,6 +22,20 @@ note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedF
   |          ^^^^^^^^^^^^^ unsatisfied trait bound introduced in this `derive` macro
   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
+error[E0277]: the trait bound `NestedVecOfTuples<Placeholder>: Clone` is not satisfied
+ --> tests/parameters/error_tuples.rs:3:10
+  |
+3 | #[derive(Parameterized)]
+  |          ^^^^^^^^^^^^^ the trait `Clone` is not implemented for `NestedVecOfTuples<Placeholder>`
+  |
+  = help: see issue #48214
+  = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider annotating `NestedVecOfTuples<Placeholder>` with `#[derive(Clone)]`
+  |
+4 + #[derive(Clone)]
+5 | struct NestedVecOfTuples<P: Parameter> {
+  |
+
 error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfied
  --> tests/parameters/error_tuples.rs:4:8
   |

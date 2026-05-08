@@ -84,8 +84,9 @@ impl Api {
 impl Executable {
     /// Returns the [`ExecutableMetadata`](crate::protos::ExecutableMetadata) associated with this [`Executable`].
     pub fn metadata(&self) -> Result<crate::protos::ExecutableMetadata, Error> {
-        use ffi::PJRT_ExecutableMetadata_DestroySerializedMetadata_Args;
-        use ffi::PJRT_ExecutableMetadata_GetExecutableMetadata_Args;
+        use ffi::{
+            PJRT_ExecutableMetadata_DestroySerializedMetadata_Args, PJRT_ExecutableMetadata_GetExecutableMetadata_Args,
+        };
         let extension = self.api().executable_metadata_extension()?;
         invoke_pjrt_api_error_fn!(
             @extension ffi::PJRT_ExecutableMetadata_Extension => extension,

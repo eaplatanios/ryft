@@ -104,7 +104,7 @@ pub(crate) mod ffi {
         unsafe extern "C" fn(args: *mut XLA_FFI_Future_SetAvailable_Args) -> *mut XLA_FFI_Error;
 
     #[repr(C)]
-    #[derive(Debug, Copy, Clone)]
+    #[derive(Copy, Clone, Debug)]
     pub struct XLA_FFI_Future_SetError_Args {
         pub struct_size: usize,
         pub extension_start: *mut XLA_FFI_Extension_Base,

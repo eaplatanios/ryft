@@ -3794,7 +3794,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::dialects::{func, linalg::IteratorType};
+    use crate::dialects::func;
+    use crate::dialects::linalg::IteratorType;
     use crate::{
         ArrayAttributeRef, Attribute, Block, Context, Operation, Region, Size, Type, Value, VectorTypeDimension,
     };

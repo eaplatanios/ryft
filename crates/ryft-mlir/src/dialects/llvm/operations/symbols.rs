@@ -889,10 +889,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::Attribute;
+    use crate::dialects::func;
     use crate::dialects::llvm::Linkage;
     use crate::dialects::llvm::operations::core::{address_of, r#return as llvm_return};
-    use crate::{Block, Context, Operation, Region, Type, TypeRef, dialects::func};
+    use crate::{Attribute, Block, Context, Operation, Region, Type, TypeRef};
 
     use super::*;
 

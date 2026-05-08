@@ -4,8 +4,8 @@ use ryft_macros::Parameter;
 
 use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
-use crate::sharding::{Sharding, ShardingError};
-use crate::types::{DataType, Layout, Type};
+use crate::sharding::{MeshAxisType, Sharding, ShardingDimension, ShardingError};
+use crate::types::{DataType, Layout, Type, TypeError};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
 /// dynamic, in which case their sizes will only be known at runtime. Dynamic dimensions may optionally have an upper
@@ -15,7 +15,7 @@ use crate::types::{DataType, Layout, Type};
 ///
 /// Note that the [`Display`] implementation of [`Size`] renders static sizes as just a number, dynamic sizes
 /// with an upper bound as `<` followed by the upper bound, and dynamic sizes with no upper bound as `*`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Parameter)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum Size {
     /// Static size that is known at compilation time.
     Static(usize),
@@ -69,7 +69,7 @@ impl From<usize> for Size {
 ///
 /// Note that the [`Display`] implementation of [`Shape`] renders shapes as the rendered dimension sizes
 /// in a comma-separated list surrounded by square brackets.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Parameter)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Shape {
     /// [`Size`]s of the array dimensions ordered from outermost to innermost.
     pub dimensions: Vec<Size>,
@@ -174,7 +174,7 @@ impl Display for Shape {
 ///   "c64[*, 42]",
 /// );
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Parameter)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ArrayType {
     /// [`DataType`] of the elements stored in the array.
     pub data_type: DataType,
@@ -258,6 +258,85 @@ impl ArrayType {
     pub fn dimension(&self, index: i32) -> Size {
         self.shape.dimension(index)
     }
+
+    /// Returns a copy of this [`ArrayType`] with a dimension inserted at the provided index. Rank-changing operations
+    /// clear explicit [`Layout`] information because [`Layout`]s do not carry enough information to infer a correct
+    /// stride or tiling for a newly inserted logical axis. [`Sharding`] information is preserved by inserting a
+    /// replicated sharding dimension at the same index and shifting the existing dimension annotations.
+    pub fn with_inserted_dimension(&self, index: usize, size: Size) -> Result<Self, TypeError> {
+        if index > self.rank() {
+            return Err(TypeError {
+                message: format!("cannot insert dimension at index {index} for rank-{} array type", self.rank()),
+            });
+        }
+        let mut dimensions = self.shape.dimensions.clone();
+        dimensions.insert(index, size);
+        let sharding = self
+            .sharding
+            .as_ref()
+            .map(|sharding| {
+                let mut sharding_dimensions = sharding.dimensions.clone();
+                sharding_dimensions.insert(index, ShardingDimension::Replicated);
+                Sharding::with_manual_axes(
+                    sharding.mesh.clone(),
+                    sharding_dimensions,
+                    sharding.unreduced_axes.clone(),
+                    sharding.reduced_manual_axes.clone(),
+                    sharding.varying_manual_axes.clone(),
+                )
+                .map_err(|error| TypeError { message: error.to_string() })
+            })
+            .transpose()?;
+        Ok(Self { data_type: self.data_type, shape: Shape::new(dimensions), layout: None, sharding })
+    }
+
+    /// Returns a copy of this [`ArrayType`] with its `axis`-th dimension removed, paired with the [`Size`] of the
+    /// removed dimension. Rank-changing operations clear explicit [`Layout`] information because [`Layout`]s do not
+    /// carry enough information to infer a correct stride or tiling after removing a logical axis. [`Sharding`]
+    /// information is preserved when the removed dimension is replicated or unconstrained. When the removed dimension
+    /// is sharded over manual mesh axes, those axes become varying manual axes because the value can still differ
+    /// across shards even though the ranked array dimension is gone. Removing a dimension sharded over non-manual
+    /// axes is rejected because there is no equivalent rank-independent metadata field for those axes.
+    pub fn without_dimension(&self, axis: usize) -> Result<(Self, Size), TypeError> {
+        if axis >= self.rank() {
+            return Err(TypeError {
+                message: format!("cannot remove dimension at index {axis} for rank-{} array type", self.rank()),
+            });
+        }
+        let mut dimensions = self.shape.dimensions.clone();
+        let dimension = dimensions.remove(axis);
+        let sharding = self
+            .sharding
+            .as_ref()
+            .map(|sharding| {
+                let mut sharding_dimensions = sharding.dimensions.clone();
+                let removed_sharding_dimension = sharding_dimensions.remove(axis);
+                let mut varying_manual_axes = sharding.varying_manual_axes.clone();
+                if let ShardingDimension::Sharded(axis_names) = removed_sharding_dimension {
+                    for axis_name in axis_names {
+                        if sharding.mesh.axis_type(&axis_name) != Some(MeshAxisType::Manual) {
+                            return Err(TypeError {
+                                message: format!(
+                                    "cannot remove sharded dimension {axis} \
+                                    because mesh axis '{axis_name}' is not manual"
+                                ),
+                            });
+                        }
+                        varying_manual_axes.insert(axis_name);
+                    }
+                }
+                Sharding::with_manual_axes(
+                    sharding.mesh.clone(),
+                    sharding_dimensions,
+                    sharding.unreduced_axes.clone(),
+                    sharding.reduced_manual_axes.clone(),
+                    varying_manual_axes,
+                )
+                .map_err(|error| TypeError { message: error.to_string() })
+            })
+            .transpose()?;
+        Ok((Self { data_type: self.data_type, shape: Shape::new(dimensions), layout: None, sharding }, dimension))
+    }
 }
 
 impl Display for ArrayType {
@@ -277,7 +356,7 @@ impl Type for ArrayType {
     #[inline]
     fn is_compatible_with(&self, other: &Self) -> bool {
         // Note that this compatibility relationship is defined here as a "broadcastability" relationship.
-        self.is_broadcastable_to(&other)
+        self.is_broadcastable_to(other)
     }
 }
 
@@ -287,7 +366,7 @@ mod tests {
 
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError};
     use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32};
-    use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout};
+    use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout, TypeError};
 
     #[test]
     fn test_size_value() {
@@ -379,6 +458,81 @@ mod tests {
         assert_eq!(t1.dimension(0), Size::Static(42));
         assert_eq!(t1.dimension(1), Size::Dynamic(None));
         assert_eq!(t1.dimension(-1), Size::Dynamic(None));
+    }
+
+    #[test]
+    fn test_array_type_insert_and_remove_dimensions() {
+        let t0 = ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]), None, None).unwrap();
+        let t1 = t0.with_inserted_dimension(1, 5.into()).unwrap();
+        let t2 = ArrayType::new(F32, Shape::new(vec![2.into(), 5.into(), 3.into()]), None, None).unwrap();
+
+        assert_eq!(t1, t2);
+        assert_eq!(t1.without_dimension(1).unwrap(), (t0, Size::Static(5)));
+
+        let t3 = ArrayType::new(
+            F32,
+            Shape::new(vec![2.into(), 3.into()]),
+            Some(Layout::Strided(StridedLayout::new(vec![12, 4]))),
+            None,
+        )
+        .unwrap();
+        let t4 = t3.with_inserted_dimension(1, 5.into()).unwrap();
+
+        assert_eq!(t4.layout, None);
+        assert_eq!(t4.shape, Shape::new(vec![2.into(), 5.into(), 3.into()]));
+
+        let (t5, removed_dimension) = t4.without_dimension(1).unwrap();
+
+        assert_eq!(removed_dimension, Size::Static(5));
+        assert_eq!(t5.layout, None);
+        assert_eq!(t5.shape, Shape::new(vec![2.into(), 3.into()]));
+
+        let m0 = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let s0 = Sharding::with_manual_axes(
+            m0.clone(),
+            vec![ShardingDimension::sharded(["x"])],
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+            ["x"],
+        )
+        .unwrap();
+        let t6 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s0.clone())).unwrap();
+        let t7 = t6.with_inserted_dimension(0, 2.into()).unwrap();
+        let s1 = t7.sharding.as_ref().unwrap();
+
+        assert_eq!(s1.dimensions, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]);
+        assert_eq!(s1.varying_manual_axes, ["x".to_string()].into_iter().collect());
+
+        let (t8, removed_dimension) = t7.without_dimension(0).unwrap();
+
+        assert_eq!(removed_dimension, Size::Static(2));
+        assert_eq!(t8, t6);
+
+        let s2 = Sharding::new(m0, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let t9 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s2)).unwrap();
+
+        let (t10, removed_dimension) = t9.without_dimension(0).unwrap();
+        let s3 = t10.sharding.unwrap();
+
+        assert_eq!(removed_dimension, Size::Static(8));
+        assert_eq!(s3.dimensions, Vec::<ShardingDimension>::new());
+        assert_eq!(s3.varying_manual_axes, ["x".to_string()].into_iter().collect());
+
+        let m1 = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let t11 = ArrayType::new(
+            F32,
+            Shape::new(vec![8.into()]),
+            None,
+            Some(Sharding::new(m1, vec![ShardingDimension::sharded(["x"])]).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            t11.without_dimension(0),
+            Err(TypeError {
+                message: "cannot remove sharded dimension 0 because mesh axis 'x' is not manual".to_string(),
+            })
+        );
     }
 
     #[test]

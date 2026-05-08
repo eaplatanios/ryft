@@ -374,7 +374,7 @@ pub(crate) mod ffi {
     pub const PJRT_API_GPU_EXTENSION_VERSION: usize = 2;
 
     #[repr(C)]
-    #[derive(Debug, Copy, Clone)]
+    #[derive(Copy, Clone, Debug)]
     pub struct PJRT_Gpu_Register_Custom_Call_Args {
         pub struct_size: usize,
         pub function_name: *const std::ffi::c_char,
@@ -422,13 +422,14 @@ pub(crate) mod ffi {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use indoc::indoc;
 
+    use crate::extensions::ffi::ffi::{XLA_FFI_CallFrame, XLA_FFI_Error};
     use crate::extensions::ffi::{
         FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiInput, FfiOutput, FfiTypeId,
-        ffi::XLA_FFI_CallFrame, ffi::XLA_FFI_Error,
     };
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use crate::tests::{TestPlatform, test_for_each_platform};
@@ -475,15 +476,19 @@ mod tests {
         let inputs = ExecutionDeviceInputs {
             inputs: &[
                 ExecutionInput {
-                    buffer: client
-                        .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
-                        .unwrap(),
+                    buffer: Arc::new(
+                        client
+                            .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+                            .unwrap(),
+                    ),
                     donatable: false,
                 },
                 ExecutionInput {
-                    buffer: client
-                        .buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
-                        .unwrap(),
+                    buffer: Arc::new(
+                        client
+                            .buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+                            .unwrap(),
+                    ),
                     donatable: false,
                 },
             ],

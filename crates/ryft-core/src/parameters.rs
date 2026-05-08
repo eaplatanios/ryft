@@ -9,7 +9,7 @@ use paste::paste;
 use thiserror::Error;
 
 /// Represents [`Parameter`]-related errors.
-#[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ParameterError {
     #[error(
         "{}",
@@ -36,10 +36,13 @@ pub enum ParameterError {
     MissingParameters { expected_count: usize, paths: Option<Vec<String>> },
 
     #[error(
-        "got ambiguous parameter values while combining parameterized values; conflicting values: {}",
+        "got ambiguous parameter values while combining parameterized values: {}",
         values.iter().map(|value| format!("'{value}'")).collect::<Vec<_>>().join(", "),
     )]
     AmbiguousParameterCombination { values: Vec<String> },
+
+    #[error("mismatched parameter structures: {left_structure} and {right_structure}")]
+    MismatchedParameterStructures { left_structure: String, right_structure: String },
 }
 
 /// Helper trait used to encode type equality constraints in the associated type bounds of [`Parameterized`].
@@ -245,7 +248,7 @@ impl Debug for ParameterPath {
 /// [this blog post](https://smallcultfollowing.com/babysteps/blog/2016/11/03/associated-type-constructors-part-2-family-traits/).
 /// This trait is generic over `P` (instead of using a non-generic family trait with `type To<P: Parameter>`) so
 /// that each family can constrain the parameter domain at the `impl` level. For example, a family can implement
-/// `ParameterizedFamily<P>` only for `P: Parameter + Clone`. With a generic associated type `To<P>` on a non-generic
+/// `ParameterizedFamily<P>` only for `P: Clone + Parameter`. With a generic associated type `To<P>` on a non-generic
 /// family trait, the declaration would quantify over all `P: Parameter`, and implementations would not be allowed to
 /// add stricter per-family bounds on `P`.
 pub trait ParameterizedFamily<P: Parameter>: Sized {
@@ -474,6 +477,8 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///
 ///   - The type on which it is used must be a struct or an enum. Unions are not supported.
 ///   - There must be exactly one generic type bounded by [`Parameter`].
+///   - The reparameterized structure type, with each nested parameter replaced by [`Placeholder`], must implement
+///     [`Clone`]. Deriving [`Clone`] on the same struct or enum is usually the simplest way to satisfy this.
 ///   - The parameter type must be _owned_ in parameter fields (i.e., parameter references or pointers are not allowed).
 ///   - Nested tuples that mix parameterized and non-parameterized elements are supported inside derived structs and
 ///     enums. However, the same kinds of mixed tuples are not generally supported inside other generic containers
@@ -606,11 +611,12 @@ pub trait Parameterized<P: Parameter>: Sized {
     where
         Self::Family: ParameterizedFamily<T>;
 
-    /// Type that represents a shape-only representation of this [`Parameterized`] type with all nested `P` parameter
-    /// types replaced by [`Placeholder`]. This must always be set to `Self::To<Placeholder>`. The only reason this is
-    /// not done by default is that defaulted associated types are not supported in stable Rust, and this forces us to
-    /// require that all implementations provide an implementation for this associated type as well.
-    type ParameterStructure: Parameterized<Placeholder, Family = Self::Family, To<P> = Self>
+    /// Type that represents a reusable shape-only representation of this [`Parameterized`] type with all nested `P`
+    /// parameter types replaced by [`Placeholder`]. This must always be set to `Self::To<Placeholder>`. The only reason
+    /// this is not done by default is that defaulted associated types are not supported in stable Rust, and this forces
+    /// us to require that all implementations provide an implementation for this associated type as well.
+    type ParameterStructure: Clone
+        + Parameterized<Placeholder, Family = Self::Family, To<P> = Self>
         + SameAs<Self::To<Placeholder>>;
 
     /// Iterator returned by [`Self::parameters`] for a borrow of the underlying [`Parameter`]s with lifetime `'t`.
@@ -814,31 +820,31 @@ pub trait Parameterized<P: Parameter>: Sized {
             }
         }
 
-        if deferred_parameters.is_none() {
-            if let Some((provided_path, parameter)) = next_parameter.take() {
-                // No mismatch occurred during traversal, but additional parameters remain. We need to materialize
-                // the remaining parameters while still applying duplicate overrides for previously matched paths.
-                let mut deferred = HashMap::with_capacity(parameters.size_hint().0 + 1);
-                let matching_path_indices = matching_path_indices.get_or_insert_with(|| {
-                    matching_paths
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .map(|(index, path)| (path, index))
-                        .collect::<HashMap<_, _>>()
-                });
+        if deferred_parameters.is_none()
+            && let Some((provided_path, parameter)) = next_parameter.take()
+        {
+            // No mismatch occurred during traversal, but additional parameters remain. We need to materialize
+            // the remaining parameters while still applying duplicate overrides for previously matched paths.
+            let mut deferred = HashMap::with_capacity(parameters.size_hint().0 + 1);
+            let matching_path_indices = matching_path_indices.get_or_insert_with(|| {
+                matching_paths
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, path)| (path, index))
+                    .collect::<HashMap<_, _>>()
+            });
 
-                let parameters = std::iter::once((provided_path, parameter)).chain(parameters);
-                for (provided_path, parameter) in parameters {
-                    if let Some(index) = matching_path_indices.get(&provided_path).copied() {
-                        values[index] = parameter;
-                    } else {
-                        deferred.insert(provided_path, parameter);
-                    }
+            let parameters = std::iter::once((provided_path, parameter)).chain(parameters);
+            for (provided_path, parameter) in parameters {
+                if let Some(index) = matching_path_indices.get(&provided_path).copied() {
+                    values[index] = parameter;
+                } else {
+                    deferred.insert(provided_path, parameter);
                 }
-
-                deferred_parameters = Some(deferred);
             }
+
+            deferred_parameters = Some(deferred);
         }
 
         if !missing_paths.is_empty() {
@@ -1960,7 +1966,7 @@ impl<
     P: Parameter,
     K: Clone + Debug + Eq + Ord + Hash,
     F: ParameterizedFamily<P> + ParameterizedFamily<Placeholder>,
-    S: BuildHasher + Clone,
+    S: Clone + BuildHasher,
 > ParameterizedFamily<P> for HashMapParameterizedFamily<K, F, S>
 {
     type To = HashMap<K, <F as ParameterizedFamily<P>>::To, S>;
@@ -1970,7 +1976,7 @@ impl<
 // The [`Parameterized`] implementation for [`HashMap`] is quite inefficient. That is because for most operations that
 // require traversal of the [`HashMap`] we end up having to perform a sort of the results that we obtain (by key) to
 // comply with the requirements of the [`Parameterized`].
-impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: BuildHasher + Clone> Parameterized<P>
+impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: Clone + BuildHasher> Parameterized<P>
     for HashMap<K, V, S>
 {
     type Family = HashMapParameterizedFamily<K, V::Family, S>;
@@ -2262,9 +2268,8 @@ mod tests {
     pub mod ryft {
         pub use ryft_macros::Parameterized;
 
-        pub use crate::parameters::ParameterError;
         pub use crate::parameters::{
-            Parameter, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
+            Parameter, ParameterError, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
             PathPrefixedParameterIterator, Placeholder,
         };
     }
