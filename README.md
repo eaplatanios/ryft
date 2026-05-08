@@ -13,9 +13,13 @@ crate is an umbrella crate that re-exports functionality from a few different cr
   months. Today, the most complete and usable part of `ryft-core` is the
   [`Parameterized`](https://docs.rs/ryft-core/latest/ryft_core/parameters/trait.Parameterized.html) API.
 - **`ryft-macros`:** Procedural macros used by `ryft` and `ryft-core` (e.g., parameter-related derivation macros).
-- **`ryft-mlir`:** High-level, ownership-aware Rust bindings for MLIR and MLIR dialects used by XLA tooling.
-- **`ryft-pjrt`:** High-level, ownership-aware Rust bindings for PJRT plugins, clients, buffers, and program execution.
-- **`ryft-xla-sys`:** Low-level `-sys` bindings for XLA/MLIR/PJRT APIs, plus native artifact/toolchain wiring.
+- **Backends:**
+  - **`ryft-ndarray`:** `ndarray` backend for `ryft`.
+  - **`ryft-xla`:** XLA backend for `ryft`.
+- **Bindings:**
+  - **`ryft-mlir`:** High-level, ownership-aware Rust bindings for MLIR and MLIR dialects used by XLA tooling.
+  - **`ryft-pjrt`:** High-level, ownership-aware Rust bindings for PJRT plugins, clients, buffers, and programs.
+  - **`ryft-xla-sys`:** Low-level `-sys` bindings for XLA/MLIR/PJRT APIs, plus native artifact/toolchain wiring.
 
 ## Feature Flags
 
