@@ -198,7 +198,7 @@ pub trait Function<'o, 'c: 'o, 't: 'c>: Symbol<'o, 'c, 't> + Callable<'o, 'c, 't
         self.callable_region()?.ok_or_else(|| {
             Error::invalid_argument(format!(
                 "missing callable region in `{}`",
-                self.name().as_str().unwrap_or("<unknown>")
+                self.name().as_str().unwrap_or("<unknown>"),
             ))
         })
     }

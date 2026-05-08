@@ -9,7 +9,7 @@ use ryft_xla_sys::mlir::dialects::transform::{
     mlirTypeIsATransformTypeParamType,
 };
 
-use crate::{Context, DialectHandle, StringRef, Type, TypeRef, mlir_subtype_trait_impls};
+use crate::{Context, DialectHandle, Error, StringRef, Type, TypeRef, mlir_subtype_trait_impls};
 
 macro_rules! transform_unit_type {
     ($type_ref:ident, $context_method:ident, $is_a:path, $get:path, $display:literal, $doc:literal) => {
@@ -27,11 +27,11 @@ macro_rules! transform_unit_type {
         }
 
         impl<'c, 't> Type<'c, 't> for $type_ref<'c, 't> {
-            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
                 if !handle.ptr.is_null() && unsafe { $is_a(handle) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR type handle"))
                 }
             }
 
@@ -50,9 +50,11 @@ macro_rules! transform_unit_type {
             #[doc = "Creates a new `"]
             #[doc = $display]
             #[doc = "` Transform dialect [`Type`] owned by this [`Context`]."]
-            pub fn $context_method<'c>(&'c self) -> $type_ref<'c, 't> {
-                self.load_dialect(DialectHandle::transform());
-                unsafe { $type_ref::from_c_api($get(*self.handle.borrow_mut()), self).unwrap() }
+            pub fn $context_method<'c>(&'c self) -> Result<$type_ref<'c, 't>, Error> {
+                self.load_dialect(DialectHandle::transform()?)?;
+                unsafe {
+                    $type_ref::from_c_api($get(*self.handle.borrow_mut()), self).map_err(|_| Error::internal(concat!("MLIR returned an invalid ", $display, " type")))
+                }
             }
         }
     };
@@ -106,11 +108,11 @@ impl OperationTypeRef<'_, '_> {
 }
 
 impl<'c, 't> Type<'c, 't> for OperationTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirTypeIsATransformOperationType(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR type handle"))
         }
     }
 
@@ -149,17 +151,20 @@ pub struct ParamTypeRef<'c, 't> {
 
 impl<'c, 't> ParamTypeRef<'c, 't> {
     /// Returns the underlying MLIR type of attributes accepted by this Transform parameter type.
-    pub fn element_type(&self) -> TypeRef<'c, 't> {
-        unsafe { TypeRef::from_c_api(mlirTransformParamTypeGetType(self.handle), self.context).unwrap() }
+    pub fn element_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        unsafe {
+            TypeRef::from_c_api(mlirTransformParamTypeGetType(self.handle), self.context)
+                .map_err(|_| Error::internal("MLIR returned an invalid Transform parameter element type"))
+        }
     }
 }
 
 impl<'c, 't> Type<'c, 't> for ParamTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirTypeIsATransformParamType(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR type handle"))
         }
     }
 
@@ -188,26 +193,26 @@ impl<'t> Context<'t> {
     pub fn transform_operation_type<'c, 's, S: Into<StringRef<'s>>>(
         &'c self,
         operation_name: S,
-    ) -> OperationTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::transform());
+    ) -> Result<OperationTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::transform()?)?;
         unsafe {
             OperationTypeRef::from_c_api(
                 mlirTransformOperationTypeGet(*self.handle.borrow_mut(), operation_name.into().to_c_api()),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::transform_operation_type`"))
         }
     }
 
     /// Creates a new [`ParamTypeRef`] owned by this [`Context`].
-    pub fn transform_param_type<'c, T: Type<'c, 't>>(&'c self, element_type: T) -> ParamTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::transform());
+    pub fn transform_param_type<'c, T: Type<'c, 't>>(&'c self, element_type: T) -> Result<ParamTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::transform()?)?;
         unsafe {
             ParamTypeRef::from_c_api(
                 mlirTransformParamTypeGet(*self.handle.borrow_mut(), element_type.to_c_api()),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::transform_param_type`"))
         }
     }
 }
@@ -227,41 +232,41 @@ mod tests {
                 #[test]
                 fn test_construction() {
                     let context = Context::new();
-                    let r#type = context.$method();
+                    let r#type = context.$method().unwrap();
                     assert_eq!(&context, r#type.context());
-                    assert_eq!(r#type.dialect().namespace().unwrap(), "transform");
+                    assert_eq!(r#type.dialect().unwrap().namespace().unwrap(), "transform");
                 }
 
                 #[test]
                 fn test_equality() {
                     let context = Context::new();
-                    let type_1 = context.$method();
-                    let type_2 = context.$method();
+                    let type_1 = context.$method().unwrap();
+                    let type_2 = context.$method().unwrap();
                     assert_eq!(type_1, type_2);
 
                     let context = Context::new();
-                    let type_2 = context.$method();
+                    let type_2 = context.$method().unwrap();
                     assert_ne!(type_1, type_2);
                 }
 
                 #[test]
                 fn test_display_and_debug() {
                     let context = Context::new();
-                    let r#type = context.$method();
+                    let r#type = context.$method().unwrap();
                     test_type_display_and_debug(r#type, $expected);
                 }
 
                 #[test]
                 fn test_parsing() {
                     let context = Context::new();
-                    let r#type = context.$method();
+                    let r#type = context.$method().unwrap();
                     assert_eq!(context.parse_type($expected).unwrap(), r#type);
                 }
 
                 #[test]
                 fn test_casting() {
                     let context = Context::new();
-                    let r#type = context.$method();
+                    let r#type = context.$method().unwrap();
                     test_type_casting(r#type);
                 }
             }
@@ -280,45 +285,45 @@ mod tests {
         #[test]
         fn test_construction_and_accessors() {
             let context = Context::new();
-            let r#type = context.transform_operation_type("func.func");
+            let r#type = context.transform_operation_type("func.func").unwrap();
             assert_eq!(&context, r#type.context());
-            assert_eq!(r#type.dialect().namespace().unwrap(), "transform");
+            assert_eq!(r#type.dialect().unwrap().namespace().unwrap(), "transform");
             assert_eq!(r#type.operation_name().as_str(), Ok("func.func"));
         }
 
         #[test]
         fn test_equality() {
             let context = Context::new();
-            let type_1 = context.transform_operation_type("func.func");
-            let type_2 = context.transform_operation_type("func.func");
+            let type_1 = context.transform_operation_type("func.func").unwrap();
+            let type_2 = context.transform_operation_type("func.func").unwrap();
             assert_eq!(type_1, type_2);
 
-            let type_2 = context.transform_operation_type("builtin.module");
+            let type_2 = context.transform_operation_type("builtin.module").unwrap();
             assert_ne!(type_1, type_2);
 
             let context = Context::new();
-            let type_2 = context.transform_operation_type("func.func");
+            let type_2 = context.transform_operation_type("func.func").unwrap();
             assert_ne!(type_1, type_2);
         }
 
         #[test]
         fn test_display_and_debug() {
             let context = Context::new();
-            let r#type = context.transform_operation_type("func.func");
+            let r#type = context.transform_operation_type("func.func").unwrap();
             test_type_display_and_debug(r#type, "!transform.op<\"func.func\">");
         }
 
         #[test]
         fn test_parsing() {
             let context = Context::new();
-            let r#type = context.transform_operation_type("func.func");
+            let r#type = context.transform_operation_type("func.func").unwrap();
             assert_eq!(context.parse_type("!transform.op<\"func.func\">").unwrap(), r#type);
         }
 
         #[test]
         fn test_casting() {
             let context = Context::new();
-            let r#type = context.transform_operation_type("func.func");
+            let r#type = context.transform_operation_type("func.func").unwrap();
             test_type_casting(r#type);
         }
     }
@@ -330,45 +335,45 @@ mod tests {
         fn test_construction_and_accessors() {
             let context = Context::new();
             let element_type = context.signless_integer_type(32);
-            let r#type = context.transform_param_type(element_type);
+            let r#type = context.transform_param_type(element_type).unwrap();
             assert_eq!(&context, r#type.context());
-            assert_eq!(r#type.dialect().namespace().unwrap(), "transform");
-            assert_eq!(r#type.element_type(), element_type);
+            assert_eq!(r#type.dialect().unwrap().namespace().unwrap(), "transform");
+            assert_eq!(r#type.element_type().unwrap(), element_type);
         }
 
         #[test]
         fn test_equality() {
             let context = Context::new();
-            let type_1 = context.transform_param_type(context.signless_integer_type(32));
-            let type_2 = context.transform_param_type(context.signless_integer_type(32));
+            let type_1 = context.transform_param_type(context.signless_integer_type(32)).unwrap();
+            let type_2 = context.transform_param_type(context.signless_integer_type(32)).unwrap();
             assert_eq!(type_1, type_2);
 
-            let type_2 = context.transform_param_type(context.signless_integer_type(64));
+            let type_2 = context.transform_param_type(context.signless_integer_type(64)).unwrap();
             assert_ne!(type_1, type_2);
 
             let context = Context::new();
-            let type_2 = context.transform_param_type(context.signless_integer_type(32));
+            let type_2 = context.transform_param_type(context.signless_integer_type(32)).unwrap();
             assert_ne!(type_1, type_2);
         }
 
         #[test]
         fn test_display_and_debug() {
             let context = Context::new();
-            let r#type = context.transform_param_type(context.signless_integer_type(32));
+            let r#type = context.transform_param_type(context.signless_integer_type(32)).unwrap();
             test_type_display_and_debug(r#type, "!transform.param<i32>");
         }
 
         #[test]
         fn test_parsing() {
             let context = Context::new();
-            let r#type = context.transform_param_type(context.signless_integer_type(32));
+            let r#type = context.transform_param_type(context.signless_integer_type(32)).unwrap();
             assert_eq!(context.parse_type("!transform.param<i32>").unwrap(), r#type);
         }
 
         #[test]
         fn test_casting() {
             let context = Context::new();
-            let r#type = context.transform_param_type(context.signless_integer_type(32));
+            let r#type = context.transform_param_type(context.signless_integer_type(32)).unwrap();
             test_type_casting(r#type);
         }
     }
