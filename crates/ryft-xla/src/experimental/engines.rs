@@ -10,7 +10,7 @@ use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
-use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearizableEngine, TangentValue};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearizableEngine, Tangent};
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::arrays::{Array, ArrayError};
@@ -163,11 +163,11 @@ impl XlaSymbolicZeroEngine {
 
 impl Engine for XlaSymbolicZeroEngine {
     type Type = ArrayType;
-    type Value = TangentValue<ArrayType, Infallible>;
+    type Value = Tangent<ArrayType, Infallible>;
 
     #[inline]
     fn zero(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Ok(TangentValue::zero(array_type.clone()))
+        Ok(Tangent::zero(array_type.clone()))
     }
 
     #[inline]
@@ -177,11 +177,11 @@ impl Engine for XlaSymbolicZeroEngine {
 }
 
 impl LinearizableEngine for XlaSymbolicZeroEngine {
-    type LinearOperationCarrier = LinearXlaOperation<TangentValue<ArrayType, Infallible>>;
+    type LinearOperationCarrier = LinearXlaOperation<Tangent<ArrayType, Infallible>>;
 }
 
 impl<'c> DifferentiableEngine for XlaEngine<'c> {
-    type Tangent = TangentValue<ArrayType, Infallible>;
+    type Tangent = Tangent<ArrayType, Infallible>;
     type LinearEngine = XlaSymbolicZeroEngine;
     type DifferentiableOperationCarrier = XlaOperation;
 

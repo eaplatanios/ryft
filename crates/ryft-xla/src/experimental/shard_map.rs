@@ -26,7 +26,7 @@ use ryft_core::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, Traci
 use ryft_core::tracing_v2::operations::{
     ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation,
 };
-use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin, TangentValue};
+use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin, Tangent};
 
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::XlaOperation;
@@ -383,11 +383,11 @@ impl OneLike for ShardMapTensor {
 }
 
 impl Differentiable<ArrayType> for ShardMapTensor {
-    type Tangent = TangentValue<ArrayType, Infallible>;
+    type Tangent = Tangent<ArrayType, Infallible>;
 
     #[inline]
     fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
-        Ok(TangentValue::zero(self.array_type.clone()))
+        Ok(Tangent::zero(self.array_type.clone()))
     }
 }
 

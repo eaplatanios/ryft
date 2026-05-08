@@ -22,7 +22,7 @@ pub(crate) mod test_util;
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
     Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
-    DifferentiableTracingEngine, DifferentiationError, JvpContext, JvpTracer, LinearizableEngine, TangentValue,
+    DifferentiableTracingEngine, DifferentiationError, JvpContext, JvpTracer, LinearizableEngine, Tangent,
 };
 pub use linear::{
     ConcreteValueAndGrad, CoordinateValue, DenseJacobian, TracedValueAndGrad, ValueAndGradDispatch, grad_with_aux,
