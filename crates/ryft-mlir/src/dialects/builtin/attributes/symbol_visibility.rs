@@ -1,6 +1,6 @@
 use ryft_xla_sys::bindings::{MlirAttribute, mlirStringAttrGet, mlirStringAttrGetValue};
 
-use crate::{Attribute, Context, FromWithContext, StringRef, SymbolVisibility, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, StringRef, SymbolVisibility, TryFromWithContext, mlir_subtype_trait_impls};
 
 /// [`StringAttributeRef`](crate::StringAttributeRef) that stores the string rendering of a [`SymbolVisibility`]. This
 /// is not really a built-in MLIR attribute type since MLIR uses [`StringAttributeRef`](crate::StringAttributeRef) for
@@ -38,9 +38,9 @@ mlir_subtype_trait_impls!(
     mlir_subtype = String,
 );
 
-impl<'c, 't> FromWithContext<'c, 't, SymbolVisibility> for SymbolVisibilityAttributeRef<'c, 't> {
-    fn from_with_context(value: SymbolVisibility, context: &'c Context<'t>) -> Self {
-        context.symbol_visibility_attribute(value)
+impl<'c, 't> TryFromWithContext<'c, 't, SymbolVisibility> for SymbolVisibilityAttributeRef<'c, 't> {
+    fn try_from_with_context(value: SymbolVisibility, context: &'c Context<'t>) -> Result<Self, Error> {
+        Ok(context.symbol_visibility_attribute(value))
     }
 }
 
@@ -60,13 +60,8 @@ impl<'t> Context<'t> {
             SymbolVisibility::Private => "private",
             SymbolVisibility::Nested => "nested",
         };
-        unsafe {
-            SymbolVisibilityAttributeRef::from_c_api(
-                mlirStringAttrGet(*self.handle.borrow(), StringRef::from(visibility).to_c_api()),
-                self,
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirStringAttrGet(*self.handle.borrow(), StringRef::from(visibility).to_c_api()) };
+        SymbolVisibilityAttributeRef { handle, context: self }
     }
 }
 
@@ -75,7 +70,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
-    use crate::{IntoWithContext, SymbolVisibility};
+    use crate::{SymbolVisibility, TryIntoWithContext};
 
     use super::*;
 
@@ -89,7 +84,8 @@ mod tests {
         assert_eq!(attribute.visibility(), Some(SymbolVisibility::Public));
 
         // Test private visibility.
-        let attribute: SymbolVisibilityAttributeRef<'_, '_> = SymbolVisibility::Private.into_with_context(&context);
+        let attribute: SymbolVisibilityAttributeRef<'_, '_> =
+            SymbolVisibility::Private.try_into_with_context(&context).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.visibility(), Some(SymbolVisibility::Private));
 

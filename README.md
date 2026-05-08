@@ -54,25 +54,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let f32_type = context.float32_type();
   
     // Types of the left-hand side, right-hand side, and result tensors in our matrix multiplication.
-    let lhs_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(3)], None, location).unwrap();
-    let rhs_type = context.tensor_type(f32_type, &[Size::Static(3), Size::Static(2)], None, location).unwrap();
-    let result_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
+    let lhs_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(3)], None, location)?;
+    let rhs_type = context.tensor_type(f32_type, &[Size::Static(3), Size::Static(2)], None, location)?;
+    let result_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(2)], None, location)?;
 
     // Body of the StableHLO module.
     module.body().append_operation({
         let mut block = context.block(&[(lhs_type, location), (rhs_type, location)]);
-        let lhs = block.argument(0).unwrap();
-        let rhs = block.argument(1).unwrap();
+        let lhs = block.argument(0)?;
+        let rhs = block.argument(1)?;
         let matmul = block.append_operation(dialects::stable_hlo::dot_general(
             lhs,
             rhs,
-            context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]),
+            context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0])?,
             None,
             None,
             result_type,
             location,
-        ));
-        block.append_operation(dialects::func::r#return(&[matmul.result(0).unwrap()], location));
+        )?);
+        block.append_operation(dialects::func::r#return(&[matmul.result(0)?], location)?);
         dialects::func::func(
             "main",
             dialects::func::FuncAttributes {
@@ -82,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             block.into(),
             location,
-        )
+        )?
     });
     assert!(module.verify());
     let program = Program::Mlir { bytecode: module.as_operation().bytecode() };

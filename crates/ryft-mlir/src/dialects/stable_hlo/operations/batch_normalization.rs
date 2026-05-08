@@ -1,35 +1,28 @@
-use crate::{
-    Attribute, DetachedOp, DialectHandle, FloatAttributeRef, IntegerAttributeRef, Location, Operation,
-    OperationBuilder, Value, mlir_op, mlir_op_trait,
-};
+use crate::{DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Value, mlir_op, mlir_op_trait};
 
-/// Name of the [`Attribute`] that is used to store [`BatchNormOperation::feature_index`].
+/// Name of the [`Attribute`](crate::Attribute) that is used to store [`BatchNormOperation::feature_index`].
 pub const BATCH_NORM_FEATURE_INDEX_ATTRIBUTE: &str = "feature_index";
 
-/// Name of the [`Attribute`] that is used to store [`BatchNormOperation::epsilon`].
+/// Name of the [`Attribute`](crate::Attribute) that is used to store [`BatchNormOperation::epsilon`].
 pub const BATCH_NORM_EPSILON_ATTRIBUTE: &str = "epsilon";
 
 /// Trait that is shared among all StableHLO [`Operation`]s that are related to
 /// [batch normalization](https://en.wikipedia.org/wiki/Batch_normalization).
 pub trait BatchNormOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the feature index dimension used by this [`BatchNormOperation`].
-    fn feature_index(&self) -> u32 {
-        self.attribute(BATCH_NORM_FEATURE_INDEX_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as u32)
-            .unwrap_or_else(|| {
-                panic!("invalid '{}' attribute in `stable_hlo::{}`", BATCH_NORM_FEATURE_INDEX_ATTRIBUTE, self.name())
-            })
+    fn feature_index(&self) -> Result<u32, Error> {
+        u32::try_from(self.integer_attribute(BATCH_NORM_FEATURE_INDEX_ATTRIBUTE)?.signless_value()).map_err(|_| {
+            Error::invalid_argument(format!(
+                "invalid '{}' attribute in `stable_hlo::{}`",
+                BATCH_NORM_FEATURE_INDEX_ATTRIBUTE,
+                self.name()
+            ))
+        })
     }
 
     /// Returns the ε parameter used by this [`BatchNormOperation`] for numerical stability.
-    fn epsilon(&self) -> f32 {
-        self.attribute(BATCH_NORM_EPSILON_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<FloatAttributeRef>())
-            .map(|attribute| attribute.value() as f32)
-            .unwrap_or_else(|| {
-                panic!("invalid '{}' attribute in `stable_hlo::{}`", BATCH_NORM_EPSILON_ATTRIBUTE, self.name())
-            })
+    fn epsilon(&self) -> Result<f32, Error> {
+        Ok(self.float_attribute(BATCH_NORM_EPSILON_ATTRIBUTE)?.value() as f32)
     }
 }
 
@@ -100,8 +93,6 @@ mlir_op_trait!(BatchNormInference, @local BatchNormOperation);
 
 /// Constructs a new detached/owned [`BatchNormInferenceOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`BatchNormInferenceOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[allow(clippy::too_many_arguments)]
 pub fn batch_norm_inference<
     'i,
@@ -126,9 +117,9 @@ pub fn batch_norm_inference<
     epsilon: f32,
     feature_index: u32,
     location: L,
-) -> DetachedBatchNormInferenceOperation<'c, 't> {
+) -> Result<DetachedBatchNormInferenceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.batch_norm_inference", location)
         .add_operand(input)
         .add_operand(scale)
@@ -142,8 +133,11 @@ pub fn batch_norm_inference<
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::batch_norm_inference`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::batch_norm_inference`"))
+        })
 }
 
 /// StableHLO [`Operation`] that computes the mean and variance of a tensor across all dimensions except for the
@@ -219,8 +213,6 @@ mlir_op_trait!(BatchNormTraining, @local BatchNormOperation);
 
 /// Constructs a new detached/owned [`BatchNormTrainingOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`BatchNormTrainingOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn batch_norm_training<
     'i,
     's,
@@ -238,9 +230,9 @@ pub fn batch_norm_training<
     epsilon: f32,
     feature_index: u32,
     location: L,
-) -> DetachedBatchNormTrainingOperation<'c, 't> {
+) -> Result<DetachedBatchNormTrainingOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.batch_norm_training", location)
         .add_operand(input)
         .add_operand(scale)
@@ -252,8 +244,11 @@ pub fn batch_norm_training<
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::batch_norm_training`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::batch_norm_training`"))
+        })
 }
 
 /// StableHLO [`Operation`] that computes gradients for [`BatchNormTrainingOperation`] for back-propagation.
@@ -369,8 +364,6 @@ mlir_op_trait!(BatchNormGrad, @local BatchNormOperation);
 
 /// Constructs a new detached/owned [`BatchNormGradOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`BatchNormGradOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[allow(clippy::too_many_arguments)]
 pub fn batch_norm_grad<
     'i,
@@ -395,9 +388,9 @@ pub fn batch_norm_grad<
     epsilon: f32,
     feature_index: u32,
     location: L,
-) -> DetachedBatchNormGradOperation<'c, 't> {
+) -> Result<DetachedBatchNormGradOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.batch_norm_grad", location)
         .add_operand(input)
         .add_operand(scale)
@@ -411,8 +404,11 @@ pub fn batch_norm_grad<
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::batch_norm_grad`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::batch_norm_grad`"))
+        })
 }
 
 #[cfg(test)]
@@ -429,50 +425,58 @@ mod tests {
     fn test_batch_norm_inference() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context
             .tensor_type(f32_type, &[Size::Static(2), Size::Static(2), Size::Static(2)], None, location)
             .unwrap();
         let param_type = context.tensor_type(f32_type, &[Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (tensor_type, location),
-                (param_type, location),
-                (param_type, location),
-                (param_type, location),
-                (param_type, location),
-            ]);
-            let operand = block.argument(0).unwrap();
-            let scale = block.argument(1).unwrap();
-            let offset = block.argument(2).unwrap();
-            let mean = block.argument(3).unwrap();
-            let variance = block.argument(4).unwrap();
-            let batch_norm_op = batch_norm_inference(operand, scale, offset, mean, variance, 0.001, 2, location);
-            assert_eq!(batch_norm_op.operands().count(), 5);
-            assert_eq!(batch_norm_op.results().count(), 1);
-            assert_eq!(batch_norm_op.epsilon(), 0.001);
-            assert_eq!(batch_norm_op.feature_index(), 2);
-            let batch_norm_op = block.append_operation(batch_norm_op);
-            block.append_operation(func::r#return(&[batch_norm_op.result(0).unwrap()], location));
-            func::func(
-                "batch_norm_inference_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        tensor_type.into(),
-                        param_type.into(),
-                        param_type.into(),
-                        param_type.into(),
-                        param_type.into(),
-                    ],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (tensor_type, location),
+                    (param_type, location),
+                    (param_type, location),
+                    (param_type, location),
+                    (param_type, location),
+                ]);
+                let operand = block.argument(0).unwrap();
+                let scale = block.argument(1).unwrap();
+                let offset = block.argument(2).unwrap();
+                let mean = block.argument(3).unwrap();
+                let variance = block.argument(4).unwrap();
+                let batch_norm_op =
+                    batch_norm_inference(operand, scale, offset, mean, variance, 0.001, 2, location).unwrap();
+                assert_eq!(batch_norm_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 5);
+                assert_eq!(batch_norm_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(batch_norm_op.epsilon().unwrap(), 0.001);
+                assert_eq!(batch_norm_op.feature_index().unwrap(), 2);
+                let batch_norm_op = block.append_operation(batch_norm_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[batch_norm_op.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "batch_norm_inference_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            tensor_type.into(),
+                            param_type.into(),
+                            param_type.into(),
+                            param_type.into(),
+                            param_type.into(),
+                        ],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -500,36 +504,56 @@ mod tests {
     fn test_batch_norm_training() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context
             .tensor_type(f32_type, &[Size::Static(2), Size::Static(2), Size::Static(2)], None, location)
             .unwrap();
         let param_type = context.tensor_type(f32_type, &[Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (param_type, location), (param_type, location)]);
-            let operand = block.argument(0).unwrap();
-            let scale = block.argument(1).unwrap();
-            let offset = block.argument(2).unwrap();
-            let batch_norm_op = batch_norm_training(operand, scale, offset, 0.001, 2, location);
-            assert_eq!(batch_norm_op.operands().count(), 3);
-            assert_eq!(batch_norm_op.results().count(), 3);
-            assert_eq!(batch_norm_op.epsilon(), 0.001);
-            assert_eq!(batch_norm_op.feature_index(), 2);
-            let batch_norm_op = block.append_operation(batch_norm_op);
-            block.append_operation(func::r#return(batch_norm_op.results().collect::<Vec<_>>().as_slice(), location));
-            func::func(
-                "batch_norm_training_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), param_type.into(), param_type.into()],
-                    results: vec![tensor_type.into(), param_type.into(), param_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(tensor_type, location), (param_type, location), (param_type, location)]);
+                let operand = block.argument(0).unwrap();
+                let scale = block.argument(1).unwrap();
+                let offset = block.argument(2).unwrap();
+                let batch_norm_op = batch_norm_training(operand, scale, offset, 0.001, 2, location).unwrap();
+                assert_eq!(batch_norm_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(batch_norm_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(batch_norm_op.epsilon().unwrap(), 0.001);
+                assert_eq!(batch_norm_op.feature_index().unwrap(), 2);
+                let batch_norm_op = block.append_operation(batch_norm_op).unwrap();
+                block
+                    .append_operation(
+                        func::r#return(
+                            batch_norm_op
+                                .results()
+                                .collect::<Result<Vec<_>, _>>()
+                                .unwrap()
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                func::func(
+                    "batch_norm_training_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), param_type.into(), param_type.into()],
+                        results: vec![tensor_type.into(), param_type.into(), param_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -555,50 +579,70 @@ mod tests {
     fn test_batch_norm_grad() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context
             .tensor_type(f32_type, &[Size::Static(2), Size::Static(2), Size::Static(2)], None, location)
             .unwrap();
         let param_type = context.tensor_type(f32_type, &[Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (tensor_type, location),
-                (param_type, location),
-                (param_type, location),
-                (param_type, location),
-                (tensor_type, location),
-            ]);
-            let operand = block.argument(0).unwrap();
-            let scale = block.argument(1).unwrap();
-            let mean = block.argument(2).unwrap();
-            let variance = block.argument(3).unwrap();
-            let grad_output = block.argument(4).unwrap();
-            let batch_norm_op = batch_norm_grad(operand, scale, mean, variance, grad_output, 0.001, 2, location);
-            assert_eq!(batch_norm_op.operands().count(), 5);
-            assert_eq!(batch_norm_op.results().count(), 3);
-            assert_eq!(batch_norm_op.epsilon(), 0.001);
-            assert_eq!(batch_norm_op.feature_index(), 2);
-            let batch_norm_op = block.append_operation(batch_norm_op);
-            block.append_operation(func::r#return(batch_norm_op.results().collect::<Vec<_>>().as_slice(), location));
-            func::func(
-                "batch_norm_grad_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        tensor_type.into(),
-                        param_type.into(),
-                        param_type.into(),
-                        param_type.into(),
-                        tensor_type.into(),
-                    ],
-                    results: vec![tensor_type.into(), param_type.into(), param_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (tensor_type, location),
+                    (param_type, location),
+                    (param_type, location),
+                    (param_type, location),
+                    (tensor_type, location),
+                ]);
+                let operand = block.argument(0).unwrap();
+                let scale = block.argument(1).unwrap();
+                let mean = block.argument(2).unwrap();
+                let variance = block.argument(3).unwrap();
+                let grad_output = block.argument(4).unwrap();
+                let batch_norm_op =
+                    batch_norm_grad(operand, scale, mean, variance, grad_output, 0.001, 2, location).unwrap();
+                assert_eq!(batch_norm_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 5);
+                assert_eq!(batch_norm_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(batch_norm_op.epsilon().unwrap(), 0.001);
+                assert_eq!(batch_norm_op.feature_index().unwrap(), 2);
+                let batch_norm_op = block.append_operation(batch_norm_op).unwrap();
+                block
+                    .append_operation(
+                        func::r#return(
+                            batch_norm_op
+                                .results()
+                                .collect::<Result<Vec<_>, _>>()
+                                .unwrap()
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                func::func(
+                    "batch_norm_grad_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            tensor_type.into(),
+                            param_type.into(),
+                            param_type.into(),
+                            param_type.into(),
+                            tensor_type.into(),
+                        ],
+                        results: vec![tensor_type.into(), param_type.into(), param_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

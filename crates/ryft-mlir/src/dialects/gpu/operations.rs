@@ -1,8 +1,8 @@
 use crate::{
-    ArrayAttributeRef, Attribute, AttributeRef, DenseInteger32ArrayAttributeRef, DetachedOp, DetachedRegion,
-    DialectHandle, FUNCTION_TYPE_ATTRIBUTE, FlatSymbolRefAttributeRef, Function, IntegerAttributeRef, IntoWithContext,
-    Location, OneRegion, Operation, OperationBuilder, RegionRef, SYMBOL_NAME_ATTRIBUTE, StringAttributeRef, StringRef,
-    Symbol, SymbolTable, Type, TypeAttributeRef, TypeRef, Value, ValueRef, mlir_op, mlir_op_trait,
+    ArrayAttributeRef, Attribute, AttributeRef, DetachedOp, DetachedRegion, DialectHandle, Error,
+    FUNCTION_TYPE_ATTRIBUTE, FlatSymbolRefAttributeRef, Function, IntegerAttributeRef, Location, OneRegion, Operation,
+    OperationBuilder, RegionRef, SYMBOL_NAME_ATTRIBUTE, StringAttributeRef, StringRef, Symbol, SymbolTable,
+    TryIntoWithContext, Type, TypeRef, Value, ValueRef, mlir_op, mlir_op_trait,
 };
 
 use super::attributes::{
@@ -48,19 +48,24 @@ macro_rules! gpu_dimension_operation {
             /// for more information.
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 /// Returns the GPU dimension queried by this operation.
-                fn dimension(&self) -> Dimension {
-                    self.attribute(DIMENSION_ATTRIBUTE)
-                        .unwrap_or_else(|| {
-                            panic!("invalid '{DIMENSION_ATTRIBUTE}' attribute in `{}`", $operation_name)
-                        })
-                        .cast::<DimensionAttributeRef>()
-                        .map(|attribute| attribute.value())
-                        .unwrap_or_else(|| panic!("invalid '{DIMENSION_ATTRIBUTE}' attribute in `{}`", $operation_name))
+                fn dimension(&self) -> Result<Dimension, Error> {
+                    self.attribute(DIMENSION_ATTRIBUTE)?
+                        .and_then(|attribute| attribute.cast::<DimensionAttributeRef>())
+                        .ok_or_else(|| {
+                            Error::invalid_argument(format!(
+                                "missing or invalid `{DIMENSION_ATTRIBUTE}` attribute in `{}`",
+                                self.name().as_str().unwrap_or("<unknown>"),
+                            ))
+                        })?.value()
                 }
 
                 /// Returns the optional upper bound associated with this operation.
-                fn upper_bound(&self) -> Option<IntegerAttributeRef<'c, 't>> {
-                    self.attribute(UPPER_BOUND_ATTRIBUTE).and_then(|attribute| attribute.cast())
+                fn upper_bound(&self) -> Result<Option<IntegerAttributeRef<'c, 't>>, Error> {
+                    if self.has_attribute(UPPER_BOUND_ATTRIBUTE) {
+                        self.integer_attribute(UPPER_BOUND_ATTRIBUTE).map(Some)
+                    } else {
+                        Ok(None)
+                    }
                 }
             }
 
@@ -77,11 +82,11 @@ macro_rules! gpu_dimension_operation {
                 dimension: Dimension,
                 upper_bound: Option<usize>,
                 location: L,
-            ) -> [<Detached $name Operation>]<'c, 't> {
+            ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 let context = location.context();
-                context.load_dialect(DialectHandle::gpu());
+                context.load_dialect(DialectHandle::gpu()?)?;
                 let builder = OperationBuilder::new($operation_name, location)
-                    .add_attribute(DIMENSION_ATTRIBUTE, context.gpu_dimension_attribute(dimension))
+                    .add_attribute(DIMENSION_ATTRIBUTE, context.gpu_dimension_attribute(dimension)?)
                     .add_result(context.index_type());
                 let builder = if let Some(upper_bound) = upper_bound {
                     builder.add_attribute(
@@ -91,10 +96,15 @@ macro_rules! gpu_dimension_operation {
                 } else {
                     builder
                 };
-                builder
-                    .build()
-                    .and_then(|operation| unsafe { operation.cast() })
-                    .expect(concat!("invalid arguments to `gpu::", stringify!($function_name), "`"))
+                builder.build().and_then(|operation| unsafe {
+                    operation.cast().ok_or_else(|| {
+                        Error::invalid_argument(concat!(
+                            "invalid arguments to `gpu::",
+                            stringify!($function_name),
+                            "`",
+                        ))
+                    })
+                })
             }
         }
     };
@@ -109,8 +119,12 @@ macro_rules! gpu_upper_bound_index_operation {
             /// for more information.
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 /// Returns the optional upper bound associated with this operation.
-                fn upper_bound(&self) -> Option<IntegerAttributeRef<'c, 't>> {
-                    self.attribute(UPPER_BOUND_ATTRIBUTE).and_then(|attribute| attribute.cast())
+                fn upper_bound(&self) -> Result<Option<IntegerAttributeRef<'c, 't>>, Error> {
+                    if self.has_attribute(UPPER_BOUND_ATTRIBUTE) {
+                        self.integer_attribute(UPPER_BOUND_ATTRIBUTE).map(Some)
+                    } else {
+                        Ok(None)
+                    }
                 }
             }
 
@@ -126,9 +140,9 @@ macro_rules! gpu_upper_bound_index_operation {
             pub fn $function_name<'c, 't: 'c, L: Location<'c, 't>>(
                 upper_bound: Option<usize>,
                 location: L,
-            ) -> [<Detached $name Operation>]<'c, 't> {
+            ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 let context = location.context();
-                context.load_dialect(DialectHandle::gpu());
+                context.load_dialect(DialectHandle::gpu()?)?;
                 let builder = OperationBuilder::new($operation_name, location).add_result(context.index_type());
                 let builder = if let Some(upper_bound) = upper_bound {
                     builder.add_attribute(
@@ -138,10 +152,15 @@ macro_rules! gpu_upper_bound_index_operation {
                 } else {
                     builder
                 };
-                builder
-                    .build()
-                    .and_then(|operation| unsafe { operation.cast() })
-                    .expect(concat!("invalid arguments to `gpu::", stringify!($function_name), "`"))
+                builder.build().and_then(|operation| unsafe {
+                    operation.cast().ok_or_else(|| {
+                        Error::invalid_argument(concat!(
+                            "invalid arguments to `gpu::",
+                            stringify!($function_name),
+                            "`",
+                        ))
+                    })
+                })
             }
         }
     };
@@ -263,40 +282,51 @@ pub const WORKGROUP_ATTRIBUTIONS_ATTRIBUTE: &str = "workgroup_attributions";
 pub trait FuncOperation<'o, 'c: 'o, 't: 'c>: Function<'o, 'c, 't> + OneRegion<'o, 'c, 't> {
     /// Returns `true` if this GPU function is a kernel.
     fn is_kernel(&self) -> bool {
-        self.attribute(KERNEL_ATTRIBUTE).is_some()
+        self.has_attribute(KERNEL_ATTRIBUTE)
     }
 
     /// Returns the optional known block size hint.
-    fn known_block_size(&self) -> Option<Vec<i32>> {
-        self.attribute(KNOWN_BLOCK_SIZE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
+    fn known_block_size(&self) -> Result<Option<Vec<i32>>, Error> {
+        if self.has_attribute(KNOWN_BLOCK_SIZE_ATTRIBUTE) {
+            self.dense_integer_32_array_attribute(KNOWN_BLOCK_SIZE_ATTRIBUTE)
+                .map(|attribute| Some(attribute.values().collect()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the optional known grid size hint.
-    fn known_grid_size(&self) -> Option<Vec<i32>> {
-        self.attribute(KNOWN_GRID_SIZE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
+    fn known_grid_size(&self) -> Result<Option<Vec<i32>>, Error> {
+        if self.has_attribute(KNOWN_GRID_SIZE_ATTRIBUTE) {
+            self.dense_integer_32_array_attribute(KNOWN_GRID_SIZE_ATTRIBUTE)
+                .map(|attribute| Some(attribute.values().collect()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the optional known cluster size hint.
-    fn known_cluster_size(&self) -> Option<Vec<i32>> {
-        self.attribute(KNOWN_CLUSTER_SIZE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
+    fn known_cluster_size(&self) -> Result<Option<Vec<i32>>, Error> {
+        if self.has_attribute(KNOWN_CLUSTER_SIZE_ATTRIBUTE) {
+            self.dense_integer_32_array_attribute(KNOWN_CLUSTER_SIZE_ATTRIBUTE)
+                .map(|attribute| Some(attribute.values().collect()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the number of workgroup attributions.
-    fn workgroup_attribution_count(&self) -> usize {
-        self.attribute(WORKGROUP_ATTRIBUTIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or(0)
+    fn workgroup_attribution_count(&self) -> Result<usize, Error> {
+        if self.has_attribute(WORKGROUP_ATTRIBUTIONS_ATTRIBUTE) {
+            usize::try_from(self.integer_attribute(WORKGROUP_ATTRIBUTIONS_ATTRIBUTE)?.signless_value())
+                .map_err(|_| Error::invalid_argument("invalid `workgroup_attributions` attribute in `gpu.func`"))
+        } else {
+            Ok(0)
+        }
     }
 
     /// Returns the GPU function body region.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
         self.body_region()
     }
 }
@@ -338,16 +368,16 @@ pub struct FuncProperties<'c, 't> {
 }
 
 /// Constructs a new detached/owned [`FuncOperation`] at the specified [`Location`].
-pub fn func<'c, 't: 'c, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
+pub fn func<'c, 't: 'c, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
     name: N,
     properties: FuncProperties<'c, 't>,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedFuncOperation<'c, 't> {
+) -> Result<DetachedFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.func", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.into_with_context(context))
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
         .add_attribute(
             FUNCTION_TYPE_ATTRIBUTE,
             context.type_attribute(context.function_type(&properties.arguments, &properties.results)),
@@ -356,18 +386,16 @@ pub fn func<'c, 't: 'c, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, 
         builder = builder.add_attribute(KERNEL_ATTRIBUTE, context.unit_attribute());
     }
     if let Some(known_block_size) = properties.known_block_size {
-        builder = builder
-            .add_attribute(KNOWN_BLOCK_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_block_size).unwrap());
+        builder =
+            builder.add_attribute(KNOWN_BLOCK_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_block_size)?);
     }
     if let Some(known_grid_size) = properties.known_grid_size {
-        builder = builder
-            .add_attribute(KNOWN_GRID_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_grid_size).unwrap());
+        builder =
+            builder.add_attribute(KNOWN_GRID_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_grid_size)?);
     }
     if let Some(known_cluster_size) = properties.known_cluster_size {
-        builder = builder.add_attribute(
-            KNOWN_CLUSTER_SIZE_ATTRIBUTE,
-            context.dense_i32_array_attribute(&known_cluster_size).unwrap(),
-        );
+        builder = builder
+            .add_attribute(KNOWN_CLUSTER_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_cluster_size)?);
     }
     if properties.workgroup_attribution_count > 0 {
         builder = builder.add_attribute(
@@ -375,18 +403,16 @@ pub fn func<'c, 't: 'c, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, 
             context.integer_attribute(context.signless_integer_type(64), properties.workgroup_attribution_count as i64),
         );
     }
-    builder
-        .add_region(body)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::func`")
+    builder.add_region(body).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::func`"))
+    })
 }
 
 /// GPU operation that returns the dynamic shared-memory memref for the current kernel.
 pub trait DynamicSharedMemoryOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the dynamic shared-memory memref.
-    fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn memref(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -400,13 +426,16 @@ mlir_op_trait!(DynamicSharedMemory, ZeroSuccessors);
 pub fn dynamic_shared_memory<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     memref_type: T,
     location: L,
-) -> DetachedDynamicSharedMemoryOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
+) -> Result<DetachedDynamicSharedMemoryOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.dynamic_shared_memory", location)
         .add_result(memref_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::dynamic_shared_memory`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::dynamic_shared_memory`"))
+        })
 }
 
 /// Properties used to construct a [`LaunchFuncOperation`].
@@ -446,104 +475,114 @@ pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operand_segment_sizes";
 /// GPU operation that launches a named GPU kernel function.
 pub trait LaunchFuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        self.operand_values().take(segment_sizes[0]).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let dependency_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        self.operand_values().take(dependency_count).collect()
     }
 
     /// Returns the kernel symbol reference.
-    fn kernel(&self) -> crate::SymbolRefAttributeRef<'c, 't> {
-        self.attribute(KERNEL_ATTRIBUTE)
-            .expect("invalid `kernel` attribute in `gpu.launch_func`")
-            .cast()
-            .expect("invalid `kernel` attribute in `gpu.launch_func`")
+    fn kernel(&self) -> Result<crate::SymbolRefAttributeRef<'c, 't>, Error> {
+        self.symbol_ref_attribute(KERNEL_ATTRIBUTE)
     }
 
     /// Returns the grid size operands.
-    fn grid_size(&self) -> Dim3<'o, 'c, 't> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        let x = segment_sizes.iter().take(1).sum::<usize>();
-        let y = segment_sizes.iter().take(2).sum::<usize>();
-        let z = segment_sizes.iter().take(3).sum::<usize>();
-        Dim3 { x: self.operand_value(x).unwrap(), y: self.operand_value(y).unwrap(), z: self.operand_value(z).unwrap() }
+    fn grid_size(&self) -> Result<Dim3<'o, 'c, 't>, Error> {
+        let operand = |segment| {
+            let range =
+                self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment)?;
+            if range.len() != 1 {
+                return Err(Error::invalid_argument(format!(
+                    "invalid `{}` attribute in `{}`",
+                    OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                    self.name(),
+                )));
+            }
+            self.operand_value(range.start)
+        };
+        Ok(Dim3 { x: operand(1)?, y: operand(2)?, z: operand(3)? })
     }
 
     /// Returns the block size operands.
-    fn block_size(&self) -> Dim3<'o, 'c, 't> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        let x = segment_sizes.iter().take(4).sum::<usize>();
-        let y = segment_sizes.iter().take(5).sum::<usize>();
-        let z = segment_sizes.iter().take(6).sum::<usize>();
-        Dim3 { x: self.operand_value(x).unwrap(), y: self.operand_value(y).unwrap(), z: self.operand_value(z).unwrap() }
+    fn block_size(&self) -> Result<Dim3<'o, 'c, 't>, Error> {
+        let operand = |segment| {
+            let range =
+                self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment)?;
+            if range.len() != 1 {
+                return Err(Error::invalid_argument(format!(
+                    "invalid `{}` attribute in `{}`",
+                    OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                    self.name(),
+                )));
+            }
+            self.operand_value(range.start)
+        };
+        Ok(Dim3 { x: operand(4)?, y: operand(5)?, z: operand(6)? })
     }
 
     /// Returns the optional cluster size operands.
-    fn cluster_size(&self) -> Option<Dim3<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        if segment_sizes[7] == 0 {
-            None
-        } else {
-            let x = segment_sizes.iter().take(7).sum::<usize>();
-            let y = segment_sizes.iter().take(8).sum::<usize>();
-            let z = segment_sizes.iter().take(9).sum::<usize>();
-            Some(Dim3 {
-                x: self.operand_value(x).unwrap(),
-                y: self.operand_value(y).unwrap(),
-                z: self.operand_value(z).unwrap(),
-            })
+    fn cluster_size(&self) -> Result<Option<Dim3<'o, 'c, 't>>, Error> {
+        let operand = |segment| {
+            let range =
+                self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment)?;
+            match range.len() {
+                0 => Ok(None),
+                1 => self.operand_value(range.start).map(Some),
+                _ => Err(Error::invalid_argument(format!(
+                    "invalid `{}` attribute in `{}`",
+                    OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                    self.name(),
+                ))),
+            }
+        };
+        match (operand(7)?, operand(8)?, operand(9)?) {
+            (None, None, None) => Ok(None),
+            (Some(x), Some(y), Some(z)) => Ok(Some(Dim3 { x, y, z })),
+            _ => Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            ))),
         }
     }
 
     /// Returns the optional dynamic shared-memory size operand.
-    fn dynamic_shared_memory_size(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        if segment_sizes[10] == 0 { None } else { self.operand_value(segment_sizes.iter().take(10).sum::<usize>()) }
+    fn dynamic_shared_memory_size(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 10)?;
+        match range.len() {
+            0 => Ok(None),
+            1 => self.operand_value(range.start).map(Some),
+            _ => Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            ))),
+        }
     }
 
     /// Returns the kernel argument operands.
-    fn kernel_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        let start = segment_sizes.iter().take(11).sum::<usize>();
-        self.operand_values().skip(start).take(segment_sizes[11]).collect()
+    fn kernel_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 11)?
+            .map(|index| self.operand_value(index))
+            .collect()
     }
 
     /// Returns the optional async object operand.
-    fn async_object(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        if segment_sizes[12] == 0 { None } else { self.operand_value(segment_sizes.iter().take(12).sum::<usize>()) }
+    fn async_object(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 12)?;
+        match range.len() {
+            0 => Ok(None),
+            1 => self.operand_value(range.start).map(Some),
+            _ => Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            ))),
+        }
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(0).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -555,9 +594,9 @@ mlir_op_trait!(LaunchFunc, ZeroSuccessors);
 pub fn launch_func<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     properties: LaunchFuncProperties<'o, 'c, 't>,
     location: L,
-) -> DetachedLaunchFuncOperation<'c, 't> {
+) -> Result<DetachedLaunchFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let cluster_size = properties.cluster_size.map(|size| size.values());
     let mut segment_sizes = vec![
         properties.async_dependencies.len(),
@@ -590,18 +629,19 @@ pub fn launch_func<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
         builder = builder.add_operand(async_object);
     }
     if properties.is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
     if !properties.is_async {
         segment_sizes[12] = usize::from(properties.async_object.is_some());
     }
     let segment_sizes = segment_sizes.iter().map(|size| *size as i32).collect::<Vec<_>>();
-    let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice()).unwrap();
+    let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice())?;
     builder
         .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::launch_func`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::launch_func`"))
+        })
 }
 
 /// Properties used to construct a [`LaunchOperation`].
@@ -644,98 +684,121 @@ pub const FUNCTION_ATTRIBUTE: &str = "function";
 /// GPU operation that launches an inline GPU kernel region.
 pub trait LaunchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        self.operand_values().take(segment_sizes[0]).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let dependency_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        self.operand_values().take(dependency_count).collect()
     }
 
     /// Returns the grid size operands.
-    fn grid_size(&self) -> Dim3<'o, 'c, 't> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        let x = segment_sizes.iter().take(1).sum::<usize>();
-        let y = segment_sizes.iter().take(2).sum::<usize>();
-        let z = segment_sizes.iter().take(3).sum::<usize>();
-        Dim3 { x: self.operand_value(x).unwrap(), y: self.operand_value(y).unwrap(), z: self.operand_value(z).unwrap() }
+    fn grid_size(&self) -> Result<Dim3<'o, 'c, 't>, Error> {
+        let operand = |segment| {
+            let range =
+                self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment)?;
+            if range.len() != 1 {
+                return Err(Error::invalid_argument(format!(
+                    "invalid `{}` attribute in `{}`",
+                    OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                    self.name(),
+                )));
+            }
+            self.operand_value(range.start)
+        };
+        Ok(Dim3 { x: operand(1)?, y: operand(2)?, z: operand(3)? })
     }
 
     /// Returns the block size operands.
-    fn block_size(&self) -> Dim3<'o, 'c, 't> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        let x = segment_sizes.iter().take(4).sum::<usize>();
-        let y = segment_sizes.iter().take(5).sum::<usize>();
-        let z = segment_sizes.iter().take(6).sum::<usize>();
-        Dim3 { x: self.operand_value(x).unwrap(), y: self.operand_value(y).unwrap(), z: self.operand_value(z).unwrap() }
+    fn block_size(&self) -> Result<Dim3<'o, 'c, 't>, Error> {
+        let operand = |segment| {
+            let range =
+                self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment)?;
+            if range.len() != 1 {
+                return Err(Error::invalid_argument(format!(
+                    "invalid `{}` attribute in `{}`",
+                    OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                    self.name(),
+                )));
+            }
+            self.operand_value(range.start)
+        };
+        Ok(Dim3 { x: operand(4)?, y: operand(5)?, z: operand(6)? })
     }
 
     /// Returns optional cluster size operands.
-    fn cluster_size(&self) -> Option<Dim3<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        if segment_sizes[7] == 0 {
-            None
-        } else {
-            let x = segment_sizes.iter().take(7).sum::<usize>();
-            let y = segment_sizes.iter().take(8).sum::<usize>();
-            let z = segment_sizes.iter().take(9).sum::<usize>();
-            Some(Dim3 {
-                x: self.operand_value(x).unwrap(),
-                y: self.operand_value(y).unwrap(),
-                z: self.operand_value(z).unwrap(),
-            })
+    fn cluster_size(&self) -> Result<Option<Dim3<'o, 'c, 't>>, Error> {
+        let operand = |segment| {
+            let range =
+                self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment)?;
+            match range.len() {
+                0 => Ok(None),
+                1 => self.operand_value(range.start).map(Some),
+                _ => Err(Error::invalid_argument(format!(
+                    "invalid `{}` attribute in `{}`",
+                    OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                    self.name(),
+                ))),
+            }
+        };
+        match (operand(7)?, operand(8)?, operand(9)?) {
+            (None, None, None) => Ok(None),
+            (Some(x), Some(y), Some(z)) => Ok(Some(Dim3 { x, y, z })),
+            _ => Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            ))),
         }
     }
 
     /// Returns the optional dynamic shared-memory size operand.
-    fn dynamic_shared_memory_size(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        if segment_sizes[10] == 0 { None } else { self.operand_value(segment_sizes.iter().take(10).sum::<usize>()) }
+    fn dynamic_shared_memory_size(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 10)?;
+        match range.len() {
+            0 => Ok(None),
+            1 => self.operand_value(range.start).map(Some),
+            _ => Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            ))),
+        }
     }
 
     /// Returns the optional module symbol.
-    fn module_symbol(&self) -> Option<FlatSymbolRefAttributeRef<'c, 't>> {
-        self.attribute(MODULE_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn module_symbol(&self) -> Result<Option<FlatSymbolRefAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(MODULE_ATTRIBUTE) {
+            self.flat_symbol_ref_attribute(MODULE_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the optional function symbol.
-    fn function_symbol(&self) -> Option<FlatSymbolRefAttributeRef<'c, 't>> {
-        self.attribute(FUNCTION_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn function_symbol(&self) -> Result<Option<FlatSymbolRefAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(FUNCTION_ATTRIBUTE) {
+            self.flat_symbol_ref_attribute(FUNCTION_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the number of workgroup attributions.
-    fn workgroup_attribution_count(&self) -> usize {
-        self.attribute(WORKGROUP_ATTRIBUTIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or(0)
+    fn workgroup_attribution_count(&self) -> Result<usize, Error> {
+        if self.has_attribute(WORKGROUP_ATTRIBUTIONS_ATTRIBUTE) {
+            usize::try_from(self.integer_attribute(WORKGROUP_ATTRIBUTIONS_ATTRIBUTE)?.signless_value())
+                .map_err(|_| Error::invalid_argument("invalid `workgroup_attributions` attribute in `gpu.launch_func`"))
+        } else {
+            Ok(0)
+        }
     }
 
     /// Returns the launch body region.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
         self.body_region()
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(0).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -750,9 +813,9 @@ pub fn launch<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     properties: LaunchProperties<'o, 'c, 't>,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedLaunchOperation<'c, 't> {
+) -> Result<DetachedLaunchOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let cluster_size = properties.cluster_size.map(|size| size.values());
     let segment_sizes = vec![
         properties.async_dependencies.len(),
@@ -790,16 +853,17 @@ pub fn launch<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
         );
     }
     if properties.is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
     let segment_sizes = segment_sizes.iter().map(|size| *size as i32).collect::<Vec<_>>();
-    let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice()).unwrap();
+    let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice())?;
     builder
         .add_region(body)
         .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::launch`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::launch`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores a `printf` format string.
@@ -808,16 +872,12 @@ pub const FORMAT_ATTRIBUTE: &str = "format";
 /// GPU device-side printf operation.
 pub trait PrintfOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the printf format string.
-    fn format(&self) -> StringRef<'c> {
-        self.attribute(FORMAT_ATTRIBUTE)
-            .expect("invalid `format` attribute in `gpu.printf`")
-            .cast::<StringAttributeRef>()
-            .map(|attribute| attribute.string())
-            .expect("invalid `format` attribute in `gpu.printf`")
+    fn format(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(FORMAT_ATTRIBUTE)?.string())
     }
 
     /// Returns the printf argument operands.
-    fn arguments(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn arguments(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 }
@@ -831,21 +891,22 @@ pub fn printf<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     format: &str,
     arguments: &[V],
     location: L,
-) -> DetachedPrintfOperation<'c, 't> {
+) -> Result<DetachedPrintfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.printf", location)
         .add_attribute(FORMAT_ATTRIBUTE, context.string_attribute(format))
         .add_operands(arguments)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::printf`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::printf`"))
+        })
 }
 
 /// GPU function return terminator operation.
 pub trait ReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the returned values.
-    fn values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 }
@@ -861,13 +922,14 @@ mlir_op_trait!(Return, ZeroSuccessors);
 pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     values: &[V],
     location: L,
-) -> DetachedReturnOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
+) -> Result<DetachedReturnOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.return", location)
         .add_operands(values)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::return`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::return`"))
+        })
 }
 
 /// GPU launch-body terminator operation.
@@ -881,18 +943,17 @@ mlir_op_trait!(Terminator, ZeroRegions);
 mlir_op_trait!(Terminator, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`TerminatorOperation`] at the specified [`Location`].
-pub fn terminator<'c, 't: 'c, L: Location<'c, 't>>(location: L) -> DetachedTerminatorOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
-    OperationBuilder::new("gpu.terminator", location)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::terminator`")
+pub fn terminator<'c, 't: 'c, L: Location<'c, 't>>(location: L) -> Result<DetachedTerminatorOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::gpu()?)?;
+    OperationBuilder::new("gpu.terminator", location).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::terminator`"))
+    })
 }
 
 /// GPU region yield operation.
 pub trait YieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the yielded values.
-    fn values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 }
@@ -908,13 +969,14 @@ mlir_op_trait!(Yield, ZeroSuccessors);
 pub fn r#yield<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     values: &[V],
     location: L,
-) -> DetachedYieldOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
+) -> Result<DetachedYieldOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.yield", location)
         .add_operands(values)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::yield`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::yield`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores an all-reduce or subgroup-reduce operation kind.
@@ -926,24 +988,37 @@ pub const UNIFORM_ATTRIBUTE: &str = "uniform";
 /// GPU all-reduce operation across a workgroup.
 pub trait AllReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion<'o, 'c, 't> {
     /// Returns the value to reduce.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the optional built-in reduction operation kind.
-    fn operation_kind(&self) -> Option<AllReduceOperationKind> {
-        self.attribute(OP_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<AllReduceOperationKindAttributeRef>())
-            .map(|attribute| attribute.value())
+    fn operation_kind(&self) -> Result<Option<AllReduceOperationKind>, Error> {
+        ({
+            let attribute_name = OP_ATTRIBUTE;
+            self.attribute(attribute_name)?
+                .map(|attribute| {
+                    attribute.cast::<AllReduceOperationKindAttributeRef>().ok_or_else(|| {
+                        Error::invalid_argument(format!(
+                            "invalid `{}` attribute in `{}`",
+                            attribute_name,
+                            self.name().as_str().unwrap_or("<unknown>"),
+                        ))
+                    })
+                })
+                .transpose()
+        }?)
+        .map(|attribute| attribute.value())
+        .transpose()
     }
 
     /// Returns `true` if the collective is marked uniform.
     fn is_uniform(&self) -> bool {
-        self.attribute(UNIFORM_ATTRIBUTE).is_some()
+        self.has_attribute(UNIFORM_ATTRIBUTE)
     }
 
     /// Returns the reduction body region.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
         self.body_region()
     }
 }
@@ -963,21 +1038,19 @@ pub fn all_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
     body: DetachedRegion<'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedAllReduceOperation<'c, 't> {
+) -> Result<DetachedAllReduceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.all_reduce", location).add_operand(value).add_result(result_type);
     if let Some(operation_kind) = operation_kind {
-        builder = builder.add_attribute(OP_ATTRIBUTE, context.gpu_all_reduce_operation_kind_attribute(operation_kind));
+        builder = builder.add_attribute(OP_ATTRIBUTE, context.gpu_all_reduce_operation_kind_attribute(operation_kind)?);
     }
     if is_uniform {
         builder = builder.add_attribute(UNIFORM_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .add_region(body)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::all_reduce`")
+    builder.add_region(body).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::all_reduce`"))
+    })
 }
 
 /// Name of the [`Attribute`] that stores subgroup cluster size.
@@ -989,35 +1062,41 @@ pub const CLUSTER_STRIDE_ATTRIBUTE: &str = "cluster_stride";
 /// GPU subgroup-reduce operation.
 pub trait SubgroupReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the value to reduce.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the built-in reduction operation kind.
-    fn operation_kind(&self) -> AllReduceOperationKind {
-        self.attribute(OP_ATTRIBUTE)
-            .expect("invalid `op` attribute in `gpu.subgroup_reduce`")
-            .cast::<AllReduceOperationKindAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `op` attribute in `gpu.subgroup_reduce`")
+    fn operation_kind(&self) -> Result<AllReduceOperationKind, Error> {
+        self.attribute(OP_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<AllReduceOperationKindAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    OP_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns `true` if the reduction is marked uniform.
     fn is_uniform(&self) -> bool {
-        self.attribute(UNIFORM_ATTRIBUTE).is_some()
+        self.has_attribute(UNIFORM_ATTRIBUTE)
     }
 
     /// Returns the optional subgroup cluster size.
-    fn cluster_size(&self) -> Option<IntegerAttributeRef<'c, 't>> {
-        self.attribute(CLUSTER_SIZE_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn cluster_size(&self) -> Result<Option<IntegerAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(CLUSTER_SIZE_ATTRIBUTE) {
+            self.integer_attribute(CLUSTER_SIZE_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the subgroup cluster stride.
-    fn cluster_stride(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(CLUSTER_STRIDE_ATTRIBUTE)
-            .expect("invalid 'cluster_stride' attribute in `gpu.subgroup_reduce`")
-            .cast()
-            .expect("invalid 'cluster_stride' attribute in `gpu.subgroup_reduce`")
+    fn cluster_stride(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(CLUSTER_STRIDE_ATTRIBUTE)
     }
 }
 
@@ -1035,17 +1114,17 @@ pub fn subgroup_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c,
     cluster_size: Option<u32>,
     cluster_stride: u32,
     location: L,
-) -> DetachedSubgroupReduceOperation<'c, 't> {
+) -> Result<DetachedSubgroupReduceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_reduce", location)
         .add_operand(value)
-        .add_attribute(OP_ATTRIBUTE, context.gpu_all_reduce_operation_kind_attribute(operation_kind))
+        .add_attribute(OP_ATTRIBUTE, context.gpu_all_reduce_operation_kind_attribute(operation_kind)?)
         .add_attribute(
             CLUSTER_STRIDE_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), cluster_stride as i64),
         )
-        .add_result(value.r#type());
+        .add_result(value.r#type()?);
     if is_uniform {
         builder = builder.add_attribute(UNIFORM_ATTRIBUTE, context.unit_attribute());
     }
@@ -1055,10 +1134,11 @@ pub fn subgroup_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c,
             context.integer_attribute(context.signless_integer_type(32), cluster_size as i64),
         );
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::subgroup_reduce`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::subgroup_reduce`"))
+    })
 }
 
 /// Name of the [`Attribute`] that stores GPU shuffle mode.
@@ -1067,37 +1147,42 @@ pub const MODE_ATTRIBUTE: &str = "mode";
 /// GPU subgroup shuffle operation.
 pub trait ShuffleOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the value to shuffle.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the shuffle offset operand.
-    fn offset(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn offset(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the shuffle width operand.
-    fn width(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn width(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the shuffle mode.
-    fn mode(&self) -> ShuffleMode {
-        self.attribute(MODE_ATTRIBUTE)
-            .expect("invalid `mode` attribute in `gpu.shuffle`")
-            .cast::<ShuffleModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `mode` attribute in `gpu.shuffle`")
+    fn mode(&self) -> Result<ShuffleMode, Error> {
+        self.attribute(MODE_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<ShuffleModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns the shuffled value result.
-    fn shuffled_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn shuffled_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the validity flag result.
-    fn valid(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(1).unwrap().as_ref()
+    fn valid(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(1)?.as_ref())
     }
 }
 
@@ -1122,19 +1207,20 @@ pub fn shuffle<
     width: Width,
     mode: ShuffleMode,
     location: L,
-) -> DetachedShuffleOperation<'c, 't> {
+) -> Result<DetachedShuffleOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.shuffle", location)
         .add_operand(value)
         .add_operand(offset)
         .add_operand(width)
-        .add_attribute(MODE_ATTRIBUTE, context.gpu_shuffle_mode_attribute(mode))
-        .add_result(value.r#type())
+        .add_attribute(MODE_ATTRIBUTE, context.gpu_shuffle_mode_attribute(mode)?)
+        .add_result(value.r#type()?)
         .add_result(context.signless_integer_type(1))
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::shuffle`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::shuffle`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores rotate offset.
@@ -1146,34 +1232,28 @@ pub const WIDTH_ATTRIBUTE: &str = "width";
 /// GPU subgroup rotate operation.
 pub trait RotateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the value to rotate.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the rotation offset attribute.
-    fn offset(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(OFFSET_ATTRIBUTE)
-            .expect("invalid 'offset' attribute in `gpu.rotate`")
-            .cast()
-            .expect("invalid 'offset' attribute in `gpu.rotate`")
+    fn offset(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(OFFSET_ATTRIBUTE)
     }
 
     /// Returns the rotation width attribute.
-    fn width(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(WIDTH_ATTRIBUTE)
-            .expect("invalid 'width' attribute in `gpu.rotate`")
-            .cast()
-            .expect("invalid 'width' attribute in `gpu.rotate`")
+    fn width(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(WIDTH_ATTRIBUTE)
     }
 
     /// Returns the rotated value result.
-    fn rotated_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn rotated_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the validity flag result.
-    fn valid(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(1).unwrap().as_ref()
+    fn valid(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(1)?.as_ref())
     }
 }
 
@@ -1187,18 +1267,19 @@ pub fn rotate<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     offset: i32,
     width: i32,
     location: L,
-) -> DetachedRotateOperation<'c, 't> {
+) -> Result<DetachedRotateOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.rotate", location)
         .add_operand(value)
         .add_attribute(OFFSET_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), offset as i64))
         .add_attribute(WIDTH_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), width as i64))
-        .add_result(value.r#type())
+        .add_result(value.r#type()?)
         .add_result(context.signless_integer_type(1))
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::rotate`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::rotate`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores GPU barrier memory fence address spaces.
@@ -1207,20 +1288,20 @@ pub const ADDRESS_SPACES_ATTRIBUTE: &str = "address_spaces";
 /// GPU workgroup barrier operation.
 pub trait BarrierOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the optional memory fence address spaces.
-    fn address_spaces(&self) -> Option<Vec<AddressSpace>> {
-        self.attribute(ADDRESS_SPACES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<ArrayAttributeRef>())
-            .map(|attribute| {
-                attribute
-                    .elements()
-                    .map(|element| {
-                        element
-                            .cast::<AddressSpaceAttributeRef>()
-                            .map(|attribute| attribute.value())
-                            .expect("invalid address space in `gpu.barrier`")
-                    })
-                    .collect()
+    fn address_spaces(&self) -> Result<Option<Vec<AddressSpace>>, Error> {
+        if !self.has_attribute(ADDRESS_SPACES_ATTRIBUTE) {
+            return Ok(None);
+        }
+        self.array_attribute(ADDRESS_SPACES_ATTRIBUTE)?
+            .elements()
+            .map(|element| {
+                element?
+                    .cast::<AddressSpaceAttributeRef>()
+                    .ok_or_else(|| Error::invalid_argument("invalid address space in `gpu.barrier`"))?
+                    .value()
             })
+            .collect::<Result<Vec<_>, Error>>()
+            .map(Some)
     }
 }
 
@@ -1233,21 +1314,20 @@ mlir_op_trait!(Barrier, ZeroSuccessors);
 pub fn barrier<'c, 't: 'c, L: Location<'c, 't>>(
     address_spaces: Option<&[AddressSpace]>,
     location: L,
-) -> DetachedBarrierOperation<'c, 't> {
+) -> Result<DetachedBarrierOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.barrier", location);
     if let Some(address_spaces) = address_spaces {
         let address_spaces = address_spaces
             .iter()
-            .map(|address_space| context.gpu_address_space_attribute(*address_space).as_ref())
-            .collect::<Vec<_>>();
+            .map(|address_space| Ok(context.gpu_address_space_attribute(*address_space)?.as_ref()))
+            .collect::<Result<Vec<_>, Error>>()?;
         builder = builder.add_attribute(ADDRESS_SPACES_ATTRIBUTE, context.array_attribute(address_spaces.as_slice()));
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::barrier`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::barrier`"))
+    })
 }
 
 /// Name of the [`Attribute`] that stores GPU binary target attributes.
@@ -1261,18 +1341,13 @@ pub trait ModuleOperation<'o, 'c: 'o, 't: 'c>:
     Operation<'o, 'c, 't> + OneRegion<'o, 'c, 't> + Symbol<'o, 'c, 't> + SymbolTable<'o, 'c, 't>
 {
     /// Returns optional target attributes.
-    fn targets(&self) -> Option<ArrayAttributeRef<'c, 't>> {
-        self.attribute(TARGETS_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn targets(&self) -> Result<Option<ArrayAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(TARGETS_ATTRIBUTE) { self.array_attribute(TARGETS_ATTRIBUTE).map(Some) } else { Ok(None) }
     }
 
     /// Returns the optional offloading handler attribute.
-    fn offloading_handler(&self) -> Option<AttributeRef<'c, 't>> {
+    fn offloading_handler(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute(OFFLOADING_HANDLER_ATTRIBUTE)
-    }
-
-    /// Returns the module body region.
-    fn body_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
     }
 }
 
@@ -1296,9 +1371,9 @@ pub fn module<'c, 't: 'c, L: Location<'c, 't>>(
     offloading_handler: Option<AttributeRef<'c, 't>>,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedModuleOperation<'c, 't> {
+) -> Result<DetachedModuleOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.module", location)
         .add_attribute(crate::SYMBOL_NAME_ATTRIBUTE, context.string_attribute(name));
     if let Some(targets) = targets {
@@ -1307,11 +1382,9 @@ pub fn module<'c, 't: 'c, L: Location<'c, 't>>(
     if let Some(offloading_handler) = offloading_handler {
         builder = builder.add_attribute(OFFLOADING_HANDLER_ATTRIBUTE, offloading_handler);
     }
-    builder
-        .add_region(body)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::module`")
+    builder.add_region(body).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::module`"))
+    })
 }
 
 /// Name of the [`Attribute`] that stores GPU binary objects.
@@ -1320,16 +1393,13 @@ pub const OBJECTS_ATTRIBUTE: &str = "objects";
 /// GPU binary operation storing serialized GPU object attributes.
 pub trait BinaryOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + Symbol<'o, 'c, 't> {
     /// Returns the optional offloading handler attribute.
-    fn offloading_handler(&self) -> Option<AttributeRef<'c, 't>> {
+    fn offloading_handler(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute(OFFLOADING_HANDLER_ATTRIBUTE)
     }
 
     /// Returns the GPU object attribute array.
-    fn objects(&self) -> ArrayAttributeRef<'c, 't> {
-        self.attribute(OBJECTS_ATTRIBUTE)
-            .expect("invalid `objects` attribute in `gpu.binary`")
-            .cast()
-            .expect("invalid `objects` attribute in `gpu.binary`")
+    fn objects(&self) -> Result<ArrayAttributeRef<'c, 't>, Error> {
+        self.array_attribute(OBJECTS_ATTRIBUTE)
     }
 }
 
@@ -1345,19 +1415,18 @@ pub fn binary<'c, 't: 'c, L: Location<'c, 't>>(
     objects: ArrayAttributeRef<'c, 't>,
     offloading_handler: Option<AttributeRef<'c, 't>>,
     location: L,
-) -> DetachedBinaryOperation<'c, 't> {
+) -> Result<DetachedBinaryOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.binary", location)
         .add_attribute(crate::SYMBOL_NAME_ATTRIBUTE, context.string_attribute(name))
         .add_attribute(OBJECTS_ATTRIBUTE, objects);
     if let Some(offloading_handler) = offloading_handler {
         builder = builder.add_attribute(OFFLOADING_HANDLER_ATTRIBUTE, offloading_handler);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::binary`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::binary`"))
+    })
 }
 
 macro_rules! gpu_one_memref_operand_operation {
@@ -1366,8 +1435,8 @@ macro_rules! gpu_one_memref_operand_operation {
             #[doc = $doc]
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 #[doc = "Returns the memref operand of this operation."]
-                fn $method(&self) -> ValueRef<'o, 'c, 't> {
-                    self.operand_value(0).unwrap()
+                fn $method(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+                    self.operand_value(0)
                 }
             }
 
@@ -1381,13 +1450,20 @@ macro_rules! gpu_one_memref_operand_operation {
             pub fn $function_name<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
                 value: V,
                 location: L,
-            ) -> [<Detached $name Operation>]<'c, 't> {
-                location.context().load_dialect(DialectHandle::gpu());
+            ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
+                location.context().load_dialect(DialectHandle::gpu()?)?;
                 OperationBuilder::new($operation_name, location)
                     .add_operand(value)
                     .build()
-                    .and_then(|operation| unsafe { operation.cast() })
-                    .expect(concat!("invalid arguments to `gpu::", stringify!($function_name), "`"))
+                    .and_then(|operation| unsafe {
+                        operation.cast().ok_or_else(|| {
+                            Error::invalid_argument(concat!(
+                                "invalid arguments to `gpu::",
+                                stringify!($function_name),
+                                "`",
+                            ))
+                        })
+                    })
             }
         }
     };
@@ -1412,13 +1488,13 @@ gpu_one_memref_operand_operation!(
 /// GPU wait operation for async token dependencies.
 pub trait WaitOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(0).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -1431,17 +1507,16 @@ pub fn wait<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     async_dependencies: &[V],
     is_async: bool,
     location: L,
-) -> DetachedWaitOperation<'c, 't> {
+) -> Result<DetachedWaitOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.wait", location).add_operands(async_dependencies);
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::wait`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::wait`"))
+    })
 }
 
 /// Name of the [`Attribute`] that marks host-shared GPU allocation.
@@ -1450,50 +1525,38 @@ pub const HOST_SHARED_ATTRIBUTE: &str = "hostShared";
 /// GPU allocation operation.
 pub trait AllocOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        self.operand_values().take(segment_sizes[0]).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let dependency_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        self.operand_values().take(dependency_count).collect()
     }
 
     /// Returns dynamic size operands.
-    fn dynamic_sizes(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        let start = segment_sizes.iter().take(1).sum::<usize>();
-        self.operand_values().skip(start).take(segment_sizes[1]).collect()
+    fn dynamic_sizes(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?
+            .map(|index| self.operand_value(index))
+            .collect()
     }
 
     /// Returns symbol operands.
-    fn symbol_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        let start = segment_sizes.iter().take(2).sum::<usize>();
-        self.operand_values().skip(start).take(segment_sizes[2]).collect()
+    fn symbol_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?
+            .map(|index| self.operand_value(index))
+            .collect()
     }
 
     /// Returns `true` if the allocation is host shared.
     fn host_shared(&self) -> bool {
-        self.attribute(HOST_SHARED_ATTRIBUTE).is_some()
+        self.has_attribute(HOST_SHARED_ATTRIBUTE)
     }
 
     /// Returns the allocated memref result.
-    fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn memref(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(1).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 1 { Ok(None) } else { self.result(1).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -1510,9 +1573,9 @@ pub fn alloc<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     host_shared: bool,
     is_async: bool,
     location: L,
-) -> DetachedAllocOperation<'c, 't> {
+) -> Result<DetachedAllocOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.alloc", location)
         .add_operands(async_dependencies)
         .add_operands(dynamic_sizes)
@@ -1522,18 +1585,19 @@ pub fn alloc<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         builder = builder.add_attribute(HOST_SHARED_ATTRIBUTE, context.unit_attribute());
     }
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
     let segment_sizes = [async_dependencies.len(), dynamic_sizes.len(), symbol_operands.len()]
         .iter()
         .map(|size| *size as i32)
         .collect::<Vec<_>>();
-    let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice()).unwrap();
+    let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice())?;
     builder
         .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::alloc`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::alloc`"))
+        })
 }
 
 macro_rules! gpu_async_prefix_operation {
@@ -1548,26 +1612,33 @@ macro_rules! gpu_async_prefix_operation {
             #[doc = $doc]
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 /// Returns async token dependencies.
-                fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-                    let token_type = self.context().gpu_async_token_type().as_ref();
-                    self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+                fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+                    let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+                    let mut dependencies = Vec::new();
+                    for operand in self.operand_values() {
+                        let operand = operand?;
+                        if operand.r#type()? != async_token_type {
+                            break;
+                        }
+                        dependencies.push(operand);
+                    }
+                    Ok(dependencies)
                 }
 
                 $(
                     #[doc = "Returns this operation operand."]
-                    fn $method(&self) -> ValueRef<'o, 'c, 't> {
-                        let token_type = self.context().gpu_async_token_type().as_ref();
-                        let async_dependency_count = self
-                            .operand_values()
-                            .take_while(|operand| operand.r#type() == token_type)
-                            .count();
-                        self.operand_value(async_dependency_count + $index).unwrap()
+                    fn $method(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+                        self.operand_value(self.async_dependencies()?.len() + $index)
                     }
                 )+
 
                 /// Returns the optional async token result.
-                fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-                    self.result(0).map(|result| result.as_ref())
+                fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+                    if self.result_count() <= 0 {
+                        Ok(None)
+                    } else {
+                        self.result(0).map(|result| Some(result.as_ref()))
+                    }
                 }
             }
 
@@ -1608,18 +1679,17 @@ pub fn dealloc<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     memref: ValueRef<'o, 'c, 't>,
     is_async: bool,
     location: L,
-) -> DetachedDeallocOperation<'c, 't> {
+) -> Result<DetachedDeallocOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder =
         OperationBuilder::new("gpu.dealloc", location).add_operands(async_dependencies).add_operand(memref);
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::dealloc`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::dealloc`"))
+    })
 }
 
 /// Constructs a new detached/owned [`MemcpyOperation`] at the specified [`Location`].
@@ -1629,20 +1699,19 @@ pub fn memcpy<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'o, 'c, 't>,
     is_async: bool,
     location: L,
-) -> DetachedMemcpyOperation<'c, 't> {
+) -> Result<DetachedMemcpyOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.memcpy", location)
         .add_operands(async_dependencies)
         .add_operand(destination)
         .add_operand(source);
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::memcpy`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::memcpy`"))
+    })
 }
 
 /// Constructs a new detached/owned [`MemsetOperation`] at the specified [`Location`].
@@ -1652,27 +1721,26 @@ pub fn memset<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     value: ValueRef<'o, 'c, 't>,
     is_async: bool,
     location: L,
-) -> DetachedMemsetOperation<'c, 't> {
+) -> Result<DetachedMemsetOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.memset", location)
         .add_operands(async_dependencies)
         .add_operand(destination)
         .add_operand(value);
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::memset`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::memset`"))
+    })
 }
 
 /// GPU operation that sets the default device index.
 pub trait SetDefaultDeviceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the device index operand.
-    fn device_index(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn device_index(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 }
 
@@ -1684,13 +1752,16 @@ mlir_op_trait!(SetDefaultDevice, ZeroSuccessors);
 pub fn set_default_device<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     device_index: V,
     location: L,
-) -> DetachedSetDefaultDeviceOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
+) -> Result<DetachedSetDefaultDeviceOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.set_default_device", location)
         .add_operand(device_index)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::set_default_device`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::set_default_device`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores MMA leading dimensions.
@@ -1702,31 +1773,28 @@ pub const TRANSPOSE_ATTRIBUTE: &str = "transpose";
 /// GPU subgroup MMA matrix load operation.
 pub trait SubgroupMmaLoadMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source memref.
-    fn source_memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source_memref(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the index operands.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(1).collect()
     }
 
     /// Returns the leading dimension attribute.
-    fn lead_dimension(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(LEAD_DIMENSION_ATTRIBUTE)
-            .expect("invalid 'leadDimension' attribute in `gpu.subgroup_mma_load_matrix`")
-            .cast()
-            .expect("invalid 'leadDimension' attribute in `gpu.subgroup_mma_load_matrix`")
+    fn lead_dimension(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(LEAD_DIMENSION_ATTRIBUTE)
     }
 
     /// Returns `true` if the load is transposed.
     fn transpose(&self) -> bool {
-        self.attribute(TRANSPOSE_ATTRIBUTE).is_some()
+        self.has_attribute(TRANSPOSE_ATTRIBUTE)
     }
 
     /// Returns the loaded MMA matrix result.
-    fn matrix(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn matrix(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -1743,9 +1811,9 @@ pub fn subgroup_mma_load_matrix<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location
     transpose: bool,
     result_type: T,
     location: L,
-) -> DetachedSubgroupMmaLoadMatrixOperation<'c, 't> {
+) -> Result<DetachedSubgroupMmaLoadMatrixOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_mma_load_matrix", location)
         .add_operand(source_memref)
         .add_operands(indices)
@@ -1754,40 +1822,38 @@ pub fn subgroup_mma_load_matrix<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location
     if transpose {
         builder = builder.add_attribute(TRANSPOSE_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::subgroup_mma_load_matrix`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::subgroup_mma_load_matrix`"))
+    })
 }
 
 /// GPU subgroup MMA matrix store operation.
 pub trait SubgroupMmaStoreMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source MMA matrix.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the destination memref.
-    fn destination_memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn destination_memref(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the index operands.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(2).collect()
     }
 
     /// Returns the leading dimension attribute.
-    fn lead_dimension(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(LEAD_DIMENSION_ATTRIBUTE)
-            .expect("invalid 'leadDimension' attribute in `gpu.subgroup_mma_store_matrix`")
-            .cast()
-            .expect("invalid 'leadDimension' attribute in `gpu.subgroup_mma_store_matrix`")
+    fn lead_dimension(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(LEAD_DIMENSION_ATTRIBUTE)
     }
 
     /// Returns `true` if the store is transposed.
     fn transpose(&self) -> bool {
-        self.attribute(TRANSPOSE_ATTRIBUTE).is_some()
+        self.has_attribute(TRANSPOSE_ATTRIBUTE)
     }
 }
 
@@ -1803,9 +1869,9 @@ pub fn subgroup_mma_store_matrix<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     lead_dimension: i64,
     transpose: bool,
     location: L,
-) -> DetachedSubgroupMmaStoreMatrixOperation<'c, 't> {
+) -> Result<DetachedSubgroupMmaStoreMatrixOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_mma_store_matrix", location)
         .add_operand(source)
         .add_operand(destination_memref)
@@ -1814,10 +1880,11 @@ pub fn subgroup_mma_store_matrix<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     if transpose {
         builder = builder.add_attribute(TRANSPOSE_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::subgroup_mma_store_matrix`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::subgroup_mma_store_matrix`"))
+    })
 }
 
 /// Name of the [`Attribute`] that marks transposed MMA matrix A operands.
@@ -1829,33 +1896,33 @@ pub const B_TRANSPOSE_ATTRIBUTE: &str = "b_transpose";
 /// GPU subgroup MMA matrix multiply-accumulate operation.
 pub trait SubgroupMmaComputeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the A operand matrix.
-    fn a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the B operand matrix.
-    fn b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn b(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the C accumulator matrix.
-    fn c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn c(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns `true` if operand A is transposed.
     fn a_transpose(&self) -> bool {
-        self.attribute(A_TRANSPOSE_ATTRIBUTE).is_some()
+        self.has_attribute(A_TRANSPOSE_ATTRIBUTE)
     }
 
     /// Returns `true` if operand B is transposed.
     fn b_transpose(&self) -> bool {
-        self.attribute(B_TRANSPOSE_ATTRIBUTE).is_some()
+        self.has_attribute(B_TRANSPOSE_ATTRIBUTE)
     }
 
     /// Returns the result matrix.
-    fn result_matrix(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn result_matrix(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -1873,9 +1940,9 @@ pub fn subgroup_mma_compute<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c,
     b_transpose: bool,
     result_type: T,
     location: L,
-) -> DetachedSubgroupMmaComputeOperation<'c, 't> {
+) -> Result<DetachedSubgroupMmaComputeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_mma_compute", location)
         .add_operand(a)
         .add_operand(b)
@@ -1887,22 +1954,23 @@ pub fn subgroup_mma_compute<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c,
     if b_transpose {
         builder = builder.add_attribute(B_TRANSPOSE_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::subgroup_mma_compute`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::subgroup_mma_compute`"))
+    })
 }
 
 /// GPU subgroup MMA constant matrix operation.
 pub trait SubgroupMmaConstantMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the scalar value broadcast into the matrix.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the resulting MMA matrix.
-    fn matrix(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn matrix(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -1917,31 +1985,34 @@ pub fn subgroup_mma_constant_matrix<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Loca
     value: ValueRef<'o, 'c, 't>,
     result_type: T,
     location: L,
-) -> DetachedSubgroupMmaConstantMatrixOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
+) -> Result<DetachedSubgroupMmaConstantMatrixOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_constant_matrix", location)
         .add_operand(value)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::subgroup_mma_constant_matrix`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::subgroup_mma_constant_matrix`"))
+        })
 }
 
 /// GPU subgroup MMA thread-local extract operation.
 pub trait SubgroupMmaExtractThreadLocalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source MMA matrix.
-    fn matrix(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn matrix(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the thread-local index operands.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(1).collect()
     }
 
     /// Returns the extracted scalar.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -1956,37 +2027,40 @@ pub fn subgroup_mma_extract_thread_local<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L:
     indices: &[ValueRef<'o, 'c, 't>],
     result_type: T,
     location: L,
-) -> DetachedSubgroupMmaExtractThreadLocalOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
+) -> Result<DetachedSubgroupMmaExtractThreadLocalOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_extract_thread_local", location)
         .add_operand(matrix)
         .add_operands(indices)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::subgroup_mma_extract_thread_local`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::subgroup_mma_extract_thread_local`"))
+        })
 }
 
 /// GPU subgroup MMA thread-local insert operation.
 pub trait SubgroupMmaInsertThreadLocalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the scalar value to insert.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the destination MMA matrix.
-    fn matrix(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn matrix(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the thread-local index operands.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(2).collect()
     }
 
     /// Returns the resulting MMA matrix.
-    fn result_matrix(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn result_matrix(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -2002,16 +2076,19 @@ pub fn subgroup_mma_insert_thread_local<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: 
     indices: &[ValueRef<'o, 'c, 't>],
     result_type: T,
     location: L,
-) -> DetachedSubgroupMmaInsertThreadLocalOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
+) -> Result<DetachedSubgroupMmaInsertThreadLocalOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_insert_thread_local", location)
         .add_operand(value)
         .add_operand(matrix)
         .add_operands(indices)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::subgroup_mma_insert_thread_local`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::subgroup_mma_insert_thread_local`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores the MMA elementwise operation kind.
@@ -2020,22 +2097,27 @@ pub const OP_TYPE_ATTRIBUTE: &str = "opType";
 /// GPU subgroup MMA elementwise operation.
 pub trait SubgroupMmaElementwiseOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the MMA matrix operands.
-    fn arguments(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn arguments(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the elementwise operation kind.
-    fn operation(&self) -> MmaElementwiseOperation {
-        self.attribute(OP_TYPE_ATTRIBUTE)
-            .expect("invalid `opType` attribute in `gpu.subgroup_mma_elementwise`")
-            .cast::<MmaElementwiseOperationAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `opType` attribute in `gpu.subgroup_mma_elementwise`")
+    fn operation(&self) -> Result<MmaElementwiseOperation, Error> {
+        self.attribute(OP_TYPE_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MmaElementwiseOperationAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    OP_TYPE_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns the resulting MMA matrix.
-    fn result_matrix(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn result_matrix(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -2050,16 +2132,19 @@ pub fn subgroup_mma_elementwise<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location
     operation: MmaElementwiseOperation,
     result_type: T,
     location: L,
-) -> DetachedSubgroupMmaElementwiseOperation<'c, 't> {
+) -> Result<DetachedSubgroupMmaElementwiseOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_elementwise", location)
         .add_operands(arguments)
-        .add_attribute(OP_TYPE_ATTRIBUTE, context.gpu_mma_elementwise_operation_attribute(operation))
+        .add_attribute(OP_TYPE_ATTRIBUTE, context.gpu_mma_elementwise_operation_attribute(operation)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::subgroup_mma_elementwise`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::subgroup_mma_elementwise`"))
+        })
 }
 
 macro_rules! gpu_sparse_async_operation {
@@ -2068,29 +2153,34 @@ macro_rules! gpu_sparse_async_operation {
             #[doc = $doc]
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 /// Returns async token dependencies.
-                fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-                    let token_type = self.context().gpu_async_token_type().as_ref();
-                    self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+                fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+                    let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+                    let mut dependencies = Vec::new();
+                    for operand in self.operand_values() {
+                        let operand = operand?;
+                        if operand.r#type()? != async_token_type {
+                            break;
+                        }
+                        dependencies.push(operand);
+                    }
+                    Ok(dependencies)
                 }
 
                 $(
                     #[doc = "Returns this operation operand."]
-                    fn $method(&self) -> ValueRef<'o, 'c, 't> {
-                        let token_type = self.context().gpu_async_token_type().as_ref();
-                        let async_dependency_count = self
-                            .operand_values()
-                            .take_while(|operand| operand.r#type() == token_type)
-                            .count();
-                        self.operand_value(async_dependency_count + $index).unwrap()
+                    fn $method(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+                        self.operand_value(self.async_dependencies()?.len() + $index)
                     }
                 )*
 
                 /// Returns the optional async token result.
-                fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
+                fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
                     if self.result_count() > 1 {
-                        self.result(self.result_count() - 1).map(|result| result.as_ref())
+                        self.result(self.result_count() - 1).map(|result| Some(result.as_ref()))
+                    } else if self.result_count() == 1 {
+                        self.result(0).map(|result| Some(result.as_ref()))
                     } else {
-                        self.result(0).map(|result| result.as_ref())
+                        Ok(None)
                     }
                 }
             }
@@ -2107,18 +2197,23 @@ macro_rules! gpu_sparse_async_operation {
                 $($method: ValueRef<'o, 'c, 't>,)*
                 is_async: bool,
                 location: L,
-            ) -> [<Detached $name Operation>]<'c, 't> {
+            ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 let context = location.context();
-                context.load_dialect(DialectHandle::gpu());
+                context.load_dialect(DialectHandle::gpu()?)?;
                 let mut builder = OperationBuilder::new($operation_name, location).add_operands(async_dependencies);
                 $(builder = builder.add_operand($method);)*
                 if is_async {
-                    builder = builder.add_result(context.gpu_async_token_type());
+                    builder = builder.add_result(context.gpu_async_token_type()?);
                 }
-                builder
-                    .build()
-                    .and_then(|operation| unsafe { operation.cast() })
-                    .expect(concat!("invalid arguments to `gpu::", stringify!($function_name), "`"))
+                builder.build().and_then(|operation| unsafe {
+                    operation.cast().ok_or_else(|| {
+                        Error::invalid_argument(concat!(
+                            "invalid arguments to `gpu::",
+                            stringify!($function_name),
+                            "`",
+                        ))
+                    })
+                })
             }
         }
     };
@@ -2130,31 +2225,38 @@ macro_rules! gpu_sparse_create_sp_mat_operation {
             #[doc = $doc]
             pub trait [<$name Operation>]<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 /// Returns async token dependencies.
-                fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-                    let token_type = self.context().gpu_async_token_type().as_ref();
-                    self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+                fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+                    let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+                    let mut dependencies = Vec::new();
+                    for operand in self.operand_values() {
+                        let operand = operand?;
+                        if operand.r#type()? != async_token_type {
+                            break;
+                        }
+                        dependencies.push(operand);
+                    }
+                    Ok(dependencies)
                 }
 
                 $(
                     #[doc = "Returns this operation operand."]
-                    fn $method(&self) -> ValueRef<'o, 'c, 't> {
-                        let token_type = self.context().gpu_async_token_type().as_ref();
-                        let async_dependency_count = self
-                            .operand_values()
-                            .take_while(|operand| operand.r#type() == token_type)
-                            .count();
-                        self.operand_value(async_dependency_count + $index).unwrap()
+                    fn $method(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+                        self.operand_value(self.async_dependencies()?.len() + $index)
                     }
                 )+
 
                 /// Returns the sparse matrix handle result.
-                fn sparse_matrix(&self) -> ValueRef<'o, 'c, 't> {
-                    self.result(0).unwrap().as_ref()
+                fn sparse_matrix(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+                    Ok(self.result(0)?.as_ref())
                 }
 
                 /// Returns the optional async token result.
-                fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-                    self.result(1).map(|result| result.as_ref())
+                fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+                    if self.result_count() <= 1 {
+                        Ok(None)
+                    } else {
+                        self.result(1).map(|result| Some(result.as_ref()))
+                    }
                 }
             }
 
@@ -2170,20 +2272,25 @@ macro_rules! gpu_sparse_create_sp_mat_operation {
                 $($method: ValueRef<'o, 'c, 't>,)+
                 is_async: bool,
                 location: L,
-            ) -> [<Detached $name Operation>]<'c, 't> {
+            ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 let context = location.context();
-                context.load_dialect(DialectHandle::gpu());
+                context.load_dialect(DialectHandle::gpu()?)?;
                 let mut builder = OperationBuilder::new($operation_name, location)
                     .add_operands(async_dependencies)
                     $(.add_operand($method))+
-                    .add_result(context.gpu_sparse_sp_mat_handle_type());
+                    .add_result(context.gpu_sparse_sp_mat_handle_type()?);
                 if is_async {
-                    builder = builder.add_result(context.gpu_async_token_type());
+                    builder = builder.add_result(context.gpu_async_token_type()?);
                 }
-                builder
-                    .build()
-                    .and_then(|operation| unsafe { operation.cast() })
-                    .expect(concat!("invalid arguments to `gpu::", stringify!($function_name), "`"))
+                builder.build().and_then(|operation| unsafe {
+                    operation.cast().ok_or_else(|| {
+                        Error::invalid_argument(concat!(
+                            "invalid arguments to `gpu::",
+                            stringify!($function_name),
+                            "`",
+                        ))
+                    })
+                })
             }
         }
     };
@@ -2192,44 +2299,39 @@ macro_rules! gpu_sparse_create_sp_mat_operation {
 /// GPU operation that creates a dense tensor sparse handle.
 pub trait CreateDnTensorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        self.operand_values().take(segment_sizes[0]).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let dependency_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        self.operand_values().take(dependency_count).collect()
     }
 
     /// Returns the dense tensor backing memref.
-    fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        self.operand_value(segment_sizes.iter().take(1).sum::<usize>()).unwrap()
+    fn memref(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        if range.len() != 1 {
+            return Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            )));
+        }
+        self.operand_value(range.start)
     }
 
     /// Returns dense tensor dimension operands.
-    fn dimensions(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        let start = segment_sizes.iter().take(2).sum::<usize>();
-        self.operand_values().skip(start).take(segment_sizes[2]).collect()
+    fn dimensions(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?
+            .map(|index| self.operand_value(index))
+            .collect()
     }
 
     /// Returns the dense tensor handle result.
-    fn dense_tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn dense_tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(1).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 1 { Ok(None) } else { self.result(1).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -2244,27 +2346,26 @@ pub fn create_dn_tensor<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     dimensions: &[ValueRef<'o, 'c, 't>],
     is_async: bool,
     location: L,
-) -> DetachedCreateDnTensorOperation<'c, 't> {
+) -> Result<DetachedCreateDnTensorOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.create_dn_tensor", location)
         .add_operands(async_dependencies)
         .add_operand(memref)
         .add_operands(dimensions)
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context
-                .dense_i32_array_attribute(&[async_dependencies.len() as i32, 1, dimensions.len() as i32])
-                .unwrap(),
+            context.dense_i32_array_attribute(&[async_dependencies.len() as i32, 1, dimensions.len() as i32])?,
         )
-        .add_result(context.gpu_sparse_dn_tensor_handle_type());
+        .add_result(context.gpu_sparse_dn_tensor_handle_type()?);
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::create_dn_tensor`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::create_dn_tensor`"))
+    })
 }
 
 gpu_sparse_async_operation!(
@@ -2330,49 +2431,56 @@ pub const PRUNE_FLAG_ATTRIBUTE: &str = "pruneFlag";
 /// GPU operation that creates a sparse matrix with 2-to-4 sparsity.
 pub trait Create2To4SpMatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+        let mut dependencies = Vec::new();
+        for operand in self.operand_values() {
+            let operand = operand?;
+            if operand.r#type()? != async_token_type {
+                break;
+            }
+            dependencies.push(operand);
+        }
+        Ok(dependencies)
     }
 
     /// Returns the row count operand.
-    fn rows(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count).unwrap()
+    fn rows(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len())
     }
 
     /// Returns the column count operand.
-    fn columns(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 1).unwrap()
+    fn columns(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 1)
     }
 
     /// Returns the pruning flag.
-    fn prune_flag(&self) -> Prune2To4SparseMatrixFlag {
-        self.attribute(PRUNE_FLAG_ATTRIBUTE)
-            .expect("invalid `pruneFlag` attribute in `gpu.create_2to4_spmat`")
-            .cast::<Prune2To4SparseMatrixFlagAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `pruneFlag` attribute in `gpu.create_2to4_spmat`")
+    fn prune_flag(&self) -> Result<Prune2To4SparseMatrixFlag, Error> {
+        self.attribute(PRUNE_FLAG_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<Prune2To4SparseMatrixFlagAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    PRUNE_FLAG_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns the dense backing memref.
-    fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 2).unwrap()
+    fn memref(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 2)
     }
 
     /// Returns the sparse matrix result.
-    fn sparse_matrix(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn sparse_matrix(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(1).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 1 { Ok(None) } else { self.result(1).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -2389,23 +2497,24 @@ pub fn create_2_to_4_sp_mat<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     memref: ValueRef<'o, 'c, 't>,
     is_async: bool,
     location: L,
-) -> DetachedCreate2To4SpMatOperation<'c, 't> {
+) -> Result<DetachedCreate2To4SpMatOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.create_2to4_spmat", location)
         .add_operands(async_dependencies)
         .add_operand(rows)
         .add_operand(columns)
         .add_operand(memref)
-        .add_attribute(PRUNE_FLAG_ATTRIBUTE, context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(prune_flag))
-        .add_result(context.gpu_sparse_sp_mat_handle_type());
+        .add_attribute(PRUNE_FLAG_ATTRIBUTE, context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(prune_flag)?)
+        .add_result(context.gpu_sparse_sp_mat_handle_type()?);
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::create_2_to_4_sp_mat`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::create_2_to_4_sp_mat`"))
+    })
 }
 
 gpu_sparse_async_operation!(
@@ -2428,58 +2537,61 @@ pub const COMPUTE_TYPE_ATTRIBUTE: &str = "computeType";
 /// GPU SpMV buffer-size operation.
 pub trait SpmvBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+        let mut dependencies = Vec::new();
+        for operand in self.operand_values() {
+            let operand = operand?;
+            if operand.r#type()? != async_token_type {
+                break;
+            }
+            dependencies.push(operand);
+        }
+        Ok(dependencies)
     }
 
     /// Returns sparse matrix A transpose mode.
-    fn mode_a(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_A_ATTRIBUTE)
-            .expect("invalid `modeA` attribute in `gpu.spmv_buffer_size`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeA` attribute in `gpu.spmv_buffer_size`")
+    fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_A_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_A_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns sparse matrix A.
-    fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count).unwrap()
+    fn sparse_matrix_a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len())
     }
 
     /// Returns dense tensor X.
-    fn dense_tensor_x(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 1).unwrap()
+    fn dense_tensor_x(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 1)
     }
 
     /// Returns dense tensor Y.
-    fn dense_tensor_y(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 2).unwrap()
+    fn dense_tensor_y(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 2)
     }
 
     /// Returns the compute type attribute.
-    fn compute_type(&self) -> TypeRef<'c, 't> {
-        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
-            .expect("invalid `computeType` attribute in `gpu.spmv_buffer_size`")
-            .cast::<TypeAttributeRef>()
-            .map(|attribute| attribute.r#type())
-            .expect("invalid `computeType` attribute in `gpu.spmv_buffer_size`")
+    fn compute_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.type_attribute(COMPUTE_TYPE_ATTRIBUTE)?.r#type()
     }
 
     /// Returns the buffer-size result.
-    fn buffer_size(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn buffer_size(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(1).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 1 { Ok(None) } else { self.result(1).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -2497,83 +2609,85 @@ pub fn spmv_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>
     compute_type: T,
     is_async: bool,
     location: L,
-) -> DetachedSpmvBufferSizeOperation<'c, 't> {
+) -> Result<DetachedSpmvBufferSizeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmv_buffer_size", location)
         .add_operands(async_dependencies)
         .add_operand(sparse_matrix_a)
         .add_operand(dense_tensor_x)
         .add_operand(dense_tensor_y)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
         .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
         .add_result(context.index_type());
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::spmv_buffer_size`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::spmv_buffer_size`"))
+    })
 }
 
 /// GPU SpMV compute operation.
 pub trait SpmvOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+        let mut dependencies = Vec::new();
+        for operand in self.operand_values() {
+            let operand = operand?;
+            if operand.r#type()? != async_token_type {
+                break;
+            }
+            dependencies.push(operand);
+        }
+        Ok(dependencies)
     }
 
     /// Returns sparse matrix A transpose mode.
-    fn mode_a(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_A_ATTRIBUTE)
-            .expect("invalid `modeA` attribute in `gpu.spmv`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeA` attribute in `gpu.spmv`")
+    fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_A_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_A_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns sparse matrix A.
-    fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count).unwrap()
+    fn sparse_matrix_a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len())
     }
 
     /// Returns dense tensor X.
-    fn dense_tensor_x(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 1).unwrap()
+    fn dense_tensor_x(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 1)
     }
 
     /// Returns dense tensor Y.
-    fn dense_tensor_y(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 2).unwrap()
+    fn dense_tensor_y(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 2)
     }
 
     /// Returns the temporary buffer.
-    fn buffer(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 3).unwrap()
+    fn buffer(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 3)
     }
 
     /// Returns the compute type attribute.
-    fn compute_type(&self) -> TypeRef<'c, 't> {
-        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
-            .expect("invalid `computeType` attribute in `gpu.spmv`")
-            .cast::<TypeAttributeRef>()
-            .map(|attribute| attribute.r#type())
-            .expect("invalid `computeType` attribute in `gpu.spmv`")
+    fn compute_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.type_attribute(COMPUTE_TYPE_ATTRIBUTE)?.r#type()
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(0).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -2592,24 +2706,23 @@ pub fn spmv<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     buffer: ValueRef<'o, 'c, 't>,
     is_async: bool,
     location: L,
-) -> DetachedSpmvOperation<'c, 't> {
+) -> Result<DetachedSpmvOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmv", location)
         .add_operands(async_dependencies)
         .add_operand(sparse_matrix_a)
         .add_operand(dense_tensor_x)
         .add_operand(dense_tensor_y)
         .add_operand(buffer)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
         .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type));
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::spmv`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::spmv`"))
+    })
 }
 
 /// Name of the MLIR attribute storing operation result segment sizes.
@@ -2618,77 +2731,86 @@ pub const RESULT_SEGMENT_SIZES_ATTRIBUTE: &str = "result_segment_sizes";
 /// GPU SpMM buffer-size operation.
 pub trait SpmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+        let mut dependencies = Vec::new();
+        for operand in self.operand_values() {
+            let operand = operand?;
+            if operand.r#type()? != async_token_type {
+                break;
+            }
+            dependencies.push(operand);
+        }
+        Ok(dependencies)
     }
 
     /// Returns sparse matrix A transpose mode.
-    fn mode_a(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_A_ATTRIBUTE)
-            .expect("invalid `modeA` attribute in `gpu.spmm_buffer_size`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeA` attribute in `gpu.spmm_buffer_size`")
+    fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_A_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_A_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns dense matrix B transpose mode.
-    fn mode_b(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_B_ATTRIBUTE)
-            .expect("invalid `modeB` attribute in `gpu.spmm_buffer_size`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeB` attribute in `gpu.spmm_buffer_size`")
+    fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_B_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_B_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns sparse matrix A.
-    fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count).unwrap()
+    fn sparse_matrix_a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len())
     }
 
     /// Returns dense matrix B.
-    fn dense_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 1).unwrap()
+    fn dense_matrix_b(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 1)
     }
 
     /// Returns dense matrix C.
-    fn dense_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 2).unwrap()
+    fn dense_matrix_c(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 2)
     }
 
     /// Returns the compute type attribute.
-    fn compute_type(&self) -> TypeRef<'c, 't> {
-        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
-            .expect("invalid `computeType` attribute in `gpu.spmm_buffer_size`")
-            .cast::<TypeAttributeRef>()
-            .map(|attribute| attribute.r#type())
-            .expect("invalid `computeType` attribute in `gpu.spmm_buffer_size`")
+    fn compute_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.type_attribute(COMPUTE_TYPE_ATTRIBUTE)?.r#type()
     }
 
     /// Returns the buffer-size results.
-    fn buffer_sizes(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(RESULT_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{RESULT_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        self.results().take(segment_sizes[0]).map(|result| result.as_ref()).collect()
+    fn buffer_sizes(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(RESULT_SEGMENT_SIZES_ATTRIBUTE, 0)?
+            .map(|index| self.result(index).map(|result| result.as_ref()))
+            .collect()
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(RESULT_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{RESULT_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        if segment_sizes[1] == 0 { None } else { self.result(segment_sizes[0]).map(|result| result.as_ref()) }
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(RESULT_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        match range.len() {
+            0 => Ok(None),
+            1 => self.result(range.start).map(|result| Some(result.as_ref())),
+            _ => Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                RESULT_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            ))),
+        }
     }
 }
 
@@ -2708,118 +2830,124 @@ pub fn spmm_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>
     buffer_size_count: usize,
     is_async: bool,
     location: L,
-) -> DetachedSpmmBufferSizeOperation<'c, 't> {
+) -> Result<DetachedSpmmBufferSizeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmm_buffer_size", location)
         .add_operands(async_dependencies)
         .add_operand(sparse_matrix_a)
         .add_operand(dense_matrix_b)
         .add_operand(dense_matrix_c)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
         .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
         .add_attribute(
             RESULT_SEGMENT_SIZES_ATTRIBUTE,
-            context
-                .dense_i32_array_attribute(&[buffer_size_count as i32, if is_async { 1 } else { 0 }])
-                .unwrap(),
+            context.dense_i32_array_attribute(&[buffer_size_count as i32, if is_async { 1 } else { 0 }])?,
         );
     for _ in 0..buffer_size_count {
         builder = builder.add_result(context.index_type());
     }
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::spmm_buffer_size`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::spmm_buffer_size`"))
+    })
 }
 
 /// GPU SpMM compute operation.
 pub trait SpmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        self.operand_values().take(segment_sizes[0]).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let dependency_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        self.operand_values().take(dependency_count).collect()
     }
 
     /// Returns sparse matrix A transpose mode.
-    fn mode_a(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_A_ATTRIBUTE)
-            .expect("invalid `modeA` attribute in `gpu.spmm`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeA` attribute in `gpu.spmm`")
+    fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_A_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_A_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns dense matrix B transpose mode.
-    fn mode_b(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_B_ATTRIBUTE)
-            .expect("invalid `modeB` attribute in `gpu.spmm`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeB` attribute in `gpu.spmm`")
+    fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_B_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_B_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns sparse matrix A.
-    fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        self.operand_value(segment_sizes.iter().take(1).sum::<usize>()).unwrap()
+    fn sparse_matrix_a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        if range.len() != 1 {
+            return Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            )));
+        }
+        self.operand_value(range.start)
     }
 
     /// Returns dense matrix B.
-    fn dense_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        self.operand_value(segment_sizes.iter().take(2).sum::<usize>()).unwrap()
+    fn dense_matrix_b(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
+        if range.len() != 1 {
+            return Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            )));
+        }
+        self.operand_value(range.start)
     }
 
     /// Returns dense matrix C.
-    fn dense_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        self.operand_value(segment_sizes.iter().take(3).sum::<usize>()).unwrap()
+    fn dense_matrix_c(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)?;
+        if range.len() != 1 {
+            return Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            )));
+        }
+        self.operand_value(range.start)
     }
 
     /// Returns temporary buffers.
-    fn buffers(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `{}`", self.name()));
-        let start = segment_sizes.iter().take(4).sum::<usize>();
-        self.operand_values().skip(start).take(segment_sizes[4]).collect()
+    fn buffers(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 4)?
+            .map(|index| self.operand_value(index))
+            .collect()
     }
 
     /// Returns the compute type attribute.
-    fn compute_type(&self) -> TypeRef<'c, 't> {
-        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
-            .expect("invalid `computeType` attribute in `gpu.spmm`")
-            .cast::<TypeAttributeRef>()
-            .map(|attribute| attribute.r#type())
-            .expect("invalid `computeType` attribute in `gpu.spmm`")
+    fn compute_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.type_attribute(COMPUTE_TYPE_ATTRIBUTE)?.r#type()
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(0).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -2839,97 +2967,102 @@ pub fn spmm<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     buffers: &[ValueRef<'o, 'c, 't>],
     is_async: bool,
     location: L,
-) -> DetachedSpmmOperation<'c, 't> {
+) -> Result<DetachedSpmmOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmm", location)
         .add_operands(async_dependencies)
         .add_operand(sparse_matrix_a)
         .add_operand(dense_matrix_b)
         .add_operand(dense_matrix_c)
         .add_operands(buffers)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
         .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context
-                .dense_i32_array_attribute(&[async_dependencies.len() as i32, 1, 1, 1, buffers.len() as i32])
-                .unwrap(),
+            context.dense_i32_array_attribute(&[async_dependencies.len() as i32, 1, 1, 1, buffers.len() as i32])?,
         );
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::spmm`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::spmm`"))
+    })
 }
 
 /// GPU SDDMM buffer-size operation.
 pub trait SddmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+        let mut dependencies = Vec::new();
+        for operand in self.operand_values() {
+            let operand = operand?;
+            if operand.r#type()? != async_token_type {
+                break;
+            }
+            dependencies.push(operand);
+        }
+        Ok(dependencies)
     }
 
     /// Returns dense matrix A transpose mode.
-    fn mode_a(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_A_ATTRIBUTE)
-            .expect("invalid `modeA` attribute in `gpu.sddmm_buffer_size`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeA` attribute in `gpu.sddmm_buffer_size`")
+    fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_A_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_A_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns dense matrix B transpose mode.
-    fn mode_b(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_B_ATTRIBUTE)
-            .expect("invalid `modeB` attribute in `gpu.sddmm_buffer_size`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeB` attribute in `gpu.sddmm_buffer_size`")
+    fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_B_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_B_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns dense matrix A.
-    fn dense_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count).unwrap()
+    fn dense_matrix_a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len())
     }
 
     /// Returns dense matrix B.
-    fn dense_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 1).unwrap()
+    fn dense_matrix_b(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 1)
     }
 
     /// Returns sparse matrix C.
-    fn sparse_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 2).unwrap()
+    fn sparse_matrix_c(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 2)
     }
 
     /// Returns the compute type attribute.
-    fn compute_type(&self) -> TypeRef<'c, 't> {
-        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
-            .expect("invalid `computeType` attribute in `gpu.sddmm_buffer_size`")
-            .cast::<TypeAttributeRef>()
-            .map(|attribute| attribute.r#type())
-            .expect("invalid `computeType` attribute in `gpu.sddmm_buffer_size`")
+    fn compute_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.type_attribute(COMPUTE_TYPE_ATTRIBUTE)?.r#type()
     }
 
     /// Returns the buffer-size result.
-    fn buffer_size(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn buffer_size(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(1).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 1 { Ok(None) } else { self.result(1).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -2948,93 +3081,100 @@ pub fn sddmm_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't
     compute_type: T,
     is_async: bool,
     location: L,
-) -> DetachedSddmmBufferSizeOperation<'c, 't> {
+) -> Result<DetachedSddmmBufferSizeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.sddmm_buffer_size", location)
         .add_operands(async_dependencies)
         .add_operand(dense_matrix_a)
         .add_operand(dense_matrix_b)
         .add_operand(sparse_matrix_c)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
         .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
         .add_result(context.index_type());
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::sddmm_buffer_size`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::sddmm_buffer_size`"))
+    })
 }
 
 /// GPU SDDMM compute operation.
 pub trait SddmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+        let mut dependencies = Vec::new();
+        for operand in self.operand_values() {
+            let operand = operand?;
+            if operand.r#type()? != async_token_type {
+                break;
+            }
+            dependencies.push(operand);
+        }
+        Ok(dependencies)
     }
 
     /// Returns dense matrix A transpose mode.
-    fn mode_a(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_A_ATTRIBUTE)
-            .expect("invalid `modeA` attribute in `gpu.sddmm`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeA` attribute in `gpu.sddmm`")
+    fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_A_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_A_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns dense matrix B transpose mode.
-    fn mode_b(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_B_ATTRIBUTE)
-            .expect("invalid `modeB` attribute in `gpu.sddmm`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeB` attribute in `gpu.sddmm`")
+    fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_B_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_B_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns dense matrix A.
-    fn dense_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count).unwrap()
+    fn dense_matrix_a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len())
     }
 
     /// Returns dense matrix B.
-    fn dense_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 1).unwrap()
+    fn dense_matrix_b(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 1)
     }
 
     /// Returns sparse matrix C.
-    fn sparse_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 2).unwrap()
+    fn sparse_matrix_c(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 2)
     }
 
     /// Returns the temporary buffer.
-    fn buffer(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 3).unwrap()
+    fn buffer(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 3)
     }
 
     /// Returns the compute type attribute.
-    fn compute_type(&self) -> TypeRef<'c, 't> {
-        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
-            .expect("invalid `computeType` attribute in `gpu.sddmm`")
-            .cast::<TypeAttributeRef>()
-            .map(|attribute| attribute.r#type())
-            .expect("invalid `computeType` attribute in `gpu.sddmm`")
+    fn compute_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.type_attribute(COMPUTE_TYPE_ATTRIBUTE)?.r#type()
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(0).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -3054,43 +3194,50 @@ pub fn sddmm<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     buffer: ValueRef<'o, 'c, 't>,
     is_async: bool,
     location: L,
-) -> DetachedSddmmOperation<'c, 't> {
+) -> Result<DetachedSddmmOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.sddmm", location)
         .add_operands(async_dependencies)
         .add_operand(dense_matrix_a)
         .add_operand(dense_matrix_b)
         .add_operand(sparse_matrix_c)
         .add_operand(buffer)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
         .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type));
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::sddmm`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::sddmm`"))
+    })
 }
 
 /// GPU operation that creates a SpGEMM descriptor.
 pub trait SpGemmCreateDescrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+        let mut dependencies = Vec::new();
+        for operand in self.operand_values() {
+            let operand = operand?;
+            if operand.r#type()? != async_token_type {
+                break;
+            }
+            dependencies.push(operand);
+        }
+        Ok(dependencies)
     }
 
     /// Returns the SpGEMM descriptor result.
-    fn descriptor(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn descriptor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(1).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 1 { Ok(None) } else { self.result(1).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -3103,19 +3250,20 @@ pub fn sp_gemm_create_descr<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     async_dependencies: &[ValueRef<'o, 'c, 't>],
     is_async: bool,
     location: L,
-) -> DetachedSpGemmCreateDescrOperation<'c, 't> {
+) -> Result<DetachedSpGemmCreateDescrOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spgemm_create_descr", location)
         .add_operands(async_dependencies)
-        .add_result(context.gpu_sparse_sp_gemm_operation_handle_type());
+        .add_result(context.gpu_sparse_sp_gemm_operation_handle_type()?);
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::sp_gemm_create_descr`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::sp_gemm_create_descr`"))
+    })
 }
 
 gpu_sparse_async_operation!(
@@ -3132,97 +3280,104 @@ pub const KIND_ATTRIBUTE: &str = "kind";
 /// GPU SpGEMM work-estimation or compute operation.
 pub trait SpGemmWorkEstimationOrComputeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+        let mut dependencies = Vec::new();
+        for operand in self.operand_values() {
+            let operand = operand?;
+            if operand.r#type()? != async_token_type {
+                break;
+            }
+            dependencies.push(operand);
+        }
+        Ok(dependencies)
     }
 
     /// Returns the SpGEMM descriptor operand.
-    fn descriptor(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count).unwrap()
+    fn descriptor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len())
     }
 
     /// Returns sparse matrix A transpose mode.
-    fn mode_a(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_A_ATTRIBUTE)
-            .expect("invalid `modeA` attribute in `gpu.spgemm_work_estimation_or_compute`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeA` attribute in `gpu.spgemm_work_estimation_or_compute`")
+    fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_A_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_A_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns sparse matrix B transpose mode.
-    fn mode_b(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_B_ATTRIBUTE)
-            .expect("invalid `modeB` attribute in `gpu.spgemm_work_estimation_or_compute`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeB` attribute in `gpu.spgemm_work_estimation_or_compute`")
+    fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_B_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_B_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns the sparse matrix A operand.
-    fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 1).unwrap()
+    fn sparse_matrix_a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 1)
     }
 
     /// Returns the sparse matrix B operand.
-    fn sparse_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 2).unwrap()
+    fn sparse_matrix_b(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 2)
     }
 
     /// Returns the sparse matrix C operand.
-    fn sparse_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 3).unwrap()
+    fn sparse_matrix_c(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 3)
     }
 
     /// Returns the current buffer-size operand.
-    fn buffer_size(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 4).unwrap()
+    fn buffer_size(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 4)
     }
 
     /// Returns the temporary buffer operand.
-    fn buffer(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 5).unwrap()
+    fn buffer(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 5)
     }
 
     /// Returns the compute type attribute.
-    fn compute_type(&self) -> TypeRef<'c, 't> {
-        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
-            .expect("invalid `computeType` attribute in `gpu.spgemm_work_estimation_or_compute`")
-            .cast::<TypeAttributeRef>()
-            .map(|attribute| attribute.r#type())
-            .expect("invalid `computeType` attribute in `gpu.spgemm_work_estimation_or_compute`")
+    fn compute_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.type_attribute(COMPUTE_TYPE_ATTRIBUTE)?.r#type()
     }
 
     /// Returns the SpGEMM work kind.
-    fn kind(&self) -> SpGemmWorkKind {
-        self.attribute(KIND_ATTRIBUTE)
-            .expect("invalid `kind` attribute in `gpu.spgemm_work_estimation_or_compute`")
-            .cast::<SpGemmWorkKindAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `kind` attribute in `gpu.spgemm_work_estimation_or_compute`")
+    fn kind(&self) -> Result<SpGemmWorkKind, Error> {
+        self.attribute(KIND_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<SpGemmWorkKindAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    KIND_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns the new buffer-size result.
-    fn new_buffer_size(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn new_buffer_size(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(1).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 1 { Ok(None) } else { self.result(1).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -3245,9 +3400,9 @@ pub fn sp_gemm_work_estimation_or_compute<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L
     kind: SpGemmWorkKind,
     is_async: bool,
     location: L,
-) -> DetachedSpGemmWorkEstimationOrComputeOperation<'c, 't> {
+) -> Result<DetachedSpGemmWorkEstimationOrComputeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spgemm_work_estimation_or_compute", location)
         .add_operands(async_dependencies)
         .add_operand(descriptor)
@@ -3256,86 +3411,93 @@ pub fn sp_gemm_work_estimation_or_compute<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L
         .add_operand(sparse_matrix_c)
         .add_operand(buffer_size)
         .add_operand(buffer)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
         .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
-        .add_attribute(KIND_ATTRIBUTE, context.gpu_sp_gemm_work_kind_attribute(kind))
+        .add_attribute(KIND_ATTRIBUTE, context.gpu_sp_gemm_work_kind_attribute(kind)?)
         .add_result(context.index_type());
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::sp_gemm_work_estimation_or_compute`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::sp_gemm_work_estimation_or_compute`"))
+    })
 }
 
 /// GPU SpGEMM copy operation.
 pub trait SpGemmCopyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+        let mut dependencies = Vec::new();
+        for operand in self.operand_values() {
+            let operand = operand?;
+            if operand.r#type()? != async_token_type {
+                break;
+            }
+            dependencies.push(operand);
+        }
+        Ok(dependencies)
     }
 
     /// Returns sparse matrix A transpose mode.
-    fn mode_a(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_A_ATTRIBUTE)
-            .expect("invalid `modeA` attribute in `gpu.spgemm_copy`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeA` attribute in `gpu.spgemm_copy`")
+    fn mode_a(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_A_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_A_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns sparse matrix B transpose mode.
-    fn mode_b(&self) -> MatrixTransposeMode {
-        self.attribute(MODE_B_ATTRIBUTE)
-            .expect("invalid `modeB` attribute in `gpu.spgemm_copy`")
-            .cast::<MatrixTransposeModeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `modeB` attribute in `gpu.spgemm_copy`")
+    fn mode_b(&self) -> Result<MatrixTransposeMode, Error> {
+        self.attribute(MODE_B_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<MatrixTransposeModeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    MODE_B_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns the SpGEMM descriptor operand.
-    fn descriptor(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count).unwrap()
+    fn descriptor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len())
     }
 
     /// Returns the sparse matrix A operand.
-    fn sparse_matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 1).unwrap()
+    fn sparse_matrix_a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 1)
     }
 
     /// Returns the sparse matrix B operand.
-    fn sparse_matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 2).unwrap()
+    fn sparse_matrix_b(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 2)
     }
 
     /// Returns the sparse matrix C operand.
-    fn sparse_matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count + 3).unwrap()
+    fn sparse_matrix_c(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len() + 3)
     }
 
     /// Returns the compute type attribute.
-    fn compute_type(&self) -> TypeRef<'c, 't> {
-        self.attribute(COMPUTE_TYPE_ATTRIBUTE)
-            .expect("invalid `computeType` attribute in `gpu.spgemm_copy`")
-            .cast::<TypeAttributeRef>()
-            .map(|attribute| attribute.r#type())
-            .expect("invalid `computeType` attribute in `gpu.spgemm_copy`")
+    fn compute_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.type_attribute(COMPUTE_TYPE_ATTRIBUTE)?.r#type()
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(0).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -3355,60 +3517,65 @@ pub fn sp_gemm_copy<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     compute_type: T,
     is_async: bool,
     location: L,
-) -> DetachedSpGemmCopyOperation<'c, 't> {
+) -> Result<DetachedSpGemmCopyOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spgemm_copy", location)
         .add_operands(async_dependencies)
         .add_operand(descriptor)
         .add_operand(sparse_matrix_a)
         .add_operand(sparse_matrix_b)
         .add_operand(sparse_matrix_c)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a))
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b))
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
         .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type));
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::sp_gemm_copy`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::sp_gemm_copy`"))
+    })
 }
 
 /// GPU sparse matrix get-size operation.
 pub trait SpMatGetSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async token dependencies.
-    fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        self.operand_values().take_while(|operand| operand.r#type() == token_type).collect()
+    fn async_dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let async_token_type = self.context().gpu_async_token_type()?.as_ref();
+        let mut dependencies = Vec::new();
+        for operand in self.operand_values() {
+            let operand = operand?;
+            if operand.r#type()? != async_token_type {
+                break;
+            }
+            dependencies.push(operand);
+        }
+        Ok(dependencies)
     }
 
     /// Returns the sparse matrix operand.
-    fn sparse_matrix(&self) -> ValueRef<'o, 'c, 't> {
-        let token_type = self.context().gpu_async_token_type().as_ref();
-        let async_dependency_count = self.operand_values().take_while(|operand| operand.r#type() == token_type).count();
-        self.operand_value(async_dependency_count).unwrap()
+    fn sparse_matrix(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(self.async_dependencies()?.len())
     }
 
     /// Returns the sparse matrix row-count result.
-    fn rows(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn rows(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the sparse matrix column-count result.
-    fn columns(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(1).unwrap().as_ref()
+    fn columns(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(1)?.as_ref())
     }
 
     /// Returns the sparse matrix non-zero-count result.
-    fn non_zero_count(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(2).unwrap().as_ref()
+    fn non_zero_count(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(2)?.as_ref())
     }
 
     /// Returns the optional async token result.
-    fn async_token(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.result(3).map(|result| result.as_ref())
+    fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.result_count() <= 3 { Ok(None) } else { self.result(3).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -3422,9 +3589,9 @@ pub fn sp_mat_get_size<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     sparse_matrix: ValueRef<'o, 'c, 't>,
     is_async: bool,
     location: L,
-) -> DetachedSpMatGetSizeOperation<'c, 't> {
+) -> Result<DetachedSpMatGetSizeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmat_get_size", location)
         .add_operands(async_dependencies)
         .add_operand(sparse_matrix)
@@ -3432,12 +3599,13 @@ pub fn sp_mat_get_size<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
         .add_result(context.index_type())
         .add_result(context.index_type());
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type());
+        builder = builder.add_result(context.gpu_async_token_type()?);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::sp_mat_get_size`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::sp_mat_get_size`"))
+    })
 }
 
 gpu_sparse_async_operation!(
@@ -3454,30 +3622,27 @@ pub const WARP_SIZE_ATTRIBUTE: &str = "warp_size";
 /// GPU operation that bridges vector code and SIMT execution by running a region on lane 0.
 pub trait WarpExecuteOnLane0Operation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion<'o, 'c, 't> {
     /// Returns the lane identifier operand.
-    fn lane_id(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lane_id(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the warp size attribute.
-    fn warp_size(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(WARP_SIZE_ATTRIBUTE)
-            .expect("invalid 'warp_size' attribute in `gpu.warp_execute_on_lane_0`")
-            .cast()
-            .expect("invalid 'warp_size' attribute in `gpu.warp_execute_on_lane_0`")
+    fn warp_size(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(WARP_SIZE_ATTRIBUTE)
     }
 
     /// Returns operands passed into the lane-0 region.
-    fn arguments(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn arguments(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(1).collect()
     }
 
     /// Returns values produced for the surrounding SIMT region.
-    fn outputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        self.results().map(|result| result.as_ref()).collect()
+    fn outputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.results().map(|result| result.map(|result| result.as_ref())).collect()
     }
 
     /// Returns the lane-0 region.
-    fn region(&self) -> RegionRef<'o, 'c, 't> {
+    fn region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
         self.body_region()
     }
 }
@@ -3495,9 +3660,9 @@ pub fn warp_execute_on_lane_0<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     region: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedWarpExecuteOnLane0Operation<'c, 't> {
+) -> Result<DetachedWarpExecuteOnLane0Operation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.warp_execute_on_lane_0", location)
         .add_operand(lane_id)
         .add_operands(arguments)
@@ -3505,8 +3670,11 @@ pub fn warp_execute_on_lane_0<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
         .add_results(result_types)
         .add_region(region)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::warp_execute_on_lane_0`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::warp_execute_on_lane_0`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores subgroup broadcast type.
@@ -3515,27 +3683,32 @@ pub const BROADCAST_TYPE_ATTRIBUTE: &str = "broadcast_type";
 /// GPU subgroup broadcast operation.
 pub trait SubgroupBroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source value.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the optional lane operand.
-    fn lane(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.operand_value(1)
+    fn lane(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.operand_count() <= 1 { Ok(None) } else { self.operand_value(1).map(Some) }
     }
 
     /// Returns the broadcast type.
-    fn broadcast_type(&self) -> BroadcastType {
-        self.attribute(BROADCAST_TYPE_ATTRIBUTE)
-            .expect("invalid `broadcast_type` attribute in `gpu.subgroup_broadcast`")
-            .cast::<BroadcastTypeAttributeRef>()
-            .map(|attribute| attribute.value())
-            .expect("invalid `broadcast_type` attribute in `gpu.subgroup_broadcast`")
+    fn broadcast_type(&self) -> Result<BroadcastType, Error> {
+        self.attribute(BROADCAST_TYPE_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<BroadcastTypeAttributeRef>())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    BROADCAST_TYPE_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns the broadcast result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -3550,32 +3723,33 @@ pub fn subgroup_broadcast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     lane: Option<ValueRef<'o, 'c, 't>>,
     broadcast_type: BroadcastType,
     location: L,
-) -> DetachedSubgroupBroadcastOperation<'c, 't> {
+) -> Result<DetachedSubgroupBroadcastOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::gpu());
+    context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_broadcast", location)
         .add_operand(source)
-        .add_attribute(BROADCAST_TYPE_ATTRIBUTE, context.gpu_broadcast_type_attribute(broadcast_type))
-        .add_result(source.r#type());
+        .add_attribute(BROADCAST_TYPE_ATTRIBUTE, context.gpu_broadcast_type_attribute(broadcast_type)?)
+        .add_result(source.r#type()?);
     if let Some(lane) = lane {
         builder = builder.add_operand(lane);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::subgroup_broadcast`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::subgroup_broadcast`"))
+    })
 }
 
 /// GPU subgroup ballot operation.
 pub trait BallotOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the predicate operand.
-    fn predicate(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn predicate(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the ballot mask result.
-    fn mask(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn mask(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -3590,14 +3764,15 @@ pub fn ballot<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Loca
     predicate: V,
     result_type: T,
     location: L,
-) -> DetachedBallotOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::gpu());
+) -> Result<DetachedBallotOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.ballot", location)
         .add_operand(predicate)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `gpu::ballot`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::ballot`"))
+        })
 }
 
 #[cfg(test)]
@@ -3616,12 +3791,12 @@ mod tests {
             fn $test_name() {
                 let context = Context::new();
                 let location = context.unknown_location();
-                let operation = $function_name($dimension, Some(128), location);
+                let operation = $function_name($dimension, Some(128), location).unwrap();
 
                 assert_eq!(operation.name().as_str(), Ok($operation_name));
-                assert_eq!(operation.dimension(), $dimension);
-                assert_eq!(operation.upper_bound().map(|attribute| attribute.signless_value()), Some(128));
-                assert_eq!(operation.output_type(), context.index_type());
+                assert_eq!(operation.dimension().unwrap(), $dimension);
+                assert_eq!(operation.upper_bound().unwrap().unwrap().signless_value(), 128);
+                assert_eq!(operation.output_type().unwrap(), context.index_type());
             }
         };
     }
@@ -3632,11 +3807,11 @@ mod tests {
             fn $test_name() {
                 let context = Context::new();
                 let location = context.unknown_location();
-                let operation = $function_name(Some(128), location);
+                let operation = $function_name(Some(128), location).unwrap();
 
                 assert_eq!(operation.name().as_str(), Ok($operation_name));
-                assert_eq!(operation.upper_bound().map(|attribute| attribute.signless_value()), Some(128));
-                assert_eq!(operation.output_type(), context.index_type());
+                assert_eq!(operation.upper_bound().unwrap().unwrap().signless_value(), 128);
+                assert_eq!(operation.output_type().unwrap(), context.index_type());
             }
         };
     }
@@ -3653,7 +3828,7 @@ mod tests {
             fn $test_name() {
                 let context = Context::new();
                 let location = context.unknown_location();
-                let token_type = context.gpu_async_token_type().as_ref();
+                let token_type = context.gpu_async_token_type().unwrap().as_ref();
                 let index_type = context.index_type().as_ref();
                 let mut arguments = vec![(token_type, location)];
                 arguments.extend((0..$operand_count).map(|_| (index_type, location)));
@@ -3662,12 +3837,12 @@ mod tests {
                 let operands = (1..=$operand_count)
                     .map(|index| block.argument(index).unwrap().as_ref())
                     .collect::<Vec<_>>();
-                let operation = $function_name(&[token], $(operands[$index],)* true, location);
+                let operation = $function_name(&[token], $(operands[$index],)* true, location).unwrap();
 
                 assert_eq!(operation.name().as_str(), Ok($operation_name));
-                assert_eq!(operation.async_dependencies(), vec![token]);
-                $(assert_eq!(operation.$method(), operands[$index]);)*
-                assert!(operation.async_token().is_some());
+                assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+                $(assert_eq!(operation.$method().unwrap(), operands[$index]);)*
+                assert!(operation.async_token().unwrap().is_some());
             }
         };
     }
@@ -3684,7 +3859,7 @@ mod tests {
             fn $test_name() {
                 let context = Context::new();
                 let location = context.unknown_location();
-                let token_type = context.gpu_async_token_type().as_ref();
+                let token_type = context.gpu_async_token_type().unwrap().as_ref();
                 let index_type = context.index_type().as_ref();
                 let mut arguments = vec![(token_type, location)];
                 arguments.extend((0..$operand_count).map(|_| (index_type, location)));
@@ -3693,13 +3868,16 @@ mod tests {
                 let operands = (1..=$operand_count)
                     .map(|index| block.argument(index).unwrap().as_ref())
                     .collect::<Vec<_>>();
-                let operation = $function_name(&[token], $(operands[$index],)+ true, location);
+                let operation = $function_name(&[token], $(operands[$index],)+ true, location).unwrap();
 
                 assert_eq!(operation.name().as_str(), Ok($operation_name));
-                assert_eq!(operation.async_dependencies(), vec![token]);
-                $(assert_eq!(operation.$method(), operands[$index]);)+
-                assert_eq!(operation.sparse_matrix().r#type(), context.gpu_sparse_sp_mat_handle_type());
-                assert!(operation.async_token().is_some());
+                assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+                $(assert_eq!(operation.$method().unwrap(), operands[$index]);)+
+                assert_eq!(
+                    operation.sparse_matrix().unwrap().r#type().unwrap(),
+                    context.gpu_sparse_sp_mat_handle_type().unwrap()
+                );
+                assert!(operation.async_token().unwrap().is_some());
             }
         };
     }
@@ -3745,16 +3923,17 @@ mod tests {
             },
             context.region(),
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.func"));
-        assert_eq!(operation.function_name().as_str(), Ok("kernel"));
+        assert_eq!(operation.function_name().unwrap().as_str(), Ok("kernel"));
         assert!(operation.is_kernel());
-        assert_eq!(operation.known_block_size(), Some(vec![1, 2, 3]));
-        assert_eq!(operation.known_grid_size(), Some(vec![4, 5, 6]));
-        assert_eq!(operation.known_cluster_size(), Some(vec![7, 8, 9]));
-        assert_eq!(operation.workgroup_attribution_count(), 2);
-        assert_eq!(operation.body().blocks().count(), 0);
+        assert_eq!(operation.known_block_size().unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(operation.known_grid_size().unwrap(), Some(vec![4, 5, 6]));
+        assert_eq!(operation.known_cluster_size().unwrap(), Some(vec![7, 8, 9]));
+        assert_eq!(operation.workgroup_attribution_count().unwrap(), 2);
+        assert_eq!(operation.body().unwrap().blocks().unwrap().count(), 0);
     }
 
     #[test]
@@ -3762,11 +3941,11 @@ mod tests {
         let context = Context::new();
         let location = context.unknown_location();
         let memref_type = context.mem_ref_type(context.float32_type(), &[Size::Dynamic], None, None, location).unwrap();
-        let operation = dynamic_shared_memory(memref_type, location);
+        let operation = dynamic_shared_memory(memref_type, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.dynamic_shared_memory"));
-        assert_eq!(operation.memref().r#type(), memref_type);
-        assert_eq!(operation.output_type(), memref_type);
+        assert_eq!(operation.memref().unwrap().r#type().unwrap(), memref_type);
+        assert_eq!(operation.output_type().unwrap(), memref_type);
     }
 
     #[test]
@@ -3774,7 +3953,7 @@ mod tests {
         let context = Context::new();
         let location = context.unknown_location();
         let index_type = context.index_type();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let block = context.block(&[
             (token_type, location),
             (index_type.as_ref(), location),
@@ -3802,18 +3981,19 @@ mod tests {
                 is_async: true,
             },
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.launch_func"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.kernel(), kernel);
-        assert_eq!(operation.grid_size(), grid_size);
-        assert_eq!(operation.block_size(), block_size);
-        assert_eq!(operation.cluster_size(), Some(cluster_size));
-        assert_eq!(operation.dynamic_shared_memory_size(), Some(dynamic_shared_memory_size));
-        assert_eq!(operation.kernel_operands(), vec![kernel_operand]);
-        assert_eq!(operation.async_object(), Some(token));
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.kernel().unwrap(), kernel);
+        assert_eq!(operation.grid_size().unwrap(), grid_size);
+        assert_eq!(operation.block_size().unwrap(), block_size);
+        assert_eq!(operation.cluster_size().unwrap(), Some(cluster_size));
+        assert_eq!(operation.dynamic_shared_memory_size().unwrap(), Some(dynamic_shared_memory_size));
+        assert_eq!(operation.kernel_operands().unwrap(), vec![kernel_operand]);
+        assert_eq!(operation.async_object().unwrap(), Some(token));
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
@@ -3821,7 +4001,7 @@ mod tests {
         let context = Context::new();
         let location = context.unknown_location();
         let index_type = context.index_type();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let block =
             context.block(&[(token_type, location), (index_type.as_ref(), location), (index_type.as_ref(), location)]);
         let token = block.argument(0).unwrap().as_ref();
@@ -3846,19 +4026,20 @@ mod tests {
             },
             context.region(),
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.launch"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.grid_size(), grid_size);
-        assert_eq!(operation.block_size(), block_size);
-        assert_eq!(operation.cluster_size(), Some(cluster_size));
-        assert_eq!(operation.dynamic_shared_memory_size(), Some(dynamic_shared_memory_size));
-        assert_eq!(operation.module_symbol(), Some(module));
-        assert_eq!(operation.function_symbol(), Some(function));
-        assert_eq!(operation.workgroup_attribution_count(), 2);
-        assert_eq!(operation.body().blocks().count(), 0);
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.grid_size().unwrap(), grid_size);
+        assert_eq!(operation.block_size().unwrap(), block_size);
+        assert_eq!(operation.cluster_size().unwrap(), Some(cluster_size));
+        assert_eq!(operation.dynamic_shared_memory_size().unwrap(), Some(dynamic_shared_memory_size));
+        assert_eq!(operation.module_symbol().unwrap(), Some(module));
+        assert_eq!(operation.function_symbol().unwrap(), Some(function));
+        assert_eq!(operation.workgroup_attribution_count().unwrap(), 2);
+        assert_eq!(operation.body().unwrap().blocks().unwrap().count(), 0);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
@@ -3868,11 +4049,11 @@ mod tests {
         let i32_type = context.signless_integer_type(32);
         let block = context.block(&[(i32_type, location)]);
         let argument = block.argument(0).unwrap();
-        let operation = printf("value: %d", &[argument], location);
+        let operation = printf("value: %d", &[argument], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.printf"));
-        assert_eq!(operation.format().as_str(), Ok("value: %d"));
-        assert_eq!(operation.arguments(), vec![argument]);
+        assert_eq!(operation.format().unwrap().as_str(), Ok("value: %d"));
+        assert_eq!(operation.arguments().unwrap(), vec![argument]);
     }
 
     #[test]
@@ -3881,17 +4062,17 @@ mod tests {
         let location = context.unknown_location();
         let block = context.block(&[(context.signless_integer_type(32), location)]);
         let value = block.argument(0).unwrap();
-        let operation = r#return(&[value], location);
+        let operation = r#return(&[value], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.return"));
-        assert_eq!(operation.values(), vec![value]);
+        assert_eq!(operation.values().unwrap(), vec![value]);
     }
 
     #[test]
     fn test_terminator_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let operation = terminator(location);
+        let operation = terminator(location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.terminator"));
         assert_eq!(operation.operand_count(), 0);
@@ -3904,10 +4085,10 @@ mod tests {
         let location = context.unknown_location();
         let block = context.block(&[(context.signless_integer_type(32), location)]);
         let value = block.argument(0).unwrap();
-        let operation = r#yield(&[value], location);
+        let operation = r#yield(&[value], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.yield"));
-        assert_eq!(operation.values(), vec![value]);
+        assert_eq!(operation.values().unwrap(), vec![value]);
     }
 
     #[test]
@@ -3916,14 +4097,21 @@ mod tests {
         let location = context.unknown_location();
         let block = context.block(&[(context.signless_integer_type(32), location)]);
         let value = block.argument(0).unwrap();
-        let operation =
-            all_reduce(value, Some(AllReduceOperationKind::Add), true, context.region(), value.r#type(), location);
+        let operation = all_reduce(
+            value,
+            Some(AllReduceOperationKind::Add),
+            true,
+            context.region(),
+            value.r#type().unwrap(),
+            location,
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.all_reduce"));
-        assert_eq!(operation.value(), value);
-        assert_eq!(operation.operation_kind(), Some(AllReduceOperationKind::Add));
+        assert_eq!(operation.value().unwrap(), value);
+        assert_eq!(operation.operation_kind().unwrap(), Some(AllReduceOperationKind::Add));
         assert!(operation.is_uniform());
-        assert_eq!(operation.body().blocks().count(), 0);
+        assert_eq!(operation.body().unwrap().blocks().unwrap().count(), 0);
         assert_eq!(operation.result_count(), 1);
     }
 
@@ -3934,14 +4122,14 @@ mod tests {
         let block = context.block(&[(context.signless_integer_type(32), location)]);
         let value = block.argument(0).unwrap();
         let operation =
-            subgroup_reduce(value, AllReduceOperationKind::MaximumSignedInteger, true, Some(4), 2, location);
+            subgroup_reduce(value, AllReduceOperationKind::MaximumSignedInteger, true, Some(4), 2, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_reduce"));
-        assert_eq!(operation.value(), value);
-        assert_eq!(operation.operation_kind(), AllReduceOperationKind::MaximumSignedInteger);
+        assert_eq!(operation.value().unwrap(), value);
+        assert_eq!(operation.operation_kind().unwrap(), AllReduceOperationKind::MaximumSignedInteger);
         assert!(operation.is_uniform());
-        assert_eq!(operation.cluster_size().map(|attribute| attribute.signless_value()), Some(4));
-        assert_eq!(operation.cluster_stride().signless_value(), 2);
+        assert_eq!(operation.cluster_size().unwrap().unwrap().signless_value(), 4);
+        assert_eq!(operation.cluster_stride().unwrap().signless_value(), 2);
     }
 
     #[test]
@@ -3956,15 +4144,16 @@ mod tests {
             block.argument(2).unwrap(),
             ShuffleMode::Xor,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.shuffle"));
-        assert_eq!(operation.value(), block.argument(0).unwrap());
-        assert_eq!(operation.offset(), block.argument(1).unwrap());
-        assert_eq!(operation.width(), block.argument(2).unwrap());
-        assert_eq!(operation.mode(), ShuffleMode::Xor);
-        assert_eq!(operation.shuffled_value().r#type(), i32_type);
-        assert_eq!(operation.valid().r#type(), context.signless_integer_type(1));
+        assert_eq!(operation.value().unwrap(), block.argument(0).unwrap());
+        assert_eq!(operation.offset().unwrap(), block.argument(1).unwrap());
+        assert_eq!(operation.width().unwrap(), block.argument(2).unwrap());
+        assert_eq!(operation.mode().unwrap(), ShuffleMode::Xor);
+        assert_eq!(operation.value().unwrap(), block.argument(0).unwrap());
+        assert_eq!(operation.offset().unwrap(), block.argument(1).unwrap());
     }
 
     #[test]
@@ -3974,24 +4163,24 @@ mod tests {
         let i32_type = context.signless_integer_type(32);
         let block = context.block(&[(i32_type, location)]);
         let value = block.argument(0).unwrap();
-        let operation = rotate(value, 1, 32, location);
+        let operation = rotate(value, 1, 32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.rotate"));
-        assert_eq!(operation.value(), value);
-        assert_eq!(operation.offset().signless_value(), 1);
-        assert_eq!(operation.width().signless_value(), 32);
-        assert_eq!(operation.rotated_value().r#type(), i32_type);
-        assert_eq!(operation.valid().r#type(), context.signless_integer_type(1));
+        assert_eq!(operation.value().unwrap(), value);
+        assert_eq!(operation.offset().unwrap().signless_value(), 1);
+        assert_eq!(operation.width().unwrap().signless_value(), 32);
+        assert_eq!(operation.value().unwrap(), value);
+        assert_eq!(operation.offset().unwrap().signless_value(), 1);
     }
 
     #[test]
     fn test_barrier_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let operation = barrier(Some(&[AddressSpace::Workgroup, AddressSpace::Private]), location);
+        let operation = barrier(Some(&[AddressSpace::Workgroup, AddressSpace::Private]), location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.barrier"));
-        assert_eq!(operation.address_spaces(), Some(vec![AddressSpace::Workgroup, AddressSpace::Private]));
+        assert_eq!(operation.address_spaces().unwrap(), Some(vec![AddressSpace::Workgroup, AddressSpace::Private]));
     }
 
     #[test]
@@ -4001,12 +4190,12 @@ mod tests {
         let target = context.string_attribute("sm_90");
         let targets = context.array_attribute(&[target]);
         let offloading_handler = context.string_attribute("handler").as_ref();
-        let operation = module("kernels", Some(targets), Some(offloading_handler), context.region(), location);
+        let operation = module("kernels", Some(targets), Some(offloading_handler), context.region(), location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.module"));
-        assert_eq!(operation.targets(), Some(targets));
-        assert_eq!(operation.offloading_handler(), Some(offloading_handler));
-        assert_eq!(operation.region(0).unwrap().blocks().count(), 0);
+        assert_eq!(operation.targets().unwrap(), Some(targets));
+        assert_eq!(operation.offloading_handler().unwrap(), Some(offloading_handler));
+        assert_eq!(operation.region(0).unwrap().blocks().unwrap().count(), 0);
     }
 
     #[test]
@@ -4014,14 +4203,14 @@ mod tests {
         let context = Context::new();
         let location = context.unknown_location();
         let target = context.string_attribute("sm_90");
-        let object = context.gpu_object_attribute(target, ObjectFormat::Binary, "object", None, None);
+        let object = context.gpu_object_attribute(target, ObjectFormat::Binary, "object", None, None).unwrap();
         let objects = context.array_attribute(&[object]);
         let offloading_handler = context.string_attribute("handler").as_ref();
-        let operation = binary("binary", objects, Some(offloading_handler), location);
+        let operation = binary("binary", objects, Some(offloading_handler), location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.binary"));
-        assert_eq!(operation.objects(), objects);
-        assert_eq!(operation.offloading_handler(), Some(offloading_handler));
+        assert_eq!(operation.objects().unwrap(), objects);
+        assert_eq!(operation.offloading_handler().unwrap(), Some(offloading_handler));
     }
 
     #[test]
@@ -4031,10 +4220,10 @@ mod tests {
         let memref_type = context.mem_ref_type(context.float32_type(), &[Size::Dynamic], None, None, location).unwrap();
         let block = context.block(&[(memref_type, location)]);
         let value = block.argument(0).unwrap();
-        let operation = host_register(value, location);
+        let operation = host_register(value, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.host_register"));
-        assert_eq!(operation.value(), value);
+        assert_eq!(operation.value().unwrap(), value);
     }
 
     #[test]
@@ -4044,70 +4233,71 @@ mod tests {
         let memref_type = context.mem_ref_type(context.float32_type(), &[Size::Dynamic], None, None, location).unwrap();
         let block = context.block(&[(memref_type, location)]);
         let value = block.argument(0).unwrap();
-        let operation = host_unregister(value, location);
+        let operation = host_unregister(value, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.host_unregister"));
-        assert_eq!(operation.value(), value);
+        assert_eq!(operation.value().unwrap(), value);
     }
 
     #[test]
     fn test_wait_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let block = context.block(&[(token_type, location)]);
         let dependency = block.argument(0).unwrap();
-        let operation = wait(&[dependency], true, location);
+        let operation = wait(&[dependency], true, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.wait"));
-        assert_eq!(operation.async_dependencies(), vec![dependency]);
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![dependency]);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_alloc_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let memref_type = context.mem_ref_type(context.float32_type(), &[Size::Dynamic], None, None, location).unwrap();
         let block = context.block(&[(token_type, location), (index_type, location), (index_type, location)]);
         let dependency = block.argument(0).unwrap().as_ref();
         let dynamic_size = block.argument(1).unwrap().as_ref();
         let symbol_operand = block.argument(2).unwrap().as_ref();
-        let operation = alloc(&[dependency], &[dynamic_size], &[symbol_operand], memref_type, true, true, location);
+        let operation =
+            alloc(&[dependency], &[dynamic_size], &[symbol_operand], memref_type, true, true, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.alloc"));
-        assert_eq!(operation.async_dependencies(), vec![dependency]);
-        assert_eq!(operation.dynamic_sizes(), vec![dynamic_size]);
-        assert_eq!(operation.symbol_operands(), vec![symbol_operand]);
+        assert_eq!(operation.async_dependencies().unwrap(), vec![dependency]);
+        assert_eq!(operation.dynamic_sizes().unwrap(), vec![dynamic_size]);
+        assert_eq!(operation.symbol_operands().unwrap(), vec![symbol_operand]);
         assert!(operation.host_shared());
-        assert_eq!(operation.memref().r#type(), memref_type);
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.memref().unwrap().r#type().unwrap(), memref_type);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_dealloc_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let memref_type = context.mem_ref_type(context.float32_type(), &[Size::Dynamic], None, None, location).unwrap();
         let block = context.block(&[(token_type, location), (memref_type.as_ref(), location)]);
         let dependency = block.argument(0).unwrap().as_ref();
         let memref = block.argument(1).unwrap().as_ref();
-        let operation = dealloc(&[dependency], memref, true, location);
+        let operation = dealloc(&[dependency], memref, true, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.dealloc"));
-        assert_eq!(operation.async_dependencies(), vec![dependency]);
-        assert_eq!(operation.memref(), memref);
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![dependency]);
+        assert_eq!(operation.memref().unwrap(), memref);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_memcpy_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let memref_type = context.mem_ref_type(context.float32_type(), &[Size::Dynamic], None, None, location).unwrap();
         let block = context.block(&[
             (token_type, location),
@@ -4117,33 +4307,33 @@ mod tests {
         let dependency = block.argument(0).unwrap().as_ref();
         let destination = block.argument(1).unwrap().as_ref();
         let source = block.argument(2).unwrap().as_ref();
-        let operation = memcpy(&[dependency], destination, source, true, location);
+        let operation = memcpy(&[dependency], destination, source, true, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.memcpy"));
-        assert_eq!(operation.async_dependencies(), vec![dependency]);
-        assert_eq!(operation.destination(), destination);
-        assert_eq!(operation.source(), source);
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![dependency]);
+        assert_eq!(operation.destination().unwrap(), destination);
+        assert_eq!(operation.source().unwrap(), source);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_memset_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let memref_type = context.mem_ref_type(context.float32_type(), &[Size::Dynamic], None, None, location).unwrap();
         let block = context.block(&[(token_type, location), (memref_type.as_ref(), location), (index_type, location)]);
         let dependency = block.argument(0).unwrap().as_ref();
         let destination = block.argument(1).unwrap().as_ref();
         let value = block.argument(2).unwrap().as_ref();
-        let operation = memset(&[dependency], destination, value, true, location);
+        let operation = memset(&[dependency], destination, value, true, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.memset"));
-        assert_eq!(operation.async_dependencies(), vec![dependency]);
-        assert_eq!(operation.destination(), destination);
-        assert_eq!(operation.value(), value);
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![dependency]);
+        assert_eq!(operation.destination().unwrap(), destination);
+        assert_eq!(operation.value().unwrap(), value);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
@@ -4152,10 +4342,10 @@ mod tests {
         let location = context.unknown_location();
         let block = context.block(&[(context.index_type(), location)]);
         let device_index = block.argument(0).unwrap();
-        let operation = set_default_device(device_index, location);
+        let operation = set_default_device(device_index, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.set_default_device"));
-        assert_eq!(operation.device_index(), device_index);
+        assert_eq!(operation.device_index().unwrap(), device_index);
     }
 
     #[test]
@@ -4164,19 +4354,20 @@ mod tests {
         let location = context.unknown_location();
         let memref_type = context.mem_ref_type(context.float32_type(), &[Size::Dynamic], None, None, location).unwrap();
         let index_type = context.index_type().as_ref();
-        let matrix_type = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A);
+        let matrix_type = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A).unwrap();
         let block = context.block(&[(memref_type.as_ref(), location), (index_type, location), (index_type, location)]);
         let source_memref = block.argument(0).unwrap().as_ref();
         let index_0 = block.argument(1).unwrap().as_ref();
         let index_1 = block.argument(2).unwrap().as_ref();
-        let operation = subgroup_mma_load_matrix(source_memref, &[index_0, index_1], 16, true, matrix_type, location);
+        let operation =
+            subgroup_mma_load_matrix(source_memref, &[index_0, index_1], 16, true, matrix_type, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_load_matrix"));
-        assert_eq!(operation.source_memref(), source_memref);
-        assert_eq!(operation.indices(), vec![index_0, index_1]);
-        assert_eq!(operation.lead_dimension().signless_value(), 16);
+        assert_eq!(operation.source_memref().unwrap(), source_memref);
+        assert_eq!(operation.indices().unwrap(), vec![index_0, index_1]);
+        assert_eq!(operation.lead_dimension().unwrap().signless_value(), 16);
         assert!(operation.transpose());
-        assert_eq!(operation.matrix().r#type(), matrix_type);
+        assert_eq!(operation.matrix().unwrap().r#type().unwrap(), matrix_type);
     }
 
     #[test]
@@ -4185,7 +4376,7 @@ mod tests {
         let location = context.unknown_location();
         let memref_type = context.mem_ref_type(context.float32_type(), &[Size::Dynamic], None, None, location).unwrap();
         let index_type = context.index_type().as_ref();
-        let matrix_type = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::C);
+        let matrix_type = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::C).unwrap();
         let block = context.block(&[
             (matrix_type.as_ref(), location),
             (memref_type.as_ref(), location),
@@ -4196,13 +4387,14 @@ mod tests {
         let destination_memref = block.argument(1).unwrap().as_ref();
         let index_0 = block.argument(2).unwrap().as_ref();
         let index_1 = block.argument(3).unwrap().as_ref();
-        let operation = subgroup_mma_store_matrix(source, destination_memref, &[index_0, index_1], 16, true, location);
+        let operation =
+            subgroup_mma_store_matrix(source, destination_memref, &[index_0, index_1], 16, true, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_store_matrix"));
-        assert_eq!(operation.source(), source);
-        assert_eq!(operation.destination_memref(), destination_memref);
-        assert_eq!(operation.indices(), vec![index_0, index_1]);
-        assert_eq!(operation.lead_dimension().signless_value(), 16);
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(operation.destination_memref().unwrap(), destination_memref);
+        assert_eq!(operation.indices().unwrap(), vec![index_0, index_1]);
+        assert_eq!(operation.lead_dimension().unwrap().signless_value(), 16);
         assert!(operation.transpose());
     }
 
@@ -4210,63 +4402,63 @@ mod tests {
     fn test_subgroup_mma_compute_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let a_type = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A);
-        let b_type = context.gpu_mma_matrix_type([8, 16], context.float32_type(), MmaMatrixOperand::B);
-        let c_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C);
+        let a_type = context.gpu_mma_matrix_type([16, 8], context.float32_type(), MmaMatrixOperand::A).unwrap();
+        let b_type = context.gpu_mma_matrix_type([8, 16], context.float32_type(), MmaMatrixOperand::B).unwrap();
+        let c_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C).unwrap();
         let block =
             context.block(&[(a_type.as_ref(), location), (b_type.as_ref(), location), (c_type.as_ref(), location)]);
         let a = block.argument(0).unwrap().as_ref();
         let b = block.argument(1).unwrap().as_ref();
         let c = block.argument(2).unwrap().as_ref();
-        let operation = subgroup_mma_compute(a, b, c, true, true, c_type, location);
+        let operation = subgroup_mma_compute(a, b, c, true, true, c_type, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_compute"));
-        assert_eq!(operation.a(), a);
-        assert_eq!(operation.b(), b);
-        assert_eq!(operation.c(), c);
+        assert_eq!(operation.a().unwrap(), a);
+        assert_eq!(operation.b().unwrap(), b);
+        assert_eq!(operation.c().unwrap(), c);
         assert!(operation.a_transpose());
         assert!(operation.b_transpose());
-        assert_eq!(operation.result_matrix().r#type(), c_type);
+        assert_eq!(operation.result_matrix().unwrap().r#type().unwrap(), c_type);
     }
 
     #[test]
     fn test_subgroup_mma_constant_matrix_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let matrix_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C);
+        let matrix_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C).unwrap();
         let block = context.block(&[(context.float32_type().as_ref(), location)]);
         let value = block.argument(0).unwrap().as_ref();
-        let operation = subgroup_mma_constant_matrix(value, matrix_type, location);
+        let operation = subgroup_mma_constant_matrix(value, matrix_type, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_constant_matrix"));
-        assert_eq!(operation.value(), value);
-        assert_eq!(operation.matrix().r#type(), matrix_type);
+        assert_eq!(operation.value().unwrap(), value);
+        assert_eq!(operation.value().unwrap(), value);
     }
 
     #[test]
     fn test_subgroup_mma_extract_thread_local_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let matrix_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C);
+        let matrix_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C).unwrap();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[(matrix_type.as_ref(), location), (index_type, location), (index_type, location)]);
         let matrix = block.argument(0).unwrap().as_ref();
         let index_0 = block.argument(1).unwrap().as_ref();
         let index_1 = block.argument(2).unwrap().as_ref();
         let operation =
-            subgroup_mma_extract_thread_local(matrix, &[index_0, index_1], context.float32_type(), location);
+            subgroup_mma_extract_thread_local(matrix, &[index_0, index_1], context.float32_type(), location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_extract_thread_local"));
-        assert_eq!(operation.matrix(), matrix);
-        assert_eq!(operation.indices(), vec![index_0, index_1]);
-        assert_eq!(operation.value().r#type(), context.float32_type());
+        assert_eq!(operation.matrix().unwrap(), matrix);
+        assert_eq!(operation.indices().unwrap(), vec![index_0, index_1]);
+        assert_eq!(operation.value().unwrap().r#type().unwrap(), context.float32_type());
     }
 
     #[test]
     fn test_subgroup_mma_insert_thread_local_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let matrix_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C);
+        let matrix_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C).unwrap();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[
             (context.float32_type().as_ref(), location),
@@ -4278,36 +4470,38 @@ mod tests {
         let matrix = block.argument(1).unwrap().as_ref();
         let index_0 = block.argument(2).unwrap().as_ref();
         let index_1 = block.argument(3).unwrap().as_ref();
-        let operation = subgroup_mma_insert_thread_local(value, matrix, &[index_0, index_1], matrix_type, location);
+        let operation =
+            subgroup_mma_insert_thread_local(value, matrix, &[index_0, index_1], matrix_type, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_insert_thread_local"));
-        assert_eq!(operation.value(), value);
-        assert_eq!(operation.matrix(), matrix);
-        assert_eq!(operation.indices(), vec![index_0, index_1]);
-        assert_eq!(operation.result_matrix().r#type(), matrix_type);
+        assert_eq!(operation.value().unwrap(), value);
+        assert_eq!(operation.matrix().unwrap(), matrix);
+        assert_eq!(operation.indices().unwrap(), vec![index_0, index_1]);
+        assert_eq!(operation.result_matrix().unwrap().r#type().unwrap(), matrix_type);
     }
 
     #[test]
     fn test_subgroup_mma_elementwise_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let matrix_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C);
+        let matrix_type = context.gpu_mma_matrix_type([16, 16], context.float32_type(), MmaMatrixOperand::C).unwrap();
         let block = context.block(&[(matrix_type.as_ref(), location), (matrix_type.as_ref(), location)]);
         let lhs = block.argument(0).unwrap().as_ref();
         let rhs = block.argument(1).unwrap().as_ref();
-        let operation = subgroup_mma_elementwise(&[lhs, rhs], MmaElementwiseOperation::AddFloat, matrix_type, location);
+        let operation =
+            subgroup_mma_elementwise(&[lhs, rhs], MmaElementwiseOperation::AddFloat, matrix_type, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_mma_elementwise"));
-        assert_eq!(operation.arguments(), vec![lhs, rhs]);
-        assert_eq!(operation.operation(), MmaElementwiseOperation::AddFloat);
-        assert_eq!(operation.result_matrix().r#type(), matrix_type);
+        assert_eq!(operation.arguments().unwrap(), vec![lhs, rhs]);
+        assert_eq!(operation.operation().unwrap(), MmaElementwiseOperation::AddFloat);
+        assert_eq!(operation.operation().unwrap(), MmaElementwiseOperation::AddFloat);
     }
 
     #[test]
     fn test_create_dn_tensor_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[
             (token_type, location),
@@ -4319,14 +4513,14 @@ mod tests {
         let memref = block.argument(1).unwrap().as_ref();
         let dimension = block.argument(2).unwrap().as_ref();
         let stride = block.argument(3).unwrap().as_ref();
-        let operation = create_dn_tensor(&[token], memref, &[dimension, stride], true, location);
+        let operation = create_dn_tensor(&[token], memref, &[dimension, stride], true, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.create_dn_tensor"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.memref(), memref);
-        assert_eq!(operation.dimensions(), vec![dimension, stride]);
-        assert_eq!(operation.dense_tensor().r#type(), context.gpu_sparse_dn_tensor_handle_type());
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.memref().unwrap(), memref);
+        assert_eq!(operation.dimensions().unwrap(), vec![dimension, stride]);
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     gpu_sparse_async_operation_test!(
@@ -4411,7 +4605,7 @@ mod tests {
     fn test_create_2_to_4_sp_mat_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[
             (token_type, location),
@@ -4431,16 +4625,17 @@ mod tests {
             memref,
             true,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.create_2to4_spmat"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.rows(), rows);
-        assert_eq!(operation.columns(), columns);
-        assert_eq!(operation.prune_flag(), Prune2To4SparseMatrixFlag::PruneAndCheck);
-        assert_eq!(operation.memref(), memref);
-        assert_eq!(operation.sparse_matrix().r#type(), context.gpu_sparse_sp_mat_handle_type());
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.rows().unwrap(), rows);
+        assert_eq!(operation.columns().unwrap(), columns);
+        assert_eq!(operation.prune_flag().unwrap(), Prune2To4SparseMatrixFlag::PruneAndCheck);
+        assert_eq!(operation.memref().unwrap(), memref);
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     gpu_sparse_async_operation_test!(
@@ -4455,7 +4650,7 @@ mod tests {
     fn test_spmv_buffer_size_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[
             (token_type, location),
@@ -4476,24 +4671,25 @@ mod tests {
             context.float32_type(),
             true,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spmv_buffer_size"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.mode_a(), MatrixTransposeMode::Transpose);
-        assert_eq!(operation.sparse_matrix_a(), sparse_matrix_a);
-        assert_eq!(operation.dense_tensor_x(), dense_tensor_x);
-        assert_eq!(operation.dense_tensor_y(), dense_tensor_y);
-        assert_eq!(operation.compute_type(), context.float32_type());
-        assert_eq!(operation.buffer_size().r#type(), context.index_type());
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.mode_a().unwrap(), MatrixTransposeMode::Transpose);
+        assert_eq!(operation.sparse_matrix_a().unwrap(), sparse_matrix_a);
+        assert_eq!(operation.dense_tensor_x().unwrap(), dense_tensor_x);
+        assert_eq!(operation.dense_tensor_y().unwrap(), dense_tensor_y);
+        assert_eq!(operation.compute_type().unwrap(), context.float32_type());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_spmv_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[
             (token_type, location),
@@ -4517,24 +4713,25 @@ mod tests {
             buffer,
             true,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spmv"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.mode_a(), MatrixTransposeMode::NonTranspose);
-        assert_eq!(operation.sparse_matrix_a(), sparse_matrix_a);
-        assert_eq!(operation.dense_tensor_x(), dense_tensor_x);
-        assert_eq!(operation.dense_tensor_y(), dense_tensor_y);
-        assert_eq!(operation.buffer(), buffer);
-        assert_eq!(operation.compute_type(), context.float32_type());
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.mode_a().unwrap(), MatrixTransposeMode::NonTranspose);
+        assert_eq!(operation.sparse_matrix_a().unwrap(), sparse_matrix_a);
+        assert_eq!(operation.dense_tensor_x().unwrap(), dense_tensor_x);
+        assert_eq!(operation.dense_tensor_y().unwrap(), dense_tensor_y);
+        assert_eq!(operation.buffer().unwrap(), buffer);
+        assert_eq!(operation.compute_type().unwrap(), context.float32_type());
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_spmm_buffer_size_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[
             (token_type, location),
@@ -4557,25 +4754,26 @@ mod tests {
             2,
             true,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spmm_buffer_size"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.mode_a(), MatrixTransposeMode::NonTranspose);
-        assert_eq!(operation.mode_b(), MatrixTransposeMode::Transpose);
-        assert_eq!(operation.sparse_matrix_a(), sparse_matrix_a);
-        assert_eq!(operation.dense_matrix_b(), dense_matrix_b);
-        assert_eq!(operation.dense_matrix_c(), dense_matrix_c);
-        assert_eq!(operation.compute_type(), context.float32_type());
-        assert_eq!(operation.buffer_sizes().len(), 2);
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.mode_a().unwrap(), MatrixTransposeMode::NonTranspose);
+        assert_eq!(operation.mode_b().unwrap(), MatrixTransposeMode::Transpose);
+        assert_eq!(operation.sparse_matrix_a().unwrap(), sparse_matrix_a);
+        assert_eq!(operation.dense_matrix_b().unwrap(), dense_matrix_b);
+        assert_eq!(operation.dense_matrix_c().unwrap(), dense_matrix_c);
+        assert_eq!(operation.compute_type().unwrap(), context.float32_type());
+        assert_eq!(operation.buffer_sizes().unwrap().len(), 2);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_spmm_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[
             (token_type, location),
@@ -4602,25 +4800,26 @@ mod tests {
             &[buffer_0, buffer_1],
             true,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spmm"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.mode_a(), MatrixTransposeMode::NonTranspose);
-        assert_eq!(operation.mode_b(), MatrixTransposeMode::Transpose);
-        assert_eq!(operation.sparse_matrix_a(), sparse_matrix_a);
-        assert_eq!(operation.dense_matrix_b(), dense_matrix_b);
-        assert_eq!(operation.dense_matrix_c(), dense_matrix_c);
-        assert_eq!(operation.buffers(), vec![buffer_0, buffer_1]);
-        assert_eq!(operation.compute_type(), context.float32_type());
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.mode_a().unwrap(), MatrixTransposeMode::NonTranspose);
+        assert_eq!(operation.mode_b().unwrap(), MatrixTransposeMode::Transpose);
+        assert_eq!(operation.sparse_matrix_a().unwrap(), sparse_matrix_a);
+        assert_eq!(operation.dense_matrix_b().unwrap(), dense_matrix_b);
+        assert_eq!(operation.dense_matrix_c().unwrap(), dense_matrix_c);
+        assert_eq!(operation.buffers().unwrap(), vec![buffer_0, buffer_1]);
+        assert_eq!(operation.compute_type().unwrap(), context.float32_type());
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_sddmm_buffer_size_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[
             (token_type, location),
@@ -4642,25 +4841,26 @@ mod tests {
             context.float32_type(),
             true,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.sddmm_buffer_size"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.mode_a(), MatrixTransposeMode::NonTranspose);
-        assert_eq!(operation.mode_b(), MatrixTransposeMode::Transpose);
-        assert_eq!(operation.dense_matrix_a(), dense_matrix_a);
-        assert_eq!(operation.dense_matrix_b(), dense_matrix_b);
-        assert_eq!(operation.sparse_matrix_c(), sparse_matrix_c);
-        assert_eq!(operation.compute_type(), context.float32_type());
-        assert_eq!(operation.buffer_size().r#type(), context.index_type());
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.mode_a().unwrap(), MatrixTransposeMode::NonTranspose);
+        assert_eq!(operation.mode_b().unwrap(), MatrixTransposeMode::Transpose);
+        assert_eq!(operation.dense_matrix_a().unwrap(), dense_matrix_a);
+        assert_eq!(operation.dense_matrix_b().unwrap(), dense_matrix_b);
+        assert_eq!(operation.sparse_matrix_c().unwrap(), sparse_matrix_c);
+        assert_eq!(operation.compute_type().unwrap(), context.float32_type());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_sddmm_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[
             (token_type, location),
@@ -4685,33 +4885,37 @@ mod tests {
             buffer,
             true,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.sddmm"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.mode_a(), MatrixTransposeMode::NonTranspose);
-        assert_eq!(operation.mode_b(), MatrixTransposeMode::Transpose);
-        assert_eq!(operation.dense_matrix_a(), dense_matrix_a);
-        assert_eq!(operation.dense_matrix_b(), dense_matrix_b);
-        assert_eq!(operation.sparse_matrix_c(), sparse_matrix_c);
-        assert_eq!(operation.buffer(), buffer);
-        assert_eq!(operation.compute_type(), context.float32_type());
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.mode_a().unwrap(), MatrixTransposeMode::NonTranspose);
+        assert_eq!(operation.mode_b().unwrap(), MatrixTransposeMode::Transpose);
+        assert_eq!(operation.dense_matrix_a().unwrap(), dense_matrix_a);
+        assert_eq!(operation.dense_matrix_b().unwrap(), dense_matrix_b);
+        assert_eq!(operation.sparse_matrix_c().unwrap(), sparse_matrix_c);
+        assert_eq!(operation.buffer().unwrap(), buffer);
+        assert_eq!(operation.compute_type().unwrap(), context.float32_type());
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_sp_gemm_create_descr_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let block = context.block(&[(token_type, location)]);
         let token = block.argument(0).unwrap().as_ref();
-        let operation = sp_gemm_create_descr(&[token], true, location);
+        let operation = sp_gemm_create_descr(&[token], true, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spgemm_create_descr"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.descriptor().r#type(), context.gpu_sparse_sp_gemm_operation_handle_type());
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(
+            operation.descriptor().unwrap().r#type().unwrap(),
+            context.gpu_sparse_sp_gemm_operation_handle_type().unwrap()
+        );
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     gpu_sparse_async_operation_test!(
@@ -4726,7 +4930,7 @@ mod tests {
     fn test_sp_gemm_work_estimation_or_compute_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[
             (token_type, location),
@@ -4758,29 +4962,30 @@ mod tests {
             SpGemmWorkKind::Compute,
             true,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spgemm_work_estimation_or_compute"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.descriptor(), descriptor);
-        assert_eq!(operation.mode_a(), MatrixTransposeMode::NonTranspose);
-        assert_eq!(operation.mode_b(), MatrixTransposeMode::Transpose);
-        assert_eq!(operation.sparse_matrix_a(), sparse_matrix_a);
-        assert_eq!(operation.sparse_matrix_b(), sparse_matrix_b);
-        assert_eq!(operation.sparse_matrix_c(), sparse_matrix_c);
-        assert_eq!(operation.buffer_size(), buffer_size);
-        assert_eq!(operation.buffer(), buffer);
-        assert_eq!(operation.compute_type(), context.float32_type());
-        assert_eq!(operation.kind(), SpGemmWorkKind::Compute);
-        assert_eq!(operation.new_buffer_size().r#type(), context.index_type());
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.descriptor().unwrap(), descriptor);
+        assert_eq!(operation.mode_a().unwrap(), MatrixTransposeMode::NonTranspose);
+        assert_eq!(operation.mode_b().unwrap(), MatrixTransposeMode::Transpose);
+        assert_eq!(operation.sparse_matrix_a().unwrap(), sparse_matrix_a);
+        assert_eq!(operation.sparse_matrix_b().unwrap(), sparse_matrix_b);
+        assert_eq!(operation.sparse_matrix_c().unwrap(), sparse_matrix_c);
+        assert_eq!(operation.buffer_size().unwrap(), buffer_size);
+        assert_eq!(operation.buffer().unwrap(), buffer);
+        assert_eq!(operation.compute_type().unwrap(), context.float32_type());
+        assert_eq!(operation.kind().unwrap(), SpGemmWorkKind::Compute);
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_sp_gemm_copy_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[
             (token_type, location),
@@ -4805,38 +5010,39 @@ mod tests {
             context.float32_type(),
             true,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spgemm_copy"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.descriptor(), descriptor);
-        assert_eq!(operation.mode_a(), MatrixTransposeMode::NonTranspose);
-        assert_eq!(operation.mode_b(), MatrixTransposeMode::Transpose);
-        assert_eq!(operation.sparse_matrix_a(), sparse_matrix_a);
-        assert_eq!(operation.sparse_matrix_b(), sparse_matrix_b);
-        assert_eq!(operation.sparse_matrix_c(), sparse_matrix_c);
-        assert_eq!(operation.compute_type(), context.float32_type());
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.descriptor().unwrap(), descriptor);
+        assert_eq!(operation.mode_a().unwrap(), MatrixTransposeMode::NonTranspose);
+        assert_eq!(operation.mode_b().unwrap(), MatrixTransposeMode::Transpose);
+        assert_eq!(operation.sparse_matrix_a().unwrap(), sparse_matrix_a);
+        assert_eq!(operation.sparse_matrix_b().unwrap(), sparse_matrix_b);
+        assert_eq!(operation.sparse_matrix_c().unwrap(), sparse_matrix_c);
+        assert_eq!(operation.compute_type().unwrap(), context.float32_type());
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     #[test]
     fn test_sp_mat_get_size_operation() {
         let context = Context::new();
         let location = context.unknown_location();
-        let token_type = context.gpu_async_token_type().as_ref();
+        let token_type = context.gpu_async_token_type().unwrap().as_ref();
         let index_type = context.index_type().as_ref();
         let block = context.block(&[(token_type, location), (index_type, location)]);
         let token = block.argument(0).unwrap().as_ref();
         let sparse_matrix = block.argument(1).unwrap().as_ref();
-        let operation = sp_mat_get_size(&[token], sparse_matrix, true, location);
+        let operation = sp_mat_get_size(&[token], sparse_matrix, true, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.spmat_get_size"));
-        assert_eq!(operation.async_dependencies(), vec![token]);
-        assert_eq!(operation.sparse_matrix(), sparse_matrix);
-        assert_eq!(operation.rows().r#type(), context.index_type());
-        assert_eq!(operation.columns().r#type(), context.index_type());
-        assert_eq!(operation.non_zero_count().r#type(), context.index_type());
-        assert!(operation.async_token().is_some());
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.sparse_matrix().unwrap(), sparse_matrix);
+        assert_eq!(operation.async_dependencies().unwrap(), vec![token]);
+        assert_eq!(operation.sparse_matrix().unwrap(), sparse_matrix);
+        assert_eq!(operation.rows().unwrap().r#type().unwrap(), context.index_type());
+        assert!(operation.async_token().unwrap().is_some());
     }
 
     gpu_sparse_async_operation_test!(
@@ -4863,14 +5069,15 @@ mod tests {
         let argument_1 = block.argument(2).unwrap().as_ref();
         let result_types = [context.index_type().as_ref(), context.index_type().as_ref()];
         let operation =
-            warp_execute_on_lane_0(lane_id, 32, &[argument_0, argument_1], &result_types, context.region(), location);
+            warp_execute_on_lane_0(lane_id, 32, &[argument_0, argument_1], &result_types, context.region(), location)
+                .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.warp_execute_on_lane_0"));
-        assert_eq!(operation.lane_id(), lane_id);
-        assert_eq!(operation.warp_size().signless_value(), 32);
-        assert_eq!(operation.arguments(), vec![argument_0, argument_1]);
-        assert_eq!(operation.outputs().len(), 2);
-        assert_eq!(WarpExecuteOnLane0Operation::region(&operation).blocks().count(), 0);
+        assert_eq!(operation.lane_id().unwrap(), lane_id);
+        assert_eq!(operation.warp_size().unwrap().signless_value(), 32);
+        assert_eq!(operation.arguments().unwrap(), vec![argument_0, argument_1]);
+        assert_eq!(operation.outputs().unwrap().len(), 2);
+        assert_eq!(operation.as_ref().region(0).unwrap().blocks().unwrap().count(), 0);
     }
 
     #[test]
@@ -4881,13 +5088,13 @@ mod tests {
         let block = context.block(&[(index_type, location), (index_type, location)]);
         let source = block.argument(0).unwrap().as_ref();
         let lane = block.argument(1).unwrap().as_ref();
-        let operation = subgroup_broadcast(source, Some(lane), BroadcastType::SpecificLane, location);
+        let operation = subgroup_broadcast(source, Some(lane), BroadcastType::SpecificLane, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.subgroup_broadcast"));
-        assert_eq!(operation.source(), source);
-        assert_eq!(operation.lane(), Some(lane.as_ref()));
-        assert_eq!(operation.broadcast_type(), BroadcastType::SpecificLane);
-        assert_eq!(SubgroupBroadcastOperation::output(&operation).r#type(), context.index_type());
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(operation.lane().unwrap(), Some(lane.as_ref()));
+        assert_eq!(operation.broadcast_type().unwrap(), BroadcastType::SpecificLane);
+        assert_eq!(operation.broadcast_type().unwrap(), BroadcastType::SpecificLane);
     }
 
     #[test]
@@ -4896,10 +5103,10 @@ mod tests {
         let location = context.unknown_location();
         let block = context.block(&[(context.signless_integer_type(1), location)]);
         let predicate = block.argument(0).unwrap();
-        let operation = ballot(predicate, context.signless_integer_type(32), location);
+        let operation = ballot(predicate, context.signless_integer_type(32), location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("gpu.ballot"));
-        assert_eq!(operation.predicate(), predicate);
-        assert_eq!(operation.mask().r#type(), context.signless_integer_type(32));
+        assert_eq!(operation.predicate().unwrap(), predicate);
+        assert_eq!(operation.predicate().unwrap(), predicate);
     }
 }

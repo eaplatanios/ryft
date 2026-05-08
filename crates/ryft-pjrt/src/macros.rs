@@ -37,7 +37,7 @@ macro_rules! invoke_pjrt_api_fn_helper {
                 let api_fn_offset = std::mem::offset_of!(crate::ffi::PJRT_Api, $fn);
                 let api_struct_size = unsafe { (*api_handle).struct_size } as usize;
                 if api_struct_size <= api_fn_offset {
-                    Err(crate::errors::Error::unimplemented(format!(
+                    Err($crate::errors::Error::unimplemented(format!(
                         "`{}` is not available in the loaded PJRT plugin (version {})",
                         stringify!($fn).to_owned(),
                         $api.api().version(),
@@ -65,7 +65,7 @@ macro_rules! invoke_pjrt_api_fn_helper {
                 let api_fn_offset = std::mem::offset_of!($api_ty, $fn);
                 let api_struct_size = unsafe { (*api_handle).base.struct_size } as usize;
                 if api_struct_size <= api_fn_offset {
-                    Err(crate::errors::Error::unimplemented(format!(
+                    Err($crate::errors::Error::unimplemented(format!(
                         "`{}` is not available in the loaded PJRT plugin (version {})",
                         stringify!($fn).to_owned(),
                         $api.api().version(),
@@ -89,7 +89,7 @@ macro_rules! invoke_pjrt_api_fn_helper {
     ) => {
         paste::paste! {
             unsafe {
-                let api_fn = (*$api.to_c_api()).$fn.ok_or_else(|| crate::errors::Error::unimplemented(format!(
+                let api_fn = (*$api.to_c_api()).$fn.ok_or_else(|| $crate::errors::Error::unimplemented(format!(
                     "`{}` is not implemented in the loaded PJRT plugin (version {})",
                     stringify!($fn).to_owned(),
                     $api.api().version(),
@@ -224,7 +224,7 @@ macro_rules! invoke_pjrt_api_error_fn {
                 Ok(outputs)
             } else {
                 unsafe {
-                    match $crate::Error::from_c_api(error, $api.api()) {
+                    match $crate::errors::Error::from_c_api(error, $api.api()) {
                         Ok(None) => Ok(outputs),
                         Ok(Some(error)) => Err(error),
                         Err(error) => Err(error),
@@ -376,7 +376,7 @@ macro_rules! invoke_distributed_api_error_fn {
             Ok(outputs)
         } else {
             unsafe {
-                match $crate::Error::from_c_api(error as *const _, $api) {
+                match $crate::errors::Error::from_c_api(error as *const _, $api) {
                     Ok(None) => Ok(outputs),
                     Ok(Some(error)) => Err(error),
                     Err(error) => Err(error),

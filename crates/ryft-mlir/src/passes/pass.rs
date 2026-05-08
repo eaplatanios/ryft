@@ -2,10 +2,10 @@ use std::borrow::Cow;
 
 use ryft_xla_sys::bindings::{
     MlirContext, MlirExternalPass, MlirExternalPassCallbacks, MlirLogicalResult, MlirOperation, MlirPass,
-    mlirCreateExternalPass, mlirExternalPassSignalFailure,
+    mlirCreateExternalPass, mlirExternalPassSignalFailure, mlirTypeIDCreate,
 };
 
-use crate::{Context, ContextRef, DialectHandle, LogicalResult, Operation, OperationRef, StringRef, TypeId};
+use crate::{Context, ContextRef, DialectHandle, Error, LogicalResult, Operation, OperationRef, StringRef, TypeId};
 
 /// MLIR passes represent the basic infrastructure for transformation and optimization. Refer to the documentation of
 /// [`PassManager`](crate::PassManager) and to the [MLIR documentation](https://mlir.llvm.org/docs/PassManagement) for
@@ -22,8 +22,12 @@ impl Pass {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirPass) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle }) }
+    pub unsafe fn from_c_api(handle: MlirPass) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR pass handle"))
+        } else {
+            Ok(Self { handle })
+        }
     }
 
     /// Returns the [`MlirPass`] that corresponds to this [`Pass`] and which can be passed to functions
@@ -39,12 +43,12 @@ impl Pass {
 }
 
 /// Trait used for supporting [`Pass`]es that are implemented in Rust in the MLIR infrastructure. Specifically,
-/// MLIR passes can be developed in Rust by implementing this trait and then using its [`Into<Pass>`] implementation
-/// to obtain a [`Pass`] that can be added to a [`PassManager`](crate::PassManager). Refer to [`ClosurePass`] for an
+/// MLIR passes can be developed in Rust by implementing this trait and then using [`Pass::from_external_pass`] to
+/// obtain a [`Pass`] that can be added to a [`PassManager`](crate::PassManager). Refer to [`ClosurePass`] for an
 /// example built-in pass that is implemented in Rust and which implements this trait.
 pub trait ExternalPass<'c, 't: 'c>: Clone + Sized {
     /// Returns the [`TypeId`] of this [`ExternalPass`].
-    fn type_id(&self) -> TypeId<'c>;
+    fn type_id(&self) -> Result<TypeId<'c>, Error>;
 
     /// Returns the name of this [`ExternalPass`].
     fn name(&self) -> Cow<'_, str>;
@@ -85,8 +89,9 @@ pub trait ExternalPass<'c, 't: 'c>: Clone + Sized {
 
         unsafe extern "C" fn destruct<'c, 't: 'c, P: ExternalPass<'c, 't>>(data: *mut std::ffi::c_void) {
             unsafe {
-                let pass = (data as *mut P).as_mut().expect("encountered invalid external pass");
-                std::ptr::drop_in_place(pass);
+                if let Some(pass) = (data as *mut P).as_mut() {
+                    std::ptr::drop_in_place(pass);
+                }
             }
         }
 
@@ -96,8 +101,11 @@ pub trait ExternalPass<'c, 't: 'c>: Clone + Sized {
         ) -> MlirLogicalResult {
             unsafe {
                 let context = ContextRef::from_c_api(context);
-                let pass = (data as *mut P).as_mut().expect("encountered invalid external pass");
-                pass.on_initialization(context).to_c_api()
+                if let Some(pass) = (data as *mut P).as_mut() {
+                    pass.on_initialization(context).to_c_api()
+                } else {
+                    LogicalResult::failure().to_c_api()
+                }
             }
         }
 
@@ -105,8 +113,10 @@ pub trait ExternalPass<'c, 't: 'c>: Clone + Sized {
             data: *mut std::ffi::c_void,
         ) -> *mut std::ffi::c_void {
             unsafe {
-                let pass = (data as *mut P).as_ref().expect("encountered invalid external pass");
-                Box::<P>::into_raw(Box::new(pass.clone())) as *mut _
+                (data as *mut P)
+                    .as_ref()
+                    .map(|pass| Box::<P>::into_raw(Box::new(pass.clone())) as *mut _)
+                    .unwrap_or(std::ptr::null_mut())
             }
         }
 
@@ -116,11 +126,17 @@ pub trait ExternalPass<'c, 't: 'c>: Clone + Sized {
             data: *mut std::ffi::c_void,
         ) {
             unsafe {
-                let pass = (data as *mut P).as_mut().expect("encountered invalid external pass");
-                let context = pass.context();
-                let operation = OperationRef::from_c_api(operation, context).expect("encountered invalid operation");
-                let result = pass.on_run(operation);
-                if result.is_failure() {
+                if let Some(pass) = (data as *mut P).as_mut() {
+                    let context = pass.context();
+                    if let Ok(operation) = OperationRef::from_c_api(operation, context) {
+                        let result = pass.on_run(operation);
+                        if result.is_failure() {
+                            mlirExternalPassSignalFailure(mlir_pass)
+                        }
+                    } else {
+                        mlirExternalPassSignalFailure(mlir_pass)
+                    }
+                } else {
                     mlirExternalPassSignalFailure(mlir_pass)
                 }
             }
@@ -136,8 +152,9 @@ pub trait ExternalPass<'c, 't: 'c>: Clone + Sized {
     }
 }
 
-impl<'c, 't: 'c, P: ExternalPass<'c, 't>> From<P> for Pass {
-    fn from(value: P) -> Self {
+impl Pass {
+    /// Creates an owned MLIR [`Pass`] from an [`ExternalPass`] implementation.
+    pub fn from_external_pass<'c, 't: 'c, P: ExternalPass<'c, 't>>(value: P) -> Result<Self, Error> {
         let name = value.name();
         let command_line_argument = value.command_line_argument();
         let command_line_description = value.command_line_description();
@@ -145,7 +162,7 @@ impl<'c, 't: 'c, P: ExternalPass<'c, 't>> From<P> for Pass {
         let dependent_dialects = value.dependent_dialects();
         unsafe {
             Self::from_c_api(mlirCreateExternalPass(
-                value.type_id().to_c_api(),
+                value.type_id()?.to_c_api(),
                 StringRef::from(name.as_ref()).to_c_api(),
                 StringRef::from(command_line_argument.as_ref().map(|s| s.as_ref()).unwrap_or("")).to_c_api(),
                 StringRef::from(command_line_description.as_ref().map(|s| s.as_ref()).unwrap_or("")).to_c_api(),
@@ -155,7 +172,6 @@ impl<'c, 't: 'c, P: ExternalPass<'c, 't>> From<P> for Pass {
                 value.to_c_api(),
                 Box::into_raw(Box::new(value)) as _,
             ))
-            .unwrap()
         }
     }
 }
@@ -195,12 +211,12 @@ pub struct ClosurePass<'c, 't: 'c, F: Clone + FnMut(OperationRef<'_, 'c, 't>) ->
 impl<'c, 't: 'c, F: Clone + FnMut(OperationRef<'_, 'c, 't>) -> LogicalResult> ExternalPass<'c, 't>
     for ClosurePass<'c, 't, F>
 {
-    fn type_id(&self) -> TypeId<'c> {
+    fn type_id(&self) -> Result<TypeId<'c>, Error> {
         // We need to make sure that the reference data used to create the [`TypeId`] is 8-byte aligned.
         #[repr(align(8))]
         struct AlignedClosure<F>(F);
         let aligned_closure = AlignedClosure(self.closure.clone());
-        TypeId::create(&aligned_closure).unwrap()
+        unsafe { TypeId::from_c_api(mlirTypeIDCreate(&aligned_closure as *const _ as *const std::ffi::c_void)) }
     }
 
     fn name(&self) -> Cow<'_, str> {
@@ -249,17 +265,24 @@ mod tests {
 
     fn test_module<'c, 't>(context: &'c Context<'t>) -> Module<'c, 't> {
         let location = context.unknown_location();
-        let module = context.module(location);
-        module.body().append_operation(func::func(
-            "foo",
-            func::FuncAttributes::default(),
-            {
-                let mut block = context.block_with_no_arguments();
-                block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-                block.into()
-            },
-            location,
-        ));
+        let module = context.module(location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(
+                func::func(
+                    "foo",
+                    func::FuncAttributes::default(),
+                    {
+                        let mut block = context.block_with_no_arguments();
+                        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                        block.try_into().unwrap()
+                    },
+                    location,
+                )
+                .unwrap(),
+            )
+            .unwrap();
         module
     }
 
@@ -274,11 +297,11 @@ mod tests {
             command_line_argument: Some("custom-arg".into()),
             command_line_description: Some("A pass with custom command line options".into()),
             operation_name: Some("builtin.module".into()),
-            dependent_dialects: vec![DialectHandle::func()],
+            dependent_dialects: vec![DialectHandle::func().unwrap()],
             closure: |op| LogicalResult::from(op.verify()),
             context: &context,
         };
-        let _ = pass.type_id();
+        let _ = pass.type_id().unwrap();
         assert_eq!(pass.name(), "stateless_pass");
         assert_eq!(pass.command_line_argument(), Some(Cow::Borrowed("custom-arg")));
         assert_eq!(pass.command_line_description(), Some(Cow::Borrowed("A pass with custom command line options")));
@@ -294,9 +317,9 @@ mod tests {
         assert_eq!(pass.operation_name(), cloned_pass.operation_name());
 
         // The running the pass.
-        let mut pass_manager = context.pass_manager();
-        pass_manager.add_pass(pass.into());
-        assert!(pass_manager.run(&module.as_operation()).is_success());
+        let mut pass_manager = context.pass_manager().unwrap();
+        pass_manager.add_pass(Pass::from_external_pass(pass).unwrap());
+        assert!(pass_manager.run(&module.as_operation().unwrap()).is_success());
 
         // Test using a stateful pass.
         let counter = Rc::new(RefCell::new(0));
@@ -309,16 +332,16 @@ mod tests {
             dependent_dialects: vec![],
             closure: |op| {
                 assert!(op.region_count() > 0);
-                assert!(op.region(0).is_some());
+                assert!(op.region(0).is_ok());
                 *counter_clone.borrow_mut() += 1;
                 LogicalResult::success()
             },
             context: &context,
         };
-        let mut pass_manager = context.pass_manager();
-        pass_manager.add_pass(pass.clone().into());
+        let mut pass_manager = context.pass_manager().unwrap();
+        pass_manager.add_pass(Pass::from_external_pass(pass.clone()).unwrap());
         assert_eq!(*counter.borrow(), 0);
-        assert!(pass_manager.run(&module.as_operation()).is_success());
+        assert!(pass_manager.run(&module.as_operation().unwrap()).is_success());
         assert_eq!(*counter.borrow(), 1);
 
         // Test a pass with a failure.
@@ -327,13 +350,13 @@ mod tests {
             command_line_argument: None,
             command_line_description: None,
             operation_name: None,
-            dependent_dialects: vec![DialectHandle::func()],
+            dependent_dialects: vec![DialectHandle::func().unwrap()],
             closure: |_| LogicalResult::failure(),
             context: &context,
         };
-        let mut pass_manager = context.pass_manager();
-        pass_manager.add_pass(pass.into());
-        assert!(pass_manager.run(&module.as_operation()).is_failure());
+        let mut pass_manager = context.pass_manager().unwrap();
+        pass_manager.add_pass(Pass::from_external_pass(pass).unwrap());
+        assert!(pass_manager.run(&module.as_operation().unwrap()).is_failure());
     }
 
     #[test]
@@ -345,8 +368,8 @@ mod tests {
         }
 
         impl<'c, 't: 'c> ExternalPass<'c, 't> for TestPass<'c, 't> {
-            fn type_id(&self) -> TypeId<'c> {
-                TypeId::create(&self).unwrap()
+            fn type_id(&self) -> Result<TypeId<'c>, Error> {
+                unsafe { TypeId::from_c_api(mlirTypeIDCreate(self as *const _ as *const std::ffi::c_void)) }
             }
 
             fn name(&self) -> Cow<'_, str> {
@@ -366,7 +389,7 @@ mod tests {
             }
 
             fn dependent_dialects(&self) -> Vec<DialectHandle<'c, 't>> {
-                vec![DialectHandle::func()]
+                vec![DialectHandle::func().unwrap()]
             }
 
             fn context(&self) -> &'c Context<'t> {
@@ -384,7 +407,20 @@ mod tests {
                 assert_eq!(operation.name().as_str().unwrap(), "builtin.module");
                 assert!(operation.verify());
                 assert_eq!(
-                    operation.region(0).unwrap().blocks().next().unwrap().operations().next().unwrap().name(),
+                    operation
+                        .region(0)
+                        .unwrap()
+                        .blocks()
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .operations()
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .name(),
                     self.context.identifier("func.func"),
                 );
                 LogicalResult::success()
@@ -394,9 +430,9 @@ mod tests {
         let context = Context::new();
         let module = test_module(&context);
         let pass = TestPass { context: &context, value: 10 };
-        let mut pass_manager = context.pass_manager();
-        pass_manager.add_pass(pass.clone().into());
-        assert!(pass_manager.run(&module.as_operation()).is_success());
+        let mut pass_manager = context.pass_manager().unwrap();
+        pass_manager.add_pass(Pass::from_external_pass(pass.clone()).unwrap());
+        assert!(pass_manager.run(&module.as_operation().unwrap()).is_success());
 
         // Check that the C API callback conversions work as expected. We are only checking `clone`
         // because the rest of the callbacks should have already been checked while running the pass.

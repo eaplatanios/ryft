@@ -1,6 +1,6 @@
 use ryft_xla_sys::bindings::MlirType;
 
-use crate::{Context, DialectHandle, Type, TypeRef, mlir_subtype_trait_impls};
+use crate::{Context, DialectHandle, Error, Type, TypeRef, mlir_subtype_trait_impls};
 
 macro_rules! async_unit_type {
     (
@@ -26,12 +26,16 @@ macro_rules! async_unit_type {
         }
 
         impl<'c, 't> Type<'c, 't> for $name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR type handle"));
                 }
                 let r#type = unsafe { TypeRef::from_c_api(handle, context) }?;
-                if r#type.to_string() == $mnemonic { Some(Self { handle, context }) } else { None }
+                if r#type.to_string() == $mnemonic {
+                    Ok(Self { handle, context })
+                } else {
+                    Err(Error::invalid_argument(concat!("expected MLIR ", $mnemonic, " type handle")))
+                }
             }
 
             unsafe fn to_c_api(&self) -> MlirType {
@@ -49,11 +53,14 @@ macro_rules! async_unit_type {
             #[doc = "Creates a new async "]
             #[doc = $summary]
             #[doc = " owned by this [`Context`]."]
-            pub fn $context_method<'c>(&'c self) -> $name<'c, 't> {
-                self.load_dialect(DialectHandle::r#async());
+            pub fn $context_method<'c>(&'c self) -> Result<$name<'c, 't>, Error> {
+                self.load_dialect(DialectHandle::r#async()?)?;
                 self.parse_type($mnemonic)
-                    .and_then(|r#type| r#type.cast())
-                    .unwrap_or_else(|| panic!("failed to parse async type `{}`", $mnemonic))
+                    .and_then(|r#type| {
+                        r#type.cast().ok_or_else(|| {
+                            Error::internal(format!("failed to cast async type `{}`", $mnemonic))
+                        })
+                    })
             }
         }
     };
@@ -84,27 +91,27 @@ pub struct ValueTypeRef<'c, 't> {
 
 impl<'c, 't> ValueTypeRef<'c, 't> {
     /// Returns the underlying value [`Type`] wrapped by this async value type.
-    pub fn value_type(&self) -> TypeRef<'c, 't> {
+    pub fn value_type(&self) -> Result<TypeRef<'c, 't>, Error> {
         let rendered_type = self.to_string();
         let value_type = rendered_type
             .strip_prefix("!async.value<")
             .and_then(|rendered_type| rendered_type.strip_suffix('>'))
-            .expect("invalid `!async.value` type");
-        self.context.parse_type(value_type).expect("invalid `!async.value` value type")
+            .ok_or_else(|| Error::internal("invalid `!async.value` type"))?;
+        self.context.parse_type(value_type)
     }
 }
 
 impl<'c, 't> Type<'c, 't> for ValueTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
         let r#type = unsafe { TypeRef::from_c_api(handle, context) }?;
         let rendered_type = r#type.to_string();
         if rendered_type.starts_with("!async.value<") && rendered_type.ends_with('>') {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR async value type handle"))
         }
     }
 
@@ -153,12 +160,11 @@ async_unit_type!(
 
 impl<'t> Context<'t> {
     /// Creates a new [`ValueTypeRef`] owned by this [`Context`] for the provided underlying value type.
-    pub fn async_value_type<'c, T: Type<'c, 't>>(&'c self, value_type: T) -> ValueTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::r#async());
+    pub fn async_value_type<'c, T: Type<'c, 't>>(&'c self, value_type: T) -> Result<ValueTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::r#async()?)?;
         let source = format!("!async.value<{value_type}>");
         self.parse_type(source)
-            .and_then(|r#type| r#type.cast())
-            .expect("invalid arguments to `Context::async_value_type`")
+            .and_then(|r#type| r#type.cast().ok_or_else(|| Error::internal("invalid async value type cast")))
     }
 }
 
@@ -175,41 +181,41 @@ mod tests {
                 #[test]
                 fn [<test_ $test_prefix>]() {
                     let context = Context::new();
-                    let r#type = context.$constructor();
+                    let r#type = context.$constructor().unwrap();
                     assert_eq!(&context, r#type.context());
-                    assert_eq!(r#type.dialect().namespace().unwrap(), "async");
+                    assert_eq!(r#type.dialect().unwrap().namespace().unwrap(), "async");
                 }
 
                 #[test]
                 fn [<test_ $test_prefix _equality>]() {
                     let context = Context::new();
-                    let type_1 = context.$constructor();
-                    let type_2 = context.$constructor();
+                    let type_1 = context.$constructor().unwrap();
+                    let type_2 = context.$constructor().unwrap();
                     assert_eq!(type_1, type_2);
 
                     let context = Context::new();
-                    let type_2 = context.$constructor();
+                    let type_2 = context.$constructor().unwrap();
                     assert_ne!(type_1, type_2);
                 }
 
                 #[test]
                 fn [<test_ $test_prefix _display_and_debug>]() {
                     let context = Context::new();
-                    let r#type = context.$constructor();
+                    let r#type = context.$constructor().unwrap();
                     test_type_display_and_debug(r#type, $expected);
                 }
 
                 #[test]
                 fn [<test_ $test_prefix _parsing>]() {
                     let context = Context::new();
-                    let r#type = context.$constructor();
+                    let r#type = context.$constructor().unwrap();
                     assert_eq!(context.parse_type($expected).unwrap(), r#type);
                 }
 
                 #[test]
                 fn [<test_ $test_prefix _casting>]() {
                     let context = Context::new();
-                    let r#type = context.$constructor();
+                    let r#type = context.$constructor().unwrap();
                     test_type_casting(r#type);
                 }
             }
@@ -225,45 +231,45 @@ mod tests {
     #[test]
     fn test_value_type() {
         let context = Context::new();
-        let value_type = context.async_value_type(context.float32_type());
+        let value_type = context.async_value_type(context.float32_type()).unwrap();
         assert_eq!(&context, value_type.context());
-        assert_eq!(value_type.dialect().namespace().unwrap(), "async");
-        assert_eq!(value_type.value_type(), context.float32_type());
+        assert_eq!(value_type.dialect().unwrap().namespace().unwrap(), "async");
+        assert_eq!(value_type.value_type().unwrap(), context.float32_type());
     }
 
     #[test]
     fn test_value_type_equality() {
         let context = Context::new();
-        let value_type_1 = context.async_value_type(context.float32_type());
-        let value_type_2 = context.async_value_type(context.float32_type());
+        let value_type_1 = context.async_value_type(context.float32_type()).unwrap();
+        let value_type_2 = context.async_value_type(context.float32_type()).unwrap();
         assert_eq!(value_type_1, value_type_2);
 
-        let value_type_2 = context.async_value_type(context.float64_type());
+        let value_type_2 = context.async_value_type(context.float64_type()).unwrap();
         assert_ne!(value_type_1, value_type_2);
 
         let context = Context::new();
-        let value_type_2 = context.async_value_type(context.float32_type());
+        let value_type_2 = context.async_value_type(context.float32_type()).unwrap();
         assert_ne!(value_type_1, value_type_2);
     }
 
     #[test]
     fn test_value_type_display_and_debug() {
         let context = Context::new();
-        let value_type = context.async_value_type(context.float32_type());
+        let value_type = context.async_value_type(context.float32_type()).unwrap();
         test_type_display_and_debug(value_type, "!async.value<f32>");
     }
 
     #[test]
     fn test_value_type_parsing() {
         let context = Context::new();
-        let value_type = context.async_value_type(context.float32_type());
+        let value_type = context.async_value_type(context.float32_type()).unwrap();
         assert_eq!(context.parse_type("!async.value<f32>").unwrap(), value_type);
     }
 
     #[test]
     fn test_value_type_casting() {
         let context = Context::new();
-        let value_type = context.async_value_type(context.float32_type());
+        let value_type = context.async_value_type(context.float32_type()).unwrap();
         test_type_casting(value_type);
     }
 }

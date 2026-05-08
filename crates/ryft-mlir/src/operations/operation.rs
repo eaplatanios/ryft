@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
+use std::ops::Range;
 
 use ryft_xla_sys::bindings::{
     MlirOperation, MlirWalkOrder, MlirWalkOrder_MlirWalkPostOrder, MlirWalkOrder_MlirWalkPreOrder, MlirWalkResult,
@@ -23,12 +24,37 @@ use ryft_xla_sys::bindings::{
 
 use crate::support::{write_to_formatter_callback, write_to_string_callback};
 use crate::{
-    Attribute, AttributeRef, Block, BlockRef, Context, Identifier, Location, LocationRef, LogicalResult,
-    NamedAttributeRef, OperandRef, OperationResultRef, RegionRef, StringRef, TypeId, TypeRef, Value, ValueRef,
-    write_to_bytes_callback,
+    AffineMapAttributeRef, ArrayAttributeRef, Attribute, AttributeRef, Block, BlockRef, BooleanAttributeRef, Context,
+    DenseArrayAttributeRef, DenseBooleanArrayAttributeRef, DenseElementsAttributeRef, DenseFloat32ArrayAttributeRef,
+    DenseFloat64ArrayAttributeRef, DenseFloatElementsAttributeRef, DenseInteger8ArrayAttributeRef,
+    DenseInteger16ArrayAttributeRef, DenseInteger32ArrayAttributeRef, DenseInteger64ArrayAttributeRef,
+    DenseIntegerElementsAttributeRef, DenseResourceElementsAttributeRef, DictionaryAttributeRef, DistinctAttributeRef,
+    ElementsAttributeRef, Error, FlatSymbolRefAttributeRef, FloatAttributeRef, Identifier, IntegerAttributeRef,
+    IntegerSetAttributeRef, Location, LocationAttributeRef, LocationRef, LogicalResult, NamedAttributeRef,
+    OpaqueAttributeRef, OperandRef, OperationResultRef, RegionRef, SparseElementsAttributeRef,
+    StridedLayoutAttributeRef, StringAttributeRef, StringRef, SymbolRefAttributeRef, SymbolVisibilityAttributeRef,
+    TypeAttributeRef, TypeId, TypeRef, UnitAttributeRef, Value, ValueRef, write_to_bytes_callback,
 };
 
 use super::printing::{AsmState, BytecodeWriterConfiguration, OperationPrintingFlags};
+
+/// Helper macro for defining typed attribute accessor functions for [`Operation`]s.
+macro_rules! mlir_operation_builtin_attribute {
+    ($method_name:ident, $attribute_type:ty) => {
+        /// Returns an [`Attribute`] of this [`Operation`] with the provided name. If no such attribute
+        /// can be found or if it is not of the appropriate type, then this function returns an [`Error`].
+        fn $method_name<N: AsRef<str>>(&self, name: N) -> Result<$attribute_type, Error> {
+            let name = name.as_ref();
+            self.attribute(name)?.and_then(|attribute| attribute.cast::<$attribute_type>()).ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    name,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })
+        }
+    };
+}
 
 /// [`Operation`]s are one of the main building blocks of MLIR programs. MLIR is fundamentally based on a graph-like
 /// data structure of nodes, called [`Operation`]s, and edges, called [`Value`]s. Each [`Value`] is either a
@@ -55,7 +81,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Option<Self>;
+    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Result<Self, Error>;
 
     /// Returns the [`MlirOperation`] that corresponds to this [`Operation`] and which can be passed to functions
     /// in the MLIR C API.
@@ -71,7 +97,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
 
     /// Returns an [`OperationRef`] that references this [`Operation`].
     fn as_ref(&self) -> OperationRef<'o, 'c, 't> {
-        unsafe { OperationRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
+        OperationRef { handle: unsafe { self.to_c_api() }, context: self.context(), owner: PhantomData }
     }
 
     /// Gets the [`TypeId`] of this [`Operation`]. Note that this function may return the same [`TypeId`] for different
@@ -79,13 +105,16 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// identifier of the corresponding MLIR C++ type for the operation and not for a specific instance of this
     /// operation type. Also, note that if the operation does not have a registered description, then this function
     /// will return [`None`].
-    fn type_id(&self) -> Option<TypeId<'c>> {
-        unsafe { TypeId::from_c_api(mlirOperationGetTypeID(self.to_c_api())) }
+    fn type_id(&self) -> Result<Option<TypeId<'c>>, Error> {
+        unsafe {
+            let handle = mlirOperationGetTypeID(self.to_c_api());
+            if handle.ptr.is_null() { Ok(None) } else { TypeId::from_c_api(handle).map(Some) }
+        }
     }
 
     /// Returns the [`Location`] of this [`Operation`].
-    fn location(&self) -> LocationRef<'c, 't> {
-        unsafe { LocationRef::from_c_api(mlirOperationGetLocation(self.to_c_api()), self.context()).unwrap() }
+    fn location(&self) -> Result<LocationRef<'c, 't>, Error> {
+        unsafe { LocationRef::from_c_api(mlirOperationGetLocation(self.to_c_api()), self.context()) }
     }
 
     /// Sets the [`Location`] of this [`Operation`].
@@ -128,20 +157,22 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     }
 
     /// Returns an inherent [`Attribute`] of this [`Operation`] with the provided name. If no such attribute can be
-    /// found, then this function returns [`None`].
+    /// found, then this function returns `Ok(None)`.
     ///
     /// Refer to the documentation of [`Operation::attributes`] for information on the distinction between
     /// inherent and discardable attributes.
-    fn inherent_attribute<N: AsRef<str>>(&self, name: N) -> Option<AttributeRef<'c, 't>> {
+    fn inherent_attribute<N: AsRef<str>>(&self, name: N) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe {
-            AttributeRef::from_c_api(
-                mlirOperationGetInherentAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api()),
-                self.context(),
-            )
+        let handle = unsafe {
+            mlirOperationGetInherentAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api())
+        };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context()).map(Some) }
         }
     }
 
@@ -201,24 +232,29 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        self.discardable_attribute(name).is_some()
+        let handle = unsafe {
+            mlirOperationGetDiscardableAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api())
+        };
+        !handle.ptr.is_null()
     }
 
     /// Returns a discardable [`Attribute`] of this [`Operation`] with the provided name. If no such attribute can be
-    /// found, then this function returns [`None`].
+    /// found, then this function returns `Ok(None)`.
     ///
     /// Refer to the documentation of [`Operation::attributes`] for information on the distinction between
     /// inherent and discardable attributes.
-    fn discardable_attribute<N: AsRef<str>>(&self, name: N) -> Option<AttributeRef<'c, 't>> {
+    fn discardable_attribute<N: AsRef<str>>(&self, name: N) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe {
-            AttributeRef::from_c_api(
-                mlirOperationGetDiscardableAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api()),
-                self.context(),
-            )
+        let handle = unsafe {
+            mlirOperationGetDiscardableAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api())
+        };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context()).map(Some) }
         }
     }
 
@@ -350,26 +386,146 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// [`Operation::has_discardable_attribute`]. Refer to the documentation of [`Operation::attributes`] for
     /// information on the distinction between inherent and discardable attributes.
     fn has_attribute<N: AsRef<str>>(&self, name: N) -> bool {
-        self.attribute(name).is_some()
-    }
-
-    /// Returns an [`Attribute`] of this [`Operation`] with the provided name. If no such attribute can be found,
-    /// then this function returns [`None`].
-    ///
-    /// It is recommended to instead use [`Operation::inherent_attribute`] or
-    /// [`Operation::discardable_attribute`]. Refer to the documentation of [`Operation::attributes`] for information
-    /// on the distinction between inherent and discardable attributes.
-    fn attribute<N: AsRef<str>>(&self, name: N) -> Option<AttributeRef<'c, 't>> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe {
-            AttributeRef::from_c_api(
-                mlirOperationGetAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api()),
-                self.context(),
-            )
+        let handle =
+            unsafe { mlirOperationGetAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api()) };
+        !handle.ptr.is_null()
+    }
+
+    /// Returns an [`Attribute`] of this [`Operation`] with the provided name. If no such attribute can be found,
+    /// then this function returns `Ok(None)`.
+    ///
+    /// It is recommended to instead use [`Operation::inherent_attribute`] or
+    /// [`Operation::discardable_attribute`]. Refer to the documentation of [`Operation::attributes`] for information
+    /// on the distinction between inherent and discardable attributes.
+    fn attribute<N: AsRef<str>>(&self, name: N) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
+        // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
+        // internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        let handle =
+            unsafe { mlirOperationGetAttributeByName(self.to_c_api(), StringRef::from(name.as_ref()).to_c_api()) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context()).map(Some) }
         }
+    }
+
+    mlir_operation_builtin_attribute!(affine_map_attribute, AffineMapAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(array_attribute, ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(boolean_attribute, BooleanAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_array_attribute, DenseArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_boolean_array_attribute, DenseBooleanArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_integer_8_array_attribute, DenseInteger8ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_integer_16_array_attribute, DenseInteger16ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_integer_32_array_attribute, DenseInteger32ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_integer_64_array_attribute, DenseInteger64ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_float_32_array_attribute, DenseFloat32ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_float_64_array_attribute, DenseFloat64ArrayAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dictionary_attribute, DictionaryAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(distinct_attribute, DistinctAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(elements_attribute, ElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_elements_attribute, DenseElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_integer_elements_attribute, DenseIntegerElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_float_elements_attribute, DenseFloatElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(dense_resource_elements_attribute, DenseResourceElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(sparse_elements_attribute, SparseElementsAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(flat_symbol_ref_attribute, FlatSymbolRefAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(float_attribute, FloatAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(integer_attribute, IntegerAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(integer_set_attribute, IntegerSetAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(location_attribute, LocationAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(opaque_attribute, OpaqueAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(strided_layout_attribute, StridedLayoutAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(string_attribute, StringAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(symbol_ref_attribute, SymbolRefAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(symbol_visibility_attribute, SymbolVisibilityAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(type_attribute, TypeAttributeRef<'c, 't>);
+    mlir_operation_builtin_attribute!(unit_attribute, UnitAttributeRef<'c, 't>);
+
+    /// Returns a named dense 32-bit integer array attribute element as a `usize`.
+    ///
+    /// This is primarily useful for operation segment-size attributes, whose MLIR representation is a dense i32
+    /// array but whose values are naturally used as Rust indices and counts.
+    ///
+    /// # Parameters
+    ///
+    ///   - `name`: Name of the operation attribute to retrieve.
+    ///   - `index`: Index of the attribute element to retrieve.
+    fn dense_integer_32_array_attribute_usize_value<N: AsRef<str>>(
+        &self,
+        name: N,
+        index: usize,
+    ) -> Result<usize, Error> {
+        let name = name.as_ref();
+        let attribute = self.dense_integer_32_array_attribute(name)?;
+        if index >= attribute.len() {
+            return Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                name,
+                self.name().as_str().unwrap_or("<unknown>"),
+            )));
+        }
+        usize::try_from(attribute.value(index)).map_err(|_| {
+            Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                name,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
+    }
+
+    /// Returns the flat operand/result index range represented by one segment-size entry.
+    ///
+    /// This helper interprets the named [`DenseInteger32ArrayAttributeRef`] as an MLIR segment-size attribute, such as
+    /// `operandSegmentSizes` or `operand_segment_sizes`. In that convention, operations store multiple variadic operand
+    /// or result groups as one flat list, and the dense i32 array stores the length of each consecutive group.
+    ///
+    /// For example, a segment-size attribute with values `[2, 3, 1]` describes three consecutive groups
+    /// in the flat list:
+    ///
+    /// ```text
+    /// segment 0: size 2 -> range 0..2
+    /// segment 1: size 3 -> range 2..5
+    /// segment 2: size 1 -> range 5..6
+    /// ```
+    ///
+    /// Therefore, requesting segment `1` returns `2..5`. The returned range indexes the operation's flat operand or
+    /// result list; it is not a range over the dense array attribute values themselves.
+    ///
+    /// # Parameters
+    ///
+    ///   - `name`: Name of the operation attribute to retrieve.
+    ///   - `index`: Index of the segment to retrieve.
+    fn dense_integer_32_array_attribute_segment_range<N: AsRef<str>>(
+        &self,
+        name: N,
+        index: usize,
+    ) -> Result<Range<usize>, Error> {
+        let name = name.as_ref();
+        let operation_name = self.name().as_str().unwrap_or("<unknown>").to_string();
+        let attribute = self.dense_integer_32_array_attribute(name)?;
+        if index >= attribute.len() {
+            return Err(Error::invalid_argument(format!("invalid `{name}` attribute in `{operation_name}`")));
+        }
+        let mut start = 0usize;
+        for segment in 0..index {
+            start = start
+                .checked_add(usize::try_from(attribute.value(segment)).map_err(|_| {
+                    Error::invalid_argument(format!("invalid `{name}` attribute in `{operation_name}`"))
+                })?)
+                .ok_or_else(|| Error::invalid_argument(format!("invalid `{name}` attribute in `{operation_name}`")))?;
+        }
+        let size = usize::try_from(attribute.value(index))
+            .map_err(|_| Error::invalid_argument(format!("invalid `{name}` attribute in `{operation_name}`")))?;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| Error::invalid_argument(format!("invalid `{name}` attribute in `{operation_name}`")))?;
+        Ok(start..end)
     }
 
     /// Sets an attribute of this [`Operation`] with the provided name to the provided value.
@@ -419,49 +575,55 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn operands<'r>(&'r self) -> impl Iterator<Item = OperandRef<'o, 'c, 't>> {
-        (0..self.operand_count()).map(|index| self.operand(index).unwrap())
+    fn operands(&self) -> impl Iterator<Item = Result<OperandRef<'o, 'c, 't>, Error>> {
+        let operand_count = self.operand_count();
+        (0..operand_count).map(|index| self.operand(index))
     }
 
     /// Returns the operand at the `index`-pth position in the operands list of this [`Operation`],
-    /// and [`None`] if `index` is out of bounds.
-    fn operand(&self, index: usize) -> Option<OperandRef<'o, 'c, 't>> {
-        if index >= self.operand_count() {
-            None
-        } else {
-            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
-            // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
-            // to MLIR internals that we have when working with the MLIR C API.
-            let _guard = self.context().borrow();
-            unsafe {
-                OperandRef::from_c_api(mlirOperationGetOpOperand(self.to_c_api(), index.cast_signed()), self.context())
-            }
+    /// or an [`Error`] if `index` is out of bounds.
+    fn operand(&self, index: usize) -> Result<OperandRef<'o, 'c, 't>, Error> {
+        let operand_count = self.operand_count();
+        if index >= operand_count {
+            return Err(Error::invalid_argument(format!(
+                "operation operand index {index} is out of bounds for length {operand_count}",
+            )));
+        }
+
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+        // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
+        // to MLIR internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        unsafe {
+            OperandRef::from_c_api(mlirOperationGetOpOperand(self.to_c_api(), index.cast_signed()), self.context())
         }
     }
 
-    /// Returns an [`Iterator`] over the operand [`Value`](crate::Value)s of this [`Operation`].
+    /// Returns an [`Iterator`] over the operand [`Value`]s of this [`Operation`].
     ///
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn operand_values<'r>(&'r self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
-        self.operands().map(|operand| operand.value())
+    fn operand_values(&self) -> impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>> {
+        let operand_count = self.operand_count();
+        (0..operand_count).map(|index| self.operand_value(index))
     }
 
-    /// Returns the operand [`Value`](crate::Value) at the `index`-pth position in the operands list of this
-    /// [`Operation`], and [`None`] if `index` is out of bounds.
-    fn operand_value(&self, index: usize) -> Option<ValueRef<'o, 'c, 't>> {
-        if index >= self.operand_count() {
-            None
-        } else {
-            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
-            // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
-            // to MLIR internals that we have when working with the MLIR C API.
-            let _guard = self.context().borrow();
-            unsafe {
-                ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context())
-            }
+    /// Returns the operand [`Value`] at the `index`-pth position in the operands list of this [`Operation`],
+    /// or an [`Error`] if `index` is out of bounds.
+    fn operand_value(&self, index: usize) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let operand_count = self.operand_count();
+        if index >= operand_count {
+            return Err(Error::invalid_argument(format!(
+                "operation operand index {index} is out of bounds for length {operand_count}",
+            )));
         }
+
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+        // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
+        // to MLIR internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        unsafe { ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context()) }
     }
 
     /// Returns an [`Iterator`] over the [`Type`](crate::Type)s of the [`Operation::operands`] of this [`Operation`].
@@ -469,14 +631,14 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn operand_types<'r>(&'r self) -> impl Iterator<Item = TypeRef<'c, 't>> {
-        self.operand_values().map(|operand| operand.r#type())
+    fn operand_types(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
+        self.operand_values().map(|operand| operand.and_then(|operand| operand.r#type()))
     }
 
     /// Returns the [`Type`](crate::Type) of the operand at the `index`-pth position in the operands list of this
-    /// [`Operation`], and [`None`] if `index` is out of bounds.
-    fn operand_type(&self, index: usize) -> Option<TypeRef<'c, 't>> {
-        self.operand_value(index).map(|operand| operand.r#type())
+    /// [`Operation`], or an [`Error`] if `index` is out of bounds.
+    fn operand_type(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        self.operand_value(index)?.r#type()
     }
 
     /// Replaces the operand at the `index`-pth position in the operands list of this [`Operation`], with the provided
@@ -555,29 +717,27 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn results<'r>(&'r self) -> impl Iterator<Item = OperationResultRef<'o, 'c, 't>> {
-        (0..self.result_count()).map(|index| unsafe {
-            OperationResultRef::from_c_api(mlirOperationGetResult(self.to_c_api(), index.cast_signed()), self.context())
-                .unwrap()
-        })
+    fn results(&self) -> impl Iterator<Item = Result<OperationResultRef<'o, 'c, 't>, Error>> {
+        let result_count = self.result_count();
+        (0..result_count).map(|index| self.result(index))
     }
 
     /// Returns the result at the `index`-pth position in the results list of this [`Operation`],
-    /// and [`None`] if `index` is out of bounds.
-    fn result(&self, index: usize) -> Option<OperationResultRef<'o, 'c, 't>> {
-        if index >= self.result_count() {
-            None
-        } else {
-            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
-            // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
-            // to MLIR internals that we have when working with the MLIR C API.
-            let _guard = self.context().borrow();
-            unsafe {
-                OperationResultRef::from_c_api(
-                    mlirOperationGetResult(self.to_c_api(), index.cast_signed()),
-                    self.context(),
-                )
-            }
+    /// or an [`Error`] if `index` is out of bounds.
+    fn result(&self, index: usize) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        let result_count = self.result_count();
+        if index >= result_count {
+            return Err(Error::invalid_argument(format!(
+                "operation result index {index} is out of bounds for length {result_count}",
+            )));
+        }
+
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+        // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
+        // to MLIR internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        unsafe {
+            OperationResultRef::from_c_api(mlirOperationGetResult(self.to_c_api(), index.cast_signed()), self.context())
         }
     }
 
@@ -586,14 +746,14 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn result_types<'r>(&'r self) -> impl Iterator<Item = TypeRef<'c, 't>> {
-        self.results().map(|result| result.r#type())
+    fn result_types(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
+        self.results().map(|result| result.and_then(|result| result.r#type()))
     }
 
     /// Returns the [`Type`](crate::Type) of the result at the `index`-pth position in the results list of this
-    /// [`Operation`], and [`None`] if `index` is out of bounds.
-    fn result_type(&self, index: usize) -> Option<TypeRef<'c, 't>> {
-        self.result(index).map(|result| result.r#type())
+    /// [`Operation`], or an [`Error`] if `index` is out of bounds.
+    fn result_type(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        self.result(index)?.r#type()
     }
 
     /// Returns `true` if this [`Operation`] is empty (i.e., if it contains no [`Region`](crate::Region)s).
@@ -615,26 +775,26 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'o, 'c, 't>> {
-        (0..self.region_count()).map(|index| unsafe {
-            RegionRef::from_c_api(mlirOperationGetRegion(self.to_c_api(), index.cast_signed()), self.context()).unwrap()
-        })
+    fn regions(&self) -> impl Iterator<Item = Result<RegionRef<'o, 'c, 't>, Error>> {
+        let region_count = self.region_count();
+        (0..region_count).map(|index| self.region(index))
     }
 
     /// Returns the [`Region`](crate::Region) at the `index`-pth position in the [`Region`](crate::Region)s list
-    /// of this [`Operation`], and [`None`] if `index` is out of bounds.
-    fn region(&self, index: usize) -> Option<RegionRef<'o, 'c, 't>> {
-        if index >= self.region_count() {
-            None
-        } else {
-            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
-            // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
-            // to MLIR internals that we have when working with the MLIR C API.
-            let _guard = self.context().borrow();
-            unsafe {
-                RegionRef::from_c_api(mlirOperationGetRegion(self.to_c_api(), index.cast_signed()), self.context())
-            }
+    /// of this [`Operation`], or an [`Error`] if `index` is out of bounds.
+    fn region(&self, index: usize) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        let region_count = self.region_count();
+        if index >= region_count {
+            return Err(Error::invalid_argument(format!(
+                "operation region index {index} is out of bounds for length {region_count}",
+            )));
         }
+
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+        // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
+        // to MLIR internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        unsafe { RegionRef::from_c_api(mlirOperationGetRegion(self.to_c_api(), index.cast_signed()), self.context()) }
     }
 
     /// Returns the number of successor [`Block`]s of this [`Operation`]. Refer to [`Block::successors`]
@@ -653,28 +813,27 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn successors<'r>(&'r self) -> impl Iterator<Item = BlockRef<'o, 'c, 't>> {
-        (0..self.successor_count()).map(|index| unsafe {
-            BlockRef::from_c_api(mlirOperationGetSuccessor(self.to_c_api(), index.cast_signed()), self.context())
-                .unwrap()
-        })
+    fn successors(&self) -> impl Iterator<Item = Result<BlockRef<'o, 'c, 't>, Error>> {
+        let successor_count = self.successor_count();
+        (0..successor_count).map(|index| self.successor(index))
     }
 
     /// Returns the successor [`Block`] at the `index`-pth position in the successors list of this [`Operation`],
-    /// and [`None`] if `index` is out of bounds. Refer to [`Block::successors`] for information
+    /// or an [`Error`] if `index` is out of bounds. Refer to [`Block::successors`] for information
     /// on how successors are defined.
-    fn successor(&self, index: usize) -> Option<BlockRef<'o, 'c, 't>> {
-        if index >= self.successor_count() {
-            None
-        } else {
-            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
-            // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
-            // to MLIR internals that we have when working with the MLIR C API.
-            let _guard = self.context().borrow();
-            unsafe {
-                BlockRef::from_c_api(mlirOperationGetSuccessor(self.to_c_api(), index.cast_signed()), self.context())
-            }
+    fn successor(&self, index: usize) -> Result<BlockRef<'o, 'c, 't>, Error> {
+        let successor_count = self.successor_count();
+        if index >= successor_count {
+            return Err(Error::invalid_argument(format!(
+                "operation successor index {index} is out of bounds for length {successor_count}",
+            )));
         }
+
+        // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+        // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
+        // to MLIR internals that we have when working with the MLIR C API.
+        let _guard = self.context().borrow();
+        unsafe { BlockRef::from_c_api(mlirOperationGetSuccessor(self.to_c_api(), index.cast_signed()), self.context()) }
     }
 
     /// Replaces the successor at the `index`-pth position in the successors list of this [`Operation`], with the
@@ -696,23 +855,29 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Returns a reference to the parent [`Block`] of this [`Operation`] (i.e., the [`Block`] that owns this
     /// operation), if one exists (i.e., if this is not a [`DetachedOperation`] or a reference to a detached
     /// operation).
-    fn parent_block(&self) -> Option<BlockRef<'o, 'c, 't>> {
+    fn parent_block(&self) -> Result<Option<BlockRef<'o, 'c, 't>>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe { BlockRef::from_c_api(mlirOperationGetBlock(self.to_c_api()), self.context()) }
+        let handle = unsafe { mlirOperationGetBlock(self.to_c_api()) };
+        if handle.ptr.is_null() { Ok(None) } else { unsafe { BlockRef::from_c_api(handle, self.context()).map(Some) } }
     }
 
     /// Returns a reference to the parent [`Operation`] of this [`Operation`] (i.e., the [`Operation`] that owns this
     /// operation), if one exists (i.e., if this is not a [`DetachedOperation`] or a reference to a detached
     /// operation).
-    fn parent_operation(&self) -> Option<OperationRef<'o, 'c, 't>> {
+    fn parent_operation(&self) -> Result<Option<OperationRef<'o, 'c, 't>>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe { OperationRef::from_c_api(mlirOperationGetParentOperation(self.to_c_api()), self.context()) }
+        let handle = unsafe { mlirOperationGetParentOperation(self.to_c_api()) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { OperationRef::from_c_api(handle, self.context()).map(Some) }
+        }
     }
 
     /// Returns `true` if this operation appears before `other` in the parent [`Block`] of this operation (assuming
@@ -754,7 +919,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
             if !handle.ptr.is_null() {
                 std::mem::forget(self);
             }
-            OperationRef::from_c_api(handle, context).unwrap()
+            OperationRef { handle, context, owner: PhantomData }
         }
     }
 
@@ -781,7 +946,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
             if !handle.ptr.is_null() {
                 std::mem::forget(self);
             }
-            OperationRef::from_c_api(handle, context).unwrap()
+            OperationRef { handle, context, owner: PhantomData }
         }
     }
 
@@ -805,8 +970,9 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
             unsafe {
                 let data = data as *mut (&mut F, &'c Context<'t>);
                 let (ref mut callback, context) = *data;
-                let operation = OperationRef::from_c_api(operation, context).unwrap();
-                (callback)(operation).to_c_api()
+                OperationRef::from_c_api(operation, context)
+                    .map(|operation| (callback)(operation).to_c_api())
+                    .unwrap_or(MlirWalkResult_MlirWalkResultInterrupt)
             }
         }
 
@@ -927,7 +1093,7 @@ pub trait DetachedOp<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// there is no guaranteed/safe way to ensure that the desired cast is valid. Therefore, attempting an invalid
     /// cast can result in undefined behavior and so this function needs to be used with care.
     unsafe fn cast<O: DetachedOp<'o, 'c, 't>>(self) -> Option<O> {
-        let operation = unsafe { O::from_c_api(self.to_c_api(), self.context()) };
+        let operation = unsafe { O::from_c_api(self.to_c_api(), self.context()).ok() };
         if operation.is_some() {
             std::mem::forget(self);
         }
@@ -940,7 +1106,7 @@ pub trait OpRef<'o, 'c: 'o, 't: 'c>: Copy + Clone + Operation<'o, 'c, 't> {
     /// Tries to cast this [`OpRef`] to an instance of `O` (e.g., an instance of [`OperationRef`]). If this
     /// is not an instance of the specified [`OpRef`] type, this function will return [`None`].
     unsafe fn cast<O: OpRef<'o, 'c, 't>>(&self) -> Option<O> {
-        unsafe { O::from_c_api(self.to_c_api(), self.context()) }
+        unsafe { O::from_c_api(self.to_c_api(), self.context()).ok() }
     }
 }
 
@@ -961,8 +1127,12 @@ pub struct DetachedOperation<'c, 't: 'c> {
 }
 
 impl<'o, 'c: 'o, 't: 'c> Operation<'o, 'c, 't> for DetachedOperation<'c, 't> {
-    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR operation handle"))
+        } else {
+            Ok(Self { handle, context })
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirOperation {
@@ -1043,23 +1213,30 @@ impl Drop for DetachedOperation<'_, '_> {
 }
 
 impl<'t> Context<'t> {
-    /// Parses a [`DetachedOperation`] from the provided string representation. Returns [`None`] if MLIR fails to parse
-    /// the provided string into an [`Operation`] (this function will also emit diagnostics if that happens). The
-    /// provided `filename` is used to create a [`FileLocationRef`](crate::FileLocationRef) that will be used as the
-    /// location of the resulting [`Operation`].
-    pub fn parse_operation<'o, 'c: 'o>(&'c self, source: &str, filename: &str) -> Option<DetachedOperation<'c, 't>> {
+    /// Parses a [`DetachedOperation`] from the provided string representation.
+    ///
+    /// Returns an [`Error`] if MLIR fails to parse the provided string into an [`Operation`] (this function will also
+    /// emit diagnostics if that happens). The provided `filename` is used to create a
+    /// [`FileLocationRef`](crate::FileLocationRef) that will be used as the location of the resulting [`Operation`].
+    pub fn parse_operation<'o, 'c: 'o>(
+        &'c self,
+        source: &str,
+        filename: &str,
+    ) -> Result<DetachedOperation<'c, 't>, Error> {
         unsafe {
-            DetachedOperation::from_c_api(
-                mlirOperationCreateParse(
-                    // The following context borrow ensures that access to the underlying MLIR data structures is done
-                    // safely from Rust. It is maybe more conservative than would be ideal, but that is due to the
-                    // limited exposure to MLIR internals that we have when working with the MLIR C API.
-                    *self.handle.borrow(),
-                    StringRef::from(source).to_c_api(),
-                    StringRef::from(filename).to_c_api(),
-                ),
-                self,
-            )
+            let handle = mlirOperationCreateParse(
+                // The following context borrow ensures that access to the underlying MLIR data structures is done
+                // safely from Rust. It is maybe more conservative than would be ideal, but that is due to the
+                // limited exposure to MLIR internals that we have when working with the MLIR C API.
+                *self.handle.borrow(),
+                StringRef::from(source).to_c_api(),
+                StringRef::from(filename).to_c_api(),
+            );
+            if handle.ptr.is_null() {
+                Err(Error::parsing_error(format!("failed to parse MLIR operation from `{filename}`")))
+            } else {
+                DetachedOperation::from_c_api(handle, self)
+            }
         }
     }
 }
@@ -1082,8 +1259,12 @@ pub struct OperationRef<'o, 'c: 'o, 't: 'c> {
 }
 
 impl<'r, 'o: 'r, 'c: 'o, 't: 'c> Operation<'r, 'c, 't> for OperationRef<'o, 'c, 't> {
-    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context, owner: PhantomData }) }
+    unsafe fn from_c_api(handle: MlirOperation, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR operation handle"))
+        } else {
+            Ok(Self { handle, context, owner: PhantomData })
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirOperation {
@@ -1138,12 +1319,6 @@ impl Display for OperationRef<'_, '_, '_> {
 impl Debug for OperationRef<'_, '_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "OperationRef[{self}]")
-    }
-}
-
-impl<'r, 'o: 'r, 'c: 'o, 't: 'c, O: DetachedOp<'r, 'c, 't>> From<&'r O> for OperationRef<'o, 'c, 't> {
-    fn from(value: &'r O) -> Self {
-        unsafe { Self::from_c_api(value.to_c_api(), value.context()).unwrap() }
     }
 }
 
@@ -1213,7 +1388,8 @@ mod tests {
 
     use crate::dialects::func;
     use crate::{
-        Block, Context, DetachedModuleOperation, DialectHandle, OperationBuilder, Region, Type, Value, ValueRef,
+        Block, Context, DetachedModuleOperation, DialectHandle, OperationBuilder, Region, Size, SymbolVisibility, Type,
+        Value, ValueRef,
     };
 
     use super::*;
@@ -1221,24 +1397,24 @@ mod tests {
     #[test]
     fn test_operation_construction() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
 
         // Test using a simple unregistered operation that has no type ID.
         let mut op = OperationBuilder::new("foo", location).build().unwrap();
-        assert_eq!(op, OperationRef::from(&op));
-        assert!(op.type_id().is_none());
-        assert_eq!(op.location(), location);
+        assert_eq!(op, op.as_ref());
+        assert!(op.type_id().unwrap().is_none());
+        assert_eq!(op.location().unwrap(), location);
         op.set_location(context.file_location("test.mlir", 4, 2));
-        assert_eq!(op.location(), context.file_location("test.mlir", 4, 2));
+        assert_eq!(op.location().unwrap(), context.file_location("test.mlir", 4, 2));
         assert_eq!(op.name(), context.identifier("foo"));
 
         // Check that registered operations have type IDs.
         let mut block = context.block_with_no_arguments();
-        block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-        let op = func::func("test_func", func::FuncAttributes::default(), block.into(), location);
-        assert!(op.type_id().is_some());
+        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+        let op = func::func("test_func", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
+        assert!(op.type_id().unwrap().is_some());
 
         // Test a C API-related edge case.
         let op = DetachedOperation { handle: MlirOperation { ptr: std::ptr::null_mut() }, context: &context };
@@ -1248,16 +1424,17 @@ mod tests {
     #[test]
     fn test_operation_inherent_attributes() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-        let mut op = func::func("test_func", func::FuncAttributes::default(), block.into(), location);
+        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+        let mut op =
+            func::func("test_func", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         assert!(op.inherent_attribute_count() > 0);
         assert!(op.has_inherent_attribute("sym_name"));
-        assert_eq!(op.inherent_attribute("sym_name"), Some(context.string_attribute("test_func").as_ref()));
+        assert_eq!(op.inherent_attribute("sym_name").unwrap(), Some(context.string_attribute("test_func").as_ref()));
         op.set_inherent_attribute("sym_name", context.string_attribute("modified"));
-        assert_eq!(op.inherent_attribute("sym_name"), Some(context.string_attribute("modified").as_ref()));
+        assert_eq!(op.inherent_attribute("sym_name").unwrap(), Some(context.string_attribute("modified").as_ref()));
     }
 
     #[test]
@@ -1275,7 +1452,7 @@ mod tests {
         op.set_discardable_attribute("custom", context.string_attribute("value"));
         assert_eq!(op.discardable_attribute_count(), 1);
         assert!(op.has_discardable_attribute("custom"));
-        assert_eq!(op.discardable_attribute("custom"), Some(context.string_attribute("value").as_ref()));
+        assert_eq!(op.discardable_attribute("custom").unwrap(), Some(context.string_attribute("value").as_ref()));
         let attributes = op.discardable_attributes().collect::<Vec<_>>();
         assert_eq!(attributes.len(), 1);
         assert_eq!(attributes[0].name(), context.identifier("custom"));
@@ -1303,15 +1480,197 @@ mod tests {
             .add_attribute("foo", context.string_attribute("bar"))
             .build()
             .unwrap();
-        assert!(op.attribute("foo").is_some());
-        assert_eq!(op.attribute("foo").map(|a| a.to_string()), Some("\"bar\"".into()));
+        assert!(op.attribute("foo").unwrap().is_some());
+        assert_eq!(op.attribute("foo").unwrap().map(|attribute| attribute.to_string()), Some("\"bar\"".into()));
         assert!(op.remove_attribute("foo"));
         assert!(!op.remove_attribute("foo"));
         op.set_attribute("foo", context.string_attribute("foo"));
-        assert_eq!(op.attribute("foo").map(|a| a.to_string()), Some("\"foo\"".into()));
+        assert_eq!(op.attribute("foo").unwrap().map(|attribute| attribute.to_string()), Some("\"foo\"".into()));
         let attribute = op.attributes().next().unwrap();
         assert_eq!(attribute.name(), context.identifier("foo"));
-        assert_eq!(attribute.attribute(), context.string_attribute("foo"));
+        assert_eq!(attribute.attribute().unwrap(), context.string_attribute("foo"));
+
+        let i32_type = context.signless_integer_type(32);
+        let i64_type = context.signless_integer_type(64);
+        let tensor_type = context.tensor_type(i32_type, &[Size::Static(2)], None, location).unwrap();
+        let float_tensor_type =
+            context.tensor_type(context.float32_type(), &[Size::Static(2)], None, location).unwrap();
+
+        let affine_map_attribute = context.affine_map_attribute(context.empty_affine_map());
+        op.set_attribute("affine_map", affine_map_attribute);
+        assert_eq!(op.affine_map_attribute("affine_map").unwrap(), affine_map_attribute);
+
+        let array_attribute =
+            context.array_attribute(&[context.integer_attribute(i32_type, 1), context.integer_attribute(i32_type, 2)]);
+        op.set_attribute("array", array_attribute);
+        assert_eq!(op.array_attribute("array").unwrap(), array_attribute);
+
+        let boolean_attribute = context.boolean_attribute(true);
+        op.set_attribute("boolean", boolean_attribute);
+        assert_eq!(op.boolean_attribute("boolean").unwrap(), boolean_attribute);
+
+        let dense_array_attribute = context.dense_i32_array_attribute(&[1, 2, 3]).unwrap();
+        op.set_attribute("dense_array", dense_array_attribute);
+        assert_eq!(
+            op.dense_array_attribute("dense_array").unwrap(),
+            dense_array_attribute.cast::<DenseArrayAttributeRef<'_, '_>>().unwrap()
+        );
+
+        let dense_boolean_array_attribute = context.dense_bool_array_attribute(&[true, false]).unwrap();
+        op.set_attribute("dense_boolean_array", dense_boolean_array_attribute);
+        assert_eq!(op.dense_boolean_array_attribute("dense_boolean_array").unwrap(), dense_boolean_array_attribute);
+
+        let dense_integer_8_array_attribute = context.dense_i8_array_attribute(&[1, 2, 3]).unwrap();
+        op.set_attribute("dense_integer_8_array", dense_integer_8_array_attribute);
+        assert_eq!(
+            op.dense_integer_8_array_attribute("dense_integer_8_array").unwrap(),
+            dense_integer_8_array_attribute
+        );
+
+        let dense_integer_16_array_attribute = context.dense_i16_array_attribute(&[1, 2, 3]).unwrap();
+        op.set_attribute("dense_integer_16_array", dense_integer_16_array_attribute);
+        assert_eq!(
+            op.dense_integer_16_array_attribute("dense_integer_16_array").unwrap(),
+            dense_integer_16_array_attribute
+        );
+
+        let dense_integer_32_array_attribute = context.dense_i32_array_attribute(&[1, 2, 3]).unwrap();
+        op.set_attribute("dense_integer_32_array", dense_integer_32_array_attribute);
+        assert_eq!(
+            op.dense_integer_32_array_attribute("dense_integer_32_array").unwrap(),
+            dense_integer_32_array_attribute
+        );
+
+        let dense_integer_64_array_attribute = context.dense_i64_array_attribute(&[1, 2, 3]).unwrap();
+        op.set_attribute("dense_integer_64_array", dense_integer_64_array_attribute);
+        assert_eq!(
+            op.dense_integer_64_array_attribute("dense_integer_64_array").unwrap(),
+            dense_integer_64_array_attribute
+        );
+
+        let dense_float_32_array_attribute = context.dense_f32_array_attribute(&[1.0, 2.0, 3.0]).unwrap();
+        op.set_attribute("dense_float_32_array", dense_float_32_array_attribute);
+        assert_eq!(op.dense_float_32_array_attribute("dense_float_32_array").unwrap(), dense_float_32_array_attribute);
+
+        let dense_float_64_array_attribute = context.dense_f64_array_attribute(&[1.0, 2.0, 3.0]).unwrap();
+        op.set_attribute("dense_float_64_array", dense_float_64_array_attribute);
+        assert_eq!(op.dense_float_64_array_attribute("dense_float_64_array").unwrap(), dense_float_64_array_attribute);
+
+        let dictionary_attribute = context.dictionary_attribute(&[
+            context.named_attribute(context.identifier("value"), context.integer_attribute(i32_type, 42))
+        ]);
+        op.set_attribute("dictionary", dictionary_attribute);
+        assert_eq!(op.dictionary_attribute("dictionary").unwrap(), dictionary_attribute);
+
+        let distinct_attribute = context.distinct_attribute(context.integer_attribute(i32_type, 42));
+        op.set_attribute("distinct", distinct_attribute);
+        assert_eq!(op.attribute("distinct").unwrap().unwrap(), distinct_attribute.as_ref());
+        // The MLIR C API does not expose a distinct-attribute predicate, so this accessor cannot downcast attributes
+        // recovered from an operation.
+        assert!(op.distinct_attribute("distinct").is_err());
+
+        let dense_integer_elements_attribute = context.dense_i32_elements_attribute(tensor_type, &[1, 2]).unwrap();
+        op.set_attribute("dense_integer_elements", dense_integer_elements_attribute);
+        assert_eq!(
+            op.elements_attribute("dense_integer_elements").unwrap(),
+            dense_integer_elements_attribute.cast::<ElementsAttributeRef<'_, '_>>().unwrap()
+        );
+        assert_eq!(
+            op.dense_elements_attribute("dense_integer_elements").unwrap(),
+            dense_integer_elements_attribute.cast::<DenseElementsAttributeRef<'_, '_>>().unwrap()
+        );
+        assert_eq!(
+            op.dense_integer_elements_attribute("dense_integer_elements").unwrap(),
+            dense_integer_elements_attribute
+        );
+
+        let dense_float_elements_attribute =
+            context.dense_f32_elements_attribute(float_tensor_type, &[1.0, 2.0]).unwrap();
+        op.set_attribute("dense_float_elements", dense_float_elements_attribute);
+        assert_eq!(op.dense_float_elements_attribute("dense_float_elements").unwrap(), dense_float_elements_attribute);
+
+        let dense_resource_elements_attribute = context
+            .dense_i32_resource_elements_attribute(
+                tensor_type,
+                StringRef::from("operation_attribute_resource"),
+                &[1, 2],
+            )
+            .unwrap();
+        op.set_attribute("dense_resource_elements", dense_resource_elements_attribute);
+        assert_eq!(
+            op.dense_resource_elements_attribute("dense_resource_elements").unwrap(),
+            dense_resource_elements_attribute
+        );
+
+        let sparse_indices_type =
+            context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
+        let sparse_indices = context.dense_i64_elements_attribute(sparse_indices_type, &[0, 0, 1, 1]).unwrap();
+        let sparse_values = context.dense_i32_elements_attribute(tensor_type, &[1, 2]).unwrap();
+        let sparse_elements_attribute =
+            context.sparse_elements_attribute(tensor_type, sparse_indices, sparse_values).unwrap();
+        op.set_attribute("sparse_elements", sparse_elements_attribute);
+        assert_eq!(op.sparse_elements_attribute("sparse_elements").unwrap(), sparse_elements_attribute);
+
+        let flat_symbol_ref_attribute = context.flat_symbol_ref_attribute("symbol");
+        op.set_attribute("flat_symbol_ref", flat_symbol_ref_attribute);
+        assert_eq!(op.flat_symbol_ref_attribute("flat_symbol_ref").unwrap(), flat_symbol_ref_attribute);
+
+        let nested_symbol_ref = context.flat_symbol_ref_attribute("nested");
+        let symbol_ref_attribute = context.symbol_ref_attribute("root".into(), &[nested_symbol_ref]);
+        op.set_attribute("symbol_ref", symbol_ref_attribute);
+        assert_eq!(op.symbol_ref_attribute("symbol_ref").unwrap(), symbol_ref_attribute);
+
+        let float_attribute = context.float_attribute(context.float64_type(), 1.5);
+        op.set_attribute("float", float_attribute);
+        assert_eq!(op.float_attribute("float").unwrap(), float_attribute);
+
+        let integer_attribute = context.integer_attribute(i32_type, 42);
+        op.set_attribute("integer", integer_attribute);
+        assert_eq!(op.integer_attribute("integer").unwrap(), integer_attribute);
+
+        let integer_set_attribute = context.integer_set_attribute(context.empty_integer_set(0, 1));
+        op.set_attribute("integer_set", integer_set_attribute);
+        assert_eq!(op.integer_set_attribute("integer_set").unwrap(), integer_set_attribute);
+
+        let location_attribute = context.location_attribute(location);
+        op.set_attribute("location", location_attribute);
+        assert_eq!(op.location_attribute("location").unwrap(), location_attribute);
+
+        let opaque_attribute = context.opaque_attribute("test_dialect", "opaque_data", context.index_type());
+        op.set_attribute("opaque", opaque_attribute);
+        assert_eq!(op.opaque_attribute("opaque").unwrap(), opaque_attribute);
+
+        let strided_layout_attribute = context.strided_layout_attribute(0, &[4, 1]);
+        op.set_attribute("strided_layout", strided_layout_attribute);
+        assert_eq!(op.strided_layout_attribute("strided_layout").unwrap(), strided_layout_attribute);
+
+        let string_attribute = context.string_attribute("value");
+        op.set_attribute("string", string_attribute);
+        assert_eq!(op.string_attribute("string").unwrap(), string_attribute);
+
+        let symbol_visibility_attribute = context.symbol_visibility_attribute(SymbolVisibility::Private);
+        op.set_attribute("symbol_visibility", symbol_visibility_attribute);
+        assert_eq!(op.symbol_visibility_attribute("symbol_visibility").unwrap(), symbol_visibility_attribute);
+
+        let type_attribute = context.type_attribute(context.index_type());
+        op.set_attribute("type", type_attribute);
+        assert_eq!(op.type_attribute("type").unwrap(), type_attribute);
+
+        let unit_attribute = context.unit_attribute();
+        op.set_attribute("unit", unit_attribute);
+        assert_eq!(op.unit_attribute("unit").unwrap(), unit_attribute);
+
+        op.set_attribute("segments", context.dense_i32_array_attribute(&[2, 3, 1]).unwrap());
+        assert_eq!(op.dense_integer_32_array_attribute_usize_value("segments", 0).unwrap(), 2);
+        assert_eq!(op.dense_integer_32_array_attribute_usize_value("segments", 1).unwrap(), 3);
+        assert_eq!(op.dense_integer_32_array_attribute_usize_value("segments", 2).unwrap(), 1);
+        assert_eq!(op.dense_integer_32_array_attribute_segment_range("segments", 0).unwrap(), 0..2);
+        assert_eq!(op.dense_integer_32_array_attribute_segment_range("segments", 1).unwrap(), 2..5);
+        assert_eq!(op.dense_integer_32_array_attribute_segment_range("segments", 2).unwrap(), 5..6);
+        assert!(op.dense_integer_32_array_attribute_usize_value("segments", 3).is_err());
+        assert!(op.dense_integer_32_array_attribute_segment_range("segments", 3).is_err());
+        assert!(op.boolean_attribute("missing").is_err());
+        assert!(op.string_attribute("boolean").is_err());
     }
 
     #[test]
@@ -1323,7 +1682,7 @@ mod tests {
 
         // Operation with no operands.
         let op = OperationBuilder::new("foo", location).build().unwrap();
-        assert_eq!(op.operands().count(), 0);
+        assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
 
         // Operation with three operands.
         let block = context.block(&[(index_type, location)]);
@@ -1334,39 +1693,45 @@ mod tests {
             .add_operand(argument_0)
             .build()
             .unwrap();
-        assert_eq!(op.operand(0).map(|operand| operand.value()), Some(argument_0));
-        assert_eq!(op.operand(1).map(|operand| operand.value()), Some(argument_0));
-        assert_eq!(op.operand(2).map(|operand| operand.value()), Some(argument_0));
-        assert_eq!(op.operand(0).map(|operand| operand.operand_index()), Some(0));
-        assert_eq!(op.operand(1).map(|operand| operand.operand_index()), Some(1));
-        assert_eq!(op.operand(2).map(|operand| operand.operand_index()), Some(2));
-        assert!(op.operand(3).is_none());
-        assert_eq!(op.operand_value(0), Some(argument_0));
-        assert_eq!(op.operand_value(1), Some(argument_0));
-        assert_eq!(op.operand_value(2), Some(argument_0));
-        assert!(op.operand_value(3).is_none());
-        assert_eq!(op.operand_values().skip(1).collect::<Vec<_>>(), vec![argument_0.clone(), argument_0]);
-        assert_eq!(op.operand_type(0), Some(index_type));
-        assert_eq!(op.operand_type(1), Some(index_type));
-        assert_eq!(op.operand_type(2), Some(index_type));
-        assert!(op.operand_type(3).is_none());
-        assert_eq!(op.operand_types().collect::<Vec<_>>(), vec![index_type, index_type, index_type]);
+        assert_eq!(op.operand(0).unwrap().value().unwrap(), argument_0);
+        assert_eq!(op.operand(1).unwrap().value().unwrap(), argument_0);
+        assert_eq!(op.operand(2).unwrap().value().unwrap(), argument_0);
+        assert_eq!(op.operand(0).unwrap().operand_index(), 0);
+        assert_eq!(op.operand(1).unwrap().operand_index(), 1);
+        assert_eq!(op.operand(2).unwrap().operand_index(), 2);
+        assert!(op.operand(3).is_err());
+        assert_eq!(op.operand_value(0).unwrap(), argument_0);
+        assert_eq!(op.operand_value(1).unwrap(), argument_0);
+        assert_eq!(op.operand_value(2).unwrap(), argument_0);
+        assert!(op.operand_value(3).is_err());
+        assert_eq!(
+            op.operand_values().collect::<Result<Vec<_>, _>>().unwrap().into_iter().skip(1).collect::<Vec<_>>(),
+            vec![argument_0.clone(), argument_0]
+        );
+        assert_eq!(op.operand_type(0).unwrap(), index_type);
+        assert_eq!(op.operand_type(1).unwrap(), index_type);
+        assert_eq!(op.operand_type(2).unwrap(), index_type);
+        assert!(op.operand_type(3).is_err());
+        assert_eq!(
+            op.operand_types().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![index_type, index_type, index_type]
+        );
 
         // Try replacing an operand of an operation.
         let i32_type = context.signless_integer_type(32).as_ref();
         let i64_type = context.signless_integer_type(64).as_ref();
         let mut block = context.block(&[(i32_type, location), (i64_type, location)]);
-        let mut op = block.append_operation(op);
+        let mut op = block.append_operation(op).unwrap();
         let argument_1 = block.argument(0).unwrap().as_ref();
         assert!(unsafe { op.replace_operand(0, argument_1) });
-        assert_eq!(op.operand(0).unwrap().value(), argument_1);
+        assert_eq!(op.operand(0).unwrap().value().unwrap(), argument_1);
         assert!(unsafe { !op.replace_operand(10, argument_0) });
 
         // Try replacing all operands of an operation.
         let argument_2 = block.argument(1).unwrap().as_ref();
         assert!(unsafe { op.replace_operands(&[argument_1, argument_2, argument_0]) });
-        assert_eq!(op.operand(0).map(|operand| operand.value()), Some(argument_1));
-        assert_eq!(op.operand(1).map(|operand| operand.value()), Some(argument_2));
+        assert_eq!(op.operand(0).unwrap().value().unwrap(), argument_1);
+        assert_eq!(op.operand(1).unwrap().value().unwrap(), argument_2);
         assert!(unsafe { !op.replace_operands(&[argument_2]) });
 
         // Try replacing all uses of one value inside an operation.
@@ -1377,9 +1742,9 @@ mod tests {
             .build()
             .unwrap();
         unsafe { op.replace_uses_of_with(argument_0, argument_2) };
-        assert_eq!(op.operand(0).map(|operand| operand.value()), Some(argument_2));
-        assert_eq!(op.operand(1).map(|operand| operand.value()), Some(argument_2));
-        assert_eq!(op.operand(2).map(|operand| operand.value()), Some(argument_2));
+        assert_eq!(op.operand(0).unwrap().value().unwrap(), argument_2);
+        assert_eq!(op.operand(1).unwrap().value().unwrap(), argument_2);
+        assert_eq!(op.operand(2).unwrap().value().unwrap(), argument_2);
     }
 
     #[test]
@@ -1392,19 +1757,22 @@ mod tests {
 
         // Operation with no results.
         let op = OperationBuilder::new("foo", location).build().unwrap();
-        assert_eq!(op.result(0), None);
+        assert!(op.result(0).is_err());
 
         // Operation with two results.
         let op = OperationBuilder::new("test.op", location).add_results(&[i32_type, i64_type]).build().unwrap();
         assert_eq!(op.result_count(), 2);
-        assert!(op.result(0).is_some());
-        assert!(op.result(1).is_some());
-        assert!(op.result(2).is_none());
+        assert!(op.result(0).is_ok());
+        assert!(op.result(1).is_ok());
+        assert!(op.result(2).is_err());
         assert_eq!(op.result_type(0).unwrap(), i32_type);
         assert_eq!(op.result_type(1).unwrap(), i64_type);
-        assert!(op.result_type(2).is_none());
-        assert_eq!(op.results().collect::<Vec<_>>().len(), 2);
-        assert_eq!(op.result_types().collect::<Vec<_>>(), vec![i32_type, i64_type]);
+        assert!(op.result_type(2).is_err());
+        assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(), 2);
+        assert_eq!(
+            op.result_types().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![i32_type, i64_type]
+        );
     }
 
     #[test]
@@ -1415,7 +1783,7 @@ mod tests {
 
         // Operation with no regions.
         let op = OperationBuilder::new("foo", location).build().unwrap();
-        assert_eq!(op.region(0), None);
+        assert!(op.region(0).is_err());
 
         // Operation with three regions.
         let region_0 = context.region();
@@ -1429,11 +1797,11 @@ mod tests {
             .unwrap();
         assert!(!op.is_empty());
         assert_eq!(op.region_count(), 3);
-        assert!(op.region(0).is_some());
-        assert!(op.region(1).is_some());
-        assert!(op.region(2).is_some());
-        assert!(op.region(3).is_none());
-        assert_eq!(op.regions().collect::<Vec<_>>().len(), 3);
+        assert!(op.region(0).is_ok());
+        assert!(op.region(1).is_ok());
+        assert!(op.region(2).is_ok());
+        assert!(op.region(3).is_err());
+        assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(), 3);
     }
 
     #[test]
@@ -1446,12 +1814,12 @@ mod tests {
         let block_2 = context.block_with_no_arguments();
         let op = OperationBuilder::new("test.op", location).add_successors(&[&block_0, &block_1]).build().unwrap();
         assert_eq!(op.successor_count(), 2);
-        assert!(op.successor(0).is_some());
-        assert!(op.successor(1).is_some());
-        assert!(op.successor(2).is_none());
-        assert_eq!(op.successors().collect::<Vec<_>>().len(), 2);
+        assert!(op.successor(0).is_ok());
+        assert!(op.successor(1).is_ok());
+        assert!(op.successor(2).is_err());
+        assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(), 2);
         let mut block_3 = context.block_with_no_arguments();
-        let mut op = block_3.append_operation(op);
+        let mut op = block_3.append_operation(op).unwrap();
         assert!(op.replace_successor(0, &block_2));
         assert!(!op.replace_successor(10, &block_2));
     }
@@ -1462,10 +1830,10 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let op = OperationBuilder::new("foo", location).build().unwrap();
-        assert!(op.parent_block().is_none());
+        assert!(op.parent_block().unwrap().is_none());
         let mut block = context.block_with_no_arguments();
-        let op = block.append_operation(op);
-        assert_eq!(op.parent_block(), Some(block.as_ref()));
+        let op = block.append_operation(op).unwrap();
+        assert_eq!(op.parent_block().unwrap(), Some(block.as_ref()));
     }
 
     #[test]
@@ -1478,25 +1846,30 @@ mod tests {
             .add_results(&[context.index_type()])
             .add_region({
                 let mut block = context.block_with_no_arguments();
-                block.append_operation(OperationBuilder::new("bar", location).build().unwrap());
-                block.into()
+                block.append_operation(OperationBuilder::new("bar", location).build().unwrap()).unwrap();
+                block.try_into().unwrap()
             })
             .build()
             .unwrap();
-        let op = block.append_operation(op);
-        assert_eq!(op.parent_operation(), None);
+        let op = block.append_operation(op).unwrap();
+        assert_eq!(op.parent_operation().unwrap(), None);
         assert_eq!(
-            &op.region(0)
+            op.region(0)
                 .unwrap()
                 .blocks()
+                .unwrap()
                 .next()
+                .unwrap()
                 .unwrap()
                 .operations()
+                .unwrap()
                 .next()
                 .unwrap()
+                .unwrap()
                 .parent_operation()
+                .unwrap()
                 .unwrap(),
-            &op
+            op
         );
     }
 
@@ -1506,9 +1879,9 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op_0 = block.append_operation(OperationBuilder::new("op_0", location).build().unwrap());
-        let op_1 = block.append_operation(OperationBuilder::new("op_1", location).build().unwrap());
-        let op_2 = block.append_operation(OperationBuilder::new("op_2", location).build().unwrap());
+        let op_0 = block.append_operation(OperationBuilder::new("op_0", location).build().unwrap()).unwrap();
+        let op_1 = block.append_operation(OperationBuilder::new("op_1", location).build().unwrap()).unwrap();
+        let op_2 = block.append_operation(OperationBuilder::new("op_2", location).build().unwrap()).unwrap();
         assert!(op_0.is_before_in_block(&op_1));
         assert!(op_0.is_before_in_block(&op_2));
         assert!(op_1.is_before_in_block(&op_2));
@@ -1523,17 +1896,25 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op_0 = block.append_operation(OperationBuilder::new("op_0", location).build().unwrap());
-        let op_1 = block.append_operation(OperationBuilder::new("op_1", location).build().unwrap());
-        let op_2 = block.append_operation(OperationBuilder::new("op_2", location).build().unwrap());
+        let op_0 = block.append_operation(OperationBuilder::new("op_0", location).build().unwrap()).unwrap();
+        let op_1 = block.append_operation(OperationBuilder::new("op_1", location).build().unwrap()).unwrap();
+        let op_2 = block.append_operation(OperationBuilder::new("op_2", location).build().unwrap()).unwrap();
         unsafe { op_1.move_after(&op_2) };
         assert_eq!(
-            block.operations().map(|op| op.name().as_str().unwrap().to_string()).collect::<Vec<_>>(),
+            block
+                .operations()
+                .unwrap()
+                .map(|op| op.unwrap().name().as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
             vec!["op_0", "op_2", "op_1"],
         );
         unsafe { op_2.move_before(&op_0) };
         assert_eq!(
-            block.operations().map(|op| op.name().as_str().unwrap().to_string()).collect::<Vec<_>>(),
+            block
+                .operations()
+                .unwrap()
+                .map(|op| op.unwrap().name().as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
             vec!["op_2", "op_0", "op_1"],
         );
     }
@@ -1544,18 +1925,20 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op = block.append_operation(
-            OperationBuilder::new("parent", location)
-                .add_results(&[context.index_type()])
-                .add_region({
-                    let mut block = context.block_with_no_arguments();
-                    block.append_operation(OperationBuilder::new("child_0", location).build().unwrap());
-                    block.append_operation(OperationBuilder::new("child_1", location).build().unwrap());
-                    block.into()
-                })
-                .build()
-                .unwrap(),
-        );
+        let op = block
+            .append_operation(
+                OperationBuilder::new("parent", location)
+                    .add_results(&[context.index_type()])
+                    .add_region({
+                        let mut block = context.block_with_no_arguments();
+                        block.append_operation(OperationBuilder::new("child_0", location).build().unwrap()).unwrap();
+                        block.append_operation(OperationBuilder::new("child_1", location).build().unwrap()).unwrap();
+                        block.try_into().unwrap()
+                    })
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
 
         // Test with [`WalkResult::Advance`].
         let mut result: Vec<String> = Vec::new();
@@ -1592,25 +1975,31 @@ mod tests {
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        let op = block.append_operation(
-            OperationBuilder::new("grandparent", location)
-                .add_region({
-                    let mut block = context.block_with_no_arguments();
-                    block.append_operation(
-                        OperationBuilder::new("parent", location)
-                            .add_region({
-                                let mut block = context.block_with_no_arguments();
-                                block.append_operation(OperationBuilder::new("child", location).build().unwrap());
-                                block.into()
-                            })
-                            .build()
-                            .unwrap(),
-                    );
-                    block.into()
-                })
-                .build()
-                .unwrap(),
-        );
+        let op = block
+            .append_operation(
+                OperationBuilder::new("grandparent", location)
+                    .add_region({
+                        let mut block = context.block_with_no_arguments();
+                        block
+                            .append_operation(
+                                OperationBuilder::new("parent", location)
+                                    .add_region({
+                                        let mut block = context.block_with_no_arguments();
+                                        block
+                                            .append_operation(OperationBuilder::new("child", location).build().unwrap())
+                                            .unwrap();
+                                        block.try_into().unwrap()
+                                    })
+                                    .build()
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                        block.try_into().unwrap()
+                    })
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
 
         // Test with [`WalkResult::Advance`].
         let mut result: Vec<String> = Vec::new();
@@ -1645,11 +2034,11 @@ mod tests {
     #[test]
     fn test_operation_bytecode() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-        let op = func::func("test_func", func::FuncAttributes::default(), block.into(), location);
+        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+        let op = func::func("test_func", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         let bytecode = op.bytecode();
         assert!(bytecode.len() > 0);
         let bytecode = op.bytecode_with_configuration(&BytecodeWriterConfiguration { version: Some(0) });
@@ -1673,8 +2062,9 @@ mod tests {
                 use_generic_op_form: true,
                 use_local_scope: true,
                 ..Default::default()
-            }),
-            Ok("\"foo\"() : () -> () [unknown]".to_string())
+            })
+            .unwrap(),
+            "\"foo\"() : () -> () [unknown]"
         );
     }
 
@@ -1685,21 +2075,21 @@ mod tests {
         let location = context.unknown_location();
         let op = OperationBuilder::new("test.op", location).build().unwrap();
         assert_eq!(
-            op.to_string_with_state(AsmState::for_operation(&op, OperationPrintingFlags::default())),
-            Ok("\"test.op\"() : () -> ()\n".to_string())
+            op.to_string_with_state(AsmState::for_operation(&op, OperationPrintingFlags::default())).unwrap(),
+            "\"test.op\"() : () -> ()\n"
         );
     }
 
     #[test]
     fn test_operation_verify() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let location = context.unknown_location();
 
         // Valid operation.
         let mut block = context.block_with_no_arguments();
-        block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-        let op = func::func("valid", func::FuncAttributes::default(), block.into(), location);
+        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+        let op = func::func("valid", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         assert!(op.verify());
 
         // Invalid operation.
@@ -1738,7 +2128,7 @@ mod tests {
 
         // Cloned operations should have the same name, attributes, etc.
         assert_eq!(op_0.name(), op_1.name());
-        assert_eq!(op_0.attribute("key"), op_1.attribute("key"));
+        assert_eq!(op_0.attribute("key").unwrap().unwrap(), op_1.attribute("key").unwrap().unwrap());
     }
 
     #[test]
@@ -1755,16 +2145,16 @@ mod tests {
 
         // Test hashing of detached operations.
         let mut map = HashMap::new();
-        map.insert(&op_0, "op_0");
-        map.insert(&op_1, "op_1");
+        assert_eq!(map.insert(&op_0, "op_0"), None);
+        assert_eq!(map.insert(&op_1, "op_1"), None);
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&op_0), Some(&"op_0"));
         assert_eq!(map.get(&op_1), Some(&"op_1"));
 
         // Test hashing of operation references.
         let mut map = HashMap::new();
-        map.insert(&op_0_ref, "op_0");
-        map.insert(&op_1_ref, "op_1");
+        assert_eq!(map.insert(&op_0_ref, "op_0"), None);
+        assert_eq!(map.insert(&op_1_ref, "op_1"), None);
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&op_0_ref), Some(&"op_0"));
         assert_eq!(map.get(&op_1_ref), Some(&"op_1"));
@@ -1785,11 +2175,11 @@ mod tests {
     #[test]
     fn test_operation_casting() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let location = context.unknown_location();
         let mut block = context.block_with_no_arguments();
-        block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-        let op = func::func("test_func", func::FuncAttributes::default(), block.into(), location);
+        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+        let op = func::func("test_func", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         let op = unsafe { op.cast::<DetachedOperation>() };
         assert!(op.is_some());
         let op = op.unwrap();
@@ -1801,17 +2191,17 @@ mod tests {
     #[test]
     fn test_operation_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
 
         // Parse a good operation.
         let op = context.parse_operation("func.func @test() {\n  func.return\n}", "test.mlir");
-        assert!(op.is_some());
+        assert!(op.is_ok());
         let op = op.unwrap();
         assert!(op.verify());
         assert_eq!(op.name().as_str(), Ok("func.func"));
 
         // Trying parsing a bad operation.
         let op = context.parse_operation("invalid syntax", "invalid.mlir");
-        assert!(op.is_none());
+        assert!(op.is_err());
     }
 }

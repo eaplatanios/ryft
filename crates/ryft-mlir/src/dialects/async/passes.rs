@@ -47,11 +47,11 @@ mod tests {
     #[test]
     fn test_create_async_passes() {
         // Verify that pass creation does not crash for the various `async` dialect passes.
-        let _ = create_async_func_to_async_runtime_pass();
-        let _ = create_async_parallel_for_pass();
-        let _ = create_async_runtime_policy_based_ref_counting_pass();
-        let _ = create_async_runtime_ref_counting_pass();
-        let _ = create_async_runtime_ref_counting_opt_pass();
-        let _ = create_async_to_async_runtime_pass();
+        let _ = create_async_func_to_async_runtime_pass().unwrap();
+        let _ = create_async_parallel_for_pass().unwrap();
+        let _ = create_async_runtime_policy_based_ref_counting_pass().unwrap();
+        let _ = create_async_runtime_ref_counting_pass().unwrap();
+        let _ = create_async_runtime_ref_counting_opt_pass().unwrap();
+        let _ = create_async_to_async_runtime_pass().unwrap();
     }
 }

@@ -1,6 +1,5 @@
 use crate::{
-    Attribute, DetachedOp, DialectHandle, IntegerAttributeRef, Location, Operation, OperationBuilder, Type, Value,
-    mlir_op, mlir_op_trait,
+    DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Type, Value, mlir_op, mlir_op_trait,
 };
 
 /// StableHLO [`Operation`] that performs a bitcast conversion on a tensor. The operation reinterprets the bit
@@ -56,20 +55,21 @@ mlir_op_trait!(BitcastConvert, ZeroSuccessors);
 /// Constructs a new detached/owned [`BitcastConvertOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`BitcastConvertOperation`] for more information on the operation semantics and constraints
 /// on the output type.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn bitcast_convert<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     input: V,
     output_type: T,
     location: L,
-) -> DetachedBitcastConvertOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedBitcastConvertOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.bitcast_convert", location)
         .add_operand(input)
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::bitcast_convert`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::bitcast_convert`"))
+        })
 }
 
 /// StableHLO [`Operation`] that performs element-wise type conversion on a tensor. The operation transforms values from
@@ -118,20 +118,21 @@ mlir_op_trait!(Convert, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ConvertOperation`] at the specified [`Location`]. Refer to the documentation of
 /// [`ConvertOperation`] for more information on the operation semantics and constraints on the output type.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn convert<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     input: V,
     output_type: T,
     location: L,
-) -> DetachedConvertOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedConvertOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.convert", location)
         .add_operand(input)
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::convert`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::convert`"))
+        })
 }
 
 /// StableHLO [`Operation`] that converts a quantized tensor to a floating-point tensor.
@@ -179,20 +180,21 @@ mlir_op_trait!(UniformDequantize, ZeroSuccessors);
 /// Constructs a new detached/owned [`UniformDequantizeOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`UniformDequantizeOperation`] for more information on the operation semantics and constraints
 /// on the output type.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn uniform_dequantize<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     input: V,
     output_type: T,
     location: L,
-) -> DetachedUniformDequantizeOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedUniformDequantizeOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.uniform_dequantize", location)
         .add_operand(input)
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::uniform_dequantize`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::uniform_dequantize`"))
+        })
 }
 
 /// StableHLO [`Operation`] that converts a floating-point tensor to a quantized tensor.
@@ -240,26 +242,27 @@ mlir_op_trait!(UniformQuantize, ZeroSuccessors);
 /// Constructs a new detached/owned [`UniformQuantizeOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`UniformQuantizeOperation`] for more information on the operation semantics and constraints
 /// on the output type.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn uniform_quantize<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     input: V,
     output_type: T,
     location: L,
-) -> DetachedUniformQuantizeOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedUniformQuantizeOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.uniform_quantize", location)
         .add_operand(input)
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::uniform_quantize`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::uniform_quantize`"))
+        })
 }
 
-/// Name of the [`Attribute`] that is used to store [`ReducePrecisionOperation::exponent_bits`].
+/// Name of the [`Attribute`](crate::Attribute) that is used to store [`ReducePrecisionOperation::exponent_bits`].
 pub const REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE: &str = "exponent_bits";
 
-/// Name of the [`Attribute`] that is used to store [`ReducePrecisionOperation::mantissa_bits`].
+/// Name of the [`Attribute`](crate::Attribute) that is used to store [`ReducePrecisionOperation::mantissa_bits`].
 pub const REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE: &str = "mantissa_bits";
 
 /// StableHLO [`Operation`] that performs element-wise reduction of floating-point precision.
@@ -303,27 +306,25 @@ pub const REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE: &str = "mantissa_bits";
 /// for more information.
 pub trait ReducePrecisionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the number of exponent bits in the target precision of this [`ReducePrecisionOperation`].
-    fn exponent_bits(&self) -> u32 {
-        self.attribute(REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as u32)
-            .unwrap_or_else(|| {
-                panic!(
+    fn exponent_bits(&self) -> Result<u32, Error> {
+        u32::try_from(self.integer_attribute(REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE)?.signless_value()).map_err(
+            |_| {
+                Error::invalid_argument(format!(
                     "invalid '{REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`"
-                )
-            })
+                ))
+            },
+        )
     }
 
     /// Returns the number of mantissa bits in the target precision of this [`ReducePrecisionOperation`].
-    fn mantissa_bits(&self) -> u32 {
-        self.attribute(REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as u32)
-            .unwrap_or_else(|| {
-                panic!(
+    fn mantissa_bits(&self) -> Result<u32, Error> {
+        u32::try_from(self.integer_attribute(REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE)?.signless_value()).map_err(
+            |_| {
+                Error::invalid_argument(format!(
                     "invalid '{REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`"
-                )
-            })
+                ))
+            },
+        )
     }
 }
 
@@ -335,16 +336,14 @@ mlir_op_trait!(ReducePrecision, ZeroSuccessors);
 /// Constructs a new detached/owned [`ReducePrecisionOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`DetachedReducePrecisionOperation`] for more information on the operation semantics and constraints
 /// on the output type.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn reduce_precision<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     exponent_bits: u32,
     mantissa_bits: u32,
     location: L,
-) -> DetachedReducePrecisionOperation<'c, 't> {
+) -> Result<DetachedReducePrecisionOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.reduce_precision", location)
         .add_operand(input)
         .add_attribute(
@@ -357,8 +356,11 @@ pub fn reduce_precision<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::reduce_precision`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::reduce_precision`"))
+        })
 }
 
 #[cfg(test)]
@@ -377,33 +379,43 @@ mod tests {
     fn test_bitcast_convert() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let i8_type = context.signless_integer_type(8);
         let input_tensor_type = context.tensor_type(f64_type, &[Size::Static(8)], None, location).unwrap();
         let output_tensor_type =
             context.tensor_type(i8_type, &[Size::Static(8), Size::Static(8)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_tensor_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let bitcast_convert_op = bitcast_convert(input_value, output_tensor_type, location);
-            assert_eq!(bitcast_convert_op.operands().count(), 1);
-            assert_eq!(bitcast_convert_op.results().count(), 1);
-            assert_eq!(bitcast_convert_op.result(0).unwrap().r#type(), output_tensor_type);
-            let bitcast_convert_block = block.append_operation(bitcast_convert_op);
-            block.append_operation(func::r#return(&[bitcast_convert_block.result(0).unwrap()], location));
-            func::func(
-                "bitcast_convert_test",
-                func::FuncAttributes {
-                    arguments: vec![input_tensor_type.into()],
-                    results: vec![output_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_tensor_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let bitcast_convert_op = bitcast_convert(input_value, output_tensor_type, location).unwrap();
+                assert_eq!(
+                    bitcast_convert_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    1
+                );
+                assert_eq!(bitcast_convert_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(bitcast_convert_op.result(0).unwrap().r#type().unwrap(), output_tensor_type);
+                let bitcast_convert_block = block.append_operation(bitcast_convert_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[bitcast_convert_block.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "bitcast_convert_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_tensor_type.into()],
+                        results: vec![output_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -421,33 +433,40 @@ mod tests {
     fn test_convert() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let f64_type = context.float64_type();
         let complex_type = context.complex_type(f64_type);
         let input_tensor_type = context.tensor_type(i32_type, &[Size::Static(3)], None, location).unwrap();
         let output_tensor_type = context.tensor_type(complex_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_tensor_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let convert_op = convert(input_value, output_tensor_type, location);
-            assert_eq!(convert_op.operands().count(), 1);
-            assert_eq!(convert_op.results().count(), 1);
-            assert_eq!(convert_op.result(0).unwrap().r#type(), output_tensor_type);
-            let convert_block = block.append_operation(convert_op);
-            block.append_operation(func::r#return(&[convert_block.result(0).unwrap()], location));
-            func::func(
-                "convert_test",
-                func::FuncAttributes {
-                    arguments: vec![input_tensor_type.into()],
-                    results: vec![output_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_tensor_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let convert_op = convert(input_value, output_tensor_type, location).unwrap();
+                assert_eq!(convert_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(convert_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(convert_op.result(0).unwrap().r#type().unwrap(), output_tensor_type);
+                let convert_block = block.append_operation(convert_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[convert_block.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "convert_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_tensor_type.into()],
+                        results: vec![output_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -464,36 +483,47 @@ mod tests {
     #[test]
     fn test_uniform_dequantize() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::tensor());
-        context.load_dialect(DialectHandle::quant());
+        context.load_dialect(DialectHandle::tensor().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::quant().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
-        let input_quantized_type = context
-            .parse_type("tensor<3x!quant.uniform<i8:f32, 0.5:5>>")
-            .expect("failed to parse quantized type");
+        let input_quantized_type = context.parse_type("tensor<3x!quant.uniform<i8:f32, 0.5:5>>").unwrap();
         let output_tensor_type = context.tensor_type(f32_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_quantized_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let uniform_dequantize_op = uniform_dequantize(input_value, output_tensor_type, location);
-            assert_eq!(uniform_dequantize_op.operands().count(), 1);
-            assert_eq!(uniform_dequantize_op.results().count(), 1);
-            assert_eq!(uniform_dequantize_op.result(0).unwrap().r#type(), output_tensor_type,);
-            let uniform_dequantize_block = block.append_operation(uniform_dequantize_op);
-            block.append_operation(func::r#return(&[uniform_dequantize_block.result(0).unwrap()], location));
-            func::func(
-                "uniform_dequantize_test",
-                func::FuncAttributes {
-                    arguments: vec![input_quantized_type.into()],
-                    results: vec![output_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_quantized_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let uniform_dequantize_op = uniform_dequantize(input_value, output_tensor_type, location).unwrap();
+                assert_eq!(
+                    uniform_dequantize_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    1
+                );
+                assert_eq!(
+                    uniform_dequantize_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    1
+                );
+                assert_eq!(uniform_dequantize_op.result(0).unwrap().r#type().unwrap(), output_tensor_type,);
+                let uniform_dequantize_block = block.append_operation(uniform_dequantize_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[uniform_dequantize_block.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "uniform_dequantize_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_quantized_type.into()],
+                        results: vec![output_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -513,36 +543,47 @@ mod tests {
     #[test]
     fn test_uniform_quantize() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::tensor());
-        context.load_dialect(DialectHandle::quant());
+        context.load_dialect(DialectHandle::tensor().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::quant().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let input_tensor_type = context.tensor_type(f32_type, &[Size::Static(3)], None, location).unwrap();
-        let output_quantized_type = context
-            .parse_type("tensor<3x!quant.uniform<i8:f32, 0.5:5>>")
-            .expect("failed to parse quantized type");
-        module.body().append_operation({
-            let mut block = context.block(&[(input_tensor_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let uniform_quantize_op = uniform_quantize(input_value, output_quantized_type, location);
-            assert_eq!(uniform_quantize_op.operands().count(), 1);
-            assert_eq!(uniform_quantize_op.results().count(), 1);
-            assert_eq!(uniform_quantize_op.result(0).unwrap().r#type(), output_quantized_type);
-            let uniform_quantize_block = block.append_operation(uniform_quantize_op);
-            block.append_operation(func::r#return(&[uniform_quantize_block.result(0).unwrap()], location));
-            func::func(
-                "uniform_quantize_test",
-                func::FuncAttributes {
-                    arguments: vec![input_tensor_type.into()],
-                    results: vec![output_quantized_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let output_quantized_type = context.parse_type("tensor<3x!quant.uniform<i8:f32, 0.5:5>>").unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_tensor_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let uniform_quantize_op = uniform_quantize(input_value, output_quantized_type, location).unwrap();
+                assert_eq!(
+                    uniform_quantize_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    1
+                );
+                assert_eq!(
+                    uniform_quantize_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    1
+                );
+                assert_eq!(uniform_quantize_op.result(0).unwrap().r#type().unwrap(), output_quantized_type);
+                let uniform_quantize_block = block.append_operation(uniform_quantize_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[uniform_quantize_block.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "uniform_quantize_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_tensor_type.into()],
+                        results: vec![output_quantized_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -563,32 +604,45 @@ mod tests {
     fn test_reduce_precision() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let input_tensor_type = context.tensor_type(f64_type, &[Size::Static(6)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_tensor_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let reduce_precision_op = reduce_precision(input_value, 5, 10, location);
-            assert_eq!(reduce_precision_op.operands().count(), 1);
-            assert_eq!(reduce_precision_op.results().count(), 1);
-            assert_eq!(reduce_precision_op.exponent_bits(), 5);
-            assert_eq!(reduce_precision_op.mantissa_bits(), 10);
-            assert_eq!(reduce_precision_op.result(0).unwrap().r#type(), input_tensor_type);
-            let reduce_precision_block = block.append_operation(reduce_precision_op);
-            block.append_operation(func::r#return(&[reduce_precision_block.result(0).unwrap()], location));
-            func::func(
-                "reduce_precision_test",
-                func::FuncAttributes {
-                    arguments: vec![input_tensor_type.into()],
-                    results: vec![input_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_tensor_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let reduce_precision_op = reduce_precision(input_value, 5, 10, location).unwrap();
+                assert_eq!(
+                    reduce_precision_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    1
+                );
+                assert_eq!(
+                    reduce_precision_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    1
+                );
+                assert_eq!(reduce_precision_op.exponent_bits().unwrap(), 5);
+                assert_eq!(reduce_precision_op.mantissa_bits().unwrap(), 10);
+                assert_eq!(reduce_precision_op.exponent_bits().unwrap(), 5);
+                let reduce_precision_block = block.append_operation(reduce_precision_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[reduce_precision_block.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "reduce_precision_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_tensor_type.into()],
+                        results: vec![input_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

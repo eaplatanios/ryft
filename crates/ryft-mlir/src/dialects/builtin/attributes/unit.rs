@@ -1,6 +1,6 @@
 use ryft_xla_sys::bindings::{MlirAttribute, mlirUnitAttrGet, mlirUnitAttrGetTypeID};
 
-use crate::{Attribute, Context, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that represents a value of `unit` type. The unit type allows only one value forming
 /// a singleton set. This attribute value is used to represent attributes that only have meaning from their existence.
@@ -35,8 +35,8 @@ pub struct UnitAttributeRef<'c, 't> {
 
 impl<'c, 't> UnitAttributeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`UnitAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirUnitAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirUnitAttrGetTypeID()) }
     }
 }
 
@@ -50,7 +50,8 @@ impl<'t> Context<'t> {
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
-        unsafe { UnitAttributeRef::from_c_api(mlirUnitAttrGet(*self.handle.borrow()), self).unwrap() }
+        let handle = unsafe { mlirUnitAttrGet(*self.handle.borrow()) };
+        UnitAttributeRef { handle, context: self }
     }
 }
 
@@ -65,11 +66,11 @@ mod tests {
     #[test]
     fn test_unit_attribute_type_id() {
         let context = Context::new();
-        let unit_attribute_id = UnitAttributeRef::type_id();
+        let unit_attribute_id = UnitAttributeRef::type_id().unwrap();
         let unit_attribute_1 = context.unit_attribute();
         let unit_attribute_2 = context.unit_attribute();
-        assert_eq!(unit_attribute_1.type_id(), unit_attribute_2.type_id());
-        assert_eq!(unit_attribute_id, unit_attribute_1.type_id());
+        assert_eq!(unit_attribute_1.type_id().unwrap(), unit_attribute_2.type_id().unwrap());
+        assert_eq!(unit_attribute_id, unit_attribute_1.type_id().unwrap());
     }
 
     #[test]

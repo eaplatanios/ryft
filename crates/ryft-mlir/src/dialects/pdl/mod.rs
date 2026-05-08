@@ -4,10 +4,9 @@
 //! matching can be more easily verified for correctness, targeted by frontends, and optimized.
 //!
 //! Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/PDLOps/) for more information.
-
 use ryft_xla_sys::bindings::mlirGetDialectHandle__pdl__;
 
-use crate::DialectHandle;
+use crate::{DialectHandle, Error};
 
 pub mod operations;
 pub mod types;
@@ -17,8 +16,8 @@ pub use types::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `pdl` [`Dialect`](crate::Dialect).
-    pub fn pdl() -> Self {
-        unsafe { Self::from_c_api(mlirGetDialectHandle__pdl__()).unwrap() }
+    pub fn pdl() -> Result<Self, Error> {
+        unsafe { Self::from_c_api(mlirGetDialectHandle__pdl__()) }
     }
 }
 
@@ -30,7 +29,7 @@ mod tests {
 
     #[test]
     fn test_pdl_dialect() {
-        let handle = DialectHandle::pdl();
+        let handle = DialectHandle::pdl().unwrap();
         assert_eq!(handle.namespace().unwrap(), "pdl");
 
         // Check that registration works (both in the context and in a registry).
@@ -41,12 +40,11 @@ mod tests {
 
         // Check that loading works.
         let context = Context::new();
-        let dialect_1 = context.load_dialect(handle);
-        assert!(dialect_1.is_some());
-        assert_eq!(dialect_1.unwrap().namespace().unwrap(), "pdl");
+        let dialect_1 = context.load_dialect(handle).unwrap();
+        assert_eq!(dialect_1.namespace().unwrap(), "pdl");
 
         // Check that comparison works.
-        let dialect_2 = context.load_dialect(DialectHandle::pdl());
+        let dialect_2 = context.load_dialect(DialectHandle::pdl().unwrap()).unwrap();
         assert_eq!(dialect_1, dialect_2);
     }
 }

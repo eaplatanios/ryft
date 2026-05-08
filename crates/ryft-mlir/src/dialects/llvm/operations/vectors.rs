@@ -1,5 +1,6 @@
 use crate::{
-    AttributeRef, DetachedOp, DialectHandle, Location, Operation, OperationBuilder, TypeRef, Value, ValueRef, mlir_op,
+    AttributeRef, DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, TypeRef, Value, ValueRef,
+    mlir_op,
 };
 
 /// Canonical MLIR operation name for [`ExtractElementOperation`].
@@ -13,18 +14,18 @@ pub trait ExtractElementOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `vector` operand.
-    fn vector(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn vector(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `position` operand.
-    fn position(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn position(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns this operation's first result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -36,17 +37,18 @@ pub fn extract_element<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>,
     position: V2,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedExtractElementOperation<'c, 't> {
+) -> Result<DetachedExtractElementOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(EXTRACT_ELEMENT_OPERATION_NAME, location);
     builder = builder.add_operand(vector);
     builder = builder.add_operand(position);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::extract_element`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::extract_element`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`InsertElementOperation`].
@@ -60,23 +62,23 @@ pub trait InsertElementOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `vector` operand.
-    fn vector(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn vector(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `value` operand.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `position` operand.
-    fn position(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn position(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns this operation's first result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -96,18 +98,19 @@ pub fn insert_element<
     position: V3,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedInsertElementOperation<'c, 't> {
+) -> Result<DetachedInsertElementOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(INSERT_ELEMENT_OPERATION_NAME, location);
     builder = builder.add_operand(vector);
     builder = builder.add_operand(value);
     builder = builder.add_operand(position);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::insert_element`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::insert_element`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`ShuffleVectorOperation`].
@@ -121,23 +124,29 @@ pub trait ShuffleVectorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `first_vector` operand.
-    fn first_vector(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn first_vector(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `second_vector` operand.
-    fn second_vector(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn second_vector(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `mask` attribute.
-    fn mask(&self) -> AttributeRef<'c, 't> {
-        self.attribute("mask").unwrap()
+    fn mask(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("mask")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "mask",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's first result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -150,18 +159,19 @@ pub fn shuffle_vector<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>, 
     result_type: TypeRef<'c, 't>,
     mask: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedShuffleVectorOperation<'c, 't> {
+) -> Result<DetachedShuffleVectorOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SHUFFLE_VECTOR_OPERATION_NAME, location);
     builder = builder.add_operand(first_vector);
     builder = builder.add_operand(second_vector);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("mask", mask);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::shuffle_vector`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::shuffle_vector`"))
+    })
 }
 
 #[cfg(test)]
@@ -178,31 +188,41 @@ mod tests {
     fn test_extract_element() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let vector_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_type, location), (i32_type.as_ref(), location)]);
-            let op =
-                extract_element(block.argument(0).unwrap(), block.argument(1).unwrap(), i32_type.as_ref(), location);
-            assert_eq!(op.operation_name(), "llvm.extractelement");
-            assert_eq!(op.vector(), block.argument(0).unwrap());
-            assert_eq!(op.position(), block.argument(1).unwrap());
-            assert_eq!(op.output_type(), i32_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_extractelement_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_type, location), (i32_type.as_ref(), location)]);
+                let op = extract_element(
+                    block.argument(0).unwrap(),
+                    block.argument(1).unwrap(),
+                    i32_type.as_ref(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.extractelement");
+                assert_eq!(op.vector().unwrap(), block.argument(0).unwrap());
+                assert_eq!(op.position().unwrap(), block.argument(1).unwrap());
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_extractelement_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -220,38 +240,47 @@ mod tests {
     fn test_insert_element() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let vector_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(vector_type, location), (i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let op = insert_element(
-                block.argument(0).unwrap(),
-                block.argument(1).unwrap(),
-                block.argument(2).unwrap(),
-                vector_type,
-                location,
-            );
-            assert_eq!(op.operation_name(), "llvm.insertelement");
-            assert_eq!(op.vector(), block.argument(0).unwrap());
-            assert_eq!(op.value(), block.argument(1).unwrap());
-            assert_eq!(op.position(), block.argument(2).unwrap());
-            assert_eq!(op.output_type(), vector_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_insert_element_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_type.into(), i32_type.into(), i32_type.into()],
-                    results: vec![vector_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (vector_type, location),
+                    (i32_type.as_ref(), location),
+                    (i32_type.as_ref(), location),
+                ]);
+                let op = insert_element(
+                    block.argument(0).unwrap(),
+                    block.argument(1).unwrap(),
+                    block.argument(2).unwrap(),
+                    vector_type,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.insertelement");
+                assert_eq!(op.vector().unwrap(), block.argument(0).unwrap());
+                assert_eq!(op.value().unwrap(), block.argument(1).unwrap());
+                assert_eq!(op.position().unwrap(), block.argument(2).unwrap());
+                assert_eq!(op.output_type().unwrap(), vector_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_insert_element_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_type.into(), i32_type.into(), i32_type.into()],
+                        results: vec![vector_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -269,37 +298,43 @@ mod tests {
     fn test_shuffle_vector() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let vector_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_type, location), (vector_type, location)]);
-            let mask = context.dense_i32_array_attribute(&[0, 1, 4, 5]).unwrap();
-            let op = shuffle_vector(
-                block.argument(0).unwrap(),
-                block.argument(1).unwrap(),
-                vector_type,
-                mask.as_ref(),
-                location,
-            );
-            assert_eq!(op.operation_name(), "llvm.shufflevector");
-            assert_eq!(op.first_vector(), block.argument(0).unwrap());
-            assert_eq!(op.second_vector(), block.argument(1).unwrap());
-            assert_eq!(op.mask(), mask);
-            assert_eq!(op.output_type(), vector_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_shufflevector_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_type.into(), vector_type.into()],
-                    results: vec![vector_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_type, location), (vector_type, location)]);
+                let mask = context.dense_i32_array_attribute(&[0, 1, 4, 5]).unwrap();
+                let op = shuffle_vector(
+                    block.argument(0).unwrap(),
+                    block.argument(1).unwrap(),
+                    vector_type,
+                    mask.as_ref(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.shufflevector");
+                assert_eq!(op.first_vector().unwrap(), block.argument(0).unwrap());
+                assert_eq!(op.second_vector().unwrap(), block.argument(1).unwrap());
+                assert_eq!(op.mask().unwrap(), mask);
+                assert_eq!(op.output_type().unwrap(), vector_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_shufflevector_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_type.into(), vector_type.into()],
+                        results: vec![vector_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             concat!(

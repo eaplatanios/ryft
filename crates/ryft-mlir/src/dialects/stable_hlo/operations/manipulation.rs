@@ -1,9 +1,9 @@
 use ryft_xla_sys::bindings::{MlirAttribute, stablehloGatherDimensionNumbersGet, stablehloScatterDimensionNumbersGet};
 
 use crate::{
-    Attribute, BooleanAttributeRef, Context, DenseInteger64ArrayAttributeRef, DetachedOp, DetachedRegion,
-    DialectHandle, IntegerAttributeRef, Location, OneRegion, Operation, OperationBuilder, RegionRef, ShapedType, Size,
-    TensorTypeRef, Type, Value, ValueRef, mlir_attribute_field, mlir_op, mlir_op_trait, mlir_subtype_trait_impls,
+    Attribute, Context, DetachedOp, DetachedRegion, DialectHandle, Error, Location, OneRegion, Operation,
+    OperationBuilder, RegionRef, ShapedType, Size, TensorTypeRef, Type, Value, ValueRef, mlir_attribute_field, mlir_op,
+    mlir_op_trait, mlir_subtype_trait_impls,
 };
 
 use super::{HasPadding, PADDING_ATTRIBUTE};
@@ -29,15 +29,10 @@ pub const GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE: &str = "dimension";
 /// for more information.
 pub trait GetDimensionSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the dimension whose size this [`GetDimensionSizeOperation`] extracts.
-    fn dimension(&self) -> usize {
-        self.attribute(GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .unwrap_or_else(|| {
-                panic!(
-                    "invalid '{GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::get_dimension_size`"
-                )
-            })
-            .signless_value() as usize
+    fn dimension(&self) -> Result<usize, Error> {
+        let value = self.integer_attribute(GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE)?.signless_value();
+        usize::try_from(value)
+            .map_err(|_| Error::invalid_argument("invalid `dimension` attribute in `stablehlo.get_dimension_size`"))
     }
 }
 
@@ -49,15 +44,13 @@ mlir_op_trait!(GetDimensionSize, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`GetDimensionSizeOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`GetDimensionSizeOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn get_dimension_size<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     dimension: usize,
     location: L,
-) -> DetachedGetDimensionSizeOperation<'c, 't> {
+) -> Result<DetachedGetDimensionSizeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.get_dimension_size", location)
         .add_operand(input)
         .add_attribute(
@@ -66,8 +59,11 @@ pub fn get_dimension_size<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::get_dimension_size`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::get_dimension_size`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`TransposeOperation::permutation`].
@@ -97,13 +93,14 @@ pub const TRANSPOSE_PERMUTATION_ATTRIBUTE: &str = "permutation";
 /// Refer to the [StableHLO specification](https://openxla.org/stablehlo/spec#transpose) for more information.
 pub trait TransposeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the dimension permutation of this [`TransposeOperation`].
-    fn permutation(&self) -> Vec<usize> {
-        self.attribute(TRANSPOSE_PERMUTATION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
-            .unwrap_or_else(|| {
-                panic!("invalid '{TRANSPOSE_PERMUTATION_ATTRIBUTE}' attribute in `stable_hlo::transpose`")
+    fn permutation(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(TRANSPOSE_PERMUTATION_ATTRIBUTE)?
+            .values()
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_| Error::invalid_argument("invalid `permutation` attribute in `stablehlo.transpose`"))
             })
+            .collect()
     }
 }
 
@@ -115,27 +112,27 @@ mlir_op_trait!(Transpose, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`TransposeOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`TransposeOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn transpose<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     permutation: &[usize],
     location: L,
-) -> DetachedTransposeOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedTransposeOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.transpose", location)
         .add_operand(input)
         .add_attribute(
             TRANSPOSE_PERMUTATION_ATTRIBUTE,
             location
                 .context()
-                .dense_i64_array_attribute(permutation.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+                .dense_i64_array_attribute(permutation.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::transpose`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::transpose`"))
+        })
 }
 
 /// StableHLO [`Operation`] that reshapes its input tensor while keeping the number of elements it contains fixed.
@@ -155,8 +152,12 @@ pub fn transpose<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 /// for more information.
 pub trait ReshapeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the target shape of this [`ReshapeOperation`].
-    fn shape(&self) -> Vec<Size> {
-        self.result(0).unwrap().r#type().cast::<TensorTypeRef>().unwrap().dimensions().collect()
+    fn shape(&self) -> Result<Vec<Size>, Error> {
+        let r#type = self
+            .result_type(0)?
+            .cast::<TensorTypeRef>()
+            .ok_or_else(|| Error::invalid_argument("invalid result type in `stablehlo.reshape`"))?;
+        Ok(r#type.dimensions().collect())
     }
 }
 
@@ -168,31 +169,32 @@ mlir_op_trait!(Reshape, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ReshapeOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ReshapeOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn reshape<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     shape: &[usize],
     location: L,
-) -> DetachedReshapeOperation<'c, 't> {
+) -> Result<DetachedReshapeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
-    let element_type = input.r#type().cast::<TensorTypeRef>().unwrap().element_type();
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
+    let element_type = input
+        .r#type()?
+        .cast::<TensorTypeRef>()
+        .ok_or_else(|| Error::invalid_argument("input must have tensor type for `stable_hlo::reshape`"))?
+        .element_type()?;
     OperationBuilder::new("stablehlo.reshape", location)
         .add_operand(input)
-        .add_result(
-            context
-                .tensor_type(
-                    element_type,
-                    shape.iter().map(|size| Size::Static(*size)).collect::<Vec<_>>().as_slice(),
-                    None,
-                    location,
-                )
-                .unwrap(),
-        )
+        .add_result(context.tensor_type(
+            element_type,
+            shape.iter().map(|size| Size::Static(*size)).collect::<Vec<_>>().as_slice(),
+            None,
+            location,
+        )?)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::reshape`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::reshape`"))
+        })
 }
 
 /// StableHLO [`Operation`] that reshapes its input tensor while keeping the number of elements it contains fixed.
@@ -215,13 +217,13 @@ pub fn reshape<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 /// for more information.
 pub trait DynamicReshapeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicReshapeOperation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the target shape of this [`DynamicReshapeOperation`].
-    fn shape(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn shape(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 }
 
@@ -232,8 +234,6 @@ mlir_op_trait!(DynamicReshape, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DynamicReshapeOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`DynamicReshapeOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn dynamic_reshape<
     'input,
     'shape,
@@ -246,22 +246,29 @@ pub fn dynamic_reshape<
     input: Input,
     shape: Shape,
     location: L,
-) -> DetachedDynamicReshapeOperation<'c, 't> {
+) -> Result<DetachedDynamicReshapeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let input_type = input
-        .r#type()
+        .r#type()?
         .cast::<TensorTypeRef>()
-        .expect("invalid arguments to `stable_hlo::dynamic_reshape`; the input is not a tensor");
-    let element_type = input_type.element_type();
+        .ok_or_else(|| Error::invalid_argument("input must have tensor type for `stable_hlo::dynamic_reshape`"))?;
+    let element_type = input_type.element_type()?;
     let output_shape = input_type.dimensions().map(|_| Size::Dynamic).collect::<Vec<_>>();
     OperationBuilder::new("stablehlo.dynamic_reshape", location)
         .add_operand(input)
         .add_operand(shape)
-        .add_result(context.tensor_type(element_type, output_shape.as_slice(), None, location).unwrap())
+        .add_result(
+            context.tensor_type(element_type, output_shape.as_slice(), None, location).map_err(|_| {
+                Error::invalid_argument("failed to infer result type for `stable_hlo::dynamic_reshape`")
+            })?,
+        )
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::dynamic_reshape`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::dynamic_reshape`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`BroadcastOperation::dimensions`]
@@ -314,14 +321,14 @@ pub const BROADCAST_DIMENSIONS_ATTRIBUTE: &str = "broadcast_dimensions";
 pub trait BroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the broadcast dimensions of this [`BroadcastOperation`], which specify
     /// how the dimensions of the operand map to the dimensions of the result.
-    fn dimensions(&self) -> Vec<usize> {
-        self.attribute(BROADCAST_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{BROADCAST_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::broadcast`")
-            })
+    fn dimensions(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(BROADCAST_DIMENSIONS_ATTRIBUTE)?
             .values()
-            .map(|value| value as usize)
+            .map(|value| {
+                usize::try_from(value).map_err(|_| {
+                    Error::invalid_argument("invalid `broadcast_dimensions` attribute in `stablehlo.broadcast_in_dim`")
+                })
+            })
             .collect()
     }
 }
@@ -334,28 +341,27 @@ mlir_op_trait!(Broadcast, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`BroadcastOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`BroadcastOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn broadcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     input: V,
     output_type: T,
     dimensions: &[usize],
     location: L,
-) -> DetachedBroadcastOperation<'c, 't> {
+) -> Result<DetachedBroadcastOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.broadcast_in_dim", location)
         .add_operand(input)
         .add_attribute(
             BROADCAST_DIMENSIONS_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+            context.dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::broadcast`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::broadcast`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`DynamicBroadcastOperation::known_expanding_dimensions`].
@@ -405,40 +411,66 @@ pub const DYNAMIC_BROADCAST_KNOWN_NON_EXPANDING_DIMENSIONS_ATTRIBUTE: &str = "kn
 /// for more information.
 pub trait DynamicBroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicBroadcastOperation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the target shape of this [`DynamicBroadcastOperation`].
-    fn shape(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn shape(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the broadcast dimensions of this [`DynamicBroadcastOperation`], which specify
     /// how the dimensions of the operand map to the dimensions of the result.
-    fn dimensions(&self) -> Vec<usize> {
-        self.attribute(BROADCAST_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{BROADCAST_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dynamic_broadcast`")
-            })
+    fn dimensions(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(BROADCAST_DIMENSIONS_ATTRIBUTE)?
             .values()
-            .map(|value| value as usize)
+            .map(|value| {
+                usize::try_from(value).map_err(|_| {
+                    Error::invalid_argument(
+                        "invalid `broadcast_dimensions` attribute in `stablehlo.dynamic_broadcast_in_dim`",
+                    )
+                })
+            })
             .collect()
     }
 
     /// Returns the known expanding dimensions of this [`DynamicBroadcastOperation`].
-    fn known_expanding_dimensions(&self) -> Option<Vec<usize>> {
-        self.attribute(DYNAMIC_BROADCAST_KNOWN_EXPANDING_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn known_expanding_dimensions(&self) -> Result<Option<Vec<usize>>, Error> {
+        if self.has_attribute(DYNAMIC_BROADCAST_KNOWN_EXPANDING_DIMENSIONS_ATTRIBUTE) {
+            self.dense_integer_64_array_attribute(DYNAMIC_BROADCAST_KNOWN_EXPANDING_DIMENSIONS_ATTRIBUTE)?
+                .values()
+                .map(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        Error::invalid_argument(
+                            "invalid `known_expanding_dimensions` attribute in `stablehlo.dynamic_broadcast_in_dim`",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the known non-expanding dimensions of this [`DynamicBroadcastOperation`].
-    fn known_non_expanding_dimensions(&self) -> Option<Vec<usize>> {
-        self.attribute(DYNAMIC_BROADCAST_KNOWN_NON_EXPANDING_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn known_non_expanding_dimensions(&self) -> Result<Option<Vec<usize>>, Error> {
+        if self.has_attribute(DYNAMIC_BROADCAST_KNOWN_NON_EXPANDING_DIMENSIONS_ATTRIBUTE) {
+            self.dense_integer_64_array_attribute(DYNAMIC_BROADCAST_KNOWN_NON_EXPANDING_DIMENSIONS_ATTRIBUTE)?
+                .values()
+                .map(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        Error::invalid_argument(
+                            "invalid `known_nonexpanding_dimensions` attribute in `stablehlo.dynamic_broadcast_in_dim`",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -449,8 +481,6 @@ mlir_op_trait!(DynamicBroadcast, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DynamicBroadcastOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`DynamicBroadcastOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn dynamic_broadcast<
     'input,
     'shape,
@@ -466,59 +496,57 @@ pub fn dynamic_broadcast<
     known_expanding_dimensions: Option<&[usize]>,
     known_non_expanding_dimensions: Option<&[usize]>,
     location: L,
-) -> DetachedDynamicBroadcastOperation<'c, 't> {
+) -> Result<DetachedDynamicBroadcastOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let input_type = input
-        .r#type()
+        .r#type()?
         .cast::<TensorTypeRef>()
-        .expect("invalid arguments to `stable_hlo::dynamic_broadcast`; `input` is not a tensor");
-    let element_type = input_type.element_type();
+        .ok_or_else(|| Error::invalid_argument("`stable_hlo::dynamic_broadcast` input must be a tensor"))?;
+    let element_type = input_type.element_type()?;
     let output_rank = shape
-        .r#type()
+        .r#type()?
         .cast::<TensorTypeRef>()
-        .expect("invalid arguments to `stable_hlo::dynamic_broadcast`; `shape` is not a tensor")
-        .dimension(0)
+        .ok_or_else(|| Error::invalid_argument("`stable_hlo::dynamic_broadcast` shape must be a tensor"))?
+        .dimension(0)?
         .value()
-        .expect(
-            "invalid arguments to `stable_hlo::dynamic_broadcast`; \
-            `shape` must be one-dimensional and have a statically known length",
-        );
+        .ok_or_else(|| {
+            Error::invalid_argument(
+                "`stable_hlo::dynamic_broadcast` shape must be one-dimensional with statically known length",
+            )
+        })?;
     let output_shape = (0..output_rank).map(|_| Size::Dynamic).collect::<Vec<_>>();
     let mut builder = OperationBuilder::new("stablehlo.dynamic_broadcast_in_dim", location)
         .add_operand(input)
         .add_operand(shape)
         .add_attribute(
             BROADCAST_DIMENSIONS_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+            context.dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         );
     if let Some(known_expanding_dimensions) = known_expanding_dimensions {
         builder = builder.add_attribute(
             DYNAMIC_BROADCAST_KNOWN_EXPANDING_DIMENSIONS_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(
-                    known_expanding_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice(),
-                )
-                .unwrap(),
+            context.dense_i64_array_attribute(
+                known_expanding_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice(),
+            )?,
         );
     }
     if let Some(known_non_expanding_dimensions) = known_non_expanding_dimensions {
         builder = builder.add_attribute(
             DYNAMIC_BROADCAST_KNOWN_NON_EXPANDING_DIMENSIONS_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(
-                    known_non_expanding_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice(),
-                )
-                .unwrap(),
+            context.dense_i64_array_attribute(
+                known_non_expanding_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice(),
+            )?,
         );
     }
     builder
-        .add_result(context.tensor_type(element_type, output_shape.as_slice(), None, location).unwrap())
+        .add_result(context.tensor_type(element_type, output_shape.as_slice(), None, location)?)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::dynamic_broadcast`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::dynamic_broadcast`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`PadOperation::edge_padding_low`].
@@ -574,40 +602,33 @@ pub const INTERIOR_PADDING_ATTRIBUTE: &str = "interior_padding";
 /// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#pad) for more information.
 pub trait PadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`PadOperation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the padding value of this [`PadOperation`].
-    fn padding_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn padding_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the edge "low" padding amounts for this [`PadOperation`].
-    fn edge_padding_low(&self) -> Vec<i64> {
-        self.attribute(EDGE_PADDING_LOW_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{EDGE_PADDING_LOW_ATTRIBUTE}' attribute in `stable_hlo::pad`"))
-            .values()
-            .collect()
+    fn edge_padding_low(&self) -> Result<Vec<i64>, Error> {
+        Ok(self.dense_integer_64_array_attribute(EDGE_PADDING_LOW_ATTRIBUTE)?.values().collect())
     }
 
     /// Returns the edge "high" padding amounts for this [`PadOperation`].
-    fn edge_padding_high(&self) -> Vec<i64> {
-        self.attribute(EDGE_PADDING_HIGH_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{EDGE_PADDING_HIGH_ATTRIBUTE}' attribute in `stable_hlo::pad`"))
-            .values()
-            .collect()
+    fn edge_padding_high(&self) -> Result<Vec<i64>, Error> {
+        Ok(self.dense_integer_64_array_attribute(EDGE_PADDING_HIGH_ATTRIBUTE)?.values().collect())
     }
 
     /// Returns the interior padding amounts for this [`PadOperation`].
-    fn interior_padding(&self) -> Vec<usize> {
-        self.attribute(INTERIOR_PADDING_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{INTERIOR_PADDING_ATTRIBUTE}' attribute in `stable_hlo::pad`"))
+    fn interior_padding(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(INTERIOR_PADDING_ATTRIBUTE)?
             .values()
-            .map(|value| value as usize)
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_| Error::invalid_argument("invalid `interior_padding` attribute in `stablehlo.pad`"))
+            })
             .collect()
     }
 }
@@ -619,8 +640,6 @@ mlir_op_trait!(Pad, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`PadOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`PadOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn pad<
     'input,
     'padding_value,
@@ -636,24 +655,24 @@ pub fn pad<
     edge_padding_high: &[i64],
     interior_padding: &[usize],
     location: L,
-) -> DetachedPadOperation<'c, 't> {
+) -> Result<DetachedPadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.pad", location)
         .add_operand(input)
         .add_operand(padding_value)
-        .add_attribute(EDGE_PADDING_LOW_ATTRIBUTE, context.dense_i64_array_attribute(edge_padding_low).unwrap())
-        .add_attribute(EDGE_PADDING_HIGH_ATTRIBUTE, context.dense_i64_array_attribute(edge_padding_high).unwrap())
+        .add_attribute(EDGE_PADDING_LOW_ATTRIBUTE, context.dense_i64_array_attribute(edge_padding_low)?)
+        .add_attribute(EDGE_PADDING_HIGH_ATTRIBUTE, context.dense_i64_array_attribute(edge_padding_high)?)
         .add_attribute(
             INTERIOR_PADDING_ATTRIBUTE,
             context
-                .dense_i64_array_attribute(interior_padding.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+                .dense_i64_array_attribute(interior_padding.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::pad`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::pad`"))
+        })
 }
 
 /// StableHLO [`Operation`] that expands a tensor by adding padding around and between its elements. Semantically,
@@ -690,28 +709,28 @@ pub fn pad<
 /// for more information.
 pub trait DynamicPadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicPadOperation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the padding value of this [`DynamicPadOperation`].
-    fn padding_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn padding_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the edge "low" padding amounts for this [`DynamicPadOperation`].
-    fn edge_padding_low(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn edge_padding_low(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the edge "high" padding amounts for this [`DynamicPadOperation`].
-    fn edge_padding_high(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(3).unwrap()
+    fn edge_padding_high(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(3)
     }
 
     /// Returns the interior padding amounts for this [`DynamicPadOperation`].
-    fn interior_padding(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(4).unwrap()
+    fn interior_padding(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(4)
     }
 }
 
@@ -722,8 +741,6 @@ mlir_op_trait!(DynamicPad, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DynamicPadOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`DynamicPadOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn dynamic_pad<
     'input,
     'padding_value,
@@ -747,8 +764,8 @@ pub fn dynamic_pad<
     interior_padding: InteriorPadding,
     output_type: T,
     location: L,
-) -> DetachedDynamicPadOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedDynamicPadOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.dynamic_pad", location)
         .add_operand(input)
         .add_operand(padding_value)
@@ -757,8 +774,11 @@ pub fn dynamic_pad<
         .add_operand(interior_padding)
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::dynamic_pad`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::dynamic_pad`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`ConcatenateOperation::dimension`].
@@ -788,18 +808,15 @@ pub trait ConcatenateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn inputs<'r>(&'r self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
+    fn inputs<'r>(&'r self) -> impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>> {
         self.operand_values()
     }
 
     /// Returns the dimension along which the input tensors will be concatenated in this [`ConcatenateOperation`].
-    fn dimension(&self) -> usize {
-        self.attribute(CONCATENATE_DIMENSION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{CONCATENATE_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::concatenate`")
-            })
-            .signless_value() as usize
+    fn dimension(&self) -> Result<usize, Error> {
+        let value = self.integer_attribute(CONCATENATE_DIMENSION_ATTRIBUTE)?.signless_value();
+        usize::try_from(value)
+            .map_err(|_| Error::invalid_argument("invalid `dimension` attribute in `stablehlo.concatenate`"))
     }
 }
 
@@ -810,15 +827,13 @@ mlir_op_trait!(Concatenate, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ConcatenateOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ConcatenateOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn concatenate<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     inputs: &[V],
     dimension: usize,
     location: L,
-) -> DetachedConcatenateOperation<'c, 't> {
+) -> Result<DetachedConcatenateOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.concatenate", location)
         .add_operands(inputs)
         .add_attribute(
@@ -827,8 +842,11 @@ pub fn concatenate<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::concatenate`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::concatenate`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`SliceOperation::start_indices`].
@@ -865,32 +883,35 @@ pub const SLICE_STRIDES_ATTRIBUTE: &str = "strides";
 /// for more information.
 pub trait SliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the start indices for this [`SliceOperation`].
-    fn start_indices(&self) -> Vec<usize> {
-        self.attribute(SLICE_START_INDICES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{SLICE_START_INDICES_ATTRIBUTE}' attribute in `stable_hlo::slice`"))
+    fn start_indices(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(SLICE_START_INDICES_ATTRIBUTE)?
             .values()
-            .map(|value| value as usize)
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_| Error::invalid_argument("invalid `start_indices` attribute in `stablehlo.slice`"))
+            })
             .collect()
     }
 
     /// Returns the limit indices for this [`SliceOperation`].
-    fn limit_indices(&self) -> Vec<usize> {
-        self.attribute(SLICE_LIMIT_INDICES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{SLICE_LIMIT_INDICES_ATTRIBUTE}' attribute in `stable_hlo::slice`"))
+    fn limit_indices(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(SLICE_LIMIT_INDICES_ATTRIBUTE)?
             .values()
-            .map(|value| value as usize)
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_| Error::invalid_argument("invalid `limit_indices` attribute in `stablehlo.slice`"))
+            })
             .collect()
     }
 
     /// Returns the strides for this [`SliceOperation`].
-    fn strides(&self) -> Vec<usize> {
-        self.attribute(SLICE_STRIDES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{SLICE_STRIDES_ATTRIBUTE}' attribute in `stable_hlo::slice`"))
+    fn strides(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(SLICE_STRIDES_ATTRIBUTE)?
             .values()
-            .map(|value| value as usize)
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_| Error::invalid_argument("invalid `strides` attribute in `stablehlo.slice`"))
+            })
             .collect()
     }
 }
@@ -903,41 +924,36 @@ mlir_op_trait!(Slice, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SliceOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`SliceOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn slice<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     start_indices: &[usize],
     limit_indices: &[usize],
     strides: &[usize],
     location: L,
-) -> DetachedSliceOperation<'c, 't> {
+) -> Result<DetachedSliceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.slice", location)
         .add_operand(input)
         .add_attribute(
             SLICE_START_INDICES_ATTRIBUTE,
             context
-                .dense_i64_array_attribute(start_indices.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+                .dense_i64_array_attribute(start_indices.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .add_attribute(
             SLICE_LIMIT_INDICES_ATTRIBUTE,
             context
-                .dense_i64_array_attribute(limit_indices.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+                .dense_i64_array_attribute(limit_indices.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .add_attribute(
             SLICE_STRIDES_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(strides.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+            context.dense_i64_array_attribute(strides.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::slice`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::slice`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`DynamicSliceOperation::slice_sizes`].
@@ -979,24 +995,24 @@ pub const DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE: &str = "slice_sizes";
 /// for more information.
 pub trait DynamicSliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicSliceOperation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the start indices of this [`DynamicSliceOperation`].
-    fn start_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (1..self.operand_count()).flat_map(|index| self.operand_value(index)).collect()
+    fn start_indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (1..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the slice sizes for this [`DynamicSliceOperation`].
-    fn slice_sizes(&self) -> Vec<usize> {
-        self.attribute(DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE}' attribute in `stable_hlo::dynamic_slice`")
-            })
+    fn slice_sizes(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE)?
             .values()
-            .map(|value| value as usize)
+            .map(|value| {
+                usize::try_from(value).map_err(|_| {
+                    Error::invalid_argument("invalid `slice_sizes` attribute in `stablehlo.dynamic_slice`")
+                })
+            })
             .collect()
     }
 }
@@ -1008,15 +1024,13 @@ mlir_op_trait!(DynamicSlice, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DynamicSliceOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`DynamicSliceOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn dynamic_slice<'v, 'i, 'c: 'v + 'i, 't: 'c, V: Value<'v, 'c, 't>, I: Value<'i, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     start_indices: &[I],
     slice_sizes: &[usize],
     location: L,
-) -> DetachedDynamicSliceOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedDynamicSliceOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.dynamic_slice", location)
         .add_operand(input)
         .add_operands(start_indices)
@@ -1024,13 +1038,15 @@ pub fn dynamic_slice<'v, 'i, 'c: 'v + 'i, 't: 'c, V: Value<'v, 'c, 't>, I: Value
             DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE,
             location
                 .context()
-                .dense_i64_array_attribute(slice_sizes.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+                .dense_i64_array_attribute(slice_sizes.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::dynamic_slice`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::dynamic_slice`"))
+        })
 }
 
 /// StableHLO [`Operation`] that produces a result tensor which is equal to [`DynamicUpdateSliceOperation::input`]
@@ -1074,18 +1090,18 @@ pub fn dynamic_slice<'v, 'i, 'c: 'v + 'i, 't: 'c, V: Value<'v, 'c, 't>, I: Value
 /// for more information.
 pub trait DynamicUpdateSliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicUpdateSliceOperation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the update value of this [`DynamicUpdateSliceOperation`].
-    fn update(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn update(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the start indices of this [`DynamicUpdateSliceOperation`].
-    fn start_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (2..self.operand_count()).flat_map(|index| self.operand_value(index)).collect()
+    fn start_indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (2..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 }
 
@@ -1096,8 +1112,6 @@ mlir_op_trait!(DynamicUpdateSlice, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DynamicUpdateSliceOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`DynamicUpdateSliceOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn dynamic_update_slice<
     'v,
     'u,
@@ -1113,16 +1127,19 @@ pub fn dynamic_update_slice<
     update: U,
     start_indices: &[I],
     location: L,
-) -> DetachedDynamicUpdateSliceOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedDynamicUpdateSliceOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     let mut operands = vec![operand.as_ref(), update.as_ref()];
     operands.extend(start_indices.iter().map(|v| v.as_ref()));
     OperationBuilder::new("stablehlo.dynamic_update_slice", location)
         .add_operands(&operands)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::dynamic_update_slice`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::dynamic_update_slice`"))
+        })
 }
 
 /// StableHLO [`Attribute`] that models the dimension information in [`GatherOperation`]s.
@@ -1186,9 +1203,9 @@ impl<'t> Context<'t> {
         start_indices_batching_dimensions: &[usize],
         start_index_map: &[usize],
         index_vector_dimension: usize,
-    ) -> GatherDimensionsAttributeRef<'c, 't> {
+    ) -> Result<GatherDimensionsAttributeRef<'c, 't>, Error> {
         // Make sure that the StableHLO dialect is loaded into the current context to prevent segmentation faults.
-        self.load_dialect(DialectHandle::stable_hlo());
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         let offset_dimensions = offset_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
         let collapsed_slice_dimensions = collapsed_slice_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
         let operand_batching_dimensions = operand_batching_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
@@ -1218,7 +1235,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_gather_dimensions`"))
         }
     }
 }
@@ -1307,38 +1324,44 @@ pub const GATHER_INDICES_ARE_SORTED_ATTRIBUTE: &str = "indices_are_sorted";
 /// for more information.
 pub trait GatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`GatherOperation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the start indices of this [`GatherOperation`].
-    fn start_indices(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn start_indices(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the dimensions configuration of this [`GatherOperation`].
-    fn dimensions(&self) -> GatherDimensionsAttributeRef<'c, 't> {
-        self.attribute(GATHER_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<GatherDimensionsAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{GATHER_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::gather`"))
+    fn dimensions(&self) -> Result<GatherDimensionsAttributeRef<'c, 't>, Error> {
+        self.attribute(GATHER_DIMENSIONS_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                GATHER_DIMENSIONS_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the slice sizes for this [`GatherOperation`].
-    fn slice_sizes(&self) -> Vec<usize> {
-        self.attribute(GATHER_SLICE_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{GATHER_SLICE_SIZES_ATTRIBUTE}' attribute in `stable_hlo::gather`"))
+    fn slice_sizes(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(GATHER_SLICE_SIZES_ATTRIBUTE)?
             .values()
-            .map(|value| value as usize)
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_| Error::invalid_argument("invalid `slice_sizes` attribute in `stablehlo.gather`"))
+            })
             .collect()
     }
 
     /// Returns whether the indices are sorted for this [`GatherOperation`].
-    fn indices_are_sorted(&self) -> bool {
-        self.attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or(false)
+    fn indices_are_sorted(&self) -> Result<bool, Error> {
+        if self.has_attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE) {
+            self.boolean_attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE).map(|attribute| attribute.value())
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -1349,8 +1372,6 @@ mlir_op_trait!(Gather, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`GatherOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`GatherOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn gather<'v, 'i, 'c: 'v + 'i, 't: 'c, V: Value<'v, 'c, 't>, I: Value<'i, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     start_indices: I,
@@ -1358,24 +1379,23 @@ pub fn gather<'v, 'i, 'c: 'v + 'i, 't: 'c, V: Value<'v, 'c, 't>, I: Value<'i, 'c
     slice_sizes: &[usize],
     indices_are_sorted: bool,
     location: L,
-) -> DetachedGatherOperation<'c, 't> {
+) -> Result<DetachedGatherOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.gather", location)
         .add_operand(input)
         .add_operand(start_indices)
         .add_attribute(GATHER_DIMENSIONS_ATTRIBUTE, dimensions)
         .add_attribute(
             GATHER_SLICE_SIZES_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(slice_sizes.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+            context.dense_i64_array_attribute(slice_sizes.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .add_attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE, context.boolean_attribute(indices_are_sorted))
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::gather`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::gather`"))
+        })
 }
 
 /// StableHLO [`Operation`] that gathers slices, same as [`GatherOperation`], with the only difference being that in
@@ -1424,35 +1444,38 @@ pub fn gather<'v, 'i, 'c: 'v + 'i, 't: 'c, V: Value<'v, 'c, 't>, I: Value<'i, 'c
 /// for more information.
 pub trait DynamicGatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicGatherOperation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the start indices of this [`DynamicGatherOperation`].
-    fn start_indices(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn start_indices(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the slice sizes for this [`DynamicGatherOperation`].
-    fn slice_sizes(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn slice_sizes(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the dimensions configuration of this [`DynamicGatherOperation`].
-    fn dimensions(&self) -> GatherDimensionsAttributeRef<'c, 't> {
-        self.attribute(GATHER_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<GatherDimensionsAttributeRef>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{GATHER_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dynamic_gather`")
-            })
+    fn dimensions(&self) -> Result<GatherDimensionsAttributeRef<'c, 't>, Error> {
+        self.attribute(GATHER_DIMENSIONS_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                GATHER_DIMENSIONS_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns whether the indices are sorted for this [`DynamicGatherOperation`].
-    fn indices_are_sorted(&self) -> bool {
-        self.attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or(false)
+    fn indices_are_sorted(&self) -> Result<bool, Error> {
+        if self.has_attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE) {
+            self.boolean_attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE).map(|attribute| attribute.value())
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -1463,8 +1486,6 @@ mlir_op_trait!(DynamicGather, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DynamicGatherOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`DynamicGatherOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn dynamic_gather<
     'v,
     'i,
@@ -1484,9 +1505,9 @@ pub fn dynamic_gather<
     output_type: T,
     indices_are_sorted: bool,
     location: L,
-) -> DetachedDynamicGatherOperation<'c, 't> {
+) -> Result<DetachedDynamicGatherOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.dynamic_gather", location)
         .add_operand(input)
         .add_operand(start_indices)
@@ -1495,8 +1516,11 @@ pub fn dynamic_gather<
         .add_attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE, context.boolean_attribute(indices_are_sorted))
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::dynamic_gather`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::dynamic_gather`"))
+        })
 }
 
 /// StableHLO [`Attribute`] that models the dimension information in [`ScatterOperation`]s.
@@ -1565,9 +1589,9 @@ impl<'t> Context<'t> {
         scatter_indices_batching_dimensions: &[usize],
         scattered_dimensions_to_operand_dimensions: &[usize],
         index_vector_dimension: usize,
-    ) -> ScatterDimensionsAttributeRef<'c, 't> {
+    ) -> Result<ScatterDimensionsAttributeRef<'c, 't>, Error> {
         // Make sure that the StableHLO dialect is loaded into the current context to prevent segmentation faults.
-        self.load_dialect(DialectHandle::stable_hlo());
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         let update_window_dimensions = update_window_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
         let inserted_window_dimensions = inserted_window_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
         let input_batching_dimensions = input_batching_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
@@ -1598,7 +1622,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_scatter_dimensions`"))
         }
     }
 }
@@ -1688,49 +1712,55 @@ pub const SCATTER_UNIQUE_INDICES_ATTRIBUTE: &str = "unique_indices";
 /// for more information.
 pub trait ScatterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion<'o, 'c, 't> {
     /// Returns the inputs of this [`ScatterOperation`].
-    fn inputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn inputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let input_count = (self.operand_count() - 1) / 2;
-        (0..input_count).flat_map(|index| self.operand_value(index)).collect()
+        (0..input_count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the scatter indices of this [`ScatterOperation`].
-    fn scatter_indices(&self) -> ValueRef<'o, 'c, 't> {
+    fn scatter_indices(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         let input_count = (self.operand_count() - 1) / 2;
-        self.operand_value(input_count).unwrap()
+        self.operand_value(input_count)
     }
 
     /// Returns the updates of this [`ScatterOperation`].
-    fn updates(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn updates(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let input_count = (self.operand_count() - 1) / 2;
-        (input_count + 1..self.operand_count()).flat_map(|index| self.operand_value(index)).collect()
+        (input_count + 1..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the dimensions configuration of this [`ScatterOperation`].
-    fn dimensions(&self) -> ScatterDimensionsAttributeRef<'c, 't> {
-        self.attribute(SCATTER_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<ScatterDimensionsAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{SCATTER_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::scatter`"))
+    fn dimensions(&self) -> Result<ScatterDimensionsAttributeRef<'c, 't>, Error> {
+        self.attribute(SCATTER_DIMENSIONS_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SCATTER_DIMENSIONS_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns whether the indices are assumed to be sorted for this [`ScatterOperation`].
-    fn indices_are_sorted(&self) -> bool {
-        self.attribute(SCATTER_INDICES_ARE_SORTED_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or(false)
+    fn indices_are_sorted(&self) -> Result<bool, Error> {
+        if self.has_attribute(SCATTER_INDICES_ARE_SORTED_ATTRIBUTE) {
+            self.boolean_attribute(SCATTER_INDICES_ARE_SORTED_ATTRIBUTE).map(|attribute| attribute.value())
+        } else {
+            Ok(false)
+        }
     }
 
     /// Returns whether the indices are assumed to be unique for this [`ScatterOperation`].
-    fn unique_indices(&self) -> bool {
-        self.attribute(SCATTER_UNIQUE_INDICES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or(false)
+    fn unique_indices(&self) -> Result<bool, Error> {
+        if self.has_attribute(SCATTER_UNIQUE_INDICES_ATTRIBUTE) {
+            self.boolean_attribute(SCATTER_UNIQUE_INDICES_ATTRIBUTE).map(|attribute| attribute.value())
+        } else {
+            Ok(false)
+        }
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the update computation
     /// used by this [`ScatterOperation`].
-    fn computation(&self) -> RegionRef<'o, 'c, 't> {
+    fn computation(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
         self.body_region()
     }
 }
@@ -1743,8 +1773,6 @@ mlir_op_trait!(Scatter, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ScatterOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ScatterOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[allow(clippy::too_many_arguments)]
 pub fn scatter<
     'input,
@@ -1765,9 +1793,9 @@ pub fn scatter<
     indices_are_sorted: bool,
     unique_indices: bool,
     location: L,
-) -> DetachedScatterOperation<'c, 't> {
+) -> Result<DetachedScatterOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.scatter", location)
         .add_operands(inputs)
         .add_operand(scatter_indices)
@@ -1778,8 +1806,11 @@ pub fn scatter<
         .add_region(computation)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::scatter`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::scatter`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`SelectAndScatterOperation::window_dimensions`].
@@ -1822,44 +1853,66 @@ pub const SELECT_AND_SCATTER_WINDOW_STRIDES_ATTRIBUTE: &str = "window_strides";
 /// for more information.
 pub trait SelectAndScatterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`SelectAndScatterOperation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the source of this [`SelectAndScatterOperation`].
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the initial value of this [`SelectAndScatterOperation`].
-    fn initial_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn initial_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the window dimensions for this [`SelectAndScatterOperation`], if specified.
-    fn window_dimensions(&self) -> Option<Vec<usize>> {
-        self.attribute(SELECT_AND_SCATTER_WINDOW_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn window_dimensions(&self) -> Result<Option<Vec<usize>>, Error> {
+        if self.has_attribute(SELECT_AND_SCATTER_WINDOW_DIMENSIONS_ATTRIBUTE) {
+            self.dense_integer_64_array_attribute(SELECT_AND_SCATTER_WINDOW_DIMENSIONS_ATTRIBUTE)?
+                .values()
+                .map(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        Error::invalid_argument(
+                            "invalid `window_dimensions` attribute in `stablehlo.select_and_scatter`",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the window strides for this [`SelectAndScatterOperation`], if specified.
-    fn window_strides(&self) -> Option<Vec<usize>> {
-        self.attribute(SELECT_AND_SCATTER_WINDOW_STRIDES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn window_strides(&self) -> Result<Option<Vec<usize>>, Error> {
+        if self.has_attribute(SELECT_AND_SCATTER_WINDOW_STRIDES_ATTRIBUTE) {
+            self.dense_integer_64_array_attribute(SELECT_AND_SCATTER_WINDOW_STRIDES_ATTRIBUTE)?
+                .values()
+                .map(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        Error::invalid_argument("invalid `window_strides` attribute in `stablehlo.select_and_scatter`")
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the select computation used
     /// by this [`SelectAndScatterOperation`].
-    fn select(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn select(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the scatter computation used
     /// by this [`SelectAndScatterOperation`].
-    fn scatter(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(1).unwrap()
+    fn scatter(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(1)
     }
 }
 
@@ -1870,8 +1923,6 @@ mlir_op_trait!(SelectAndScatter, @local HasPadding);
 
 /// Constructs a new detached/owned [`SelectAndScatterOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`SelectAndScatterOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[allow(clippy::too_many_arguments)]
 pub fn select_and_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
@@ -1883,9 +1934,9 @@ pub fn select_and_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     select: DetachedRegion<'c, 't>,
     scatter: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedSelectAndScatterOperation<'c, 't> {
+) -> Result<DetachedSelectAndScatterOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.select_and_scatter", location)
         .add_operand(input)
         .add_operand(source)
@@ -1893,29 +1944,32 @@ pub fn select_and_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     if let Some(window_dimensions) = window_dimensions {
         builder = builder.add_attribute(
             SELECT_AND_SCATTER_WINDOW_DIMENSIONS_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(window_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+            context.dense_i64_array_attribute(
+                window_dimensions.iter().map(|value| *value as i64).collect::<Vec<_>>().as_slice(),
+            )?,
         );
     }
     if let Some(window_strides) = window_strides {
         builder = builder.add_attribute(
             SELECT_AND_SCATTER_WINDOW_STRIDES_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(window_strides.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+            context.dense_i64_array_attribute(
+                window_strides.iter().map(|value| *value as i64).collect::<Vec<_>>().as_slice(),
+            )?,
         );
     }
     if let Some(padding) = padding {
-        builder = builder.add_attribute(PADDING_ATTRIBUTE, context.stable_hlo_padding(padding, location));
+        builder = builder.add_attribute(PADDING_ATTRIBUTE, context.stable_hlo_padding(padding, location)?);
     }
     builder
         .add_region(select)
         .add_region(scatter)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::select_and_scatter`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::select_and_scatter`"))
+        })
 }
 
 #[cfg(test)]
@@ -1940,33 +1994,38 @@ mod tests {
     fn test_get_dimension_size() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let i32_type = context.signless_integer_type(32);
         let input_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(3)], None, location).unwrap();
         let output_type = context.tensor_type(i32_type, &[], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let op = get_dimension_size(input_value, 1, location);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type);
-            assert_eq!(op.dimension(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "get_dimension_size_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let op = get_dimension_size(input_value, 1, location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
+                assert_eq!(op.dimension().unwrap(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "get_dimension_size_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1984,7 +2043,7 @@ mod tests {
     fn test_transpose() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let input_type = context
             .tensor_type(i32_type, &[Size::Static(3), Size::Static(4), Size::Static(5)], None, location)
@@ -1992,28 +2051,33 @@ mod tests {
         let output_type = context
             .tensor_type(i32_type, &[Size::Static(5), Size::Static(3), Size::Static(4)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = transpose(input, &[2, 0, 1], location);
-            assert_eq!(op.permutation(), vec![2, 0, 1]);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "transpose_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = transpose(input, &[2, 0, 1], location).unwrap();
+                assert_eq!(op.permutation().unwrap(), vec![2, 0, 1]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "transpose_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2031,32 +2095,37 @@ mod tests {
     fn test_reshape() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let input_type = context.tensor_type(i32_type, &[Size::Static(1), Size::Static(6)], None, location).unwrap();
         let output_type = context.tensor_type(i32_type, &[Size::Static(2), Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = reshape(input, &[2, 3], location);
-            assert_eq!(op.shape(), vec![Size::Static(2), Size::Static(3)]);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "reshape_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = reshape(input, &[2, 3], location).unwrap();
+                assert_eq!(op.shape().unwrap(), vec![Size::Static(2), Size::Static(3)]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "reshape_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2074,33 +2143,38 @@ mod tests {
     fn test_dynamic_reshape() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let input_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(3)], None, location).unwrap();
         let shape_type = context.tensor_type(i64_type, &[Size::Static(2)], None, location).unwrap();
         let output_type = context.tensor_type(i64_type, &[Size::Dynamic, Size::Dynamic], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (shape_type, location)]);
-            let input = block.argument(0).unwrap();
-            let output_shape = block.argument(1).unwrap();
-            let op = dynamic_reshape(input, output_shape, location);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "dynamic_reshape_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), shape_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (shape_type, location)]);
+                let input = block.argument(0).unwrap();
+                let output_shape = block.argument(1).unwrap();
+                let op = dynamic_reshape(input, output_shape, location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "dynamic_reshape_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), shape_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2118,34 +2192,39 @@ mod tests {
     fn test_broadcast() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let input_type = context.tensor_type(i32_type, &[Size::Static(1), Size::Static(3)], None, location).unwrap();
         let output_type = context
             .tensor_type(i32_type, &[Size::Static(2), Size::Static(3), Size::Static(2)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = broadcast(input, output_type, &[2, 1], location);
-            assert_eq!(op.dimensions(), vec![2, 1]);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "broadcast_in_dim_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = broadcast(input, output_type, &[2, 1], location).unwrap();
+                assert_eq!(op.dimensions().unwrap(), vec![2, 1]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "broadcast_in_dim_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2163,7 +2242,7 @@ mod tests {
     fn test_dynamic_broadcast() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
         let input_type = context.tensor_type(i32_type, &[Size::Static(1), Size::Static(3)], None, location).unwrap();
@@ -2171,30 +2250,36 @@ mod tests {
         let output_type = context
             .tensor_type(i32_type, &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (shape_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let shape_value = block.argument(1).unwrap();
-            let op = dynamic_broadcast(input_value, shape_value, &[2, 1], Some(&[1]), Some(&[0]), location);
-            assert_eq!(op.dimensions(), vec![2, 1]);
-            assert_eq!(op.known_expanding_dimensions(), Some(vec![1]));
-            assert_eq!(op.known_non_expanding_dimensions(), Some(vec![0]));
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "dynamic_broadcast_in_dim_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), shape_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (shape_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let shape_value = block.argument(1).unwrap();
+                let op =
+                    dynamic_broadcast(input_value, shape_value, &[2, 1], Some(&[1]), Some(&[0]), location).unwrap();
+                assert_eq!(op.dimensions().unwrap(), vec![2, 1]);
+                assert_eq!(op.known_expanding_dimensions().unwrap(), Some(vec![1]));
+                assert_eq!(op.known_non_expanding_dimensions().unwrap(), Some(vec![0]));
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "dynamic_broadcast_in_dim_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), shape_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2218,37 +2303,42 @@ mod tests {
     fn test_pad() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let input_type = context.tensor_type(i32_type, &[Size::Static(2), Size::Static(3)], None, location).unwrap();
         let padding_value_type = context.tensor_type(i32_type, &[], None, location).unwrap();
         let output_type = context.tensor_type(i32_type, &[Size::Static(5), Size::Static(5)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (padding_value_type, location)]);
-            let input = block.argument(0).unwrap();
-            let padding_value = block.argument(1).unwrap();
-            let op = pad(input, padding_value, &[0, 1], &[2, 1], &[1, 0], location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.padding_value(), padding_value);
-            assert_eq!(op.edge_padding_low(), vec![0, 1]);
-            assert_eq!(op.edge_padding_high(), vec![2, 1]);
-            assert_eq!(op.interior_padding(), vec![1, 0]);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pad_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), padding_value_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (padding_value_type, location)]);
+                let input = block.argument(0).unwrap();
+                let padding_value = block.argument(1).unwrap();
+                let op = pad(input, padding_value, &[0, 1], &[2, 1], &[1, 0], location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.padding_value().unwrap(), padding_value);
+                assert_eq!(op.edge_padding_low().unwrap(), vec![0, 1]);
+                assert_eq!(op.edge_padding_high().unwrap(), vec![2, 1]);
+                assert_eq!(op.interior_padding().unwrap(), vec![1, 0]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pad_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), padding_value_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2272,62 +2362,68 @@ mod tests {
     fn test_dynamic_pad() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
         let input_type = context.tensor_type(i32_type, &[Size::Static(2), Size::Static(3)], None, location).unwrap();
         let padding_value_type = context.tensor_type(i32_type, &[], None, location).unwrap();
         let padding_specification_type = context.tensor_type(i64_type, &[Size::Static(2)], None, location).unwrap();
         let output_type = context.tensor_type(i32_type, &[Size::Static(4), Size::Static(8)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (input_type, location),
-                (padding_value_type, location),
-                (padding_specification_type, location),
-                (padding_specification_type, location),
-                (padding_specification_type, location),
-            ]);
-            let input = block.argument(0).unwrap();
-            let padding_value = block.argument(1).unwrap();
-            let edge_padding_low = block.argument(2).unwrap();
-            let edge_padding_high = block.argument(3).unwrap();
-            let interior_padding = block.argument(4).unwrap();
-            let op = dynamic_pad(
-                input,
-                padding_value,
-                edge_padding_low,
-                edge_padding_high,
-                interior_padding,
-                output_type,
-                location,
-            );
-            assert_eq!(op.input(), input);
-            assert_eq!(op.padding_value(), padding_value);
-            assert_eq!(op.edge_padding_low(), edge_padding_low);
-            assert_eq!(op.edge_padding_high(), edge_padding_high);
-            assert_eq!(op.interior_padding(), interior_padding);
-            assert_eq!(op.operands().count(), 5);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "dynamic_pad_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        input_type.into(),
-                        padding_value_type.into(),
-                        padding_specification_type.into(),
-                        padding_specification_type.into(),
-                        padding_specification_type.into(),
-                    ],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (input_type, location),
+                    (padding_value_type, location),
+                    (padding_specification_type, location),
+                    (padding_specification_type, location),
+                    (padding_specification_type, location),
+                ]);
+                let input = block.argument(0).unwrap();
+                let padding_value = block.argument(1).unwrap();
+                let edge_padding_low = block.argument(2).unwrap();
+                let edge_padding_high = block.argument(3).unwrap();
+                let interior_padding = block.argument(4).unwrap();
+                let op = dynamic_pad(
+                    input,
+                    padding_value,
+                    edge_padding_low,
+                    edge_padding_high,
+                    interior_padding,
+                    output_type,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.padding_value().unwrap(), padding_value);
+                assert_eq!(op.edge_padding_low().unwrap(), edge_padding_low);
+                assert_eq!(op.edge_padding_high().unwrap(), edge_padding_high);
+                assert_eq!(op.interior_padding().unwrap(), interior_padding);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 5);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "dynamic_pad_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            input_type.into(),
+                            padding_value_type.into(),
+                            padding_specification_type.into(),
+                            padding_specification_type.into(),
+                            padding_specification_type.into(),
+                        ],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2352,34 +2448,39 @@ mod tests {
     fn test_concatenate() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let input_0_type = context.tensor_type(i64_type, &[Size::Static(3), Size::Static(2)], None, location).unwrap();
         let input_1_type = context.tensor_type(i64_type, &[Size::Static(1), Size::Static(2)], None, location).unwrap();
         let output_type = context.tensor_type(i64_type, &[Size::Static(4), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_0_type, location), (input_1_type, location)]);
-            let input0_value = block.argument(0).unwrap();
-            let input1_value = block.argument(1).unwrap();
-            let op = concatenate(&[input0_value, input1_value], 0, location);
-            assert_eq!(op.dimension(), 0);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "concatenate_test",
-                func::FuncAttributes {
-                    arguments: vec![input_0_type.into(), input_1_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_0_type, location), (input_1_type, location)]);
+                let input0_value = block.argument(0).unwrap();
+                let input1_value = block.argument(1).unwrap();
+                let op = concatenate(&[input0_value, input1_value], 0, location).unwrap();
+                assert_eq!(op.dimension().unwrap(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "concatenate_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_0_type.into(), input_1_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2398,7 +2499,7 @@ mod tests {
     fn test_slice() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let input_type = context
             .tensor_type(i32_type, &[Size::Static(3), Size::Static(4), Size::Static(5)], None, location)
@@ -2406,30 +2507,35 @@ mod tests {
         let output_type = context
             .tensor_type(i32_type, &[Size::Static(2), Size::Static(2), Size::Static(3)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = slice(input, &[0, 1, 0], &[2, 3, 5], &[1, 1, 2], location);
-            assert_eq!(op.start_indices(), vec![0, 1, 0]);
-            assert_eq!(op.limit_indices(), vec![2, 3, 5]);
-            assert_eq!(op.strides(), vec![1, 1, 2]);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "slice_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = slice(input, &[0, 1, 0], &[2, 3, 5], &[1, 1, 2], location).unwrap();
+                assert_eq!(op.start_indices().unwrap(), vec![0, 1, 0]);
+                assert_eq!(op.limit_indices().unwrap(), vec![2, 3, 5]);
+                assert_eq!(op.strides().unwrap(), vec![1, 1, 2]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "slice_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2447,7 +2553,7 @@ mod tests {
     fn test_dynamic_slice() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
         let input_type = context
@@ -2457,38 +2563,44 @@ mod tests {
         let output_type = context
             .tensor_type(i32_type, &[Size::Static(1), Size::Static(2), Size::Static(3)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (input_type, location),
-                (index_type, location),
-                (index_type, location),
-                (index_type, location),
-            ]);
-            let input = block.argument(0).unwrap();
-            let start_index_0 = block.argument(1).unwrap();
-            let start_index_1 = block.argument(2).unwrap();
-            let start_index_2 = block.argument(3).unwrap();
-            let op = dynamic_slice(input, &[start_index_0, start_index_1, start_index_2], &[1, 2, 3], location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.start_indices(), vec![start_index_0, start_index_1, start_index_2]);
-            assert_eq!(op.slice_sizes(), vec![1, 2, 3]);
-            assert_eq!(op.operands().count(), 4);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "dynamic_slice_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), index_type.into(), index_type.into(), index_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (input_type, location),
+                    (index_type, location),
+                    (index_type, location),
+                    (index_type, location),
+                ]);
+                let input = block.argument(0).unwrap();
+                let start_index_0 = block.argument(1).unwrap();
+                let start_index_1 = block.argument(2).unwrap();
+                let start_index_2 = block.argument(3).unwrap();
+                let op =
+                    dynamic_slice(input, &[start_index_0, start_index_1, start_index_2], &[1, 2, 3], location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.start_indices().unwrap(), vec![start_index_0, start_index_1, start_index_2]);
+                assert_eq!(op.slice_sizes().unwrap(), vec![1, 2, 3]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 4);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "dynamic_slice_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), index_type.into(), index_type.into(), index_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2512,7 +2624,7 @@ mod tests {
     fn test_dynamic_update_slice() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
         let input_type = context
@@ -2525,46 +2637,52 @@ mod tests {
         let output_type = context
             .tensor_type(i32_type, &[Size::Static(3), Size::Static(4), Size::Static(5)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (input_type, location),
-                (update_type, location),
-                (index_type, location),
-                (index_type, location),
-                (index_type, location),
-            ]);
-            let input = block.argument(0).unwrap();
-            let update = block.argument(1).unwrap();
-            let start_index_0 = block.argument(2).unwrap();
-            let start_index_1 = block.argument(3).unwrap();
-            let start_index_2 = block.argument(4).unwrap();
-            let op = dynamic_update_slice(input, update, &[start_index_0, start_index_1, start_index_2], location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.update(), update);
-            assert_eq!(op.start_indices(), vec![start_index_0, start_index_1, start_index_2]);
-            assert_eq!(op.operands().count(), 5);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "dynamic_update_slice_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        input_type.into(),
-                        update_type.into(),
-                        index_type.into(),
-                        index_type.into(),
-                        index_type.into(),
-                    ],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (input_type, location),
+                    (update_type, location),
+                    (index_type, location),
+                    (index_type, location),
+                    (index_type, location),
+                ]);
+                let input = block.argument(0).unwrap();
+                let update = block.argument(1).unwrap();
+                let start_index_0 = block.argument(2).unwrap();
+                let start_index_1 = block.argument(3).unwrap();
+                let start_index_2 = block.argument(4).unwrap();
+                let op = dynamic_update_slice(input, update, &[start_index_0, start_index_1, start_index_2], location)
+                    .unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.update().unwrap(), update);
+                assert_eq!(op.start_indices().unwrap(), vec![start_index_0, start_index_1, start_index_2]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 5);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "dynamic_update_slice_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            input_type.into(),
+                            update_type.into(),
+                            index_type.into(),
+                            index_type.into(),
+                            index_type.into(),
+                        ],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2589,7 +2707,7 @@ mod tests {
     #[test]
     fn test_gather_dimensions_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8);
+        let attribute = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.offset_dimensions(), vec![0, 1]);
         assert_eq!(attribute.collapsed_slice_dimensions(), vec![2, 3]);
@@ -2604,24 +2722,24 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8);
-        let attribute_2 = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8);
+        let attribute_1 = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8).unwrap();
+        let attribute_2 = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_scatter_dimensions(&[], &[0, 1], &[4], &[], &[6, 7], 1);
+        let attribute_2 = context.stable_hlo_gather_dimensions(&[], &[0, 1], &[4], &[], &[6, 7], 1).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8);
+        let attribute_2 = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_gather_dimensions_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8);
+        let attribute = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8).unwrap();
         test_attribute_display_and_debug(
             attribute,
             "#stablehlo.gather<\
@@ -2638,7 +2756,7 @@ mod tests {
     #[test]
     fn test_gather_dimensions_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8);
+        let attribute = context.stable_hlo_gather_dimensions(&[0, 1], &[2, 3], &[4], &[5], &[6, 7], 8).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -2646,7 +2764,7 @@ mod tests {
     fn test_gather() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let input_type = context
             .tensor_type(i64_type, &[Size::Static(3), Size::Static(4), Size::Static(2)], None, location)
@@ -2662,31 +2780,37 @@ mod tests {
                 location,
             )
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (indices_type, location)]);
-            let operand = block.argument(0).unwrap();
-            let start_indices = block.argument(1).unwrap();
-            let dimension_numbers = context.stable_hlo_gather_dimensions(&[2, 3], &[0], &[], &[], &[1, 0], 2);
-            let op = gather(operand, start_indices, dimension_numbers, &[1, 2, 2], false, location);
-            assert_eq!(op.dimensions(), dimension_numbers);
-            assert_eq!(op.slice_sizes(), vec![1, 2, 2]);
-            assert_eq!(op.indices_are_sorted(), false);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "gather_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), indices_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (indices_type, location)]);
+                let operand = block.argument(0).unwrap();
+                let start_indices = block.argument(1).unwrap();
+                let dimension_numbers =
+                    context.stable_hlo_gather_dimensions(&[2, 3], &[0], &[], &[], &[1, 0], 2).unwrap();
+                let op = gather(operand, start_indices, dimension_numbers, &[1, 2, 2], false, location).unwrap();
+                assert_eq!(op.dimensions().unwrap(), dimension_numbers);
+                assert_eq!(op.slice_sizes().unwrap(), vec![1, 2, 2]);
+                assert!(!op.indices_are_sorted().unwrap());
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "gather_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), indices_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2716,7 +2840,7 @@ mod tests {
     fn test_dynamic_gather() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let operand_tensor_type = context
             .tensor_type(i64_type, &[Size::Static(3), Size::Static(4), Size::Static(2)], None, location)
@@ -2733,42 +2857,49 @@ mod tests {
                 location,
             )
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (operand_tensor_type, location),
-                (indices_tensor_type, location),
-                (slice_sizes_tensor_type, location),
-            ]);
-            let input = block.argument(0).unwrap();
-            let start_indices = block.argument(1).unwrap();
-            let slice_sizes = block.argument(2).unwrap();
-            let dimensions = context.stable_hlo_gather_dimensions(&[2, 3], &[0], &[], &[], &[1, 0], 2);
-            let op = dynamic_gather(input, start_indices, slice_sizes, dimensions, output_tensor_type, true, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.start_indices(), start_indices);
-            assert_eq!(op.slice_sizes(), slice_sizes);
-            assert_eq!(op.dimensions(), dimensions);
-            assert_eq!(op.indices_are_sorted(), true);
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op_block = block.append_operation(op);
-            block.append_operation(func::r#return(&[op_block.result(0).unwrap()], location));
-            func::func(
-                "dynamic_gather_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        operand_tensor_type.into(),
-                        indices_tensor_type.into(),
-                        slice_sizes_tensor_type.into(),
-                    ],
-                    results: vec![output_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (operand_tensor_type, location),
+                    (indices_tensor_type, location),
+                    (slice_sizes_tensor_type, location),
+                ]);
+                let input = block.argument(0).unwrap();
+                let start_indices = block.argument(1).unwrap();
+                let slice_sizes = block.argument(2).unwrap();
+                let dimensions = context.stable_hlo_gather_dimensions(&[2, 3], &[0], &[], &[], &[1, 0], 2).unwrap();
+                let op =
+                    dynamic_gather(input, start_indices, slice_sizes, dimensions, output_tensor_type, true, location)
+                        .unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.start_indices().unwrap(), start_indices);
+                assert_eq!(op.slice_sizes().unwrap(), slice_sizes);
+                assert_eq!(op.dimensions().unwrap(), dimensions);
+                assert!(op.indices_are_sorted().unwrap());
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op_block = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op_block.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "dynamic_gather_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            operand_tensor_type.into(),
+                            indices_tensor_type.into(),
+                            slice_sizes_tensor_type.into(),
+                        ],
+                        results: vec![output_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2797,9 +2928,9 @@ mod tests {
     #[test]
     fn test_scatter_dimensions_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7);
+        let attribute = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "stablehlo");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "stablehlo");
         assert_eq!(attribute.update_window_dimensions(), vec![0, 1]);
         assert_eq!(attribute.inserted_window_dimensions(), vec![2]);
         assert_eq!(attribute.input_batching_dimensions(), vec![3]);
@@ -2813,24 +2944,24 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7);
-        let attribute_2 = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7);
+        let attribute_1 = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7).unwrap();
+        let attribute_2 = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_scatter_dimensions(&[], &[1], &[0], &[4], &[], 1);
+        let attribute_2 = context.stable_hlo_scatter_dimensions(&[], &[1], &[0], &[4], &[], 1).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7);
+        let attribute_2 = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_scatter_dimensions_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7);
+        let attribute = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7).unwrap();
         test_attribute_display_and_debug(
             attribute,
             "#stablehlo.scatter<\
@@ -2847,7 +2978,7 @@ mod tests {
     #[test]
     fn test_scatter_dimensions_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7);
+        let attribute = context.stable_hlo_scatter_dimensions(&[0, 1], &[2], &[3], &[4], &[5, 6], 7).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -2855,7 +2986,7 @@ mod tests {
     fn test_scatter() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
         let i32_scalar_type = context.tensor_type(i32_type, &[], None, location).unwrap();
@@ -2869,50 +3000,57 @@ mod tests {
         let output_type = context
             .tensor_type(i32_type, &[Size::Static(3), Size::Static(4), Size::Static(2)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (indices_type, location), (update_type, location)]);
-            let mut region = context.region();
-            let mut inner_block = context.block(&[(i32_scalar_type, location), (i32_scalar_type, location)]);
-            let current = inner_block.argument(0).unwrap();
-            let update = inner_block.argument(1).unwrap();
-            let add_op = stable_hlo::add(current, update, location);
-            let add_op = inner_block.append_operation(add_op);
-            let return_op = stable_hlo::r#return(&[add_op.result(0).unwrap()], location);
-            inner_block.append_operation(return_op);
-            region.append_block(inner_block);
-            let dimensions = context.stable_hlo_scatter_dimensions(&[1, 2], &[0], &[], &[], &[0, 1], 1);
-            let op = scatter(
-                &[block.argument(0).unwrap()],
-                block.argument(1).unwrap(),
-                &[block.argument(2).unwrap()],
-                dimensions,
-                region.into(),
-                false,
-                false,
-                location,
-            );
-            assert_eq!(op.inputs(), vec![block.argument(0).unwrap()]);
-            assert_eq!(op.scatter_indices(), block.argument(1).unwrap());
-            assert_eq!(op.updates(), vec![block.argument(2).unwrap()]);
-            assert_eq!(op.dimensions(), dimensions);
-            assert_eq!(op.indices_are_sorted(), false);
-            assert_eq!(op.unique_indices(), false);
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "scatter_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), indices_type.into(), update_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(input_type, location), (indices_type, location), (update_type, location)]);
+                let mut region = context.region();
+                let mut inner_block = context.block(&[(i32_scalar_type, location), (i32_scalar_type, location)]);
+                let current = inner_block.argument(0).unwrap();
+                let update = inner_block.argument(1).unwrap();
+                let add_op = stable_hlo::add(current, update, location).unwrap();
+                let add_op = inner_block.append_operation(add_op).unwrap();
+                let return_op = stable_hlo::r#return(&[add_op.result(0).unwrap()], location).unwrap();
+                inner_block.append_operation(return_op).unwrap();
+                region.append_block(inner_block).unwrap();
+                let dimensions = context.stable_hlo_scatter_dimensions(&[1, 2], &[0], &[], &[], &[0, 1], 1).unwrap();
+                let op = scatter(
+                    &[block.argument(0).unwrap()],
+                    block.argument(1).unwrap(),
+                    &[block.argument(2).unwrap()],
+                    dimensions,
+                    region.into(),
+                    false,
+                    false,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.inputs().unwrap(), vec![block.argument(0).unwrap()]);
+                assert_eq!(op.scatter_indices().unwrap(), block.argument(1).unwrap());
+                assert_eq!(op.updates().unwrap(), vec![block.argument(2).unwrap()]);
+                assert_eq!(op.dimensions().unwrap(), dimensions);
+                assert!(!op.indices_are_sorted().unwrap());
+                assert!(!op.unique_indices().unwrap());
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "scatter_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), indices_type.into(), update_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2947,79 +3085,87 @@ mod tests {
     fn test_select_and_scatter() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let i32_scalar_type = context.tensor_type(i32_type, &[], None, location).unwrap();
         let input_type = context.tensor_type(i32_type, &[Size::Static(4), Size::Static(6)], None, location).unwrap();
         let source_type = context.tensor_type(i32_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
         let output_type = context.tensor_type(i32_type, &[Size::Static(4), Size::Static(6)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(input_type, location), (source_type, location), (i32_scalar_type, location)]);
-            let input = block.argument(0).unwrap();
-            let source = block.argument(1).unwrap();
-            let initial_value = block.argument(2).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(input_type, location), (source_type, location), (i32_scalar_type, location)]);
+                let input = block.argument(0).unwrap();
+                let source = block.argument(1).unwrap();
+                let initial_value = block.argument(2).unwrap();
 
-            // Create the `select` region.
-            let mut select_region = context.region();
-            let mut select_block = context.block(&[(i32_scalar_type, location), (i32_scalar_type, location)]);
-            let compare_op = stable_hlo::compare(
-                select_block.argument(0).unwrap(),
-                select_block.argument(1).unwrap(),
-                stable_hlo::ComparisonDirection::GreaterThanOrEqual,
-                stable_hlo::ComparisonType::Signed,
-                location,
-            );
-            let compare_op = select_block.append_operation(compare_op);
-            let return_op = stable_hlo::r#return(&[compare_op.result(0).unwrap()], location);
-            select_block.append_operation(return_op);
-            select_region.append_block(select_block);
+                // Create the `select` region.
+                let mut select_region = context.region();
+                let mut select_block = context.block(&[(i32_scalar_type, location), (i32_scalar_type, location)]);
+                let compare_op = stable_hlo::compare(
+                    select_block.argument(0).unwrap(),
+                    select_block.argument(1).unwrap(),
+                    stable_hlo::ComparisonDirection::GreaterThanOrEqual,
+                    stable_hlo::ComparisonType::Signed,
+                    location,
+                )
+                .unwrap();
+                let compare_op = select_block.append_operation(compare_op).unwrap();
+                let return_op = stable_hlo::r#return(&[compare_op.result(0).unwrap()], location).unwrap();
+                select_block.append_operation(return_op).unwrap();
+                select_region.append_block(select_block).unwrap();
 
-            // Create the `scatter` region.
-            let mut scatter_region = context.region();
-            let mut scatter_block = context.block(&[(i32_scalar_type, location), (i32_scalar_type, location)]);
-            let add_op =
-                stable_hlo::add(scatter_block.argument(0).unwrap(), scatter_block.argument(1).unwrap(), location);
-            let add_op = scatter_block.append_operation(add_op);
-            let return_op = stable_hlo::r#return(&[add_op.result(0).unwrap()], location);
-            scatter_block.append_operation(return_op);
-            scatter_region.append_block(scatter_block);
+                // Create the `scatter` region.
+                let mut scatter_region = context.region();
+                let mut scatter_block = context.block(&[(i32_scalar_type, location), (i32_scalar_type, location)]);
+                let add_op =
+                    stable_hlo::add(scatter_block.argument(0).unwrap(), scatter_block.argument(1).unwrap(), location)
+                        .unwrap();
+                let add_op = scatter_block.append_operation(add_op).unwrap();
+                let return_op = stable_hlo::r#return(&[add_op.result(0).unwrap()], location).unwrap();
+                scatter_block.append_operation(return_op).unwrap();
+                scatter_region.append_block(scatter_block).unwrap();
 
-            // Create the `select_and_scatter` operation.
-            let op = select_and_scatter(
-                input,
-                source,
-                initial_value,
-                Some(&[2, 3]),
-                Some(&[2, 3]),
-                Some(&[(0, 1), (0, 0)]),
-                select_region.into(),
-                scatter_region.into(),
-                location,
-            );
-            assert_eq!(op.input(), input);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.initial_value(), initial_value);
-            assert_eq!(op.window_dimensions(), Some(vec![2, 3]));
-            assert_eq!(op.window_strides(), Some(vec![2, 3]));
-            assert_eq!(op.padding(), Some(vec![(0, 1), (0, 0)]));
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), output_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "select_and_scatter_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), source_type.into(), i32_scalar_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+                // Create the `select_and_scatter` operation.
+                let op = select_and_scatter(
+                    input,
+                    source,
+                    initial_value,
+                    Some(&[2, 3]),
+                    Some(&[2, 3]),
+                    Some(&[(0, 1), (0, 0)]),
+                    select_region.into(),
+                    scatter_region.into(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.initial_value().unwrap(), initial_value);
+                assert_eq!(op.window_dimensions().unwrap(), Some(vec![2, 3]));
+                assert_eq!(op.window_strides().unwrap(), Some(vec![2, 3]));
+                assert_eq!(op.padding().unwrap(), Some(vec![(0, 1), (0, 0)]));
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "select_and_scatter_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), source_type.into(), i32_scalar_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

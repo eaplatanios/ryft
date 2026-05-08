@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use ryft_xla_sys::bindings::{MlirAttribute, stablehloOutputOperandAliasGet};
 
 use crate::{
-    ArrayAttributeRef, Attribute, AttributeRef, BooleanAttributeRef, Context, DenseInteger64ArrayAttributeRef,
-    DenseIntegerElementsAttributeRef, DetachedOp, DetachedRegion, DialectHandle, DictionaryAttributeRef,
-    ElementsAttribute, ElementsAttributeRef, FlatSymbolRefAttributeRef, FromWithContext, IntegerAttributeRef,
-    IntoWithContext, Location, OneRegion, Operation, OperationBuilder, RegionRef, ShapedType, StringAttributeRef,
-    StringRef, Type, Value, ValueRef, mlir_attribute_field, mlir_op, mlir_op_trait, mlir_subtype_trait_impls,
+    Attribute, AttributeRef, Context, DenseIntegerElementsAttributeRef, DetachedOp, DetachedRegion, DialectHandle,
+    DictionaryAttributeRef, ElementsAttribute, ElementsAttributeRef, Error, FlatSymbolRefAttributeRef, IndexTypeRef,
+    IntegerAttributeRef, Location, OneRegion, Operation, OperationBuilder, RegionRef, ShapedType, ShapedTypeRef,
+    StringAttributeRef, StringRef, TryFromWithContext, TryIntoWithContext, Type, Value, ValueRef, mlir_attribute_field,
+    mlir_op, mlir_op_trait, mlir_subtype_trait_impls,
 };
 
 /// Name of the [`Attribute`] that is used to store [`ConstantOperation::value`].
@@ -30,10 +30,8 @@ pub const CONSTANT_VALUE_ATTRIBUTE: &str = "value";
 /// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#constant) for more information.
 pub trait ConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the constant value that is stored in this [`Operation`].
-    fn value(&self) -> ElementsAttributeRef<'c, 't> {
-        self.attribute(CONSTANT_VALUE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{CONSTANT_VALUE_ATTRIBUTE}' attribute in `stable_hlo::constant`"))
+    fn value(&self) -> Result<ElementsAttributeRef<'c, 't>, Error> {
+        self.elements_attribute(CONSTANT_VALUE_ATTRIBUTE)
     }
 }
 
@@ -50,14 +48,17 @@ mlir_op_trait!(Constant, ZeroSuccessors);
 pub fn constant<'c, 't, A: ElementsAttribute<'c, 't>, L: Location<'c, 't>>(
     value: A,
     location: L,
-) -> DetachedConstantOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedConstantOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.constant", location)
         .add_attribute(CONSTANT_VALUE_ATTRIBUTE, value)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::constant`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::constant`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`DynamicIotaOperation::iota_dimension`]
@@ -92,11 +93,10 @@ pub const IOTA_DIMENSION_ATTRIBUTE: &str = "iota_dimension";
 /// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#iota) for more information.
 pub trait IotaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the dimension along which the values of the output tensor of this [`IotaOperation`] increase.
-    fn iota_dimension(&self) -> usize {
-        self.attribute(IOTA_DIMENSION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{IOTA_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::dynamic_iota`"))
-            .signless_value() as usize
+    fn iota_dimension(&self) -> Result<usize, Error> {
+        let value = self.integer_attribute(IOTA_DIMENSION_ATTRIBUTE)?.signless_value();
+        usize::try_from(value)
+            .map_err(|_| Error::invalid_argument("invalid `iota_dimension` attribute in `stablehlo.iota`"))
     }
 }
 
@@ -107,14 +107,12 @@ mlir_op_trait!(Iota, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`IotaOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`IotaOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn iota<'c, 't: 'c, T: ShapedType<'c, 't>, L: Location<'c, 't>>(
     output_type: T,
     iota_dimension: usize,
     location: L,
-) -> DetachedIotaOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedIotaOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.iota", location)
         .add_attribute(
             IOTA_DIMENSION_ATTRIBUTE,
@@ -124,8 +122,9 @@ pub fn iota<'c, 't: 'c, T: ShapedType<'c, 't>, L: Location<'c, 't>>(
         )
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::iota`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::iota`"))
+        })
 }
 
 /// StableHLO [`Operation`] that fills an output tensor with values in increasing order starting from zero along the
@@ -153,11 +152,10 @@ pub fn iota<'c, 't: 'c, T: ShapedType<'c, 't>, L: Location<'c, 't>>(
 /// for more information.
 pub trait DynamicIotaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the dimension along which the values of the output tensor of this [`DynamicIotaOperation`] increase.
-    fn iota_dimension(&self) -> usize {
-        self.attribute(IOTA_DIMENSION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{IOTA_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::dynamic_iota`"))
-            .signless_value() as usize
+    fn iota_dimension(&self) -> Result<usize, Error> {
+        let value = self.integer_attribute(IOTA_DIMENSION_ATTRIBUTE)?.signless_value();
+        usize::try_from(value)
+            .map_err(|_| Error::invalid_argument("invalid `iota_dimension` attribute in `stablehlo.dynamic_iota`"))
     }
 }
 
@@ -171,15 +169,13 @@ mlir_op_trait!(DynamicIota, ZeroSuccessors);
 ///
 /// Note that since this operation supports dynamic shapes (as opposed to [`iota`] which only supports static shapes),
 /// the provided `output_type` can have certain dimensions set to [`Size::Dynamic`](crate::Size::Dynamic).
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn dynamic_iota<'s, 'c: 's, 't: 'c, S: Value<'s, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     output_shape: S,
     output_type: T,
     iota_dimension: usize,
     location: L,
-) -> DetachedDynamicIotaOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedDynamicIotaOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.dynamic_iota", location)
         .add_operand(output_shape)
         .add_attribute(
@@ -190,8 +186,11 @@ pub fn dynamic_iota<'s, 'c: 's, 't: 'c, S: Value<'s, 'c, 't>, T: Type<'c, 't>, L
         )
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::dynamic_iota`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::dynamic_iota`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`SortOperation::dimension`].
@@ -252,25 +251,20 @@ pub const SORT_IS_STABLE_ATTRIBUTE: &str = "is_stable";
 /// for more information.
 pub trait SortOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion<'o, 'c, 't> {
     /// Returns the dimension over which this [`SortOperation`] sorts its inputs.
-    fn dimension(&self) -> usize {
-        self.attribute(SORT_DIMENSION_ATTRIBUTE)
-            .and_then(|attribute| {
-                attribute.cast::<IntegerAttributeRef<'c, 't>>().map(|attribute| attribute.signless_value() as usize)
-            })
-            .unwrap_or_else(|| panic!("invalid '{SORT_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::sort`"))
+    fn dimension(&self) -> Result<usize, Error> {
+        let value = self.integer_attribute(SORT_DIMENSION_ATTRIBUTE)?.signless_value();
+        usize::try_from(value).map_err(|_| Error::invalid_argument("invalid `dimension` attribute in `stablehlo.sort`"))
     }
 
     /// Returns `true` if the sorting performed by this [`SortOperation`] is stable (i.e., the relative order of
     /// elements considered to be equal by the comparator is preserved).
-    fn is_stable(&self) -> bool {
-        self.attribute(SORT_IS_STABLE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<BooleanAttributeRef<'c, 't>>().map(|attribute| attribute.value()))
-            .unwrap_or_else(|| panic!("invalid '{SORT_IS_STABLE_ATTRIBUTE}' attribute in `stable_hlo::sort`"))
+    fn is_stable(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(SORT_IS_STABLE_ATTRIBUTE)?.value())
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the comparator
     /// used by this [`SortOperation`].
-    fn comparator(&self) -> RegionRef<'o, 'c, 't> {
+    fn comparator(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
         self.body_region()
     }
 }
@@ -289,9 +283,9 @@ pub fn sort<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     is_stable: bool,
     comparator: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedSortOperation<'c, 't> {
+) -> Result<DetachedSortOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.sort", location)
         .add_operands(inputs)
         .add_attribute(
@@ -302,8 +296,9 @@ pub fn sort<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
         .add_region(comparator)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::sort`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::sort`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`ReverseOperation::reverse_dimensions`].
@@ -329,11 +324,14 @@ pub const REVERSE_DIMENSIONS_ATTRIBUTE: &str = "dimensions";
 /// Refer to the [StableHLO specification](https://openxla.org/stablehlo/spec#reverse) for more information.
 pub trait ReverseOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the dimensions along which to reverse the elements of the input to this [`ReverseOperation`].
-    fn reverse_dimensions(&self) -> Vec<usize> {
-        self.attribute(REVERSE_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
-            .unwrap_or_else(|| panic!("invalid '{REVERSE_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reverse`"))
+    fn reverse_dimensions(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(REVERSE_DIMENSIONS_ATTRIBUTE)?
+            .values()
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_| Error::invalid_argument("invalid `dimensions` attribute in `stablehlo.reverse`"))
+            })
+            .collect()
     }
 }
 
@@ -350,21 +348,23 @@ pub fn reverse<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     dimensions: &[usize],
     location: L,
-) -> DetachedReverseOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedReverseOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.reverse", location)
         .add_operand(input)
         .add_attribute(
             REVERSE_DIMENSIONS_ATTRIBUTE,
             location
                 .context()
-                .dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+                .dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::reverse`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::reverse`"))
+        })
 }
 
 /// StableHLO [`Operation`] that represents a return operation from within a StableHLO function. It is equivalent to
@@ -380,7 +380,7 @@ pub trait ReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn values(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
+    fn values(&self) -> impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>> {
         self.operand_values()
     }
 }
@@ -397,13 +397,14 @@ mlir_op_trait!(Return, ZeroRegions);
 pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     values: &[V],
     location: L,
-) -> DetachedReturnOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedReturnOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.return", location)
         .add_operands(values)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::return`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::return`"))
+        })
 }
 
 /// StableHLO [`Operation`] that ensures that the [`Operation`]s that produce its operands (i.e., inputs) are executed
@@ -438,14 +439,17 @@ mlir_op_trait!(OptimizationBarrier, ZeroSuccessors);
 pub fn optimization_barrier<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     operands: &[V],
     location: L,
-) -> DetachedOptimizationBarrierOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedOptimizationBarrierOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.optimization_barrier", location)
         .add_operands(operands)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::optimization_barrier`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::optimization_barrier`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`CompositeOperation::composite_name`].
@@ -504,41 +508,39 @@ pub const COMPOSITE_DECOMPOSITION_ATTRIBUTE: &str = "decomposition";
 /// [official StableHLO specification](https://openxla.org/stablehlo/spec#composite) for more information.
 pub trait CompositeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the name of this [`CompositeOperation`] that follows namespaced operation naming conventions.
-    fn composite_name(&self) -> StringRef<'c> {
-        self.attribute(COMPOSITE_NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>().map(|attribute| attribute.string()))
-            .unwrap_or_else(|| panic!("invalid '{COMPOSITE_NAME_ATTRIBUTE}' attribute in `stable_hlo::composite`"))
+    fn composite_name(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(COMPOSITE_NAME_ATTRIBUTE)?.string())
     }
 
     /// Returns the version of this [`CompositeOperation`]. Typically, version 0 means that a composite operation is
     /// under development and does not imply any compatibility guarantees, whereas higher versions do.
-    fn composite_version(&self) -> u32 {
-        self.attribute(COMPOSITE_VERSION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>().map(|attribute| attribute.unsigned_value()))
-            .map(|attribute| attribute as u32)
-            .unwrap_or_default()
+    fn composite_version(&self) -> Result<u32, Error> {
+        if self.has_attribute(COMPOSITE_VERSION_ATTRIBUTE) {
+            u32::try_from(self.integer_attribute(COMPOSITE_VERSION_ATTRIBUTE)?.unsigned_value())
+                .map_err(|_| Error::invalid_argument("invalid `version` attribute in `stable_hlo::composite`"))
+        } else {
+            Ok(0)
+        }
     }
 
     /// Returns the composite [`Attribute`]s of this [`CompositeOperation`] that will be propagated to
     /// [`CompositeOperation::composite_decomposition`] when this operation is invoked.
-    fn composite_attributes(&self) -> HashMap<StringRef<'c>, AttributeRef<'c, 't>> {
-        self.attribute(COMPOSITE_ATTRIBUTES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DictionaryAttributeRef>().map(|attribute| attribute.into()))
-            .unwrap_or_default()
+    fn composite_attributes(&self) -> Result<HashMap<StringRef<'c>, AttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(COMPOSITE_ATTRIBUTES_ATTRIBUTE) {
+            HashMap::try_from(self.dictionary_attribute(COMPOSITE_ATTRIBUTES_ATTRIBUTE)?)
+        } else {
+            Ok(HashMap::new())
+        }
     }
 
     /// Returns the name/symbol of the decomposition [`func::func`](crate::dialects::func::func)  of this
     /// [`CompositeOperation`]. The referred function must be defined in the parent scope of this operation.
-    fn composite_decomposition(&self) -> StringRef<'c> {
-        self.attribute(COMPOSITE_DECOMPOSITION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<FlatSymbolRefAttributeRef>().map(|attribute| attribute.reference()))
-            .unwrap_or_else(|| {
-                panic!("invalid '{COMPOSITE_DECOMPOSITION_ATTRIBUTE}' attribute in `stable_hlo::composite`")
-            })
+    fn composite_decomposition(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.flat_symbol_ref_attribute(COMPOSITE_DECOMPOSITION_ATTRIBUTE)?.reference())
     }
 
     /// Returns an [`Iterator`] over the [`Region`](crate::Region)s carried by this [`CompositeOperation`].
-    fn composite_regions(&self) -> impl Iterator<Item = RegionRef<'o, 'c, 't>> {
+    fn composite_regions(&self) -> impl Iterator<Item = Result<RegionRef<'o, 'c, 't>, Error>> {
         self.regions()
     }
 }
@@ -559,10 +561,10 @@ pub fn composite<
     'c: 'v,
     't: 'c,
     's,
-    N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     A: Attribute<'c, 't>,
     V: Value<'v, 'c, 't>,
-    D: IntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
+    D: TryIntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
     T: Type<'c, 't>,
     L: Location<'c, 't>,
 >(
@@ -574,17 +576,17 @@ pub fn composite<
     regions: Vec<DetachedRegion<'c, 't>>,
     result_types: &[T],
     location: L,
-) -> DetachedCompositeOperation<'c, 't> {
+) -> Result<DetachedCompositeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.composite", location)
         .add_operands(operands)
-        .add_attribute(COMPOSITE_NAME_ATTRIBUTE, name.into_with_context(context))
-        .add_attribute(COMPOSITE_DECOMPOSITION_ATTRIBUTE, decomposition.into_with_context(context));
+        .add_attribute(COMPOSITE_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
+        .add_attribute(COMPOSITE_DECOMPOSITION_ATTRIBUTE, decomposition.try_into_with_context(context)?);
     if let Some(attributes) = attributes.filter(|attributes| !attributes.is_empty()) {
         builder = builder.add_attribute(
             COMPOSITE_ATTRIBUTES_ATTRIBUTE,
-            DictionaryAttributeRef::from_with_context(attributes, context),
+            DictionaryAttributeRef::try_from_with_context(attributes, context)?,
         )
     }
     builder = builder.add_attribute(
@@ -594,11 +596,11 @@ pub fn composite<
     if !regions.is_empty() {
         builder = builder.add_regions(regions);
     }
-    builder
-        .add_results(result_types)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::composite`")
+    builder.add_results(result_types).build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::composite`"))
+    })
 }
 
 /// API version used by a [`CustomCallOperation`]. This determines the format in which the custom operation metadata
@@ -626,16 +628,16 @@ impl<'c, 't> From<IntegerAttributeRef<'c, 't>> for CustomCallApiVersion {
     }
 }
 
-impl<'c, 't> FromWithContext<'c, 't, CustomCallApiVersion> for IntegerAttributeRef<'c, 't> {
-    fn from_with_context(value: CustomCallApiVersion, context: &'c Context<'t>) -> Self {
+impl<'c, 't> TryFromWithContext<'c, 't, CustomCallApiVersion> for IntegerAttributeRef<'c, 't> {
+    fn try_from_with_context(value: CustomCallApiVersion, context: &'c Context<'t>) -> Result<Self, Error> {
         let r#type = context.signless_integer_type(32);
-        match value {
+        Ok(match value {
             CustomCallApiVersion::Unspecified => context.integer_attribute(r#type, 0),
             CustomCallApiVersion::Original => context.integer_attribute(r#type, 1),
             CustomCallApiVersion::StatusReturning => context.integer_attribute(r#type, 2),
             CustomCallApiVersion::StatusReturningUnified => context.integer_attribute(r#type, 3),
             CustomCallApiVersion::TypedFfi => context.integer_attribute(r#type, 4),
-        }
+        })
     }
 }
 
@@ -726,9 +728,9 @@ impl<'t> Context<'t> {
         output_tuple_indices: &[usize],
         operand_index: usize,
         operand_tuple_indices: &[usize],
-    ) -> OutputOperandAliasAttributeRef<'c, 't> {
+    ) -> Result<OutputOperandAliasAttributeRef<'c, 't>, Error> {
         // Make sure that the StableHLO dialect is loaded into the current context to prevent segmentation faults.
-        self.load_dialect(DialectHandle::stable_hlo());
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         let output_tuple_indices = output_tuple_indices.iter().map(|v| *v as i64).collect::<Vec<_>>();
         let operand_tuple_indices = operand_tuple_indices.iter().map(|v| *v as i64).collect::<Vec<_>>();
         // While this operation can mutate the context (in that it might add an entry to its corresponding
@@ -748,7 +750,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_output_operand_alias`"))
         }
     }
 }
@@ -838,104 +840,120 @@ pub const XLA_GPU_UNPIN_CUSTOM_CALL_TARGET_NAME: &str = "Unpin";
 /// [official XLA documentation](https://openxla.org/xla/custom_call) for more information.
 pub trait CustomCallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the name of the target implementation of this [`CustomCallOperation`].
-    fn custom_call_target_name(&self) -> StringRef<'c> {
-        self.attribute(CUSTOM_CALL_TARGET_NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>().map(|attribute| attribute.string()))
-            .unwrap_or_else(|| {
-                panic!("invalid '{CUSTOM_CALL_TARGET_NAME_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
-            })
+    fn custom_call_target_name(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(CUSTOM_CALL_TARGET_NAME_ATTRIBUTE)?.string())
     }
 
     /// Returns `true` if executing this [`CustomCallOperation`] can result in side effects
     /// (i.e., if this operation is not _pure_).
-    fn custom_call_has_side_effect(&self) -> bool {
-        self.attribute(CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<BooleanAttributeRef>().map(|attribute| attribute.value()))
-            .unwrap_or_else(|| {
-                panic!("invalid '{CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
-            })
+    fn custom_call_has_side_effect(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE)?.value())
     }
 
     /// Returns the backend configuration of this [`CustomCallOperation`]. This is either a [`StringAttributeRef`]
     /// (when [`CustomCallOperation::custom_call_api_version`] is not [`CustomCallApiVersion::TypedFfi`])
     /// or a [`DictionaryAttributeRef`] (when [`CustomCallOperation::custom_call_api_version`] is
     /// [`CustomCallApiVersion::TypedFfi`]) that contains implementation-specific metadata.
-    fn custom_call_backend_config(&self) -> AttributeRef<'c, 't> {
-        self.attribute(CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<AttributeRef>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
-            })
+    fn custom_call_backend_config(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute(CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE)?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the [`CustomCallApiVersion`] of this [`CustomCallOperation`].
-    fn custom_call_api_version(&self) -> CustomCallApiVersion {
-        self.attribute(CUSTOM_CALL_API_VERSION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>().map(|attribute| attribute.into()))
-            .unwrap_or_else(|| {
-                panic!("invalid '{CUSTOM_CALL_API_VERSION_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
-            })
+    fn custom_call_api_version(&self) -> Result<CustomCallApiVersion, Error> {
+        Ok(self.integer_attribute(CUSTOM_CALL_API_VERSION_ATTRIBUTE)?.into())
     }
 
     /// Returns the names/symbols of functions that are used by this [`CustomCallOperation`].
-    fn custom_call_called_computations(&self) -> Vec<StringRef<'c>> {
-        let error_message =
-            format!("invalid '{CUSTOM_CALL_CALLED_COMPUTATIONS_ATTRIBUTE}' attribute in `stable_hlo::custom_call`");
-        self.attribute(CUSTOM_CALL_CALLED_COMPUTATIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<ArrayAttributeRef>())
-            .expect(&error_message)
+    fn custom_call_called_computations(&self) -> Result<Vec<StringRef<'c>>, Error> {
+        self.array_attribute(CUSTOM_CALL_CALLED_COMPUTATIONS_ATTRIBUTE)?
             .elements()
-            .map(|attribute| attribute.cast::<FlatSymbolRefAttributeRef>().expect(&error_message).reference())
+            .map(|attribute| {
+                attribute?
+                    .cast::<FlatSymbolRefAttributeRef>()
+                    .map(|attribute| attribute.reference())
+                    .ok_or_else(|| {
+                        Error::invalid_argument("invalid `called_computations` attribute in `stablehlo.custom_call`")
+                    })
+            })
             .collect()
     }
 
     /// Returns the optional memory layout information for the operands/inputs and the results/outputs of this
     /// [`CustomCallOperation`]. Refer to the documentation of [`CustomCallMemoryLayouts`] for information on the
     /// semantics of these memory layouts.
-    fn custom_call_memory_layouts(&self) -> Option<CustomCallMemoryLayouts> {
-        let error_message =
-            format!("invalid '{CUSTOM_CALL_OPERAND_LAYOUTS_ATTRIBUTE}' attribute in `stable_hlo::custom_call`");
-        self.attribute(CUSTOM_CALL_OPERAND_LAYOUTS_ATTRIBUTE)
-            .expect(&error_message)
-            .cast::<ArrayAttributeRef>()
-            .zip(
-                self.attribute(CUSTOM_CALL_RESULT_LAYOUTS_ATTRIBUTE)
-                    .expect(&error_message)
-                    .cast::<ArrayAttributeRef>(),
-            )
-            .map(|(operands, results)| CustomCallMemoryLayouts {
-                operands: operands
-                    .elements()
-                    .map(|attribute| unsafe {
-                        attribute
-                            .cast::<DenseIntegerElementsAttributeRef<'c, 't>>()
-                            .expect(&error_message)
-                            .usize_elements()
-                            .collect()
-                    })
-                    .collect(),
-                results: results
-                    .elements()
-                    .map(|attribute| unsafe {
-                        attribute
-                            .cast::<DenseIntegerElementsAttributeRef<'c, 't>>()
-                            .expect(&error_message)
-                            .usize_elements()
-                            .collect()
-                    })
-                    .collect(),
-            })
+    fn custom_call_memory_layouts(&self) -> Result<Option<CustomCallMemoryLayouts>, Error> {
+        let operands = if self.has_attribute(CUSTOM_CALL_OPERAND_LAYOUTS_ATTRIBUTE) {
+            Some(self.array_attribute(CUSTOM_CALL_OPERAND_LAYOUTS_ATTRIBUTE)?)
+        } else {
+            None
+        };
+        let results = if self.has_attribute(CUSTOM_CALL_RESULT_LAYOUTS_ATTRIBUTE) {
+            Some(self.array_attribute(CUSTOM_CALL_RESULT_LAYOUTS_ATTRIBUTE)?)
+        } else {
+            None
+        };
+        let (operands, results) = match (operands, results) {
+            (Some(operands), Some(results)) => (operands, results),
+            (None, None) => return Ok(None),
+            _ => {
+                return Err(Error::invalid_argument(
+                    "custom call operand and result layouts must be provided together",
+                ));
+            }
+        };
+        Ok(Some(CustomCallMemoryLayouts {
+            operands: operands
+                .elements()
+                .map(|attribute| {
+                    let attribute = attribute?.cast::<DenseIntegerElementsAttributeRef<'c, 't>>().ok_or_else(|| {
+                        Error::invalid_argument("invalid `operand_layouts` attribute in `stablehlo.custom_call`")
+                    })?;
+                    let r#type = attribute.r#type()?.cast::<ShapedTypeRef>().ok_or_else(|| {
+                        Error::invalid_argument("invalid `operand_layouts` attribute in `stablehlo.custom_call`")
+                    })?;
+                    if !r#type.element_type()?.is::<IndexTypeRef>() {
+                        return Err(Error::invalid_argument(
+                            "invalid `operand_layouts` attribute in `stablehlo.custom_call`",
+                        ));
+                    }
+                    unsafe { attribute.usize_elements().collect() }
+                })
+                .collect::<Result<Vec<_>, Error>>()?,
+            results: results
+                .elements()
+                .map(|attribute| {
+                    let attribute = attribute?.cast::<DenseIntegerElementsAttributeRef<'c, 't>>().ok_or_else(|| {
+                        Error::invalid_argument("invalid `result_layouts` attribute in `stablehlo.custom_call`")
+                    })?;
+                    let r#type = attribute.r#type()?.cast::<ShapedTypeRef>().ok_or_else(|| {
+                        Error::invalid_argument("invalid `result_layouts` attribute in `stablehlo.custom_call`")
+                    })?;
+                    if !r#type.element_type()?.is::<IndexTypeRef>() {
+                        return Err(Error::invalid_argument(
+                            "invalid `result_layouts` attribute in `stablehlo.custom_call`",
+                        ));
+                    }
+                    unsafe { attribute.usize_elements().collect() }
+                })
+                .collect::<Result<Vec<_>, Error>>()?,
+        }))
     }
 
     /// Returns the alias relationship between outputs and operands of this [`CustomCallOperation`].
-    fn custom_call_output_operand_aliases(&self) -> Vec<OutputOperandAliasAttributeRef<'c, 't>> {
-        let error_message =
-            format!("invalid '{CUSTOM_CALL_OUTPUT_OPERAND_ALIASES_ATTRIBUTE}' attribute in `stable_hlo::custom_call`");
-        self.attribute(CUSTOM_CALL_OUTPUT_OPERAND_ALIASES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<ArrayAttributeRef>())
-            .expect(&error_message)
+    fn custom_call_output_operand_aliases(&self) -> Result<Vec<OutputOperandAliasAttributeRef<'c, 't>>, Error> {
+        self.array_attribute(CUSTOM_CALL_OUTPUT_OPERAND_ALIASES_ATTRIBUTE)?
             .elements()
-            .map(|attribute| attribute.cast::<OutputOperandAliasAttributeRef>().expect(&error_message))
+            .map(|attribute| {
+                attribute?.cast::<OutputOperandAliasAttributeRef>().ok_or_else(|| {
+                    Error::invalid_argument("invalid `output_operand_aliases` attribute in `stablehlo.custom_call`")
+                })
+            })
             .collect()
     }
 }
@@ -958,7 +976,7 @@ pub fn custom_call<
     'c: 'v,
     't: 'c,
     V: Value<'v, 'c, 't>,
-    N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     T: Type<'c, 't>,
     L: Location<'c, 't>,
 >(
@@ -972,12 +990,12 @@ pub fn custom_call<
     output_operand_aliases: &[OutputOperandAliasAttributeRef<'c, 't>],
     output_types: &[T],
     location: L,
-) -> DetachedCustomCallOperation<'c, 't> {
+) -> Result<DetachedCustomCallOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.custom_call", location)
         .add_operands(inputs)
-        .add_attribute(CUSTOM_CALL_TARGET_NAME_ATTRIBUTE, target_name.into_with_context(context))
+        .add_attribute(CUSTOM_CALL_TARGET_NAME_ATTRIBUTE, target_name.try_into_with_context(context)?)
         .add_attribute(CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE, context.boolean_attribute(has_side_effect));
 
     if let Some(backend_config) = backend_config {
@@ -992,8 +1010,10 @@ pub fn custom_call<
                     &memory_layouts
                         .operands
                         .iter()
-                        .map(|layout| DenseIntegerElementsAttributeRef::from_with_context(layout.as_slice(), context))
-                        .collect::<Vec<_>>(),
+                        .map(|layout| {
+                            DenseIntegerElementsAttributeRef::try_from_with_context(layout.as_slice(), context)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
                 ),
             )
             .add_attribute(
@@ -1002,20 +1022,28 @@ pub fn custom_call<
                     &memory_layouts
                         .results
                         .iter()
-                        .map(|layout| DenseIntegerElementsAttributeRef::from_with_context(layout.as_slice(), context))
-                        .collect::<Vec<_>>(),
+                        .map(|layout| {
+                            DenseIntegerElementsAttributeRef::try_from_with_context(layout.as_slice(), context)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
                 ),
             );
     }
 
     builder
-        .add_attribute(CUSTOM_CALL_API_VERSION_ATTRIBUTE, IntegerAttributeRef::from_with_context(api_version, context))
+        .add_attribute(
+            CUSTOM_CALL_API_VERSION_ATTRIBUTE,
+            IntegerAttributeRef::try_from_with_context(api_version, context)?,
+        )
         .add_attribute(CUSTOM_CALL_CALLED_COMPUTATIONS_ATTRIBUTE, context.array_attribute(called_computations))
         .add_attribute(CUSTOM_CALL_OUTPUT_OPERAND_ALIASES_ATTRIBUTE, context.array_attribute(output_operand_aliases))
         .add_results(output_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::custom_call`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::custom_call`"))
+        })
 }
 
 /// Constructs a new detached/owned [`CustomCallOperation`] for the XLA GPU `CreateBuffer` built-in target.
@@ -1027,7 +1055,7 @@ pub fn custom_call<
 pub fn gpu_create_buffer_custom_call<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     output_type: T,
     location: L,
-) -> DetachedCustomCallOperation<'c, 't> {
+) -> Result<DetachedCustomCallOperation<'c, 't>, Error> {
     custom_call::<ValueRef, _, _, _>(
         &[],
         XLA_GPU_CREATE_BUFFER_CUSTOM_CALL_TARGET_NAME,
@@ -1052,7 +1080,7 @@ pub fn gpu_pin_custom_call<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c,
     input: V,
     output_type: T,
     location: L,
-) -> DetachedCustomCallOperation<'c, 't> {
+) -> Result<DetachedCustomCallOperation<'c, 't>, Error> {
     custom_call(
         &[input],
         XLA_GPU_PIN_CUSTOM_CALL_TARGET_NAME,
@@ -1077,7 +1105,7 @@ pub fn gpu_unpin_custom_call<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'
     input: V,
     output_type: T,
     location: L,
-) -> DetachedCustomCallOperation<'c, 't> {
+) -> Result<DetachedCustomCallOperation<'c, 't>, Error> {
     custom_call(
         &[input],
         XLA_GPU_UNPIN_CUSTOM_CALL_TARGET_NAME,
@@ -1104,38 +1132,43 @@ mod tests {
     use crate::{Attribute, Block, Context, Operation, Region, Size, StringRef, SymbolVisibility, Value};
 
     use super::{
-        CompositeOperation, CustomCallApiVersion, CustomCallMemoryLayouts, CustomCallOperation, DynamicIotaOperation,
-        IotaOperation, ReverseOperation, SortOperation, XLA_GPU_CREATE_BUFFER_CUSTOM_CALL_TARGET_NAME,
-        XLA_GPU_PIN_CUSTOM_CALL_TARGET_NAME, XLA_GPU_UNPIN_CUSTOM_CALL_TARGET_NAME, composite, constant, custom_call,
-        dynamic_iota, gpu_create_buffer_custom_call, gpu_pin_custom_call, gpu_unpin_custom_call, iota,
-        optimization_barrier, r#return, reverse, sort,
+        CompositeOperation, ConstantOperation, CustomCallApiVersion, CustomCallMemoryLayouts, CustomCallOperation,
+        DynamicIotaOperation, IotaOperation, ReverseOperation, SortOperation,
+        XLA_GPU_CREATE_BUFFER_CUSTOM_CALL_TARGET_NAME, XLA_GPU_PIN_CUSTOM_CALL_TARGET_NAME,
+        XLA_GPU_UNPIN_CUSTOM_CALL_TARGET_NAME, composite, constant, custom_call, dynamic_iota,
+        gpu_create_buffer_custom_call, gpu_pin_custom_call, gpu_unpin_custom_call, iota, optimization_barrier,
+        r#return, reverse, sort,
     };
 
     #[test]
     fn test_constant() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let tensor_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(4)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = constant(
-                context.dense_i64_elements_attribute(tensor_type, &[0, 1, 2, 3, 4, 5, 6, 7]).unwrap(),
-                location,
-            );
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "constant_test",
-                func::FuncAttributes { arguments: vec![], results: vec![tensor_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let value = context.dense_i64_elements_attribute(tensor_type, &[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+                let op = constant(value, location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.value().unwrap().to_string(), value.to_string());
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "constant_test",
+                    func::FuncAttributes { arguments: vec![], results: vec![tensor_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1153,26 +1186,31 @@ mod tests {
     fn test_iota() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(4), Size::Static(5)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = iota(tensor_type, 1, location);
-            assert_eq!(op.iota_dimension(), 1);
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), tensor_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "iota_test",
-                func::FuncAttributes { arguments: vec![], results: vec![tensor_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = iota(tensor_type, 1, location).unwrap();
+                assert_eq!(op.iota_dimension().unwrap(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), tensor_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "iota_test",
+                    func::FuncAttributes { arguments: vec![], results: vec![tensor_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1190,30 +1228,35 @@ mod tests {
     fn test_dynamic_iota() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let shape_tensor_type = context.tensor_type(i64_type, &[Size::Static(2)], None, location).unwrap();
         let tensor_type = context.tensor_type(i64_type, &[Size::Dynamic, Size::Dynamic], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(shape_tensor_type, location)]);
-            let op = dynamic_iota(block.argument(0).unwrap(), tensor_type, 1, location);
-            assert_eq!(op.iota_dimension(), 1);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "dynamic_iota_test",
-                func::FuncAttributes {
-                    arguments: vec![shape_tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(shape_tensor_type, location)]);
+                let op = dynamic_iota(block.argument(0).unwrap(), tensor_type, 1, location).unwrap();
+                assert_eq!(op.iota_dimension().unwrap(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "dynamic_iota_test",
+                    func::FuncAttributes {
+                        arguments: vec![shape_tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1231,48 +1274,75 @@ mod tests {
     fn test_sort() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let input_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
         let scalar_i64_type = context.tensor_type(i64_type, &[], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (input_type, location)]);
-            let mut comparator_region = context.region();
-            let mut comparator_block = context.block(&[
-                (scalar_i64_type, location),
-                (scalar_i64_type, location),
-                (scalar_i64_type, location),
-                (scalar_i64_type, location),
-            ]);
-            let compare_op = comparator_block.append_operation(stable_hlo::compare(
-                comparator_block.argument(0).unwrap(),
-                comparator_block.argument(1).unwrap(),
-                stable_hlo::ComparisonDirection::GreaterThan,
-                stable_hlo::ComparisonType::Signed,
-                location,
-            ));
-            comparator_block.append_operation(r#return(&[compare_op.result(0).unwrap()], location));
-            comparator_region.append_block(comparator_block);
-            let op = sort(&block.arguments().collect::<Vec<_>>(), 1, true, comparator_region, location);
-            assert_eq!(op.dimension(), 1);
-            assert_eq!(op.is_stable(), true);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 2);
-            assert_eq!(op.regions().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&op.results().collect::<Vec<_>>(), location));
-            func::func(
-                "sort_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), input_type.into()],
-                    results: vec![input_type.into(), input_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (input_type, location)]);
+                let mut comparator_region = context.region();
+                let mut comparator_block = context.block(&[
+                    (scalar_i64_type, location),
+                    (scalar_i64_type, location),
+                    (scalar_i64_type, location),
+                    (scalar_i64_type, location),
+                ]);
+                let compare_op = comparator_block
+                    .append_operation(
+                        stable_hlo::compare(
+                            comparator_block.argument(0).unwrap(),
+                            comparator_block.argument(1).unwrap(),
+                            stable_hlo::ComparisonDirection::GreaterThan,
+                            stable_hlo::ComparisonType::Signed,
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                comparator_block
+                    .append_operation(r#return(&[compare_op.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                comparator_region.append_block(comparator_block).unwrap();
+                let op = sort(
+                    &block.arguments().collect::<Result<Vec<_>, _>>().unwrap(),
+                    1,
+                    true,
+                    comparator_region,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.dimension().unwrap(), 1);
+                assert!(op.is_stable().unwrap());
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(
+                        func::r#return(
+                            &op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                func::func(
+                    "sort_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), input_type.into()],
+                        results: vec![input_type.into(), input_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1294,7 +1364,7 @@ mod tests {
     fn test_reverse() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let input_tensor_type = context
             .tensor_type(i32_type, &[Size::Static(3), Size::Static(4), Size::Static(5)], None, location)
@@ -1302,28 +1372,33 @@ mod tests {
         let output_tensor_type = context
             .tensor_type(i32_type, &[Size::Static(3), Size::Static(4), Size::Static(5)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_tensor_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = reverse(input, &[0, 2], location);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.reverse_dimensions(), vec![0, 2]);
-            assert_eq!(op.result(0).unwrap().r#type(), output_tensor_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "reverse_test",
-                func::FuncAttributes {
-                    arguments: vec![input_tensor_type.into()],
-                    results: vec![output_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = reverse(input, &[0, 2], location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.reverse_dimensions().unwrap(), vec![0, 2]);
+                assert_eq!(op.reverse_dimensions().unwrap(), vec![0, 2]);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "reverse_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_tensor_type.into()],
+                        results: vec![output_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1342,38 +1417,44 @@ mod tests {
     fn test_return() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
         let scalar_tensor_type = context.tensor_type(f32_type, &[], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let mut map_region = context.region();
-            let mut map_block = context.block(&[(scalar_tensor_type, location)]);
-            let input = map_block.argument(0).unwrap();
-            let negate_op = stable_hlo::negate(input, location);
-            let negate_op = map_block.append_operation(negate_op);
-            let return_op = r#return(&[negate_op.result(0).unwrap()], location);
-            assert_eq!(return_op.operands().count(), 1);
-            assert_eq!(return_op.results().count(), 0);
-            assert_eq!(return_op.regions().count(), 0);
-            map_block.append_operation(return_op);
-            map_region.append_block(map_block);
-            let map_op = stable_hlo::map(&[block.argument(0).unwrap()], &[0, 1], map_region.into(), location);
-            let map_op = block.append_operation(map_op);
-            block.append_operation(func::r#return(&[map_op.result(0).unwrap()], location));
-            func::func(
-                "return_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let mut map_region = context.region();
+                let mut map_block = context.block(&[(scalar_tensor_type, location)]);
+                let input = map_block.argument(0).unwrap();
+                let negate_op = stable_hlo::negate(input, location).unwrap();
+                let negate_op = map_block.append_operation(negate_op).unwrap();
+                let return_op = r#return(&[negate_op.result(0).unwrap()], location).unwrap();
+                assert_eq!(return_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(return_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(return_op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                map_block.append_operation(return_op).unwrap();
+                map_region.append_block(map_block).unwrap();
+                let map_op =
+                    stable_hlo::map(&[block.argument(0).unwrap()], &[0, 1], map_region.into(), location).unwrap();
+                let map_op = block.append_operation(map_op).unwrap();
+                block.append_operation(func::r#return(&[map_op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "return_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1395,27 +1476,41 @@ mod tests {
     fn test_optimization_barrier() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let tensor_type = context.tensor_type(context.float32_type(), &[], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let op = optimization_barrier(&block.arguments().collect::<Vec<_>>(), location);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 2);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&op.results().collect::<Vec<_>>(), location));
-            func::func(
-                "optimization_barrier_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into(), tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let op =
+                    optimization_barrier(&block.arguments().collect::<Result<Vec<_>, _>>().unwrap(), location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(
+                        func::r#return(
+                            &op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>(),
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                func::func(
+                    "optimization_barrier_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into(), tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1433,69 +1528,92 @@ mod tests {
     fn test_composite() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[], None, location).unwrap();
-        module.body().append_operation({
-            let mut decomposition = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let op = stable_hlo::add(decomposition.argument(0).unwrap(), decomposition.argument(1).unwrap(), location);
-            let op = decomposition.append_operation(op);
-            decomposition.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "my_op",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    visibility: SymbolVisibility::Private,
-                    ..Default::default()
-                },
-                decomposition.into(),
-                location,
-            )
-        });
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let composite_attributes =
-                HashMap::from([(StringRef::from("my_op_attribute"), context.unit_attribute().as_ref())]);
-            let mut composite_region = context.region();
-            let mut composite_region_block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            composite_region_block.append_operation(stable_hlo::r#return(
-                &composite_region_block.arguments().collect::<Vec<_>>(),
-                location,
-            ));
-            composite_region.append_block(composite_region_block);
-            let composite_op = composite(
-                "my_namespace.my_op",
-                1,
-                Some(&composite_attributes),
-                &block.arguments().collect::<Vec<_>>(),
-                "my_op",
-                vec![composite_region.into()],
-                &[tensor_type],
-                location,
-            );
-            assert_eq!(composite_op.composite_name().as_str().unwrap(), "my_namespace.my_op");
-            assert_eq!(composite_op.composite_version(), 1);
-            assert_eq!(composite_op.composite_attributes(), composite_attributes);
-            assert_eq!(composite_op.composite_decomposition().as_str().unwrap(), "my_op");
-            assert_eq!(composite_op.composite_regions().count(), 1);
-            assert_eq!(composite_op.operands().count(), 2);
-            assert_eq!(composite_op.results().count(), 1);
-            assert_eq!(composite_op.regions().count(), 1);
-            let composite_op = block.append_operation(composite_op);
-            block.append_operation(func::r#return(&[composite_op.result(0).unwrap()], location));
-            func::func(
-                "composite_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut decomposition = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let op =
+                    stable_hlo::add(decomposition.argument(0).unwrap(), decomposition.argument(1).unwrap(), location)
+                        .unwrap();
+                let op = decomposition.append_operation(op).unwrap();
+                decomposition.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "my_op",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        visibility: SymbolVisibility::Private,
+                        ..Default::default()
+                    },
+                    decomposition.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let composite_attributes =
+                    HashMap::from([(StringRef::from("my_op_attribute"), context.unit_attribute().as_ref())]);
+                let mut composite_region = context.region();
+                let mut composite_region_block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                composite_region_block
+                    .append_operation(
+                        stable_hlo::r#return(
+                            &composite_region_block.arguments().collect::<Result<Vec<_>, _>>().unwrap(),
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                composite_region.append_block(composite_region_block).unwrap();
+                let composite_op = composite(
+                    "my_namespace.my_op",
+                    1,
+                    Some(&composite_attributes),
+                    &block.arguments().collect::<Result<Vec<_>, _>>().unwrap(),
+                    "my_op",
+                    vec![composite_region.into()],
+                    &[tensor_type],
+                    location,
+                )
+                .unwrap();
+                assert_eq!(composite_op.composite_name().unwrap().as_str().unwrap(), "my_namespace.my_op");
+                assert_eq!(composite_op.composite_version().unwrap(), 1);
+                assert_eq!(composite_op.composite_attributes().unwrap(), composite_attributes);
+                assert_eq!(composite_op.composite_decomposition().unwrap().as_str().unwrap(), "my_op");
+                assert_eq!(
+                    composite_op.composite_regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
+                    1,
+                );
+                assert_eq!(composite_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(composite_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(composite_op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let composite_op = block.append_operation(composite_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[composite_op.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "composite_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1523,7 +1641,7 @@ mod tests {
     #[test]
     fn test_output_operand_alias_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]);
+        let attribute = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.output_tuple_indices(), vec![0, 1]);
         assert_eq!(attribute.operand_index(), 2);
@@ -1535,24 +1653,24 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]);
-        let attribute_2 = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]);
+        let attribute_1 = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]).unwrap();
+        let attribute_2 = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_output_operand_alias(&[1, 0], 2, &[3, 4]);
+        let attribute_2 = context.stable_hlo_output_operand_alias(&[1, 0], 2, &[3, 4]).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]);
+        let attribute_2 = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_output_operand_alias_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]);
+        let attribute = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]).unwrap();
         test_attribute_display_and_debug(
             attribute,
             "#stablehlo.output_operand_alias<\
@@ -1566,7 +1684,7 @@ mod tests {
     #[test]
     fn test_output_operand_alias_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]);
+        let attribute = context.stable_hlo_output_operand_alias(&[0, 1], 2, &[3, 4]).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -1574,82 +1692,95 @@ mod tests {
     fn test_custom_call() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(4), Size::Static(2)], None, location).unwrap();
         let memref_type =
             context.mem_ref_type(f32_type, &[Size::Static(4), Size::Static(2)], None, None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let backend_config = context.string_attribute("status_returning_attribute");
-            let op = custom_call(
-                &block.arguments().collect::<Vec<_>>(),
-                "my_custom_op",
-                true,
-                Some(backend_config.as_ref()),
-                CustomCallApiVersion::StatusReturning,
-                &[context.flat_symbol_ref_attribute("add_0"), context.flat_symbol_ref_attribute("add_1")],
-                Some(CustomCallMemoryLayouts { operands: vec![vec![0, 1], vec![1, 0]], results: vec![vec![1, 0]] }),
-                &[
-                    context.stable_hlo_output_operand_alias(&[], 1, &[]),
-                    context.stable_hlo_output_operand_alias(&[], 0, &[]),
-                ],
-                &[tensor_type],
-                location,
-            );
-            assert_eq!(op.custom_call_target_name().as_str().unwrap(), "my_custom_op");
-            assert!(op.custom_call_has_side_effect());
-            assert_eq!(op.custom_call_backend_config(), backend_config);
-            assert_eq!(op.custom_call_api_version(), CustomCallApiVersion::StatusReturning);
-            assert_eq!(
-                op.custom_call_called_computations()
-                    .iter()
-                    .map(|string_ref| string_ref.as_str().unwrap())
-                    .collect::<Vec<_>>(),
-                ["add_0", "add_1"],
-            );
-            assert_eq!(
-                op.custom_call_memory_layouts(),
-                Some(CustomCallMemoryLayouts { operands: vec![vec![0, 1], vec![1, 0]], results: vec![vec![1, 0]] })
-            );
-            assert_eq!(op.custom_call_output_operand_aliases().len(), 2);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 0);
-            let op = block.append_operation(op);
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let backend_config = context.string_attribute("status_returning_attribute");
+                let op = custom_call(
+                    &block.arguments().collect::<Result<Vec<_>, _>>().unwrap(),
+                    "my_custom_op",
+                    true,
+                    Some(backend_config.as_ref()),
+                    CustomCallApiVersion::StatusReturning,
+                    &[context.flat_symbol_ref_attribute("add_0"), context.flat_symbol_ref_attribute("add_1")],
+                    Some(CustomCallMemoryLayouts { operands: vec![vec![0, 1], vec![1, 0]], results: vec![vec![1, 0]] }),
+                    &[
+                        context.stable_hlo_output_operand_alias(&[], 1, &[]).unwrap(),
+                        context.stable_hlo_output_operand_alias(&[], 0, &[]).unwrap(),
+                    ],
+                    &[tensor_type],
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.custom_call_target_name().unwrap().as_str().unwrap(), "my_custom_op");
+                assert!(op.custom_call_has_side_effect().unwrap());
+                assert_eq!(op.custom_call_backend_config().unwrap(), backend_config);
+                assert_eq!(op.custom_call_api_version().unwrap(), CustomCallApiVersion::StatusReturning);
+                assert_eq!(
+                    op.custom_call_called_computations()
+                        .unwrap()
+                        .iter()
+                        .map(|string_ref| string_ref.as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["add_0", "add_1"],
+                );
+                assert_eq!(
+                    op.custom_call_memory_layouts().unwrap(),
+                    Some(CustomCallMemoryLayouts { operands: vec![vec![0, 1], vec![1, 0]], results: vec![vec![1, 0]] })
+                );
+                assert_eq!(op.custom_call_output_operand_aliases().unwrap().len(), 2);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                let op = block.append_operation(op).unwrap();
 
-            // Add a couple more custom calls testing the XLA GPU built-in constructors.
-            let create_buffer_op = gpu_create_buffer_custom_call(memref_type, location);
-            assert_eq!(
-                create_buffer_op.custom_call_target_name().as_str().unwrap(),
-                XLA_GPU_CREATE_BUFFER_CUSTOM_CALL_TARGET_NAME,
-            );
-            assert_eq!(create_buffer_op.custom_call_api_version(), CustomCallApiVersion::TypedFfi);
-            block.append_operation(create_buffer_op);
+                // Add a couple more custom calls testing the XLA GPU built-in constructors.
+                let create_buffer_op = gpu_create_buffer_custom_call(memref_type, location).unwrap();
+                assert_eq!(
+                    create_buffer_op.custom_call_target_name().unwrap().as_str().unwrap(),
+                    XLA_GPU_CREATE_BUFFER_CUSTOM_CALL_TARGET_NAME,
+                );
+                assert_eq!(create_buffer_op.custom_call_api_version().unwrap(), CustomCallApiVersion::TypedFfi);
+                block.append_operation(create_buffer_op).unwrap();
 
-            let pin_op = gpu_pin_custom_call(op.result(0).unwrap(), memref_type, location);
-            assert_eq!(pin_op.custom_call_target_name().as_str().unwrap(), XLA_GPU_PIN_CUSTOM_CALL_TARGET_NAME);
-            assert_eq!(pin_op.custom_call_api_version(), CustomCallApiVersion::TypedFfi);
-            let pin_op = block.append_operation(pin_op);
+                let pin_op = gpu_pin_custom_call(op.result(0).unwrap(), memref_type, location).unwrap();
+                assert_eq!(
+                    pin_op.custom_call_target_name().unwrap().as_str().unwrap(),
+                    XLA_GPU_PIN_CUSTOM_CALL_TARGET_NAME
+                );
+                assert_eq!(pin_op.custom_call_api_version().unwrap(), CustomCallApiVersion::TypedFfi);
+                let pin_op = block.append_operation(pin_op).unwrap();
 
-            let unpin_op = gpu_unpin_custom_call(pin_op.result(0).unwrap(), tensor_type, location);
-            assert_eq!(unpin_op.custom_call_target_name().as_str().unwrap(), XLA_GPU_UNPIN_CUSTOM_CALL_TARGET_NAME);
-            assert_eq!(unpin_op.custom_call_api_version(), CustomCallApiVersion::TypedFfi);
-            let unpin_op = block.append_operation(unpin_op);
+                let unpin_op = gpu_unpin_custom_call(pin_op.result(0).unwrap(), tensor_type, location).unwrap();
+                assert_eq!(
+                    unpin_op.custom_call_target_name().unwrap().as_str().unwrap(),
+                    XLA_GPU_UNPIN_CUSTOM_CALL_TARGET_NAME,
+                );
+                assert_eq!(unpin_op.custom_call_api_version().unwrap(), CustomCallApiVersion::TypedFfi);
+                let unpin_op = block.append_operation(unpin_op).unwrap();
 
-            block.append_operation(func::r#return(&[unpin_op.result(0).unwrap()], location));
-            func::func(
-                "custom_call_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+                block.append_operation(func::r#return(&[unpin_op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "custom_call_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

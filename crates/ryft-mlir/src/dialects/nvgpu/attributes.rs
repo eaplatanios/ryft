@@ -3,7 +3,7 @@ use ryft_xla_sys::mlir::dialects::nvgpu::{
     MlirNvgpuEnumAttribute, mlirAttributeIsANvgpuEnumAttr, mlirNvgpuEnumAttrGet, mlirNvgpuEnumAttrGetValue,
 };
 
-use crate::{Attribute, Context, DialectHandle, FromWithContext, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, DialectHandle, Error, mlir_subtype_trait_impls};
 
 macro_rules! nvgpu_enum_attribute {
     (
@@ -61,18 +61,19 @@ macro_rules! nvgpu_enum_attribute {
 
         impl $attribute_name<'_, '_> {
             /// Returns the enum value stored in this attribute.
-            pub fn value(&self) -> $enum_name {
-                $enum_name::from_value(unsafe { mlirNvgpuEnumAttrGetValue(self.handle, $ffi_kind) })
-                    .expect(concat!("invalid NVGPU ", $description, " attribute"))
+            pub fn value(&self) -> Result<$enum_name, Error> {
+                $enum_name::from_value(unsafe { mlirNvgpuEnumAttrGetValue(self.handle, $ffi_kind) }).ok_or_else(|| {
+                    Error::invalid_argument(concat!("invalid nvgpu ", $description, " attribute"))
+                })
             }
         }
 
         impl<'c, 't> Attribute<'c, 't> for $attribute_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
                 if !handle.ptr.is_null() && unsafe { mlirAttributeIsANvgpuEnumAttr(handle, $ffi_kind) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR attribute handle"))
                 }
             }
 
@@ -87,24 +88,18 @@ macro_rules! nvgpu_enum_attribute {
 
         mlir_subtype_trait_impls!($attribute_name<'c, 't> as Attribute, mlir_type = Attribute);
 
-        impl<'c, 't> FromWithContext<'c, 't, $enum_name> for $attribute_name<'c, 't> {
-            fn from_with_context(value: $enum_name, context: &'c Context<'t>) -> Self {
-                context.$context_method(value)
-            }
-        }
-
         impl<'t> Context<'t> {
             #[doc = "Creates a new NVGPU "]
             #[doc = $description]
             #[doc = " attribute owned by this [`Context`]."]
-            pub fn $context_method<'c>(&'c self, value: $enum_name) -> $attribute_name<'c, 't> {
-                self.load_dialect(DialectHandle::nvgpu());
+            pub fn $context_method<'c>(&'c self, value: $enum_name) -> Result<$attribute_name<'c, 't>, Error> {
+                self.load_dialect(DialectHandle::nvgpu()?)?;
                 unsafe {
                     $attribute_name::from_c_api(
                         mlirNvgpuEnumAttrGet(*self.handle.borrow_mut(), $ffi_kind, value.value()),
                         self,
                     )
-                    .expect(concat!("invalid arguments to `Context::", stringify!($context_method), "`"))
+                    .map_err(|_| Error::invalid_argument(concat!("invalid nvgpu ", $description, " attribute")))
                 }
             }
         }
@@ -193,31 +188,31 @@ mod tests {
                 #[test]
                 fn [<test_ $test_name _attribute>]() {
                     let context = Context::new();
-                    let attribute = context.$constructor($enum_name::$first);
+                    let attribute = context.$constructor($enum_name::$first).unwrap();
                     assert_eq!(&context, attribute.context());
-                    assert_eq!(attribute.value(), $enum_name::$first);
-                    assert_eq!($enum_name::from_value(attribute.value().value()), Some($enum_name::$first));
+                    assert_eq!(attribute.value().unwrap(), $enum_name::$first);
+                    assert_eq!($enum_name::from_value(attribute.value().unwrap().value()), Some($enum_name::$first));
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_equality>]() {
                     let context = Context::new();
-                    let attribute_1 = context.$constructor($enum_name::$first);
-                    let attribute_2 = context.$constructor($enum_name::$first);
+                    let attribute_1 = context.$constructor($enum_name::$first).unwrap();
+                    let attribute_2 = context.$constructor($enum_name::$first).unwrap();
                     assert_eq!(attribute_1, attribute_2);
 
-                    let attribute_2 = context.$constructor($enum_name::$second);
+                    let attribute_2 = context.$constructor($enum_name::$second).unwrap();
                     assert_ne!(attribute_1, attribute_2);
 
                     let context = Context::new();
-                    let attribute_2 = context.$constructor($enum_name::$first);
+                    let attribute_2 = context.$constructor($enum_name::$first).unwrap();
                     assert_ne!(attribute_1, attribute_2);
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_display_and_debug>]() {
                     let context = Context::new();
-                    let attribute = context.$constructor($enum_name::$first);
+                    let attribute = context.$constructor($enum_name::$first).unwrap();
                     let expected = format!("#nvgpu<{} {}>", stringify!($test_name), $enum_name::$first.as_str());
                     test_attribute_display_and_debug(attribute, Box::leak(expected.into_boxed_str()));
                 }
@@ -225,8 +220,8 @@ mod tests {
                 #[test]
                 fn [<test_ $test_name _attribute_parsing>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::nvgpu());
-                    let attribute = context.$constructor($enum_name::$first);
+                    context.load_dialect(DialectHandle::nvgpu().unwrap()).unwrap();
+                    let attribute = context.$constructor($enum_name::$first).unwrap();
                     let source = format!("#nvgpu<{} {}>", stringify!($test_name), $enum_name::$first.as_str());
                     assert_eq!(context.parse_attribute(&source).unwrap().cast::<$attribute_name>().unwrap(), attribute);
                 }
@@ -234,7 +229,7 @@ mod tests {
                 #[test]
                 fn [<test_ $test_name _attribute_casting>]() {
                     let context = Context::new();
-                    let attribute = context.$constructor($enum_name::$first);
+                    let attribute = context.$constructor($enum_name::$first).unwrap();
                     test_attribute_casting(attribute);
                 }
             }

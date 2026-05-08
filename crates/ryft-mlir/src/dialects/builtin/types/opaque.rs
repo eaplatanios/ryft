@@ -2,7 +2,7 @@ use ryft_xla_sys::bindings::{
     MlirType, mlirOpaqueTypeGet, mlirOpaqueTypeGetData, mlirOpaqueTypeGetDialectNamespace, mlirOpaqueTypeGetTypeID,
 };
 
-use crate::{Context, StringRef, Type, TypeId, mlir_subtype_trait_impls};
+use crate::{Context, Error, StringRef, Type, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Type`] that represents a type associated with a dialect that has not been registered with the
 /// owning context. [`OpaqueTypeRef`] [`Display`](std::fmt::Display) renderings consist of the namespace of the dialect
@@ -21,8 +21,8 @@ pub struct OpaqueTypeRef<'c, 't> {
 
 impl<'c, 't> OpaqueTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`OpaqueTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirOpaqueTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirOpaqueTypeGetTypeID()) }
     }
 
     /// Returns the namespace of the dialect with which this [`OpaqueTypeRef`] is associated. The returned string is
@@ -53,17 +53,14 @@ impl<'t> Context<'t> {
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
-        unsafe {
-            OpaqueTypeRef::from_c_api(
-                mlirOpaqueTypeGet(
-                    *self.handle.borrow(),
-                    StringRef::from(dialect_namespace.as_ref()).to_c_api(),
-                    StringRef::from(data.as_ref()).to_c_api(),
-                ),
-                self,
+        let handle = unsafe {
+            mlirOpaqueTypeGet(
+                *self.handle.borrow(),
+                StringRef::from(dialect_namespace.as_ref()).to_c_api(),
+                StringRef::from(data.as_ref()).to_c_api(),
             )
-            .unwrap()
-        }
+        };
+        OpaqueTypeRef { handle, context: self }
     }
 }
 
@@ -78,11 +75,11 @@ mod tests {
     #[test]
     fn test_opaque_type_type_id() {
         let context = Context::new();
-        let opaque_type = OpaqueTypeRef::type_id();
+        let opaque_type = OpaqueTypeRef::type_id().unwrap();
         let opaque_type_1 = context.opaque_type("test_dialect", "test_data");
         let opaque_type_2 = context.opaque_type("test_dialect", "test_data");
-        assert_eq!(opaque_type_1.type_id(), opaque_type_2.type_id());
-        assert_eq!(opaque_type, opaque_type_1.type_id());
+        assert_eq!(opaque_type_1.type_id().unwrap(), opaque_type_2.type_id().unwrap());
+        assert_eq!(opaque_type, opaque_type_1.type_id().unwrap());
     }
 
     #[test]

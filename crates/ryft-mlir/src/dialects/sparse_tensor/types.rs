@@ -9,7 +9,7 @@ use ryft_xla_sys::mlir::dialects::sparse_tensor::{
     mlirTypeIsASparseTensorStorageSpecifierType,
 };
 
-use crate::{Attribute, Context, DialectHandle, Type, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, DialectHandle, Error, Type, mlir_subtype_trait_impls};
 
 use super::SparseTensorEncodingAttributeRef;
 
@@ -26,23 +26,23 @@ pub struct StorageSpecifierTypeRef<'c, 't> {
 
 impl<'c, 't> StorageSpecifierTypeRef<'c, 't> {
     /// Returns the sparse tensor encoding associated with this storage specifier.
-    pub fn encoding(&self) -> SparseTensorEncodingAttributeRef<'c, 't> {
+    pub fn encoding(&self) -> Result<SparseTensorEncodingAttributeRef<'c, 't>, Error> {
         unsafe {
             SparseTensorEncodingAttributeRef::from_c_api(
                 mlirSparseTensorStorageSpecifierTypeGetEncoding(self.handle),
                 self.context,
             )
-            .expect("invalid sparse tensor storage specifier encoding")
+            .map_err(|_| Error::internal("invalid sparse tensor storage specifier encoding"))
         }
     }
 }
 
 impl<'c, 't> Type<'c, 't> for StorageSpecifierTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirTypeIsASparseTensorStorageSpecifierType(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR type handle"))
         }
     }
 
@@ -70,13 +70,13 @@ pub struct IterationSpaceTypeRef<'c, 't> {
 
 impl<'c, 't> IterationSpaceTypeRef<'c, 't> {
     /// Returns the sparse tensor encoding associated with this iteration space.
-    pub fn encoding(&self) -> SparseTensorEncodingAttributeRef<'c, 't> {
+    pub fn encoding(&self) -> Result<SparseTensorEncodingAttributeRef<'c, 't>, Error> {
         unsafe {
             SparseTensorEncodingAttributeRef::from_c_api(
                 mlirSparseTensorIterSpaceTypeGetEncoding(self.handle),
                 self.context,
             )
-            .expect("invalid sparse tensor iteration space encoding")
+            .map_err(|_| Error::internal("invalid sparse tensor iteration space encoding"))
         }
     }
 
@@ -97,11 +97,11 @@ impl<'c, 't> IterationSpaceTypeRef<'c, 't> {
 }
 
 impl<'c, 't> Type<'c, 't> for IterationSpaceTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirTypeIsASparseTensorIterSpaceType(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR type handle"))
         }
     }
 
@@ -128,13 +128,13 @@ pub struct IteratorTypeRef<'c, 't> {
 
 impl<'c, 't> IteratorTypeRef<'c, 't> {
     /// Returns the sparse tensor encoding associated with this iterator.
-    pub fn encoding(&self) -> SparseTensorEncodingAttributeRef<'c, 't> {
+    pub fn encoding(&self) -> Result<SparseTensorEncodingAttributeRef<'c, 't>, Error> {
         unsafe {
             SparseTensorEncodingAttributeRef::from_c_api(
                 mlirSparseTensorIteratorTypeGetEncoding(self.handle),
                 self.context,
             )
-            .expect("invalid sparse tensor iterator encoding")
+            .map_err(|_| Error::internal("invalid sparse tensor iterator encoding"))
         }
     }
 
@@ -155,11 +155,11 @@ impl<'c, 't> IteratorTypeRef<'c, 't> {
 }
 
 impl<'c, 't> Type<'c, 't> for IteratorTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirTypeIsASparseTensorIteratorType(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR type handle"))
         }
     }
 
@@ -179,14 +179,14 @@ impl<'t> Context<'t> {
     pub fn sparse_tensor_storage_specifier_type<'c>(
         &'c self,
         encoding: SparseTensorEncodingAttributeRef<'c, 't>,
-    ) -> StorageSpecifierTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::sparse_tensor());
+    ) -> Result<StorageSpecifierTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::sparse_tensor()?)?;
         unsafe {
             StorageSpecifierTypeRef::from_c_api(
                 mlirSparseTensorStorageSpecifierTypeGet(*self.handle.borrow(), encoding.to_c_api()),
                 self,
             )
-            .expect("invalid sparse tensor storage specifier type")
+            .map_err(|_| Error::internal("invalid sparse tensor storage specifier type"))
         }
     }
 
@@ -196,14 +196,14 @@ impl<'t> Context<'t> {
         encoding: SparseTensorEncodingAttributeRef<'c, 't>,
         lower_level: u64,
         upper_level: u64,
-    ) -> IterationSpaceTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::sparse_tensor());
+    ) -> Result<IterationSpaceTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::sparse_tensor()?)?;
         unsafe {
             IterationSpaceTypeRef::from_c_api(
                 mlirSparseTensorIterSpaceTypeGet(*self.handle.borrow(), encoding.to_c_api(), lower_level, upper_level),
                 self,
             )
-            .expect("invalid sparse tensor iteration space type")
+            .map_err(|_| Error::internal("invalid sparse tensor iteration space type"))
         }
     }
 
@@ -213,14 +213,14 @@ impl<'t> Context<'t> {
         encoding: SparseTensorEncodingAttributeRef<'c, 't>,
         lower_level: u64,
         upper_level: u64,
-    ) -> IteratorTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::sparse_tensor());
+    ) -> Result<IteratorTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::sparse_tensor()?)?;
         unsafe {
             IteratorTypeRef::from_c_api(
                 mlirSparseTensorIteratorTypeGet(*self.handle.borrow(), encoding.to_c_api(), lower_level, upper_level),
                 self,
             )
-            .expect("invalid sparse tensor iterator type")
+            .map_err(|_| Error::internal("invalid sparse tensor iterator type"))
         }
     }
 }
@@ -238,78 +238,96 @@ mod tests {
     #[test]
     fn test_storage_specifier_type() {
         let context = Context::new();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let r#type = context.sparse_tensor_storage_specifier_type(encoding);
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        let r#type = context.sparse_tensor_storage_specifier_type(encoding).unwrap();
         assert_eq!(&context, r#type.context());
-        assert_eq!(r#type.encoding().to_string(), encoding.to_string());
+        assert_eq!(r#type.encoding().unwrap().to_string(), encoding.to_string());
     }
 
     #[test]
     fn test_storage_specifier_type_equality() {
         let context = Context::new();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let type_1 = context.sparse_tensor_storage_specifier_type(encoding);
-        let type_2 = context.sparse_tensor_storage_specifier_type(encoding);
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        let type_1 = context.sparse_tensor_storage_specifier_type(encoding).unwrap();
+        let type_2 = context.sparse_tensor_storage_specifier_type(encoding).unwrap();
         assert_eq!(type_1, type_2);
 
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Dense)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let type_2 = context.sparse_tensor_storage_specifier_type(encoding);
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Dense)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        let type_2 = context.sparse_tensor_storage_specifier_type(encoding).unwrap();
         assert_ne!(type_1, type_2);
 
         let context = Context::new();
-        let type_2 = context.sparse_tensor_storage_specifier_type(context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        ));
+        let type_2 = context
+            .sparse_tensor_storage_specifier_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
         assert_ne!(type_1, type_2);
     }
 
     #[test]
     fn test_storage_specifier_type_display_and_debug() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_storage_specifier_type(context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        ));
+        let r#type = context
+            .sparse_tensor_storage_specifier_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
         test_type_display_and_debug(
             r#type,
             "!sparse_tensor.storage_specifier<#sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>>",
@@ -319,17 +337,23 @@ mod tests {
     #[test]
     fn test_storage_specifier_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::sparse_tensor());
-        let r#type = context.sparse_tensor_storage_specifier_type(context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        ));
+        context.load_dialect(DialectHandle::sparse_tensor().unwrap()).unwrap();
+        let r#type = context
+            .sparse_tensor_storage_specifier_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
         assert_eq!(
             context
                 .parse_type(
@@ -345,35 +369,43 @@ mod tests {
     #[test]
     fn test_storage_specifier_type_casting() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_storage_specifier_type(context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        ));
+        let r#type = context
+            .sparse_tensor_storage_specifier_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
         test_type_casting(r#type);
     }
 
     #[test]
     fn test_iteration_space_type() {
         let context = Context::new();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let r#type = context.sparse_tensor_iteration_space_type(encoding, 0, 1);
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        let r#type = context.sparse_tensor_iteration_space_type(encoding, 0, 1).unwrap();
         assert_eq!(&context, r#type.context());
-        assert_eq!(r#type.encoding(), encoding);
+        assert_eq!(r#type.encoding().unwrap(), encoding);
         assert_eq!(r#type.lower_level(), 0);
         assert_eq!(r#type.upper_level(), 1);
         assert_eq!(r#type.space_dimension(), 1);
@@ -382,26 +414,8 @@ mod tests {
     #[test]
     fn test_iteration_space_type_equality() {
         let context = Context::new();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let type_1 = context.sparse_tensor_iteration_space_type(encoding, 0, 1);
-        let type_2 = context.sparse_tensor_iteration_space_type(encoding, 0, 1);
-        assert_eq!(type_1, type_2);
-
-        let type_2 = context.sparse_tensor_iteration_space_type(encoding, 0, 2);
-        assert_ne!(type_1, type_2);
-
-        let context = Context::new();
-        let type_2 = context.sparse_tensor_iteration_space_type(
-            context.sparse_tensor_encoding_attribute(
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
                 &[LevelType::from(LevelFormat::Compressed)],
                 Some(context.identity_affine_map(1)),
                 None,
@@ -410,30 +424,58 @@ mod tests {
                 None,
                 None,
                 &[],
-            ),
-            0,
-            1,
-        );
+            )
+            .unwrap();
+        let type_1 = context.sparse_tensor_iteration_space_type(encoding, 0, 1).unwrap();
+        let type_2 = context.sparse_tensor_iteration_space_type(encoding, 0, 1).unwrap();
+        assert_eq!(type_1, type_2);
+
+        let type_2 = context.sparse_tensor_iteration_space_type(encoding, 0, 2).unwrap();
+        assert_ne!(type_1, type_2);
+
+        let context = Context::new();
+        let type_2 = context
+            .sparse_tensor_iteration_space_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
+                0,
+                1,
+            )
+            .unwrap();
         assert_ne!(type_1, type_2);
     }
 
     #[test]
     fn test_iteration_space_type_display_and_debug() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_iteration_space_type(
-            context.sparse_tensor_encoding_attribute(
-                &[LevelType::from(LevelFormat::Compressed)],
-                Some(context.identity_affine_map(1)),
-                None,
+        let r#type = context
+            .sparse_tensor_iteration_space_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
                 0,
-                0,
-                None,
-                None,
-                &[],
-            ),
-            0,
-            1,
-        );
+                1,
+            )
+            .unwrap();
         test_type_display_and_debug(
             r#type,
             "!sparse_tensor.iter_space<<{ map = (d0) -> (d0 : compressed) }>, lvls = 0>",
@@ -443,21 +485,25 @@ mod tests {
     #[test]
     fn test_iteration_space_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::sparse_tensor());
-        let r#type = context.sparse_tensor_iteration_space_type(
-            context.sparse_tensor_encoding_attribute(
-                &[LevelType::from(LevelFormat::Compressed)],
-                Some(context.identity_affine_map(1)),
-                None,
+        context.load_dialect(DialectHandle::sparse_tensor().unwrap()).unwrap();
+        let r#type = context
+            .sparse_tensor_iteration_space_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
                 0,
-                0,
-                None,
-                None,
-                &[],
-            ),
-            0,
-            1,
-        );
+                1,
+            )
+            .unwrap();
         assert_eq!(
             context
                 .parse_type(
@@ -473,8 +519,32 @@ mod tests {
     #[test]
     fn test_iteration_space_type_casting() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_iteration_space_type(
-            context.sparse_tensor_encoding_attribute(
+        let r#type = context
+            .sparse_tensor_iteration_space_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
+                0,
+                1,
+            )
+            .unwrap();
+        test_type_casting(r#type);
+    }
+
+    #[test]
+    fn test_iterator_type() {
+        let context = Context::new();
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
                 &[LevelType::from(LevelFormat::Compressed)],
                 Some(context.identity_affine_map(1)),
                 None,
@@ -483,29 +553,11 @@ mod tests {
                 None,
                 None,
                 &[],
-            ),
-            0,
-            1,
-        );
-        test_type_casting(r#type);
-    }
-
-    #[test]
-    fn test_iterator_type() {
-        let context = Context::new();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let r#type = context.sparse_tensor_iterator_type(encoding, 0, 1);
+            )
+            .unwrap();
+        let r#type = context.sparse_tensor_iterator_type(encoding, 0, 1).unwrap();
         assert_eq!(&context, r#type.context());
-        assert_eq!(r#type.encoding(), encoding);
+        assert_eq!(r#type.encoding().unwrap(), encoding);
         assert_eq!(r#type.lower_level(), 0);
         assert_eq!(r#type.upper_level(), 1);
         assert_eq!(r#type.space_dimension(), 1);
@@ -514,26 +566,8 @@ mod tests {
     #[test]
     fn test_iterator_type_equality() {
         let context = Context::new();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let type_1 = context.sparse_tensor_iterator_type(encoding, 0, 1);
-        let type_2 = context.sparse_tensor_iterator_type(encoding, 0, 1);
-        assert_eq!(type_1, type_2);
-
-        let type_2 = context.sparse_tensor_iterator_type(encoding, 0, 2);
-        assert_ne!(type_1, type_2);
-
-        let context = Context::new();
-        let type_2 = context.sparse_tensor_iterator_type(
-            context.sparse_tensor_encoding_attribute(
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
                 &[LevelType::from(LevelFormat::Compressed)],
                 Some(context.identity_affine_map(1)),
                 None,
@@ -542,51 +576,83 @@ mod tests {
                 None,
                 None,
                 &[],
-            ),
-            0,
-            1,
-        );
+            )
+            .unwrap();
+        let type_1 = context.sparse_tensor_iterator_type(encoding, 0, 1).unwrap();
+        let type_2 = context.sparse_tensor_iterator_type(encoding, 0, 1).unwrap();
+        assert_eq!(type_1, type_2);
+
+        let type_2 = context.sparse_tensor_iterator_type(encoding, 0, 2).unwrap();
+        assert_ne!(type_1, type_2);
+
+        let context = Context::new();
+        let type_2 = context
+            .sparse_tensor_iterator_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
+                0,
+                1,
+            )
+            .unwrap();
         assert_ne!(type_1, type_2);
     }
 
     #[test]
     fn test_iterator_type_display_and_debug() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_iterator_type(
-            context.sparse_tensor_encoding_attribute(
-                &[LevelType::from(LevelFormat::Compressed)],
-                Some(context.identity_affine_map(1)),
-                None,
+        let r#type = context
+            .sparse_tensor_iterator_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
                 0,
-                0,
-                None,
-                None,
-                &[],
-            ),
-            0,
-            1,
-        );
+                1,
+            )
+            .unwrap();
         test_type_display_and_debug(r#type, "!sparse_tensor.iterator<<{ map = (d0) -> (d0 : compressed) }>, lvls = 0>");
     }
 
     #[test]
     fn test_iterator_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::sparse_tensor());
-        let r#type = context.sparse_tensor_iterator_type(
-            context.sparse_tensor_encoding_attribute(
-                &[LevelType::from(LevelFormat::Compressed)],
-                Some(context.identity_affine_map(1)),
-                None,
+        context.load_dialect(DialectHandle::sparse_tensor().unwrap()).unwrap();
+        let r#type = context
+            .sparse_tensor_iterator_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
                 0,
-                0,
-                None,
-                None,
-                &[],
-            ),
-            0,
-            1,
-        );
+                1,
+            )
+            .unwrap();
         assert_eq!(
             context
                 .parse_type(
@@ -602,20 +668,24 @@ mod tests {
     #[test]
     fn test_iterator_type_casting() {
         let context = Context::new();
-        let r#type = context.sparse_tensor_iterator_type(
-            context.sparse_tensor_encoding_attribute(
-                &[LevelType::from(LevelFormat::Compressed)],
-                Some(context.identity_affine_map(1)),
-                None,
+        let r#type = context
+            .sparse_tensor_iterator_type(
+                context
+                    .sparse_tensor_encoding_attribute(
+                        &[LevelType::from(LevelFormat::Compressed)],
+                        Some(context.identity_affine_map(1)),
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
                 0,
-                0,
-                None,
-                None,
-                &[],
-            ),
-            0,
-            1,
-        );
+                1,
+            )
+            .unwrap();
         test_type_casting(r#type);
     }
 }

@@ -2,7 +2,7 @@ use ryft_xla_sys::bindings::{
     MlirAttribute, mlirArrayAttrGet, mlirArrayAttrGetElement, mlirArrayAttrGetNumElements, mlirArrayAttrGetTypeID,
 };
 
-use crate::{Attribute, AttributeRef, Context, FromWithContext, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, AttributeRef, Context, Error, TryFromWithContext, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that stores an array of other [`Attribute`] values.
 ///
@@ -30,8 +30,8 @@ pub struct ArrayAttributeRef<'c, 't> {
 
 impl<'c, 't> ArrayAttributeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`ArrayAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirArrayAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirArrayAttrGetTypeID()) }
     }
 
     /// Returns the length of this [`ArrayAttributeRef`] (i.e., the number of element [`Attribute`]s it contains).
@@ -45,28 +45,33 @@ impl<'c, 't> ArrayAttributeRef<'c, 't> {
     }
 
     /// Returns the element [`AttributeRef`]s of this [`ArrayAttributeRef`].
-    pub fn elements(&self) -> impl Iterator<Item = AttributeRef<'c, 't>> {
-        (0..self.len()).map(|index| self.element(index))
+    pub fn elements(&self) -> impl Iterator<Item = Result<AttributeRef<'c, 't>, Error>> {
+        let len = self.len();
+        (0..len).map(|index| unsafe {
+            AttributeRef::from_c_api(mlirArrayAttrGetElement(self.handle, index.cast_signed()), self.context).map_err(
+                |_| Error::internal(format!("expected non-null MLIR array attribute element handle at index {index}")),
+            )
+        })
     }
 
-    /// Returns the element [`AttributeRef`] of this [`ArrayAttributeRef`] at the specified index.
-    ///
-    /// Note that this function will panic if the provided index is out of bounds.
-    pub fn element(&self, index: usize) -> AttributeRef<'c, 't> {
-        if index >= self.len() {
-            panic!("index is out of bounds");
+    /// Returns the element [`AttributeRef`] of this [`ArrayAttributeRef`] at the specified index, or an error if the
+    /// index is out of bounds.
+    pub fn element(&self, index: usize) -> Result<AttributeRef<'c, 't>, Error> {
+        let len = self.len();
+        if index >= len {
+            return Err(Error::invalid_argument(format!(
+                "array attribute element index {index} is out of bounds for length {len}"
+            )));
         }
-        unsafe {
-            AttributeRef::from_c_api(mlirArrayAttrGetElement(self.handle, index.cast_signed()), self.context).unwrap()
-        }
+        unsafe { AttributeRef::from_c_api(mlirArrayAttrGetElement(self.handle, index.cast_signed()), self.context) }
     }
 }
 
 mlir_subtype_trait_impls!(ArrayAttributeRef<'c, 't> as Attribute, mlir_type = Attribute, mlir_subtype = Array);
 
-impl<'c, 't, A: Attribute<'c, 't>> FromWithContext<'c, 't, &[A]> for ArrayAttributeRef<'c, 't> {
-    fn from_with_context(value: &[A], context: &'c Context<'t>) -> Self {
-        context.array_attribute(value)
+impl<'c, 't, A: Attribute<'c, 't>> TryFromWithContext<'c, 't, &[A]> for ArrayAttributeRef<'c, 't> {
+    fn try_from_with_context(value: &[A], context: &'c Context<'t>) -> Result<Self, Error> {
+        Ok(context.array_attribute(value))
     }
 }
 
@@ -80,11 +85,9 @@ impl<'t> Context<'t> {
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
             let elements = elements.iter().map(|element| element.to_c_api()).collect::<Vec<_>>();
-            ArrayAttributeRef::from_c_api(
-                mlirArrayAttrGet(*self.handle.borrow(), elements.len().cast_signed(), elements.as_ptr() as *const _),
-                self,
-            )
-            .unwrap()
+            let handle =
+                mlirArrayAttrGet(*self.handle.borrow(), elements.len().cast_signed(), elements.as_ptr() as *const _);
+            ArrayAttributeRef { handle, context: self }
         }
     }
 }
@@ -100,11 +103,11 @@ mod tests {
     #[test]
     fn test_array_attribute_type_id() {
         let context = Context::new();
-        let array_attribute_id = ArrayAttributeRef::type_id();
+        let array_attribute_id = ArrayAttributeRef::type_id().unwrap();
         let array_attribute_1 = context.array_attribute(&[context.unit_attribute()]);
         let array_attribute_2 = context.array_attribute(&[context.unit_attribute()]);
-        assert_eq!(array_attribute_1.type_id(), array_attribute_2.type_id());
-        assert_eq!(array_attribute_id, array_attribute_1.type_id());
+        assert_eq!(array_attribute_1.type_id().unwrap(), array_attribute_2.type_id().unwrap());
+        assert_eq!(array_attribute_id, array_attribute_1.type_id().unwrap());
     }
 
     #[test]
@@ -126,9 +129,10 @@ mod tests {
         let attribute = context.array_attribute(&elements);
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.len(), 3);
-        assert_eq!(attribute.element(0), elements[0]);
-        assert_eq!(attribute.element(1), elements[1]);
-        assert_eq!(attribute.element(2), elements[2]);
+        assert_eq!(attribute.element(0).unwrap(), elements[0]);
+        assert_eq!(attribute.element(1).unwrap(), elements[1]);
+        assert_eq!(attribute.element(2).unwrap(), elements[2]);
+        assert!(attribute.element(3).is_err());
 
         // Test array with mixed attribute types.
         let mixed_elements = vec![

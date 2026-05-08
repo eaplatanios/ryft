@@ -1,5 +1,5 @@
 use crate::{
-    DetachedOp, DialectHandle, Location, Operation, OperationBuilder, Value, ValueRef, mlir_op, mlir_op_trait,
+    DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Value, ValueRef, mlir_op, mlir_op_trait,
 };
 
 use super::{Accuracy, HasAccuracy, RESULT_ACCURACY_ATTRIBUTE};
@@ -36,21 +36,20 @@ mlir_op_trait!(Sine, @local HasAccuracy);
 
 /// Constructs a new detached/owned [`SineOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`SineOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn sine<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     accuracy: Accuracy,
     location: L,
-) -> DetachedSineOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedSineOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.sine", location)
         .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy))
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::sine`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::sine`"))
+        })
 }
 
 /// StableHLO [`Operation`] that performs element-wise cosine computation on a tensor.
@@ -85,21 +84,20 @@ mlir_op_trait!(Cosine, @local HasAccuracy);
 
 /// Constructs a new detached/owned [`CosineOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`CosineOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn cosine<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     accuracy: Accuracy,
     location: L,
-) -> DetachedCosineOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedCosineOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.cosine", location)
         .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy))
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::cosine`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::cosine`"))
+        })
 }
 
 /// StableHLO [`Operation`] that performs element-wise tangent computation on a tensor.
@@ -137,21 +135,20 @@ mlir_op_trait!(Tan, @local HasAccuracy);
 
 /// Constructs a new detached/owned [`TanOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`TanOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn tan<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     accuracy: Accuracy,
     location: L,
-) -> DetachedTanOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedTanOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.tan", location)
         .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy))
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::tan`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::tan`"))
+        })
 }
 
 /// StableHLO [`Operation`] that performs element-wise hyperbolic tangent computation on a tensor.
@@ -183,21 +180,20 @@ mlir_op_trait!(Tanh, @local HasAccuracy);
 
 /// Constructs a new detached/owned [`TanhOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`TanhOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn tanh<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     accuracy: Accuracy,
     location: L,
-) -> DetachedTanhOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedTanhOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.tanh", location)
         .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy))
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::tanh`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::tanh`"))
+        })
 }
 
 /// StableHLO [`Operation`] that performs element-wise arc tangent of two values computation on two tensors. The
@@ -223,13 +219,13 @@ pub fn tanh<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 /// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#atan2) for more information.
 pub trait Atan2Operation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`Atan2Operation`].
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side input of this [`Atan2Operation`].
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 }
 
@@ -240,8 +236,6 @@ mlir_op_trait!(Atan2, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`Atan2Operation`] at the specified [`Location`]. Refer to the
 /// documentation of [`Atan2Operation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn atan2<
     'lhs,
     'rhs,
@@ -254,15 +248,16 @@ pub fn atan2<
     lhs: LHS,
     rhs: RHS,
     location: L,
-) -> DetachedAtan2Operation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedAtan2Operation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.atan2", location)
         .add_operand(lhs)
         .add_operand(rhs)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::atan2`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::atan2`"))
+        })
 }
 
 #[cfg(test)]
@@ -271,7 +266,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func;
-    use crate::{Block, Context, OneOperand, OneResult, Operation, Size, Value};
+    use crate::{Block, Context, OneOperand, Operation, Size};
 
     use super::{Accuracy, Atan2Operation, HasAccuracy, atan2, cosine, sine, tan, tanh};
 
@@ -279,32 +274,37 @@ mod tests {
     fn test_sine() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = sine(input, Accuracy::Default, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.accuracy(), Accuracy::Default);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "sine_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = sine(input, Accuracy::Default, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.accuracy().unwrap(), Accuracy::Default);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "sine_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -322,32 +322,37 @@ mod tests {
     fn test_cosine() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = cosine(input, Accuracy::Default, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.accuracy(), Accuracy::Default);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "cosine_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = cosine(input, Accuracy::Default, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.accuracy().unwrap(), Accuracy::Default);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "cosine_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -365,32 +370,37 @@ mod tests {
     fn test_tan() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let tensor_type = context.tensor_type(f64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = tan(input, Accuracy::Default, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.accuracy(), Accuracy::Default);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "tan_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = tan(input, Accuracy::Default, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.accuracy().unwrap(), Accuracy::Default);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "tan_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -408,32 +418,37 @@ mod tests {
     fn test_tanh() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = tanh(input, Accuracy::Default, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.accuracy(), Accuracy::Default);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "tanh_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = tanh(input, Accuracy::Default, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.accuracy().unwrap(), Accuracy::Default);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "tanh_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -451,33 +466,38 @@ mod tests {
     fn test_atan2() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let tensor_type = context.tensor_type(f64_type, &[Size::Static(4)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = atan2(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "atan2_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = atan2(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                let op = atan2(lhs, rhs, location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "atan2_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

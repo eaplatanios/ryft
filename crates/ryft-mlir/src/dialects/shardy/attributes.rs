@@ -25,7 +25,7 @@ use ryft_xla_sys::bindings::{
     sdyTensorShardingPerValueAttrGetShardingsElem, sdyTensorShardingPerValueAttrGetShardingsSize,
 };
 
-use crate::{Attribute, AttributeRef, Context, DialectHandle, StringRef, mlir_subtype_trait_impls};
+use crate::{Attribute, AttributeRef, Context, DialectHandle, Error, StringRef, mlir_subtype_trait_impls};
 
 /// Shardy [`Attribute`] for `all_to_all` parameter entries.
 ///
@@ -41,9 +41,13 @@ pub struct AllToAllParamAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for AllToAllParamAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-        if attribute_has_shardy_mnemonic(attribute, "all_to_all_param") { Some(Self { handle, context }) } else { None }
+        if attribute_has_shardy_mnemonic(attribute, "all_to_all_param") {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -71,12 +75,12 @@ pub struct AllToAllParamListAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for AllToAllParamListAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
         if attribute_has_shardy_mnemonic(attribute, "all_to_all_param_list") {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -111,17 +115,22 @@ impl<'c, 't> AxisRefAttributeRef<'c, 't> {
     }
 
     /// Returns split metadata when this references a sub-axis.
-    pub fn sub_axis_info(&self) -> Option<SubAxisInfoAttributeRef<'c, 't>> {
-        unsafe { SubAxisInfoAttributeRef::from_c_api(sdyAxisRefAttrGetSubAxisInfo(self.handle), self.context) }
+    pub fn sub_axis_info(&self) -> Result<Option<SubAxisInfoAttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { sdyAxisRefAttrGetSubAxisInfo(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { SubAxisInfoAttributeRef::from_c_api(handle, self.context).map(Some) }
+        }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for AxisRefAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsAnAxisRefAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -147,8 +156,8 @@ impl<'t> Context<'t> {
         &'c self,
         name: N,
         sub_axis_info: Option<SubAxisInfoAttributeRef<'c, 't>>,
-    ) -> AxisRefAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::shardy());
+    ) -> Result<AxisRefAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             AxisRefAttributeRef::from_c_api(
                 sdyAxisRefAttrGet(
@@ -158,7 +167,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_axis_ref`"))
         }
     }
 }
@@ -177,9 +186,13 @@ pub struct AxisRefListAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for AxisRefListAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
-        if attribute_has_shardy_mnemonic(attribute, "axis_ref_list") { Some(Self { handle, context }) } else { None }
+        if attribute_has_shardy_mnemonic(attribute, "axis_ref_list") {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -221,11 +234,11 @@ impl<'c, 't> DimMappingAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for DimMappingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsADimMappingAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -246,8 +259,8 @@ impl<'t> Context<'t> {
     /// # Parameters
     ///
     ///   - `factor_indices`: Rule-factor indices mapped to a tensor dimension.
-    pub fn shardy_dim_mapping<'c>(&'c self, factor_indices: &[usize]) -> DimMappingAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::shardy());
+    pub fn shardy_dim_mapping<'c>(&'c self, factor_indices: &[usize]) -> Result<DimMappingAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let factor_indices = factor_indices.iter().map(|value| *value as i64).collect::<Vec<_>>();
             DimMappingAttributeRef::from_c_api(
@@ -258,7 +271,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_dim_mapping`"))
         }
     }
 }
@@ -283,13 +296,8 @@ impl<'c, 't> DimensionShardingAttributeRef<'c, 't> {
             let count = sdyDimensionShardingAttrGetAxesSize(self.handle).cast_unsigned();
             let mut axes = Vec::with_capacity(count);
             for index in 0..count {
-                axes.push(
-                    AxisRefAttributeRef::from_c_api(
-                        sdyDimensionShardingAttrGetAxesElem(self.handle, index.cast_signed()),
-                        self.context,
-                    )
-                    .unwrap(),
-                );
+                let handle = sdyDimensionShardingAttrGetAxesElem(self.handle, index.cast_signed());
+                axes.push(AxisRefAttributeRef { handle, context: self.context });
             }
             axes
         }
@@ -308,11 +316,11 @@ impl<'c, 't> DimensionShardingAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for DimensionShardingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsADimensionShardingAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -340,8 +348,8 @@ impl<'t> Context<'t> {
         axes: I,
         is_closed: bool,
         priority: Option<usize>,
-    ) -> DimensionShardingAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::shardy());
+    ) -> Result<DimensionShardingAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let axes = axes.into_iter().map(|axis| axis.to_c_api()).collect::<Vec<_>>();
             DimensionShardingAttributeRef::from_c_api(
@@ -354,7 +362,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_dimension_sharding`"))
         }
     }
 }
@@ -373,12 +381,12 @@ pub struct ListOfAxisRefListsAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for ListOfAxisRefListsAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
         if attribute_has_shardy_mnemonic(attribute, "list_of_axis_ref_lists") {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -421,11 +429,11 @@ impl<'c, 't> ManualAxesAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for ManualAxesAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsAManualAxesAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -446,15 +454,18 @@ impl<'t> Context<'t> {
     /// # Parameters
     ///
     ///   - `axes`: Axes that are handled manually inside `sdy.manual_computation`.
-    pub fn shardy_manual_axes<'c, A: AsRef<str>>(&'c self, axes: &[A]) -> ManualAxesAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::shardy());
+    pub fn shardy_manual_axes<'c, A: AsRef<str>>(
+        &'c self,
+        axes: &[A],
+    ) -> Result<ManualAxesAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let axes = axes.iter().map(|axis| self.string_attribute(axis.as_ref()).to_c_api()).collect::<Vec<_>>();
             ManualAxesAttributeRef::from_c_api(
                 sdyManualAxesAttrGet(*self.handle.borrow(), axes.len().cast_signed(), axes.as_ptr()),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_manual_axes`"))
         }
     }
 }
@@ -479,13 +490,8 @@ impl<'c, 't> MeshAttributeRef<'c, 't> {
             let count = sdyMeshAttrGetAxesSize(self.handle).cast_unsigned();
             let mut axes = Vec::with_capacity(count);
             for index in 0..count {
-                axes.push(
-                    MeshAxisAttributeRef::from_c_api(
-                        sdyMeshAttrGetAxesElem(self.handle, index.cast_signed()),
-                        self.context,
-                    )
-                    .unwrap(),
-                );
+                let handle = sdyMeshAttrGetAxesElem(self.handle, index.cast_signed());
+                axes.push(MeshAxisAttributeRef { handle, context: self.context });
             }
             axes
         }
@@ -505,11 +511,11 @@ impl<'c, 't> MeshAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for MeshAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsAMeshAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -535,8 +541,8 @@ impl<'t> Context<'t> {
         &'c self,
         axes: I,
         device_ids: &[usize],
-    ) -> MeshAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::shardy());
+    ) -> Result<MeshAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let axes = axes.into_iter().map(|axis| axis.to_c_api()).collect::<Vec<_>>();
             let device_ids = device_ids.iter().map(|value| *value as i64).collect::<Vec<_>>();
@@ -550,7 +556,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_mesh`"))
         }
     }
 }
@@ -581,11 +587,11 @@ impl<'c, 't> MeshAxisAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for MeshAxisAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsAMeshAxisAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -607,14 +613,18 @@ impl<'t> Context<'t> {
     ///
     ///   - `name`: Logical axis name.
     ///   - `size`: Positive axis size.
-    pub fn shardy_mesh_axis<'c, N: AsRef<str>>(&'c self, name: N, size: usize) -> MeshAxisAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::shardy());
+    pub fn shardy_mesh_axis<'c, N: AsRef<str>>(
+        &'c self,
+        name: N,
+        size: usize,
+    ) -> Result<MeshAxisAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             MeshAxisAttributeRef::from_c_api(
                 sdyMeshAxisAttrGet(*self.handle.borrow(), StringRef::from(name.as_ref()).to_c_api(), size as i64),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_mesh_axis`"))
         }
     }
 }
@@ -656,13 +666,8 @@ impl<'c, 't> OpShardingRuleAttributeRef<'c, 't> {
             let count = sdyOpShardingRuleAttrGetOperandMappingsSize(self.handle).cast_unsigned();
             let mut values = Vec::with_capacity(count);
             for index in 0..count {
-                values.push(
-                    TensorMappingAttributeRef::from_c_api(
-                        sdyOpShardingRuleAttrGetOperandMappingsElem(self.handle, index.cast_signed()),
-                        self.context,
-                    )
-                    .unwrap(),
-                );
+                let handle = sdyOpShardingRuleAttrGetOperandMappingsElem(self.handle, index.cast_signed());
+                values.push(TensorMappingAttributeRef { handle, context: self.context });
             }
             values
         }
@@ -674,13 +679,8 @@ impl<'c, 't> OpShardingRuleAttributeRef<'c, 't> {
             let count = sdyOpShardingRuleAttrGetResultMappingsSize(self.handle).cast_unsigned();
             let mut values = Vec::with_capacity(count);
             for index in 0..count {
-                values.push(
-                    TensorMappingAttributeRef::from_c_api(
-                        sdyOpShardingRuleAttrGetResultMappingsElem(self.handle, index.cast_signed()),
-                        self.context,
-                    )
-                    .unwrap(),
-                );
+                let handle = sdyOpShardingRuleAttrGetResultMappingsElem(self.handle, index.cast_signed());
+                values.push(TensorMappingAttributeRef { handle, context: self.context });
             }
             values
         }
@@ -738,11 +738,11 @@ impl<'c, 't> OpShardingRuleAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for OpShardingRuleAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsAOpShardingRuleAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -781,8 +781,8 @@ impl<'t> Context<'t> {
         permutation_factors: &[usize],
         blocked_propagation_factors: &[usize],
         is_custom_rule: bool,
-    ) -> OpShardingRuleAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::shardy());
+    ) -> Result<OpShardingRuleAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let factor_sizes = factor_sizes.iter().map(|value| *value as i64).collect::<Vec<_>>();
             let operand_mappings = operand_mappings.iter().map(|value| value.to_c_api()).collect::<Vec<_>>();
@@ -814,7 +814,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_op_sharding_rule`"))
         }
     }
 }
@@ -845,11 +845,11 @@ impl<'c, 't> SubAxisInfoAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for SubAxisInfoAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsASubAxisInfoAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -871,14 +871,18 @@ impl<'t> Context<'t> {
     ///
     ///   - `pre_size`: Product of split factors to the left.
     ///   - `size`: Split-factor size for this sub-axis.
-    pub fn shardy_sub_axis_info<'c>(&'c self, pre_size: usize, size: usize) -> SubAxisInfoAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::shardy());
+    pub fn shardy_sub_axis_info<'c>(
+        &'c self,
+        pre_size: usize,
+        size: usize,
+    ) -> Result<SubAxisInfoAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             SubAxisInfoAttributeRef::from_c_api(
                 sdySubAxisInfoAttrGet(*self.handle.borrow(), pre_size as i64, size as i64),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_sub_axis_info`"))
         }
     }
 }
@@ -908,13 +912,8 @@ impl<'c, 't> TensorMappingAttributeRef<'c, 't> {
             let count = sdyTensorMappingAttrGetDimMappingsSize(self.handle).cast_unsigned();
             let mut dim_mappings = Vec::with_capacity(count);
             for index in 0..count {
-                dim_mappings.push(
-                    DimMappingAttributeRef::from_c_api(
-                        sdyTensorMappingAttrGetDimMappingsElem(self.handle, index.cast_signed()),
-                        self.context,
-                    )
-                    .unwrap(),
-                );
+                let handle = sdyTensorMappingAttrGetDimMappingsElem(self.handle, index.cast_signed());
+                dim_mappings.push(DimMappingAttributeRef { handle, context: self.context });
             }
             dim_mappings
         }
@@ -922,11 +921,11 @@ impl<'c, 't> TensorMappingAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for TensorMappingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsATensorMappingAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -950,15 +949,15 @@ impl<'t> Context<'t> {
     pub fn shardy_tensor_mapping<'c>(
         &'c self,
         dim_mappings: &[DimMappingAttributeRef<'c, 't>],
-    ) -> TensorMappingAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::shardy());
+    ) -> Result<TensorMappingAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let dim_mappings = dim_mappings.iter().map(|value| value.to_c_api()).collect::<Vec<_>>();
             TensorMappingAttributeRef::from_c_api(
                 sdyTensorMappingAttrGet(*self.handle.borrow(), dim_mappings.len().cast_signed(), dim_mappings.as_ptr()),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_tensor_mapping`"))
         }
     }
 }
@@ -978,8 +977,11 @@ pub struct TensorShardingAttributeRef<'c, 't> {
 
 impl<'c, 't> TensorShardingAttributeRef<'c, 't> {
     /// Returns the mesh payload or mesh symbol reference.
-    pub fn mesh_or_ref(&self) -> AttributeRef<'c, 't> {
-        unsafe { AttributeRef::from_c_api(sdyTensorShardingAttrGetMeshOrRef(self.handle), self.context).unwrap() }
+    pub fn mesh_or_ref(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        unsafe {
+            AttributeRef::from_c_api(sdyTensorShardingAttrGetMeshOrRef(self.handle), self.context)
+                .map_err(|_| Error::internal("expected non-null Shardy tensor sharding mesh attribute"))
+        }
     }
 
     /// Returns per-dimension sharding descriptors.
@@ -988,13 +990,8 @@ impl<'c, 't> TensorShardingAttributeRef<'c, 't> {
             let count = sdyTensorShardingAttrGetDimShardingsSize(self.handle).cast_unsigned();
             let mut dim_shardings = Vec::with_capacity(count);
             for index in 0..count {
-                dim_shardings.push(
-                    DimensionShardingAttributeRef::from_c_api(
-                        sdyTensorShardingAttrGetDimShardingsElem(self.handle, index.cast_signed()),
-                        self.context,
-                    )
-                    .unwrap(),
-                );
+                let handle = sdyTensorShardingAttrGetDimShardingsElem(self.handle, index.cast_signed());
+                dim_shardings.push(DimensionShardingAttributeRef { handle, context: self.context });
             }
             dim_shardings
         }
@@ -1006,13 +1003,8 @@ impl<'c, 't> TensorShardingAttributeRef<'c, 't> {
             let count = sdyTensorShardingAttrGetReplicatedAxesSize(self.handle).cast_unsigned();
             let mut axes = Vec::with_capacity(count);
             for index in 0..count {
-                axes.push(
-                    AxisRefAttributeRef::from_c_api(
-                        sdyTensorShardingAttrGetReplicatedAxesElem(self.handle, index.cast_signed()),
-                        self.context,
-                    )
-                    .unwrap(),
-                );
+                let handle = sdyTensorShardingAttrGetReplicatedAxesElem(self.handle, index.cast_signed());
+                axes.push(AxisRefAttributeRef { handle, context: self.context });
             }
             axes
         }
@@ -1024,13 +1016,8 @@ impl<'c, 't> TensorShardingAttributeRef<'c, 't> {
             let count = sdyTensorShardingAttrGetUnreducedAxesSize(self.handle).cast_unsigned();
             let mut axes = Vec::with_capacity(count);
             for index in 0..count {
-                axes.push(
-                    AxisRefAttributeRef::from_c_api(
-                        sdyTensorShardingAttrGetUnreducedAxesElem(self.handle, index.cast_signed()),
-                        self.context,
-                    )
-                    .unwrap(),
-                );
+                let handle = sdyTensorShardingAttrGetUnreducedAxesElem(self.handle, index.cast_signed());
+                axes.push(AxisRefAttributeRef { handle, context: self.context });
             }
             axes
         }
@@ -1038,11 +1025,11 @@ impl<'c, 't> TensorShardingAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for TensorShardingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsATensorShardingAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -1072,8 +1059,8 @@ impl<'t> Context<'t> {
         dim_shardings: &[DimensionShardingAttributeRef<'c, 't>],
         replicated_axes: &[AxisRefAttributeRef<'c, 't>],
         unreduced_axes: &[AxisRefAttributeRef<'c, 't>],
-    ) -> TensorShardingAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::shardy());
+    ) -> Result<TensorShardingAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let dim_shardings = dim_shardings.iter().map(|value| value.to_c_api()).collect::<Vec<_>>();
             let replicated_axes = replicated_axes.iter().map(|value| value.to_c_api()).collect::<Vec<_>>();
@@ -1091,7 +1078,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_tensor_sharding`"))
         }
     }
 }
@@ -1116,13 +1103,8 @@ impl<'c, 't> TensorShardingPerValueAttributeRef<'c, 't> {
             let count = sdyTensorShardingPerValueAttrGetShardingsSize(self.handle).cast_unsigned();
             let mut shardings = Vec::with_capacity(count);
             for index in 0..count {
-                shardings.push(
-                    TensorShardingAttributeRef::from_c_api(
-                        sdyTensorShardingPerValueAttrGetShardingsElem(self.handle, index.cast_signed()),
-                        self.context,
-                    )
-                    .unwrap(),
-                );
+                let handle = sdyTensorShardingPerValueAttrGetShardingsElem(self.handle, index.cast_signed());
+                shardings.push(TensorShardingAttributeRef { handle, context: self.context });
             }
             shardings
         }
@@ -1130,11 +1112,11 @@ impl<'c, 't> TensorShardingPerValueAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for TensorShardingPerValueAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { sdyAttributeIsATensorShardingPerValueAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -1158,8 +1140,8 @@ impl<'t> Context<'t> {
     pub fn shardy_tensor_sharding_per_value<'c>(
         &'c self,
         shardings: &[TensorShardingAttributeRef<'c, 't>],
-    ) -> TensorShardingPerValueAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::shardy());
+    ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
             let shardings = shardings.iter().map(|value| value.to_c_api()).collect::<Vec<_>>();
             TensorShardingPerValueAttributeRef::from_c_api(
@@ -1170,7 +1152,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::shardy_tensor_sharding_per_value`"))
         }
     }
 }
@@ -1239,11 +1221,11 @@ mod tests {
     #[test]
     fn test_axis_ref_attribute() {
         let context = Context::new();
-        let sub_axis_info = context.shardy_sub_axis_info(2, 4);
-        let attribute = context.shardy_axis_ref("data", Some(sub_axis_info));
+        let sub_axis_info = context.shardy_sub_axis_info(2, 4).unwrap();
+        let attribute = context.shardy_axis_ref("data", Some(sub_axis_info)).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.name().as_str().unwrap(), "data");
-        assert_eq!(attribute.sub_axis_info(), Some(sub_axis_info));
+        assert_eq!(attribute.sub_axis_info().unwrap(), Some(sub_axis_info));
         test_attribute_casting(attribute);
     }
 
@@ -1263,7 +1245,7 @@ mod tests {
     #[test]
     fn test_dim_mapping_attribute() {
         let context = Context::new();
-        let attribute = context.shardy_dim_mapping(&[0, 1, 3]);
+        let attribute = context.shardy_dim_mapping(&[0, 1, 3]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.factor_indices(), vec![0, 1, 3]);
         test_attribute_casting(attribute);
@@ -1272,8 +1254,8 @@ mod tests {
     #[test]
     fn test_dimension_sharding_attribute() {
         let context = Context::new();
-        let axis_ref = context.shardy_axis_ref("data", None);
-        let attribute = context.shardy_dimension_sharding([axis_ref], true, Some(2));
+        let axis_ref = context.shardy_axis_ref("data", None).unwrap();
+        let attribute = context.shardy_dimension_sharding([axis_ref], true, Some(2)).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.axes(), vec![axis_ref]);
         assert!(attribute.is_closed());
@@ -1297,7 +1279,7 @@ mod tests {
     #[test]
     fn test_manual_axes_attribute() {
         let context = Context::new();
-        let attribute = context.shardy_manual_axes(&["data", "model"]);
+        let attribute = context.shardy_manual_axes(&["data", "model"]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(
             attribute.axes().iter().map(|axis| axis.as_str().unwrap()).collect::<Vec<_>>(),
@@ -1309,9 +1291,9 @@ mod tests {
     #[test]
     fn test_mesh_attribute() {
         let context = Context::new();
-        let axis_a = context.shardy_mesh_axis("a", 2);
-        let axis_b = context.shardy_mesh_axis("b", 4);
-        let attribute = context.shardy_mesh([axis_a, axis_b], &[0, 2, 4, 6, 1, 3, 5, 7]);
+        let axis_a = context.shardy_mesh_axis("a", 2).unwrap();
+        let axis_b = context.shardy_mesh_axis("b", 4).unwrap();
+        let attribute = context.shardy_mesh([axis_a, axis_b], &[0, 2, 4, 6, 1, 3, 5, 7]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.axes(), vec![axis_a, axis_b]);
         assert_eq!(attribute.device_ids(), vec![0, 2, 4, 6, 1, 3, 5, 7]);
@@ -1321,7 +1303,7 @@ mod tests {
     #[test]
     fn test_mesh_axis_attribute() {
         let context = Context::new();
-        let attribute = context.shardy_mesh_axis("data", 8);
+        let attribute = context.shardy_mesh_axis("data", 8).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.name().as_str().unwrap(), "data");
         assert_eq!(attribute.size(), 8);
@@ -1331,18 +1313,11 @@ mod tests {
     #[test]
     fn test_op_sharding_rule_attribute() {
         let context = Context::new();
-        let dim_mapping = context.shardy_dim_mapping(&[0, 1]);
-        let tensor_mapping = context.shardy_tensor_mapping(&[dim_mapping]);
-        let attribute = context.shardy_op_sharding_rule(
-            &[8, 16],
-            &[tensor_mapping],
-            &[tensor_mapping],
-            &[0],
-            &[1],
-            &[0],
-            &[],
-            true,
-        );
+        let dim_mapping = context.shardy_dim_mapping(&[0, 1]).unwrap();
+        let tensor_mapping = context.shardy_tensor_mapping(&[dim_mapping]).unwrap();
+        let attribute = context
+            .shardy_op_sharding_rule(&[8, 16], &[tensor_mapping], &[tensor_mapping], &[0], &[1], &[0], &[], true)
+            .unwrap();
         assert_eq!(&context, attribute.context());
         assert!(attribute.is_custom_rule());
         assert_eq!(attribute.factor_sizes(), vec![8, 16]);
@@ -1358,7 +1333,7 @@ mod tests {
     #[test]
     fn test_sub_axis_info_attribute() {
         let context = Context::new();
-        let attribute = context.shardy_sub_axis_info(3, 5);
+        let attribute = context.shardy_sub_axis_info(3, 5).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.pre_size(), 3);
         assert_eq!(attribute.size(), 5);
@@ -1368,9 +1343,9 @@ mod tests {
     #[test]
     fn test_tensor_mapping_attribute() {
         let context = Context::new();
-        let dim_mapping_0 = context.shardy_dim_mapping(&[0]);
-        let dim_mapping_1 = context.shardy_dim_mapping(&[1]);
-        let attribute = context.shardy_tensor_mapping(&[dim_mapping_0, dim_mapping_1]);
+        let dim_mapping_0 = context.shardy_dim_mapping(&[0]).unwrap();
+        let dim_mapping_1 = context.shardy_dim_mapping(&[1]).unwrap();
+        let attribute = context.shardy_tensor_mapping(&[dim_mapping_0, dim_mapping_1]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.rank(), 2);
         assert_eq!(attribute.dim_mappings(), vec![dim_mapping_0, dim_mapping_1]);
@@ -1380,13 +1355,13 @@ mod tests {
     #[test]
     fn test_tensor_sharding_attribute() {
         let context = Context::new();
-        let mesh_axis = context.shardy_mesh_axis("x", 2);
-        let mesh = context.shardy_mesh([mesh_axis], &[]);
-        let axis_ref = context.shardy_axis_ref("x", None);
-        let dim_sharding = context.shardy_dimension_sharding([axis_ref], true, None);
-        let attribute = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[axis_ref], &[]);
+        let mesh_axis = context.shardy_mesh_axis("x", 2).unwrap();
+        let mesh = context.shardy_mesh([mesh_axis], &[]).unwrap();
+        let axis_ref = context.shardy_axis_ref("x", None).unwrap();
+        let dim_sharding = context.shardy_dimension_sharding([axis_ref], true, None).unwrap();
+        let attribute = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[axis_ref], &[]).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.mesh_or_ref(), mesh.as_ref());
+        assert_eq!(attribute.mesh_or_ref().unwrap(), mesh.as_ref());
         assert_eq!(attribute.dim_shardings(), vec![dim_sharding]);
         assert_eq!(attribute.replicated_axes(), vec![axis_ref]);
         assert!(attribute.unreduced_axes().is_empty());
@@ -1396,12 +1371,12 @@ mod tests {
     #[test]
     fn test_tensor_sharding_per_value_attribute() {
         let context = Context::new();
-        let mesh_axis = context.shardy_mesh_axis("x", 2);
-        let mesh = context.shardy_mesh([mesh_axis], &[]);
-        let axis_ref = context.shardy_axis_ref("x", None);
-        let dim_sharding = context.shardy_dimension_sharding([axis_ref], true, None);
-        let tensor_sharding = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[], &[]);
-        let attribute = context.shardy_tensor_sharding_per_value(&[tensor_sharding]);
+        let mesh_axis = context.shardy_mesh_axis("x", 2).unwrap();
+        let mesh = context.shardy_mesh([mesh_axis], &[]).unwrap();
+        let axis_ref = context.shardy_axis_ref("x", None).unwrap();
+        let dim_sharding = context.shardy_dimension_sharding([axis_ref], true, None).unwrap();
+        let tensor_sharding = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[], &[]).unwrap();
+        let attribute = context.shardy_tensor_sharding_per_value(&[tensor_sharding]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.shardings(), vec![tensor_sharding]);
         test_attribute_casting(attribute);

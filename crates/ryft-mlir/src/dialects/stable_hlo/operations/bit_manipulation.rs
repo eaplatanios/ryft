@@ -1,5 +1,5 @@
 use crate::{
-    DetachedOp, DialectHandle, Location, Operation, OperationBuilder, Value, ValueRef, mlir_op, mlir_op_trait,
+    DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Value, ValueRef, mlir_op, mlir_op_trait,
 };
 
 /// StableHLO [`Operation`] that performs element-wise left shift of two tensors. The operation shifts the bits of
@@ -22,13 +22,13 @@ use crate::{
 /// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#shift_left) for more information.
 pub trait ShiftLeftOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`ShiftLeftOperation`].
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side input of this [`ShiftLeftOperation`].
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 }
 
@@ -39,8 +39,6 @@ mlir_op_trait!(ShiftLeft, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ShiftLeftOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ShiftLeftOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn shift_left<
     'lhs,
     'rhs,
@@ -53,15 +51,18 @@ pub fn shift_left<
     lhs: LHS,
     rhs: RHS,
     location: L,
-) -> DetachedShiftLeftOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedShiftLeftOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.shift_left", location)
         .add_operand(lhs)
         .add_operand(rhs)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::shift_left`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::shift_left`"))
+        })
 }
 
 /// StableHLO [`Operation`] that performs element-wise arithmetic right shift of two tensors. The operation shifts
@@ -87,13 +88,13 @@ pub fn shift_left<
 /// for more information.
 pub trait ShiftRightArithmeticOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`ShiftRightArithmeticOperation`].
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side input of this [`ShiftRightArithmeticOperation`].
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 }
 
@@ -104,8 +105,6 @@ mlir_op_trait!(ShiftRightArithmetic, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ShiftRightArithmeticOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ShiftRightArithmeticOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn shift_right_arithmetic<
     'lhs,
     'rhs,
@@ -118,15 +117,18 @@ pub fn shift_right_arithmetic<
     lhs: LHS,
     rhs: RHS,
     location: L,
-) -> DetachedShiftRightArithmeticOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedShiftRightArithmeticOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.shift_right_arithmetic", location)
         .add_operand(lhs)
         .add_operand(rhs)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::shift_right_arithmetic`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::shift_right_arithmetic`"))
+        })
 }
 
 /// StableHLO [`Operation`] that performs element-wise logical right shift of two tensors. The operation shifts
@@ -152,13 +154,13 @@ pub fn shift_right_arithmetic<
 /// for more information.
 pub trait ShiftRightLogicalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`ShiftRightLogicalOperation`].
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side input of this [`ShiftRightLogicalOperation`].
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 }
 
@@ -169,8 +171,6 @@ mlir_op_trait!(ShiftRightLogical, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ShiftRightLogicalOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ShiftRightLogicalOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn shift_right_logical<
     'lhs,
     'rhs,
@@ -183,15 +183,18 @@ pub fn shift_right_logical<
     lhs: LHS,
     rhs: RHS,
     location: L,
-) -> DetachedShiftRightLogicalOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedShiftRightLogicalOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.shift_right_logical", location)
         .add_operand(lhs)
         .add_operand(rhs)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::shift_right_logical`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::shift_right_logical`"))
+        })
 }
 
 /// StableHLO [`Operation`] that counts the number of leading zero bits in each element of the input tensor.
@@ -220,19 +223,20 @@ mlir_op_trait!(CountLeadingZeros, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`CountLeadingZerosOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`CountLeadingZerosOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn count_leading_zeros<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     location: L,
-) -> DetachedCountLeadingZerosOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedCountLeadingZerosOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.count_leading_zeros", location)
         .add_operand(input)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::count_leading_zeros`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::count_leading_zeros`"))
+        })
 }
 
 /// StableHLO [`Operation`] that counts the number of bits set to `1` in each element of the input tensor.
@@ -260,19 +264,20 @@ mlir_op_trait!(PopulationCount, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`PopulationCountOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`PopulationCountOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn population_count<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     location: L,
-) -> DetachedPopulationCountOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedPopulationCountOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.popcnt", location)
         .add_operand(input)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::population_count`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::population_count`"))
+        })
 }
 
 #[cfg(test)]
@@ -281,7 +286,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func;
-    use crate::{Block, Context, OneOperand, OneResult, Operation, Size, Value};
+    use crate::{Block, Context, OneOperand, Operation, Size};
 
     use super::{
         ShiftLeftOperation, ShiftRightArithmeticOperation, ShiftRightLogicalOperation, count_leading_zeros,
@@ -292,33 +297,38 @@ mod tests {
     fn test_shift_left() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = shift_left(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "shift_left_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = shift_left(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                let op = shift_left(lhs, rhs, location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "shift_left_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -336,33 +346,38 @@ mod tests {
     fn test_shift_right_arithmetic() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = shift_right_arithmetic(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "shift_right_arithmetic_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = shift_right_arithmetic(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                let op = shift_right_arithmetic(lhs, rhs, location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "shift_right_arithmetic_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -380,33 +395,38 @@ mod tests {
     fn test_shift_right_logical() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = shift_right_logical(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "shift_right_logical_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = shift_right_logical(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                let op = shift_right_logical(lhs, rhs, location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "shift_right_logical_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -424,31 +444,36 @@ mod tests {
     fn test_count_leading_zeros() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i8_type = context.signless_integer_type(8);
         let tensor_type = context.tensor_type(i8_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = count_leading_zeros(input, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "count_leading_zeros_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = count_leading_zeros(input, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "count_leading_zeros_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -466,31 +491,36 @@ mod tests {
     fn test_population_count() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i8_type = context.signless_integer_type(8);
         let tensor_type = context.tensor_type(i8_type, &[Size::Static(4)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = population_count(input, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "popcnt_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = population_count(input, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "popcnt_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

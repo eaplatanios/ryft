@@ -1,7 +1,7 @@
 use crate::{
-    ArrayAttributeRef, Attribute, BooleanAttributeRef, DenseInteger32ArrayAttributeRef, DetachedOp, DetachedRegion,
-    DialectHandle, FlatSymbolRefAttributeRef, IntegerAttributeRef, Location, Operation, OperationBuilder,
-    OperationResultRef, RegionRef, StringAttributeRef, TypeAttributeRef, TypeRef, ValueRef, mlir_op, mlir_op_trait,
+    ArrayAttributeRef, Attribute, DenseInteger32ArrayAttributeRef, DetachedOp, DetachedRegion, DialectHandle, Error,
+    FlatSymbolRefAttributeRef, IntegerAttributeRef, Location, Operation, OperationBuilder, OperationResultRef,
+    RegionRef, StringAttributeRef, TypeAttributeRef, TypeRef, ValueRef, mlir_op, mlir_op_trait,
 };
 
 use super::attributes::{
@@ -18,13 +18,13 @@ use super::attributes::{
 /// for more information.
 pub trait IntToPtrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the integer source value.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the pointer result.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -35,20 +35,19 @@ mlir_op_trait!(IntToPtr, ZeroRegions);
 mlir_op_trait!(IntToPtr, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`IntToPtrOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn int_to_ptr<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedIntToPtrOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedIntToPtrOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.int_to_ptr", location)
         .add_operand(src)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::int_to_ptr`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::int_to_ptr`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that casts a pointer value to an integer value.
@@ -57,13 +56,13 @@ pub fn int_to_ptr<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait PtrToIntOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the pointer source value.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the integer result.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -74,20 +73,19 @@ mlir_op_trait!(PtrToInt, ZeroRegions);
 mlir_op_trait!(PtrToInt, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`PtrToIntOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn ptr_to_int<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedPtrToIntOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedPtrToIntOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.ptr_to_int", location)
         .add_operand(src)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::ptr_to_int`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::ptr_to_int`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that casts between values with the same bit width.
@@ -96,13 +94,13 @@ pub fn ptr_to_int<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait BitcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source value.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the bitcast result.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -113,20 +111,19 @@ mlir_op_trait!(Bitcast, ZeroRegions);
 mlir_op_trait!(Bitcast, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`BitcastOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn bitcast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedBitcastOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedBitcastOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.bitcast", location)
         .add_operand(src)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::bitcast`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::bitcast`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` floating-point rounding mode.
@@ -138,19 +135,20 @@ pub const ROUNDING_ATTRIBUTE: &str = "rounding";
 /// for more information.
 pub trait FpToFpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source value.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the optional rounding mode.
-    fn rounding(&self) -> Option<RoundingModeAttributeRef<'c, 't>> {
-        self.attribute(ROUNDING_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<RoundingModeAttributeRef>())
+    fn rounding(&self) -> Result<Option<RoundingModeAttributeRef<'c, 't>>, Error> {
+        Ok(self
+            .attribute(ROUNDING_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast::<RoundingModeAttributeRef>()))
     }
 
     /// Returns the cast result.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -161,25 +159,21 @@ mlir_op_trait!(FpToFp, ZeroRegions);
 mlir_op_trait!(FpToFp, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`FpToFpOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn fp_to_fp<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     rounding: Option<RoundingMode>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedFpToFpOperation<'c, 't> {
+) -> Result<DetachedFpToFpOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     let mut builder = OperationBuilder::new("tt.fp_to_fp", location).add_operand(src);
     if let Some(rounding) = rounding {
-        builder = builder.add_attribute(ROUNDING_ATTRIBUTE, context.triton_tt_rounding_mode_attribute(rounding));
+        builder = builder.add_attribute(ROUNDING_ATTRIBUTE, context.triton_tt_rounding_mode_attribute(rounding)?);
     }
-    builder
-        .add_result(result_type)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::fp_to_fp`")
+    builder.add_result(result_type).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::fp_to_fp`"))
+    })
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` NaN propagation mode.
@@ -191,31 +185,34 @@ pub const PROPAGATE_NAN_ATTRIBUTE: &str = "propagateNan";
 /// for more information.
 pub trait ClampFOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the value to clamp.
-    fn x(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn x(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the minimum bound.
-    fn min(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn min(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the maximum bound.
-    fn max(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn max(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the NaN propagation mode.
-    fn propagate_nan(&self) -> PropagateNanAttributeRef<'c, 't> {
-        self.attribute(PROPAGATE_NAN_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", PROPAGATE_NAN_ATTRIBUTE, "tt.clampf"))
-            .cast::<PropagateNanAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", PROPAGATE_NAN_ATTRIBUTE, "tt.clampf"))
+    fn propagate_nan(&self) -> Result<PropagateNanAttributeRef<'c, 't>, Error> {
+        self.attribute(PROPAGATE_NAN_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                PROPAGATE_NAN_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the clamped result.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -225,8 +222,6 @@ mlir_op_trait!(ClampF, ZeroRegions);
 mlir_op_trait!(ClampF, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ClampFOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn clampf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     x: ValueRef<'v, 'c, 't>,
     min: ValueRef<'v, 'c, 't>,
@@ -234,18 +229,19 @@ pub fn clampf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     propagate_nan: PropagateNan,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedClampFOperation<'c, 't> {
+) -> Result<DetachedClampFOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.clampf", location)
         .add_operand(x)
         .add_operand(min)
         .add_operand(max)
-        .add_attribute(PROPAGATE_NAN_ATTRIBUTE, context.triton_tt_propagate_nan_attribute(propagate_nan))
+        .add_attribute(PROPAGATE_NAN_ATTRIBUTE, context.triton_tt_propagate_nan_attribute(propagate_nan)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::clampf`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::clampf`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that computes a precise floating-point square root.
@@ -254,13 +250,13 @@ pub fn clampf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait PreciseSqrtOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input value.
-    fn x(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn x(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the square-root result.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -271,20 +267,19 @@ mlir_op_trait!(PreciseSqrt, ZeroRegions);
 mlir_op_trait!(PreciseSqrt, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`PreciseSqrtOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn precise_sqrt<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     x: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedPreciseSqrtOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedPreciseSqrtOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.precise_sqrt", location)
         .add_operand(x)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::precise_sqrt`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::precise_sqrt`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that computes a precise floating-point division.
@@ -293,18 +288,18 @@ pub fn precise_sqrt<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait PreciseDivFOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the dividend.
-    fn x(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn x(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the divisor.
-    fn y(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn y(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the division result.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -314,22 +309,21 @@ mlir_op_trait!(PreciseDivF, ZeroRegions);
 mlir_op_trait!(PreciseDivF, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`PreciseDivFOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn precise_divf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     x: ValueRef<'v, 'c, 't>,
     y: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedPreciseDivFOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedPreciseDivFOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.precise_divf", location)
         .add_operand(x)
         .add_operand(y)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::precise_divf`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::precise_divf`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that returns the high bits of an unsigned integer product.
@@ -338,18 +332,18 @@ pub fn precise_divf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait MulhiUIOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand-side input.
-    fn x(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn x(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand-side input.
-    fn y(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn y(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the high-product result.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -359,22 +353,21 @@ mlir_op_trait!(MulhiUI, ZeroRegions);
 mlir_op_trait!(MulhiUI, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`MulhiUIOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn mulhiui<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     x: ValueRef<'v, 'c, 't>,
     y: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedMulhiUIOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedMulhiUIOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.mulhiui", location)
         .add_operand(x)
         .add_operand(y)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::mulhiui`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::mulhiui`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that adds an integer offset to a pointer.
@@ -383,18 +376,18 @@ pub fn mulhiui<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait AddPtrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the base pointer.
-    fn ptr(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn ptr(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the integer offset.
-    fn offset(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn offset(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the adjusted pointer.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -404,22 +397,21 @@ mlir_op_trait!(AddPtr, ZeroRegions);
 mlir_op_trait!(AddPtr, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`AddPtrOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn addptr<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     ptr: ValueRef<'v, 'c, 't>,
     offset: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedAddPtrOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedAddPtrOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.addptr", location)
         .add_operand(ptr)
         .add_operand(offset)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::addptr`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::addptr`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores Triton `tt` operand segment sizes.
@@ -440,63 +432,59 @@ pub const IS_VOLATILE_ATTRIBUTE: &str = "isVolatile";
 /// for more information.
 pub trait LoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the pointer operand.
-    fn ptr(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn ptr(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the optional mask operand.
-    fn mask(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let sizes: Vec<i32> = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
-            .unwrap_or_default();
-        if sizes.get(1).copied().unwrap_or(0) > 0 { self.operand_value(1) } else { None }
+    fn mask(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)? > 0 {
+            self.operand_value(1).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the optional fallback value operand.
-    fn other(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let sizes: Vec<i32> = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
-            .unwrap_or_default();
-        if sizes.get(2).copied().unwrap_or(0) > 0 {
-            let index = 1 + sizes.get(1).copied().unwrap_or(0) as usize;
-            self.operand_value(index)
+    fn other(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)? > 0 {
+            let index = 1 + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+            self.operand_value(index).map(Some)
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Returns the cache modifier.
-    fn cache(&self) -> CacheModifierAttributeRef<'c, 't> {
-        self.attribute(CACHE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", CACHE_ATTRIBUTE, "tt.load"))
-            .cast::<CacheModifierAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", CACHE_ATTRIBUTE, "tt.load"))
+    fn cache(&self) -> Result<CacheModifierAttributeRef<'c, 't>, Error> {
+        self.attribute(CACHE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                CACHE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the eviction policy.
-    fn evict(&self) -> EvictionPolicyAttributeRef<'c, 't> {
-        self.attribute(EVICT_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", EVICT_ATTRIBUTE, "tt.load"))
-            .cast::<EvictionPolicyAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", EVICT_ATTRIBUTE, "tt.load"))
+    fn evict(&self) -> Result<EvictionPolicyAttributeRef<'c, 't>, Error> {
+        self.attribute(EVICT_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                EVICT_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns `true` if this load is volatile.
-    fn is_volatile(&self) -> bool {
-        self.attribute(IS_VOLATILE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", IS_VOLATILE_ATTRIBUTE, "tt.load"))
-            .cast::<BooleanAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", IS_VOLATILE_ATTRIBUTE, "tt.load"))
-            .value()
+    fn is_volatile(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(IS_VOLATILE_ATTRIBUTE)?.value())
     }
 
     /// Returns the loaded value.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -506,8 +494,6 @@ mlir_op_trait!(Load, ZeroRegions);
 mlir_op_trait!(Load, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`LoadOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     ptr: ValueRef<'v, 'c, 't>,
     mask: Option<ValueRef<'v, 'c, 't>>,
@@ -517,9 +503,9 @@ pub fn load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     is_volatile: bool,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedLoadOperation<'c, 't> {
+) -> Result<DetachedLoadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     let mut builder = OperationBuilder::new("tt.load", location).add_operand(ptr);
     if let Some(mask) = mask {
         builder = builder.add_operand(mask);
@@ -530,17 +516,16 @@ pub fn load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     builder
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context
-                .dense_i32_array_attribute(&[1, i32::from(mask.is_some()), i32::from(other.is_some())])
-                .unwrap(),
+            context.dense_i32_array_attribute(&[1, i32::from(mask.is_some()), i32::from(other.is_some())])?,
         )
-        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache))
-        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict))
+        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)
+        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?)
         .add_attribute(IS_VOLATILE_ATTRIBUTE, context.boolean_attribute(is_volatile))
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::load`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::load`"))
+        })
 }
 
 /// Name of the [`Attribute`] that marks a Triton `tt` store as ignoring CTA behavior.
@@ -552,39 +537,44 @@ pub const IGNORE_CTA_ATTRIBUTE: &str = "ignore_cta";
 /// for more information.
 pub trait StoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the pointer operand.
-    fn ptr(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn ptr(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the value to store.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the optional mask operand.
-    fn mask(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let sizes: Vec<i32> = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
-            .unwrap_or_default();
-        if sizes.get(2).copied().unwrap_or(0) > 0 { self.operand_value(2) } else { None }
+    fn mask(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)? > 0 {
+            self.operand_value(2).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the cache modifier.
-    fn cache(&self) -> CacheModifierAttributeRef<'c, 't> {
-        self.attribute(CACHE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", CACHE_ATTRIBUTE, "tt.store"))
-            .cast::<CacheModifierAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", CACHE_ATTRIBUTE, "tt.store"))
+    fn cache(&self) -> Result<CacheModifierAttributeRef<'c, 't>, Error> {
+        self.attribute(CACHE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                CACHE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the eviction policy.
-    fn evict(&self) -> EvictionPolicyAttributeRef<'c, 't> {
-        self.attribute(EVICT_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", EVICT_ATTRIBUTE, "tt.store"))
-            .cast::<EvictionPolicyAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", EVICT_ATTRIBUTE, "tt.store"))
+    fn evict(&self) -> Result<EvictionPolicyAttributeRef<'c, 't>, Error> {
+        self.attribute(EVICT_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                EVICT_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns `true` if this store is marked to ignore CTA behavior.
@@ -598,8 +588,6 @@ mlir_op_trait!(Store, ZeroRegions);
 mlir_op_trait!(Store, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`StoreOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     ptr: ValueRef<'v, 'c, 't>,
     value: ValueRef<'v, 'c, 't>,
@@ -608,9 +596,9 @@ pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     evict: EvictionPolicy,
     ignore_cta: bool,
     location: L,
-) -> DetachedStoreOperation<'c, 't> {
+) -> Result<DetachedStoreOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     let mut builder = OperationBuilder::new("tt.store", location).add_operand(ptr).add_operand(value);
     if let Some(mask) = mask {
         builder = builder.add_operand(mask);
@@ -618,17 +606,16 @@ pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     builder = builder
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context.dense_i32_array_attribute(&[1, 1, i32::from(mask.is_some())]).unwrap(),
+            context.dense_i32_array_attribute(&[1, 1, i32::from(mask.is_some())])?,
         )
-        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache))
-        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict));
+        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)
+        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?);
     if ignore_cta {
         builder = builder.add_attribute(IGNORE_CTA_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::store`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::store`"))
+    })
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` atomic read-modify-write operation.
@@ -646,52 +633,60 @@ pub const SCOPE_ATTRIBUTE: &str = "scope";
 /// for more information.
 pub trait AtomicRmwOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the atomic read-modify-write operation kind.
-    fn atomic_rmw_op(&self) -> RmwOpAttributeRef<'c, 't> {
-        self.attribute(ATOMIC_RMW_OP_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", ATOMIC_RMW_OP_ATTRIBUTE, "tt.atomic_rmw"))
-            .cast::<RmwOpAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", ATOMIC_RMW_OP_ATTRIBUTE, "tt.atomic_rmw"))
+    fn atomic_rmw_op(&self) -> Result<RmwOpAttributeRef<'c, 't>, Error> {
+        self.attribute(ATOMIC_RMW_OP_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                ATOMIC_RMW_OP_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the pointer operand.
-    fn ptr(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn ptr(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the value operand.
-    fn val(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn val(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the optional mask operand.
-    fn mask(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let sizes: Vec<i32> = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
-            .unwrap_or_default();
-        if sizes.get(2).copied().unwrap_or(0) > 0 { self.operand_value(2) } else { None }
+    fn mask(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)? > 0 {
+            self.operand_value(2).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the memory semantic.
-    fn sem(&self) -> MemSemanticAttributeRef<'c, 't> {
-        self.attribute(SEM_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", SEM_ATTRIBUTE, "tt.atomic_rmw"))
-            .cast::<MemSemanticAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", SEM_ATTRIBUTE, "tt.atomic_rmw"))
+    fn sem(&self) -> Result<MemSemanticAttributeRef<'c, 't>, Error> {
+        self.attribute(SEM_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SEM_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the memory synchronization scope.
-    fn scope(&self) -> MemSyncScopeAttributeRef<'c, 't> {
-        self.attribute(SCOPE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", SCOPE_ATTRIBUTE, "tt.atomic_rmw"))
-            .cast::<MemSyncScopeAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", SCOPE_ATTRIBUTE, "tt.atomic_rmw"))
+    fn scope(&self) -> Result<MemSyncScopeAttributeRef<'c, 't>, Error> {
+        self.attribute(SCOPE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SCOPE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the old value read from memory.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -701,8 +696,6 @@ mlir_op_trait!(AtomicRmw, ZeroRegions);
 mlir_op_trait!(AtomicRmw, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`AtomicRmwOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn atomic_rmw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     atomic_rmw_op: RmwOp,
     ptr: ValueRef<'v, 'c, 't>,
@@ -712,9 +705,9 @@ pub fn atomic_rmw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     scope: MemSyncScope,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedAtomicRmwOperation<'c, 't> {
+) -> Result<DetachedAtomicRmwOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     let mut builder = OperationBuilder::new("tt.atomic_rmw", location).add_operand(ptr).add_operand(val);
     if let Some(mask) = mask {
         builder = builder.add_operand(mask);
@@ -722,15 +715,16 @@ pub fn atomic_rmw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     builder
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context.dense_i32_array_attribute(&[1, 1, i32::from(mask.is_some())]).unwrap(),
+            context.dense_i32_array_attribute(&[1, 1, i32::from(mask.is_some())])?,
         )
-        .add_attribute(ATOMIC_RMW_OP_ATTRIBUTE, context.triton_tt_rmw_op_attribute(atomic_rmw_op))
-        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem))
-        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope))
+        .add_attribute(ATOMIC_RMW_OP_ATTRIBUTE, context.triton_tt_rmw_op_attribute(atomic_rmw_op)?)
+        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem)?)
+        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::atomic_rmw`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::atomic_rmw`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that performs an atomic compare-and-swap operation.
@@ -739,39 +733,45 @@ pub fn atomic_rmw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait AtomicCasOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the pointer operand.
-    fn ptr(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn ptr(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the comparison value.
-    fn cmp(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn cmp(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the replacement value.
-    fn val(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn val(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the memory semantic.
-    fn sem(&self) -> MemSemanticAttributeRef<'c, 't> {
-        self.attribute(SEM_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", SEM_ATTRIBUTE, "tt.atomic_cas"))
-            .cast::<MemSemanticAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", SEM_ATTRIBUTE, "tt.atomic_cas"))
+    fn sem(&self) -> Result<MemSemanticAttributeRef<'c, 't>, Error> {
+        self.attribute(SEM_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SEM_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the memory synchronization scope.
-    fn scope(&self) -> MemSyncScopeAttributeRef<'c, 't> {
-        self.attribute(SCOPE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", SCOPE_ATTRIBUTE, "tt.atomic_cas"))
-            .cast::<MemSyncScopeAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", SCOPE_ATTRIBUTE, "tt.atomic_cas"))
+    fn scope(&self) -> Result<MemSyncScopeAttributeRef<'c, 't>, Error> {
+        self.attribute(SCOPE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SCOPE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the old value read from memory.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -781,8 +781,6 @@ mlir_op_trait!(AtomicCas, ZeroRegions);
 mlir_op_trait!(AtomicCas, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`AtomicCasOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn atomic_cas<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     ptr: ValueRef<'v, 'c, 't>,
     cmp: ValueRef<'v, 'c, 't>,
@@ -791,19 +789,20 @@ pub fn atomic_cas<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     scope: MemSyncScope,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedAtomicCasOperation<'c, 't> {
+) -> Result<DetachedAtomicCasOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.atomic_cas", location)
         .add_operand(ptr)
         .add_operand(cmp)
         .add_operand(val)
-        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem))
-        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope))
+        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem)?)
+        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::atomic_cas`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::atomic_cas`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that splats a scalar value into a tensor.
@@ -812,13 +811,13 @@ pub fn atomic_cas<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait SplatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the scalar source value.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the tensor result.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -829,20 +828,19 @@ mlir_op_trait!(Splat, ZeroRegions);
 mlir_op_trait!(Splat, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SplatOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn splat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedSplatOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedSplatOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.splat", location)
         .add_operand(src)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::splat`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::splat`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that converts a single-element tensor to a scalar.
@@ -851,13 +849,13 @@ pub fn splat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait UnsplatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor source value.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the scalar result.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -868,20 +866,19 @@ mlir_op_trait!(Unsplat, ZeroRegions);
 mlir_op_trait!(Unsplat, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`UnsplatOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn unsplat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedUnsplatOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedUnsplatOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.unsplat", location)
         .add_operand(src)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::unsplat`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::unsplat`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` dimension axis.
@@ -893,21 +890,18 @@ pub const AXIS_ATTRIBUTE: &str = "axis";
 /// for more information.
 pub trait ExpandDimsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor source value.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the inserted axis.
-    fn axis(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(AXIS_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.expand_dims"))
-            .cast::<IntegerAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.expand_dims"))
+    fn axis(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(AXIS_ATTRIBUTE)
     }
 
     /// Returns the expanded tensor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -918,23 +912,22 @@ mlir_op_trait!(ExpandDims, ZeroRegions);
 mlir_op_trait!(ExpandDims, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ExpandDimsOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn expand_dims<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     axis: i64,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedExpandDimsOperation<'c, 't> {
+) -> Result<DetachedExpandDimsOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.expand_dims", location)
         .add_operand(src)
         .add_attribute(AXIS_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), axis))
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::expand_dims`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::expand_dims`"))
+        })
 }
 
 /// Name of the [`Attribute`] that allows a Triton `tt` reshape to reorder elements.
@@ -949,8 +942,8 @@ pub const EFFICIENT_LAYOUT_ATTRIBUTE: &str = "efficient_layout";
 /// for more information.
 pub trait ReshapeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor source value.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns `true` if element reordering is allowed.
@@ -964,8 +957,8 @@ pub trait ReshapeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the reshaped tensor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -976,17 +969,15 @@ mlir_op_trait!(Reshape, ZeroRegions);
 mlir_op_trait!(Reshape, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ReshapeOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn reshape<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     allow_reorder: bool,
     efficient_layout: bool,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedReshapeOperation<'c, 't> {
+) -> Result<DetachedReshapeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     let mut builder = OperationBuilder::new("tt.reshape", location).add_operand(src);
     if allow_reorder {
         builder = builder.add_attribute(ALLOW_REORDER_ATTRIBUTE, context.unit_attribute());
@@ -994,11 +985,9 @@ pub fn reshape<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     if efficient_layout {
         builder = builder.add_attribute(EFFICIENT_LAYOUT_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .add_result(result_type)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::reshape`")
+    builder.add_result(result_type).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::reshape`"))
+    })
 }
 
 /// Triton `tt` [`Operation`] that broadcasts a tensor to a larger shape.
@@ -1007,13 +996,13 @@ pub fn reshape<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait BroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor source value.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the broadcast tensor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -1024,20 +1013,19 @@ mlir_op_trait!(Broadcast, ZeroRegions);
 mlir_op_trait!(Broadcast, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`BroadcastOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn broadcast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedBroadcastOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedBroadcastOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.broadcast", location)
         .add_operand(src)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::broadcast`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::broadcast`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that concatenates two tensors.
@@ -1046,18 +1034,18 @@ pub fn broadcast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait CatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand-side tensor.
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand-side tensor.
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the concatenated tensor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -1067,22 +1055,21 @@ mlir_op_trait!(Cat, ZeroRegions);
 mlir_op_trait!(Cat, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`CatOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn cat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     lhs: ValueRef<'v, 'c, 't>,
     rhs: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedCatOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedCatOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.cat", location)
         .add_operand(lhs)
         .add_operand(rhs)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::cat`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::cat`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that joins two tensors along a new minor dimension.
@@ -1091,18 +1078,18 @@ pub fn cat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait JoinOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand-side tensor.
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand-side tensor.
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the joined tensor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -1112,22 +1099,21 @@ mlir_op_trait!(Join, ZeroRegions);
 mlir_op_trait!(Join, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`JoinOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn join<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     lhs: ValueRef<'v, 'c, 't>,
     rhs: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedJoinOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedJoinOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.join", location)
         .add_operand(lhs)
         .add_operand(rhs)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::join`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::join`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that splits a tensor along its last dimension.
@@ -1136,18 +1122,18 @@ pub fn join<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait SplitOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor source value.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the left split result.
-    fn out_lhs(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn out_lhs(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.result(0)
     }
 
     /// Returns the right split result.
-    fn out_rhs(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 1).unwrap()
+    fn out_rhs(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.result(1)
     }
 }
 
@@ -1156,20 +1142,19 @@ mlir_op_trait!(Split, ZeroRegions);
 mlir_op_trait!(Split, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SplitOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn split<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     result_types: &[TypeRef<'c, 't>],
     location: L,
-) -> DetachedSplitOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedSplitOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.split", location)
         .add_operand(src)
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::split`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::split`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` transpose order.
@@ -1181,21 +1166,18 @@ pub const ORDER_ATTRIBUTE: &str = "order";
 /// for more information.
 pub trait TransOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor source value.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the transpose order.
-    fn order(&self) -> DenseInteger32ArrayAttributeRef<'c, 't> {
-        self.attribute(ORDER_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", ORDER_ATTRIBUTE, "tt.trans"))
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", ORDER_ATTRIBUTE, "tt.trans"))
+    fn order(&self) -> Result<DenseInteger32ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_32_array_attribute(ORDER_ATTRIBUTE)
     }
 
     /// Returns the transposed tensor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -1206,23 +1188,22 @@ mlir_op_trait!(Trans, ZeroRegions);
 mlir_op_trait!(Trans, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`TransOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn trans<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     order: &[i32],
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedTransOperation<'c, 't> {
+) -> Result<DetachedTransOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.trans", location)
         .add_operand(src)
-        .add_attribute(ORDER_ATTRIBUTE, context.dense_i32_array_attribute(order).unwrap())
+        .add_attribute(ORDER_ATTRIBUTE, context.dense_i32_array_attribute(order)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::trans`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::trans`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that returns the current program identifier along an axis.
@@ -1231,16 +1212,19 @@ pub fn trans<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait GetProgramIdOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the queried program identifier axis.
-    fn axis(&self) -> ProgramIdDimAttributeRef<'c, 't> {
-        self.attribute(AXIS_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.get_program_id"))
-            .cast::<ProgramIdDimAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.get_program_id"))
+    fn axis(&self) -> Result<ProgramIdDimAttributeRef<'c, 't>, Error> {
+        self.attribute(AXIS_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                AXIS_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the program identifier.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -1251,21 +1235,20 @@ mlir_op_trait!(GetProgramId, ZeroRegions);
 mlir_op_trait!(GetProgramId, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`GetProgramIdOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn get_program_id<'c, 't: 'c, L: Location<'c, 't>>(
     axis: ProgramIdDim,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedGetProgramIdOperation<'c, 't> {
+) -> Result<DetachedGetProgramIdOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.get_program_id", location)
-        .add_attribute(AXIS_ATTRIBUTE, context.triton_tt_program_id_dim_attribute(axis))
+        .add_attribute(AXIS_ATTRIBUTE, context.triton_tt_program_id_dim_attribute(axis)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::get_program_id`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::get_program_id`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that returns the number of programs along an axis.
@@ -1274,16 +1257,19 @@ pub fn get_program_id<'c, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait GetNumProgramsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the queried program-count axis.
-    fn axis(&self) -> ProgramIdDimAttributeRef<'c, 't> {
-        self.attribute(AXIS_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.get_num_programs"))
-            .cast::<ProgramIdDimAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.get_num_programs"))
+    fn axis(&self) -> Result<ProgramIdDimAttributeRef<'c, 't>, Error> {
+        self.attribute(AXIS_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                AXIS_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the number of programs.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -1294,21 +1280,22 @@ mlir_op_trait!(GetNumPrograms, ZeroRegions);
 mlir_op_trait!(GetNumPrograms, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`GetNumProgramsOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn get_num_programs<'c, 't: 'c, L: Location<'c, 't>>(
     axis: ProgramIdDim,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedGetNumProgramsOperation<'c, 't> {
+) -> Result<DetachedGetNumProgramsOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.get_num_programs", location)
-        .add_attribute(AXIS_ATTRIBUTE, context.triton_tt_program_id_dim_attribute(axis))
+        .add_attribute(AXIS_ATTRIBUTE, context.triton_tt_program_id_dim_attribute(axis)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::get_num_programs`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::get_num_programs`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores Triton `tt` dot input precision.
@@ -1323,39 +1310,39 @@ pub const MAX_NUM_IMPRECISE_ACC_ATTRIBUTE: &str = "maxNumImpreciseAcc";
 /// for more information.
 pub trait DotOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand-side matrix.
-    fn a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand-side matrix.
-    fn b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn b(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the accumulator matrix.
-    fn c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn c(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the input precision mode.
-    fn input_precision(&self) -> InputPrecisionAttributeRef<'c, 't> {
-        self.attribute(INPUT_PRECISION_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", INPUT_PRECISION_ATTRIBUTE, "tt.dot"))
-            .cast::<InputPrecisionAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", INPUT_PRECISION_ATTRIBUTE, "tt.dot"))
+    fn input_precision(&self) -> Result<InputPrecisionAttributeRef<'c, 't>, Error> {
+        self.attribute(INPUT_PRECISION_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                INPUT_PRECISION_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the maximum number of imprecise accumulations.
-    fn max_num_imprecise_acc(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(MAX_NUM_IMPRECISE_ACC_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", MAX_NUM_IMPRECISE_ACC_ATTRIBUTE, "tt.dot"))
-            .cast::<IntegerAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", MAX_NUM_IMPRECISE_ACC_ATTRIBUTE, "tt.dot"))
+    fn max_num_imprecise_acc(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(MAX_NUM_IMPRECISE_ACC_ATTRIBUTE)
     }
 
     /// Returns the dot result.
-    fn d(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn d(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.result(0)
     }
 }
 
@@ -1365,8 +1352,6 @@ mlir_op_trait!(Dot, ZeroRegions);
 mlir_op_trait!(Dot, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DotOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn dot<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     a: ValueRef<'v, 'c, 't>,
     b: ValueRef<'v, 'c, 't>,
@@ -1375,22 +1360,23 @@ pub fn dot<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     max_num_imprecise_acc: i64,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedDotOperation<'c, 't> {
+) -> Result<DetachedDotOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.dot", location)
         .add_operand(a)
         .add_operand(b)
         .add_operand(c)
-        .add_attribute(INPUT_PRECISION_ATTRIBUTE, context.triton_tt_input_precision_attribute(input_precision))
+        .add_attribute(INPUT_PRECISION_ATTRIBUTE, context.triton_tt_input_precision_attribute(input_precision)?)
         .add_attribute(
             MAX_NUM_IMPRECISE_ACC_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), max_num_imprecise_acc),
         )
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::dot`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::dot`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores the left scaled-dot element type.
@@ -1414,91 +1400,79 @@ pub const RHS_K_PACK_ATTRIBUTE: &str = "rhs_k_pack";
 /// for more information.
 pub trait DotScaledOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand-side matrix.
-    fn a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand-side matrix.
-    fn b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn b(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the accumulator matrix.
-    fn c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn c(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the optional left-hand-side scale tensor.
-    fn a_scale(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let sizes: Vec<i32> = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
-            .unwrap_or_default();
-        if sizes.get(3).copied().unwrap_or(0) > 0 { self.operand_value(3) } else { None }
+    fn a_scale(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)? > 0 {
+            self.operand_value(3).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the optional right-hand-side scale tensor.
-    fn b_scale(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        let sizes: Vec<i32> = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
-            .unwrap_or_default();
-        if sizes.get(4).copied().unwrap_or(0) > 0 {
-            let index = 3 + sizes.get(3).copied().unwrap_or(0) as usize;
-            self.operand_value(index)
+    fn b_scale(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 4)? > 0 {
+            let index = 3 + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)?;
+            self.operand_value(index).map(Some)
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Returns the left-hand-side element type.
-    fn a_elem_type(&self) -> ScaleDotElemTypeAttributeRef<'c, 't> {
-        self.attribute(A_ELEM_TYPE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", A_ELEM_TYPE_ATTRIBUTE, "tt.dot_scaled"))
-            .cast::<ScaleDotElemTypeAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", A_ELEM_TYPE_ATTRIBUTE, "tt.dot_scaled"))
+    fn a_elem_type(&self) -> Result<ScaleDotElemTypeAttributeRef<'c, 't>, Error> {
+        self.attribute(A_ELEM_TYPE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                A_ELEM_TYPE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the right-hand-side element type.
-    fn b_elem_type(&self) -> ScaleDotElemTypeAttributeRef<'c, 't> {
-        self.attribute(B_ELEM_TYPE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", B_ELEM_TYPE_ATTRIBUTE, "tt.dot_scaled"))
-            .cast::<ScaleDotElemTypeAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", B_ELEM_TYPE_ATTRIBUTE, "tt.dot_scaled"))
+    fn b_elem_type(&self) -> Result<ScaleDotElemTypeAttributeRef<'c, 't>, Error> {
+        self.attribute(B_ELEM_TYPE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                B_ELEM_TYPE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns `true` if fast math is enabled.
-    fn fast_math(&self) -> bool {
-        self.attribute(FAST_MATH_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", FAST_MATH_ATTRIBUTE, "tt.dot_scaled"))
-            .cast::<BooleanAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", FAST_MATH_ATTRIBUTE, "tt.dot_scaled"))
-            .value()
+    fn fast_math(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(FAST_MATH_ATTRIBUTE)?.value())
     }
 
     /// Returns `true` if the left-hand-side K dimension is packed.
-    fn lhs_k_pack(&self) -> bool {
-        self.attribute(LHS_K_PACK_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", LHS_K_PACK_ATTRIBUTE, "tt.dot_scaled"))
-            .cast::<BooleanAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", LHS_K_PACK_ATTRIBUTE, "tt.dot_scaled"))
-            .value()
+    fn lhs_k_pack(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(LHS_K_PACK_ATTRIBUTE)?.value())
     }
 
     /// Returns `true` if the right-hand-side K dimension is packed.
-    fn rhs_k_pack(&self) -> bool {
-        self.attribute(RHS_K_PACK_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", RHS_K_PACK_ATTRIBUTE, "tt.dot_scaled"))
-            .cast::<BooleanAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", RHS_K_PACK_ATTRIBUTE, "tt.dot_scaled"))
-            .value()
+    fn rhs_k_pack(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(RHS_K_PACK_ATTRIBUTE)?.value())
     }
 
     /// Returns the scaled-dot result.
-    fn d(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn d(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.result(0)
     }
 }
 
@@ -1508,8 +1482,6 @@ mlir_op_trait!(DotScaled, ZeroRegions);
 mlir_op_trait!(DotScaled, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DotScaledOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn dot_scaled<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     a: ValueRef<'v, 'c, 't>,
     b: ValueRef<'v, 'c, 't>,
@@ -1523,9 +1495,9 @@ pub fn dot_scaled<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     rhs_k_pack: bool,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedDotScaledOperation<'c, 't> {
+) -> Result<DetachedDotScaledOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     let mut builder = OperationBuilder::new("tt.dot_scaled", location).add_operand(a).add_operand(b).add_operand(c);
     if let Some(a_scale) = a_scale {
         builder = builder.add_operand(a_scale);
@@ -1536,19 +1508,24 @@ pub fn dot_scaled<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     builder
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context
-                .dense_i32_array_attribute(&[1, 1, 1, i32::from(a_scale.is_some()), i32::from(b_scale.is_some())])
-                .unwrap(),
+            context.dense_i32_array_attribute(&[
+                1,
+                1,
+                1,
+                i32::from(a_scale.is_some()),
+                i32::from(b_scale.is_some()),
+            ])?,
         )
-        .add_attribute(A_ELEM_TYPE_ATTRIBUTE, context.triton_tt_scale_dot_elem_type_attribute(a_elem_type))
-        .add_attribute(B_ELEM_TYPE_ATTRIBUTE, context.triton_tt_scale_dot_elem_type_attribute(b_elem_type))
+        .add_attribute(A_ELEM_TYPE_ATTRIBUTE, context.triton_tt_scale_dot_elem_type_attribute(a_elem_type)?)
+        .add_attribute(B_ELEM_TYPE_ATTRIBUTE, context.triton_tt_scale_dot_elem_type_attribute(b_elem_type)?)
         .add_attribute(FAST_MATH_ATTRIBUTE, context.boolean_attribute(fast_math))
         .add_attribute(LHS_K_PACK_ATTRIBUTE, context.boolean_attribute(lhs_k_pack))
         .add_attribute(RHS_K_PACK_ATTRIBUTE, context.boolean_attribute(rhs_k_pack))
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::dot_scaled`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::dot_scaled`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that reduces one or more tensors using a combiner region.
@@ -1557,25 +1534,22 @@ pub fn dot_scaled<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait ReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source tensors.
-    fn srcs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn srcs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the reduction axis.
-    fn axis(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(AXIS_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.reduce"))
-            .cast::<IntegerAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.reduce"))
+    fn axis(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(AXIS_ATTRIBUTE)
     }
 
     /// Returns the combiner region.
-    fn combine_op(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn combine_op(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns the reduction results.
-    fn result_values(&self) -> Vec<OperationResultRef<'o, 'c, 't>> {
+    fn result_values(&self) -> Result<Vec<OperationResultRef<'o, 'c, 't>>, Error> {
         self.results().collect()
     }
 }
@@ -1585,25 +1559,24 @@ mlir_op_trait!(Reduce, OneRegion);
 mlir_op_trait!(Reduce, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ReduceOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     srcs: &[ValueRef<'v, 'c, 't>],
     axis: i64,
     result_types: &[TypeRef<'c, 't>],
     combine_op: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedReduceOperation<'c, 't> {
+) -> Result<DetachedReduceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.reduce", location)
         .add_operands(srcs)
         .add_attribute(AXIS_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), axis))
         .add_region(combine_op)
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::reduce`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::reduce`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that terminates a `tt.reduce` combiner region.
@@ -1612,7 +1585,7 @@ pub fn reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait ReduceReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the yielded reduction values.
-    fn result_values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn result_values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 }
@@ -1622,18 +1595,16 @@ mlir_op_trait!(ReduceReturn, ZeroRegions);
 mlir_op_trait!(ReduceReturn, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ReduceReturnOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn reduce_return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_values: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedReduceReturnOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
-    OperationBuilder::new("tt.reduce.return", location)
-        .add_operands(result_values)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::reduce_return`")
+) -> Result<DetachedReduceReturnOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
+    OperationBuilder::new("tt.reduce.return", location).add_operands(result_values).build().and_then(
+        |operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::reduce_return`"))
+        },
+    )
 }
 
 /// Name of the [`Attribute`] that marks a Triton `tt` scan as reverse.
@@ -1645,34 +1616,27 @@ pub const REVERSE_ATTRIBUTE: &str = "reverse";
 /// for more information.
 pub trait ScanOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source tensors.
-    fn srcs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn srcs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the scan axis.
-    fn axis(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(AXIS_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.scan"))
-            .cast::<IntegerAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.scan"))
+    fn axis(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(AXIS_ATTRIBUTE)
     }
 
     /// Returns `true` if the scan proceeds in reverse order.
-    fn reverse(&self) -> bool {
-        self.attribute(REVERSE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", REVERSE_ATTRIBUTE, "tt.scan"))
-            .cast::<BooleanAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", REVERSE_ATTRIBUTE, "tt.scan"))
-            .value()
+    fn reverse(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(REVERSE_ATTRIBUTE)?.value())
     }
 
     /// Returns the combiner region.
-    fn combine_op(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn combine_op(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns the scan results.
-    fn result_values(&self) -> Vec<OperationResultRef<'o, 'c, 't>> {
+    fn result_values(&self) -> Result<Vec<OperationResultRef<'o, 'c, 't>>, Error> {
         self.results().collect()
     }
 }
@@ -1682,8 +1646,6 @@ mlir_op_trait!(Scan, OneRegion);
 mlir_op_trait!(Scan, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ScanOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn scan<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     srcs: &[ValueRef<'v, 'c, 't>],
     axis: i64,
@@ -1691,9 +1653,9 @@ pub fn scan<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_types: &[TypeRef<'c, 't>],
     combine_op: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedScanOperation<'c, 't> {
+) -> Result<DetachedScanOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.scan", location)
         .add_operands(srcs)
         .add_attribute(AXIS_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), axis))
@@ -1701,8 +1663,9 @@ pub fn scan<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_region(combine_op)
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::scan`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::scan`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that terminates a `tt.scan` combiner region.
@@ -1711,7 +1674,7 @@ pub fn scan<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait ScanReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the yielded scan values.
-    fn result_values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn result_values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 }
@@ -1721,18 +1684,17 @@ mlir_op_trait!(ScanReturn, ZeroRegions);
 mlir_op_trait!(ScanReturn, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ScanReturnOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn scan_return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_values: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedScanReturnOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedScanReturnOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.scan.return", location)
         .add_operands(result_values)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::scan_return`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::scan_return`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` map-elementwise packing factor.
@@ -1744,25 +1706,22 @@ pub const PACK_ATTRIBUTE: &str = "pack";
 /// for more information.
 pub trait MapElementwiseOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source tensors.
-    fn srcs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn srcs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the packing factor.
-    fn pack(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(PACK_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", PACK_ATTRIBUTE, "tt.map_elementwise"))
-            .cast::<IntegerAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", PACK_ATTRIBUTE, "tt.map_elementwise"))
+    fn pack(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(PACK_ATTRIBUTE)
     }
 
     /// Returns the scalar mapping region.
-    fn scalar_op(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn scalar_op(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns the mapped tensors.
-    fn result_values(&self) -> Vec<OperationResultRef<'o, 'c, 't>> {
+    fn result_values(&self) -> Result<Vec<OperationResultRef<'o, 'c, 't>>, Error> {
         self.results().collect()
     }
 }
@@ -1772,25 +1731,26 @@ mlir_op_trait!(MapElementwise, OneRegion);
 mlir_op_trait!(MapElementwise, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`MapElementwiseOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn map_elementwise<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     srcs: &[ValueRef<'v, 'c, 't>],
     pack: i64,
     result_types: &[TypeRef<'c, 't>],
     scalar_op: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedMapElementwiseOperation<'c, 't> {
+) -> Result<DetachedMapElementwiseOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.map_elementwise", location)
         .add_operands(srcs)
         .add_attribute(PACK_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), pack))
         .add_region(scalar_op)
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::map_elementwise`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::map_elementwise`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that terminates a `tt.map_elementwise` region.
@@ -1799,7 +1759,7 @@ pub fn map_elementwise<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait MapElementwiseReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the yielded mapped values.
-    fn result_values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn result_values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 }
@@ -1809,18 +1769,19 @@ mlir_op_trait!(MapElementwiseReturn, ZeroRegions);
 mlir_op_trait!(MapElementwiseReturn, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`MapElementwiseReturnOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn map_elementwise_return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     result_values: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedMapElementwiseReturnOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedMapElementwiseReturnOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.map_elementwise.return", location)
         .add_operands(result_values)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::map_elementwise_return`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::map_elementwise_return`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores an external elementwise library name.
@@ -1841,46 +1802,33 @@ pub const PURE_ATTRIBUTE: &str = "pure";
 /// for more information.
 pub trait ExternElementwiseOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source values.
-    fn srcs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn srcs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the library name.
-    fn libname(&self) -> StringAttributeRef<'c, 't> {
-        self.attribute(LIBNAME_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", LIBNAME_ATTRIBUTE, "tt.extern_elementwise"))
-            .cast::<StringAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", LIBNAME_ATTRIBUTE, "tt.extern_elementwise"))
+    fn libname(&self) -> Result<StringAttributeRef<'c, 't>, Error> {
+        self.string_attribute(LIBNAME_ATTRIBUTE)
     }
 
     /// Returns the library path.
-    fn libpath(&self) -> StringAttributeRef<'c, 't> {
-        self.attribute(LIBPATH_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", LIBPATH_ATTRIBUTE, "tt.extern_elementwise"))
-            .cast::<StringAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", LIBPATH_ATTRIBUTE, "tt.extern_elementwise"))
+    fn libpath(&self) -> Result<StringAttributeRef<'c, 't>, Error> {
+        self.string_attribute(LIBPATH_ATTRIBUTE)
     }
 
     /// Returns the external symbol name.
-    fn symbol(&self) -> StringAttributeRef<'c, 't> {
-        self.attribute(SYMBOL_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", SYMBOL_ATTRIBUTE, "tt.extern_elementwise"))
-            .cast::<StringAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", SYMBOL_ATTRIBUTE, "tt.extern_elementwise"))
+    fn symbol(&self) -> Result<StringAttributeRef<'c, 't>, Error> {
+        self.string_attribute(SYMBOL_ATTRIBUTE)
     }
 
     /// Returns `true` if the external function is pure.
-    fn pure(&self) -> bool {
-        self.attribute(PURE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", PURE_ATTRIBUTE, "tt.extern_elementwise"))
-            .cast::<BooleanAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", PURE_ATTRIBUTE, "tt.extern_elementwise"))
-            .value()
+    fn pure(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(PURE_ATTRIBUTE)?.value())
     }
 
     /// Returns the external call result.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -1890,8 +1838,6 @@ mlir_op_trait!(ExternElementwise, ZeroRegions);
 mlir_op_trait!(ExternElementwise, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ExternElementwiseOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn extern_elementwise<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     srcs: &[ValueRef<'v, 'c, 't>],
     libname: &str,
@@ -1900,9 +1846,9 @@ pub fn extern_elementwise<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     pure: bool,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedExternElementwiseOperation<'c, 't> {
+) -> Result<DetachedExternElementwiseOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.extern_elementwise", location)
         .add_operands(srcs)
         .add_attribute(LIBNAME_ATTRIBUTE, context.string_attribute(libname))
@@ -1911,8 +1857,11 @@ pub fn extern_elementwise<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_attribute(PURE_ATTRIBUTE, context.boolean_attribute(pure))
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::extern_elementwise`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::extern_elementwise`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` range start.
@@ -1927,24 +1876,18 @@ pub const END_ATTRIBUTE: &str = "end";
 /// for more information.
 pub trait MakeRangeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the inclusive range start.
-    fn start(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(START_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", START_ATTRIBUTE, "tt.make_range"))
-            .cast::<IntegerAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", START_ATTRIBUTE, "tt.make_range"))
+    fn start(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(START_ATTRIBUTE)
     }
 
     /// Returns the exclusive range end.
-    fn end(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(END_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", END_ATTRIBUTE, "tt.make_range"))
-            .cast::<IntegerAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", END_ATTRIBUTE, "tt.make_range"))
+    fn end(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(END_ATTRIBUTE)
     }
 
     /// Returns the range tensor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -1955,23 +1898,22 @@ mlir_op_trait!(MakeRange, ZeroRegions);
 mlir_op_trait!(MakeRange, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`MakeRangeOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn make_range<'c, 't: 'c, L: Location<'c, 't>>(
     start: i64,
     end: i64,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedMakeRangeOperation<'c, 't> {
+) -> Result<DetachedMakeRangeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.make_range", location)
         .add_attribute(START_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), start))
         .add_attribute(END_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), end))
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::make_range`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::make_range`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores inline assembly text.
@@ -1989,57 +1931,32 @@ pub const PACKED_ELEMENT_ATTRIBUTE: &str = "packed_element";
 /// for more information.
 pub trait ElementwiseInlineAsmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the inline assembly text.
-    fn asm_string(&self) -> StringAttributeRef<'c, 't> {
-        self.attribute(ASM_STRING_ATTRIBUTE)
-            .unwrap_or_else(|| {
-                panic!("missing `{}` attribute in `{}`", ASM_STRING_ATTRIBUTE, "tt.elementwise_inline_asm")
-            })
-            .cast::<StringAttributeRef>()
-            .unwrap_or_else(|| {
-                panic!("invalid `{}` attribute in `{}`", ASM_STRING_ATTRIBUTE, "tt.elementwise_inline_asm")
-            })
+    fn asm_string(&self) -> Result<StringAttributeRef<'c, 't>, Error> {
+        self.string_attribute(ASM_STRING_ATTRIBUTE)
     }
 
     /// Returns the inline assembly constraints.
-    fn constraints(&self) -> StringAttributeRef<'c, 't> {
-        self.attribute(CONSTRAINTS_ATTRIBUTE)
-            .unwrap_or_else(|| {
-                panic!("missing `{}` attribute in `{}`", CONSTRAINTS_ATTRIBUTE, "tt.elementwise_inline_asm")
-            })
-            .cast::<StringAttributeRef>()
-            .unwrap_or_else(|| {
-                panic!("invalid `{}` attribute in `{}`", CONSTRAINTS_ATTRIBUTE, "tt.elementwise_inline_asm")
-            })
+    fn constraints(&self) -> Result<StringAttributeRef<'c, 't>, Error> {
+        self.string_attribute(CONSTRAINTS_ATTRIBUTE)
     }
 
     /// Returns `true` if the inline assembly is pure.
-    fn pure(&self) -> bool {
-        self.attribute(PURE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", PURE_ATTRIBUTE, "tt.elementwise_inline_asm"))
-            .cast::<BooleanAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", PURE_ATTRIBUTE, "tt.elementwise_inline_asm"))
-            .value()
+    fn pure(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(PURE_ATTRIBUTE)?.value())
     }
 
     /// Returns the packed element count.
-    fn packed_element(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(PACKED_ELEMENT_ATTRIBUTE)
-            .unwrap_or_else(|| {
-                panic!("missing `{}` attribute in `{}`", PACKED_ELEMENT_ATTRIBUTE, "tt.elementwise_inline_asm")
-            })
-            .cast::<IntegerAttributeRef>()
-            .unwrap_or_else(|| {
-                panic!("invalid `{}` attribute in `{}`", PACKED_ELEMENT_ATTRIBUTE, "tt.elementwise_inline_asm")
-            })
+    fn packed_element(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(PACKED_ELEMENT_ATTRIBUTE)
     }
 
     /// Returns the inline assembly operands.
-    fn args(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn args(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the inline assembly results.
-    fn result_values(&self) -> Vec<OperationResultRef<'o, 'c, 't>> {
+    fn result_values(&self) -> Result<Vec<OperationResultRef<'o, 'c, 't>>, Error> {
         self.results().collect()
     }
 }
@@ -2049,8 +1966,6 @@ mlir_op_trait!(ElementwiseInlineAsm, ZeroRegions);
 mlir_op_trait!(ElementwiseInlineAsm, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ElementwiseInlineAsmOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn elementwise_inline_asm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     args: &[ValueRef<'v, 'c, 't>],
     asm_string: &str,
@@ -2059,9 +1974,9 @@ pub fn elementwise_inline_asm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     packed_element: i64,
     result_types: &[TypeRef<'c, 't>],
     location: L,
-) -> DetachedElementwiseInlineAsmOperation<'c, 't> {
+) -> Result<DetachedElementwiseInlineAsmOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.elementwise_inline_asm", location)
         .add_operands(args)
         .add_attribute(ASM_STRING_ATTRIBUTE, context.string_attribute(asm_string))
@@ -2073,8 +1988,11 @@ pub fn elementwise_inline_asm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         )
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::elementwise_inline_asm`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::elementwise_inline_asm`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that computes a histogram tensor.
@@ -2083,18 +2001,18 @@ pub fn elementwise_inline_asm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait HistogramOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input tensor.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the optional mask tensor.
-    fn mask(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.operand_value(1)
+    fn mask(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.operand_count() <= 1 { Ok(None) } else { self.operand_value(1).map(Some) }
     }
 
     /// Returns the histogram tensor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -2104,24 +2022,20 @@ mlir_op_trait!(Histogram, ZeroRegions);
 mlir_op_trait!(Histogram, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`HistogramOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn histogram<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     mask: Option<ValueRef<'v, 'c, 't>>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedHistogramOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedHistogramOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     let mut builder = OperationBuilder::new("tt.histogram", location).add_operand(src);
     if let Some(mask) = mask {
         builder = builder.add_operand(mask);
     }
-    builder
-        .add_result(result_type)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::histogram`")
+    builder.add_result(result_type).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::histogram`"))
+    })
 }
 
 /// Triton `tt` [`Operation`] that gathers elements from a tensor along an axis.
@@ -2130,21 +2044,18 @@ pub fn histogram<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait GatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source tensor.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the indices tensor.
-    fn indices(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn indices(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the gather axis.
-    fn axis(&self) -> IntegerAttributeRef<'c, 't> {
-        self.attribute(AXIS_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.gather"))
-            .cast::<IntegerAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", AXIS_ATTRIBUTE, "tt.gather"))
+    fn axis(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(AXIS_ATTRIBUTE)
     }
 
     /// Returns `true` if the gather is marked as having an efficient layout.
@@ -2153,8 +2064,8 @@ pub trait GatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the gathered tensor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -2164,8 +2075,6 @@ mlir_op_trait!(Gather, ZeroRegions);
 mlir_op_trait!(Gather, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`GatherOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn gather<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     src: ValueRef<'v, 'c, 't>,
     indices: ValueRef<'v, 'c, 't>,
@@ -2173,9 +2082,9 @@ pub fn gather<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     efficient_layout: bool,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedGatherOperation<'c, 't> {
+) -> Result<DetachedGatherOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     let mut builder = OperationBuilder::new("tt.gather", location)
         .add_operand(src)
         .add_operand(indices)
@@ -2183,11 +2092,9 @@ pub fn gather<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     if efficient_layout {
         builder = builder.add_attribute(EFFICIENT_LAYOUT_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .add_result(result_type)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::gather`")
+    builder.add_result(result_type).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::gather`"))
+    })
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` print prefix.
@@ -2205,33 +2112,23 @@ pub const IS_SIGNED_ATTRIBUTE: &str = "isSigned";
 /// for more information.
 pub trait PrintOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the print prefix.
-    fn prefix(&self) -> StringAttributeRef<'c, 't> {
-        self.attribute(PREFIX_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", PREFIX_ATTRIBUTE, "tt.print"))
-            .cast::<StringAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", PREFIX_ATTRIBUTE, "tt.print"))
+    fn prefix(&self) -> Result<StringAttributeRef<'c, 't>, Error> {
+        self.string_attribute(PREFIX_ATTRIBUTE)
     }
 
     /// Returns `true` if arguments are printed in hexadecimal.
-    fn hex(&self) -> bool {
-        self.attribute(HEX_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", HEX_ATTRIBUTE, "tt.print"))
-            .cast::<BooleanAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", HEX_ATTRIBUTE, "tt.print"))
-            .value()
+    fn hex(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(HEX_ATTRIBUTE)?.value())
     }
 
     /// Returns the values to print.
-    fn args(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn args(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the signedness flags for printed values.
-    fn is_signed(&self) -> DenseInteger32ArrayAttributeRef<'c, 't> {
-        self.attribute(IS_SIGNED_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", IS_SIGNED_ATTRIBUTE, "tt.print"))
-            .cast::<DenseInteger32ArrayAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", IS_SIGNED_ATTRIBUTE, "tt.print"))
+    fn is_signed(&self) -> Result<DenseInteger32ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_32_array_attribute(IS_SIGNED_ATTRIBUTE)
     }
 }
 
@@ -2240,25 +2137,24 @@ mlir_op_trait!(Print, ZeroRegions);
 mlir_op_trait!(Print, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`PrintOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn print<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     args: &[ValueRef<'v, 'c, 't>],
     prefix: &str,
     hex: bool,
     is_signed: &[i32],
     location: L,
-) -> DetachedPrintOperation<'c, 't> {
+) -> Result<DetachedPrintOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.print", location)
         .add_operands(args)
         .add_attribute(PREFIX_ATTRIBUTE, context.string_attribute(prefix))
         .add_attribute(HEX_ATTRIBUTE, context.boolean_attribute(hex))
-        .add_attribute(IS_SIGNED_ATTRIBUTE, context.dense_i32_array_attribute(is_signed).unwrap())
+        .add_attribute(IS_SIGNED_ATTRIBUTE, context.dense_i32_array_attribute(is_signed)?)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::print`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::print`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` assertion message.
@@ -2270,16 +2166,13 @@ pub const MESSAGE_ATTRIBUTE: &str = "message";
 /// for more information.
 pub trait AssertOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the assertion condition.
-    fn condition(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn condition(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the assertion message.
-    fn message(&self) -> StringAttributeRef<'c, 't> {
-        self.attribute(MESSAGE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", MESSAGE_ATTRIBUTE, "tt.assert"))
-            .cast::<StringAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", MESSAGE_ATTRIBUTE, "tt.assert"))
+    fn message(&self) -> Result<StringAttributeRef<'c, 't>, Error> {
+        self.string_attribute(MESSAGE_ATTRIBUTE)
     }
 }
 
@@ -2288,21 +2181,20 @@ mlir_op_trait!(Assert, ZeroRegions);
 mlir_op_trait!(Assert, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`AssertOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn assert<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     condition: ValueRef<'v, 'c, 't>,
     message: &str,
     location: L,
-) -> DetachedAssertOperation<'c, 't> {
+) -> Result<DetachedAssertOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.assert", location)
         .add_operand(condition)
         .add_attribute(MESSAGE_ATTRIBUTE, context.string_attribute(message))
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::assert`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::assert`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores a tensor descriptor padding option.
@@ -2314,33 +2206,36 @@ pub const PADDING_ATTRIBUTE: &str = "padding";
 /// for more information.
 pub trait MakeTensorDescOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the base pointer.
-    fn base(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn base(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the shape values.
-    fn shape(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn shape(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = (self.operand_count().saturating_sub(1)) / 2;
         self.operand_values().skip(1).take(count).collect()
     }
 
     /// Returns the stride values.
-    fn strides(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn strides(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = (self.operand_count().saturating_sub(1)) / 2;
         self.operand_values().skip(1 + count).collect()
     }
 
     /// Returns the padding option.
-    fn padding(&self) -> PaddingOptionAttributeRef<'c, 't> {
-        self.attribute(PADDING_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", PADDING_ATTRIBUTE, "tt.make_tensor_descriptor"))
-            .cast::<PaddingOptionAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", PADDING_ATTRIBUTE, "tt.make_tensor_descriptor"))
+    fn padding(&self) -> Result<PaddingOptionAttributeRef<'c, 't>, Error> {
+        self.attribute(PADDING_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                PADDING_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the tensor descriptor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -2350,8 +2245,6 @@ mlir_op_trait!(MakeTensorDesc, ZeroRegions);
 mlir_op_trait!(MakeTensorDesc, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`MakeTensorDescOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn make_tensor_descriptor<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     base: ValueRef<'v, 'c, 't>,
     shape: &[ValueRef<'v, 'c, 't>],
@@ -2359,18 +2252,21 @@ pub fn make_tensor_descriptor<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     padding: PaddingOption,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedMakeTensorDescOperation<'c, 't> {
+) -> Result<DetachedMakeTensorDescOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.make_tensor_descriptor", location)
         .add_operand(base)
         .add_operands(shape)
         .add_operands(strides)
-        .add_attribute(PADDING_ATTRIBUTE, context.triton_tt_padding_option_attribute(padding))
+        .add_attribute(PADDING_ATTRIBUTE, context.triton_tt_padding_option_attribute(padding)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::make_tensor_descriptor`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::make_tensor_descriptor`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` call callee.
@@ -2382,20 +2278,17 @@ pub const CALLEE_ATTRIBUTE: &str = "callee";
 /// for more information.
 pub trait CallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the callee symbol reference.
-    fn callee(&self) -> FlatSymbolRefAttributeRef<'c, 't> {
-        self.attribute(CALLEE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", CALLEE_ATTRIBUTE, "tt.call"))
-            .cast::<FlatSymbolRefAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", CALLEE_ATTRIBUTE, "tt.call"))
+    fn callee(&self) -> Result<FlatSymbolRefAttributeRef<'c, 't>, Error> {
+        self.flat_symbol_ref_attribute(CALLEE_ATTRIBUTE)
     }
 
     /// Returns the call arguments.
-    fn operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the call results.
-    fn result_values(&self) -> Vec<OperationResultRef<'o, 'c, 't>> {
+    fn result_values(&self) -> Result<Vec<OperationResultRef<'o, 'c, 't>>, Error> {
         self.results().collect()
     }
 }
@@ -2405,23 +2298,22 @@ mlir_op_trait!(Call, ZeroRegions);
 mlir_op_trait!(Call, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`CallOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn call<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     callee: &str,
     operands: &[ValueRef<'v, 'c, 't>],
     result_types: &[TypeRef<'c, 't>],
     location: L,
-) -> DetachedCallOperation<'c, 't> {
+) -> Result<DetachedCallOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.call", location)
         .add_operands(operands)
         .add_attribute(CALLEE_ATTRIBUTE, context.flat_symbol_ref_attribute(callee))
         .add_results(result_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::call`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::call`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` function symbol name.
@@ -2445,41 +2337,45 @@ pub const RESULT_ATTRIBUTES_ATTRIBUTE: &str = "res_attrs";
 /// for more information.
 pub trait FuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the function symbol name.
-    fn sym_name(&self) -> StringAttributeRef<'c, 't> {
-        self.attribute(SYMBOL_NAME_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", SYMBOL_NAME_ATTRIBUTE, "tt.func"))
-            .cast::<StringAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", SYMBOL_NAME_ATTRIBUTE, "tt.func"))
+    fn sym_name(&self) -> Result<StringAttributeRef<'c, 't>, Error> {
+        self.string_attribute(SYMBOL_NAME_ATTRIBUTE)
     }
 
     /// Returns the function type.
-    fn function_type(&self) -> TypeAttributeRef<'c, 't> {
-        self.attribute(FUNCTION_TYPE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", FUNCTION_TYPE_ATTRIBUTE, "tt.func"))
-            .cast::<TypeAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", FUNCTION_TYPE_ATTRIBUTE, "tt.func"))
+    fn function_type(&self) -> Result<TypeAttributeRef<'c, 't>, Error> {
+        self.type_attribute(FUNCTION_TYPE_ATTRIBUTE)
     }
 
     /// Returns the optional symbol visibility.
-    fn sym_visibility(&self) -> Option<StringAttributeRef<'c, 't>> {
-        self.attribute(SYMBOL_VISIBILITY_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
+    fn sym_visibility(&self) -> Result<Option<StringAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(SYMBOL_VISIBILITY_ATTRIBUTE) {
+            self.string_attribute(SYMBOL_VISIBILITY_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the optional function argument attributes.
-    fn arg_attrs(&self) -> Option<ArrayAttributeRef<'c, 't>> {
-        self.attribute(ARG_ATTRIBUTES_ATTRIBUTE).and_then(|attribute| attribute.cast::<ArrayAttributeRef>())
+    fn arg_attrs(&self) -> Result<Option<ArrayAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(ARG_ATTRIBUTES_ATTRIBUTE) {
+            self.array_attribute(ARG_ATTRIBUTES_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the optional function result attributes.
-    fn res_attrs(&self) -> Option<ArrayAttributeRef<'c, 't>> {
-        self.attribute(RESULT_ATTRIBUTES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<ArrayAttributeRef>())
+    fn res_attrs(&self) -> Result<Option<ArrayAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(RESULT_ATTRIBUTES_ATTRIBUTE) {
+            self.array_attribute(RESULT_ATTRIBUTES_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the function body region.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -2488,8 +2384,6 @@ mlir_op_trait!(Func, OneRegion);
 mlir_op_trait!(Func, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`FuncOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn func<'c, 't: 'c, L: Location<'c, 't>>(
     sym_name: &str,
     function_type: TypeRef<'c, 't>,
@@ -2498,9 +2392,9 @@ pub fn func<'c, 't: 'c, L: Location<'c, 't>>(
     res_attrs: Option<ArrayAttributeRef<'c, 't>>,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedFuncOperation<'c, 't> {
+) -> Result<DetachedFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     let mut builder = OperationBuilder::new("tt.func", location)
         .add_attribute(SYMBOL_NAME_ATTRIBUTE, context.string_attribute(sym_name))
         .add_attribute(FUNCTION_TYPE_ATTRIBUTE, context.type_attribute(function_type));
@@ -2513,11 +2407,9 @@ pub fn func<'c, 't: 'c, L: Location<'c, 't>>(
     if let Some(res_attrs) = res_attrs {
         builder = builder.add_attribute(RESULT_ATTRIBUTES_ATTRIBUTE, res_attrs);
     }
-    builder
-        .add_region(body)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::func`")
+    builder.add_region(body).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::func`"))
+    })
 }
 
 /// Triton `tt` [`Operation`] that returns values from a Triton `tt` function.
@@ -2526,7 +2418,7 @@ pub fn func<'c, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait ReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the returned values.
-    fn srcs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn srcs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 }
@@ -2536,18 +2428,17 @@ mlir_op_trait!(Return, ZeroRegions);
 mlir_op_trait!(Return, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ReturnOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn r#return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     srcs: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedReturnOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedReturnOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.return", location)
         .add_operands(srcs)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::return`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::return`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that loads from a tensor descriptor.
@@ -2556,34 +2447,40 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait DescriptorLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor descriptor.
-    fn desc(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn desc(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the descriptor indices.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(1).collect()
     }
 
     /// Returns the cache modifier.
-    fn cache(&self) -> CacheModifierAttributeRef<'c, 't> {
-        self.attribute(CACHE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", CACHE_ATTRIBUTE, "tt.descriptor_load"))
-            .cast::<CacheModifierAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", CACHE_ATTRIBUTE, "tt.descriptor_load"))
+    fn cache(&self) -> Result<CacheModifierAttributeRef<'c, 't>, Error> {
+        self.attribute(CACHE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                CACHE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the eviction policy.
-    fn evict(&self) -> EvictionPolicyAttributeRef<'c, 't> {
-        self.attribute(EVICT_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", EVICT_ATTRIBUTE, "tt.descriptor_load"))
-            .cast::<EvictionPolicyAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", EVICT_ATTRIBUTE, "tt.descriptor_load"))
+    fn evict(&self) -> Result<EvictionPolicyAttributeRef<'c, 't>, Error> {
+        self.attribute(EVICT_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                EVICT_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the loaded tensor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -2593,8 +2490,6 @@ mlir_op_trait!(DescriptorLoad, ZeroRegions);
 mlir_op_trait!(DescriptorLoad, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DescriptorLoadOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn descriptor_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     desc: ValueRef<'v, 'c, 't>,
     indices: &[ValueRef<'v, 'c, 't>],
@@ -2602,18 +2497,21 @@ pub fn descriptor_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     evict: EvictionPolicy,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedDescriptorLoadOperation<'c, 't> {
+) -> Result<DetachedDescriptorLoadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.descriptor_load", location)
         .add_operand(desc)
         .add_operands(indices)
-        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache))
-        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict))
+        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)
+        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::descriptor_load`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::descriptor_load`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that stores a tensor through a tensor descriptor.
@@ -2622,17 +2520,17 @@ pub fn descriptor_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait DescriptorStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor descriptor.
-    fn desc(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn desc(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the tensor to store.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the descriptor indices.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(2).collect()
     }
 }
@@ -2642,22 +2540,23 @@ mlir_op_trait!(DescriptorStore, ZeroRegions);
 mlir_op_trait!(DescriptorStore, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DescriptorStoreOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn descriptor_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     desc: ValueRef<'v, 'c, 't>,
     src: ValueRef<'v, 'c, 't>,
     indices: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedDescriptorStoreOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedDescriptorStoreOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.descriptor_store", location)
         .add_operand(desc)
         .add_operand(src)
         .add_operands(indices)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::descriptor_store`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::descriptor_store`"))
+        })
 }
 
 /// Name of the [`Attribute`] that stores a descriptor reduce kind.
@@ -2669,25 +2568,28 @@ pub const KIND_ATTRIBUTE: &str = "kind";
 /// for more information.
 pub trait DescriptorReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the descriptor reduce kind.
-    fn kind(&self) -> DescriptorReduceKindAttributeRef<'c, 't> {
-        self.attribute(KIND_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("missing `{}` attribute in `{}`", KIND_ATTRIBUTE, "tt.descriptor_reduce"))
-            .cast::<DescriptorReduceKindAttributeRef>()
-            .unwrap_or_else(|| panic!("invalid `{}` attribute in `{}`", KIND_ATTRIBUTE, "tt.descriptor_reduce"))
+    fn kind(&self) -> Result<DescriptorReduceKindAttributeRef<'c, 't>, Error> {
+        self.attribute(KIND_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                KIND_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the tensor descriptor.
-    fn desc(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn desc(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the tensor to reduce into the descriptor.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the descriptor indices.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(2).collect()
     }
 }
@@ -2697,25 +2599,26 @@ mlir_op_trait!(DescriptorReduce, ZeroRegions);
 mlir_op_trait!(DescriptorReduce, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DescriptorReduceOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn descriptor_reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     kind: DescriptorReduceKind,
     desc: ValueRef<'v, 'c, 't>,
     src: ValueRef<'v, 'c, 't>,
     indices: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedDescriptorReduceOperation<'c, 't> {
+) -> Result<DetachedDescriptorReduceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::triton_tt());
+    context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.descriptor_reduce", location)
         .add_operand(desc)
         .add_operand(src)
         .add_operands(indices)
-        .add_attribute(KIND_ATTRIBUTE, context.triton_tt_descriptor_reduce_kind_attribute(kind))
+        .add_attribute(KIND_ATTRIBUTE, context.triton_tt_descriptor_reduce_kind_attribute(kind)?)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::descriptor_reduce`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::descriptor_reduce`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that gathers rows from a tensor descriptor.
@@ -2724,23 +2627,23 @@ pub fn descriptor_reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait DescriptorGatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor descriptor.
-    fn desc(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn desc(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the x-offset tensor.
-    fn x_offsets(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn x_offsets(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the y-offset scalar.
-    fn y_offset(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn y_offset(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the gathered tensor.
-    fn result(&self) -> OperationResultRef<'o, 'c, 't> {
-        Operation::result(self, 0).unwrap()
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
     }
 }
 
@@ -2750,24 +2653,25 @@ mlir_op_trait!(DescriptorGather, ZeroRegions);
 mlir_op_trait!(DescriptorGather, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DescriptorGatherOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn descriptor_gather<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     desc: ValueRef<'v, 'c, 't>,
     x_offsets: ValueRef<'v, 'c, 't>,
     y_offset: ValueRef<'v, 'c, 't>,
     result_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedDescriptorGatherOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedDescriptorGatherOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.descriptor_gather", location)
         .add_operand(desc)
         .add_operand(x_offsets)
         .add_operand(y_offset)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::descriptor_gather`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::descriptor_gather`"))
+        })
 }
 
 /// Triton `tt` [`Operation`] that scatters rows into a tensor descriptor.
@@ -2776,23 +2680,23 @@ pub fn descriptor_gather<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// for more information.
 pub trait DescriptorScatterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor descriptor.
-    fn desc(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn desc(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the x-offset tensor.
-    fn x_offsets(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn x_offsets(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the y-offset scalar.
-    fn y_offset(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn y_offset(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the source tensor.
-    fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(3).unwrap()
+    fn src(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(3)
     }
 }
 
@@ -2801,24 +2705,25 @@ mlir_op_trait!(DescriptorScatter, ZeroRegions);
 mlir_op_trait!(DescriptorScatter, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DescriptorScatterOperation`] at the specified [`Location`].
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn descriptor_scatter<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     desc: ValueRef<'v, 'c, 't>,
     x_offsets: ValueRef<'v, 'c, 't>,
     y_offset: ValueRef<'v, 'c, 't>,
     src: ValueRef<'v, 'c, 't>,
     location: L,
-) -> DetachedDescriptorScatterOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::triton_tt());
+) -> Result<DetachedDescriptorScatterOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.descriptor_scatter", location)
         .add_operand(desc)
         .add_operand(x_offsets)
         .add_operand(y_offset)
         .add_operand(src)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tt::descriptor_scatter`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::descriptor_scatter`"))
+        })
 }
 
 #[cfg(test)]
@@ -2883,8 +2788,8 @@ mod tests {
             let tensor_i1_type = context.tensor_type(i1_type, &[Size::Static(4)], None, location).unwrap();
             let tensor_i32_type = context.tensor_type(i32_type, &[Size::Static(4)], None, location).unwrap();
             let tensor_f32_type = context.tensor_type(f32_type, &[Size::Static(4)], None, location).unwrap();
-            let pointer_type = context.triton_tt_pointer_type(f32_type, 1);
-            let tensor_desc_type = context.triton_tt_tensor_desc_type(&[Size::Static(4)], f32_type, None);
+            let pointer_type = context.triton_tt_pointer_type(f32_type, 1).unwrap();
+            let tensor_desc_type = context.triton_tt_tensor_desc_type(&[Size::Static(4)], f32_type, None).unwrap();
             let function_type = context.function_type(&[i32_type], &[i32_type]);
 
             Self {
@@ -2908,7 +2813,7 @@ mod tests {
             #[test]
             fn $test_name() {
                 let $context = Context::new();
-                $context.load_dialect(DialectHandle::triton_tt());
+                $context.load_dialect(DialectHandle::triton_tt().unwrap()).unwrap();
                 let $location = $context.unknown_location();
                 let $types = TestTypes::new(&$context, $location);
                 let block = $context.block(&[
@@ -2937,84 +2842,87 @@ mod tests {
     }
 
     tt_operation_test!(test_int_to_ptr_operation, |context, location, values, types| {
-        let operation = int_to_ptr(values[0], types.pointer, location);
+        let operation = int_to_ptr(values[0], types.pointer, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.int_to_ptr"));
-        assert_eq!(operation.src(), values[0]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.pointer);
+        assert_eq!(operation.src().unwrap(), values[0]);
+        assert_eq!(operation.src().unwrap(), values[0]);
         assert_eq!(operation.context(), &context);
     });
 
     tt_operation_test!(test_ptr_to_int_operation, |context, location, values, types| {
-        let operation = ptr_to_int(values[1], types.i64, location);
+        let operation = ptr_to_int(values[1], types.i64, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.ptr_to_int"));
-        assert_eq!(operation.src(), values[1]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.i64);
+        assert_eq!(operation.src().unwrap(), values[1]);
+        assert_eq!(operation.src().unwrap(), values[1]);
         assert_eq!(operation.context(), &context);
     });
 
     tt_operation_test!(test_bitcast_operation, |_context, location, values, types| {
-        let operation = bitcast(values[2], types.i32, location);
+        let operation = bitcast(values[2], types.i32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.bitcast"));
-        assert_eq!(operation.src(), values[2]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.i32);
+        assert_eq!(operation.src().unwrap(), values[2]);
+        assert_eq!(operation.src().unwrap(), values[2]);
     });
 
     tt_operation_test!(test_fp_to_fp_operation, |_context, location, values, types| {
-        let operation = fp_to_fp(values[2], Some(RoundingMode::TowardsZero), types.f64, location);
+        let operation = fp_to_fp(values[2], Some(RoundingMode::TowardsZero), types.f64, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.fp_to_fp"));
-        assert_eq!(operation.src(), values[2]);
-        assert_eq!(operation.rounding().map(|attribute| attribute.value()), Some(RoundingMode::TowardsZero));
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.f64);
+        assert_eq!(operation.src().unwrap(), values[2]);
+        assert_eq!(
+            operation.rounding().unwrap().map(|attribute| attribute.value().unwrap()),
+            Some(RoundingMode::TowardsZero),
+        );
+        assert_eq!(operation.src().unwrap(), values[2]);
     });
 
     tt_operation_test!(test_clampf_operation, |_context, location, values, types| {
-        let operation = clampf(values[2], values[14], values[2], PropagateNan::All, types.f32, location);
+        let operation = clampf(values[2], values[14], values[2], PropagateNan::All, types.f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.clampf"));
-        assert_eq!(operation.x(), values[2]);
-        assert_eq!(operation.min(), values[14]);
-        assert_eq!(operation.max(), values[2]);
-        assert_eq!(operation.propagate_nan().value(), PropagateNan::All);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.f32);
+        assert_eq!(operation.x().unwrap(), values[2]);
+        assert_eq!(operation.min().unwrap(), values[14]);
+        assert_eq!(operation.max().unwrap(), values[2]);
+        assert_eq!(operation.propagate_nan().unwrap().value().unwrap(), PropagateNan::All);
+        assert_eq!(operation.x().unwrap(), values[2]);
     });
 
     tt_operation_test!(test_precise_sqrt_operation, |_context, location, values, types| {
-        let operation = precise_sqrt(values[2], types.f32, location);
+        let operation = precise_sqrt(values[2], types.f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.precise_sqrt"));
-        assert_eq!(operation.x(), values[2]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.f32);
+        assert_eq!(operation.x().unwrap(), values[2]);
+        assert_eq!(operation.x().unwrap(), values[2]);
     });
 
     tt_operation_test!(test_precise_divf_operation, |_context, location, values, types| {
-        let operation = precise_divf(values[2], values[14], types.f32, location);
+        let operation = precise_divf(values[2], values[14], types.f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.precise_divf"));
-        assert_eq!(operation.x(), values[2]);
-        assert_eq!(operation.y(), values[14]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.f32);
+        assert_eq!(operation.x().unwrap(), values[2]);
+        assert_eq!(operation.y().unwrap(), values[14]);
+        assert_eq!(operation.x().unwrap(), values[2]);
     });
 
     tt_operation_test!(test_mulhiui_operation, |_context, location, values, types| {
-        let operation = mulhiui(values[8], values[12], types.i32, location);
+        let operation = mulhiui(values[8], values[12], types.i32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.mulhiui"));
-        assert_eq!(operation.x(), values[8]);
-        assert_eq!(operation.y(), values[12]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.i32);
+        assert_eq!(operation.x().unwrap(), values[8]);
+        assert_eq!(operation.y().unwrap(), values[12]);
+        assert_eq!(operation.x().unwrap(), values[8]);
     });
 
     tt_operation_test!(test_addptr_operation, |_context, location, values, types| {
-        let operation = addptr(values[1], values[8], types.pointer, location);
+        let operation = addptr(values[1], values[8], types.pointer, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.addptr"));
-        assert_eq!(operation.ptr(), values[1]);
-        assert_eq!(operation.offset(), values[8]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.pointer);
+        assert_eq!(operation.ptr().unwrap(), values[1]);
+        assert_eq!(operation.offset().unwrap(), values[8]);
+        assert_eq!(operation.ptr().unwrap(), values[1]);
     });
 
     tt_operation_test!(test_load_operation, |_context, location, values, types| {
@@ -3027,16 +2935,17 @@ mod tests {
             true,
             types.f32,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.load"));
-        assert_eq!(operation.ptr(), values[1]);
-        assert_eq!(operation.mask(), Some(values[7]));
-        assert_eq!(operation.other(), Some(values[2]));
-        assert_eq!(operation.cache().value(), CacheModifier::CacheAll);
-        assert_eq!(operation.evict().value(), EvictionPolicy::EvictFirst);
-        assert!(operation.is_volatile());
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.f32);
+        assert_eq!(operation.ptr().unwrap(), values[1]);
+        assert_eq!(operation.mask().unwrap(), Some(values[7]));
+        assert_eq!(operation.other().unwrap(), Some(values[2]));
+        assert_eq!(operation.cache().unwrap().value().unwrap(), CacheModifier::CacheAll);
+        assert_eq!(operation.evict().unwrap().value().unwrap(), EvictionPolicy::EvictFirst);
+        assert!(operation.is_volatile().unwrap());
+        assert_eq!(operation.ptr().unwrap(), values[1]);
     });
 
     tt_operation_test!(test_store_operation, |_context, location, values, _types| {
@@ -3048,14 +2957,15 @@ mod tests {
             EvictionPolicy::EvictLast,
             true,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.store"));
-        assert_eq!(operation.ptr(), values[1]);
-        assert_eq!(operation.value(), values[2]);
-        assert_eq!(operation.mask(), Some(values[7]));
-        assert_eq!(operation.cache().value(), CacheModifier::WriteBack);
-        assert_eq!(operation.evict().value(), EvictionPolicy::EvictLast);
+        assert_eq!(operation.ptr().unwrap(), values[1]);
+        assert_eq!(operation.value().unwrap(), values[2]);
+        assert_eq!(operation.mask().unwrap(), Some(values[7]));
+        assert_eq!(operation.cache().unwrap().value().unwrap(), CacheModifier::WriteBack);
+        assert_eq!(operation.evict().unwrap().value().unwrap(), EvictionPolicy::EvictLast);
         assert!(operation.ignore_cta());
     });
 
@@ -3069,136 +2979,139 @@ mod tests {
             MemSyncScope::Cta,
             types.f32,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.atomic_rmw"));
-        assert_eq!(operation.atomic_rmw_op().value(), RmwOp::FloatAdd);
-        assert_eq!(operation.ptr(), values[1]);
-        assert_eq!(operation.val(), values[2]);
-        assert_eq!(operation.mask(), Some(values[7]));
-        assert_eq!(operation.sem().value(), MemSemantic::AcquireRelease);
-        assert_eq!(operation.scope().value(), MemSyncScope::Cta);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.f32);
+        assert_eq!(operation.atomic_rmw_op().unwrap().value().unwrap(), RmwOp::FloatAdd);
+        assert_eq!(operation.ptr().unwrap(), values[1]);
+        assert_eq!(operation.val().unwrap(), values[2]);
+        assert_eq!(operation.mask().unwrap(), Some(values[7]));
+        assert_eq!(operation.sem().unwrap().value().unwrap(), MemSemantic::AcquireRelease);
+        assert_eq!(operation.scope().unwrap().value().unwrap(), MemSyncScope::Cta);
+        assert_eq!(operation.atomic_rmw_op().unwrap().value().unwrap(), RmwOp::FloatAdd);
     });
 
     tt_operation_test!(test_atomic_cas_operation, |_context, location, values, types| {
         let operation =
-            atomic_cas(values[1], values[2], values[14], MemSemantic::Acquire, MemSyncScope::Gpu, types.f32, location);
+            atomic_cas(values[1], values[2], values[14], MemSemantic::Acquire, MemSyncScope::Gpu, types.f32, location)
+                .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.atomic_cas"));
-        assert_eq!(operation.ptr(), values[1]);
-        assert_eq!(operation.cmp(), values[2]);
-        assert_eq!(operation.val(), values[14]);
-        assert_eq!(operation.sem().value(), MemSemantic::Acquire);
-        assert_eq!(operation.scope().value(), MemSyncScope::Gpu);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.f32);
+        assert_eq!(operation.ptr().unwrap(), values[1]);
+        assert_eq!(operation.cmp().unwrap(), values[2]);
+        assert_eq!(operation.val().unwrap(), values[14]);
+        assert_eq!(operation.sem().unwrap().value().unwrap(), MemSemantic::Acquire);
+        assert_eq!(operation.scope().unwrap().value().unwrap(), MemSyncScope::Gpu);
+        assert_eq!(operation.ptr().unwrap(), values[1]);
     });
 
     tt_operation_test!(test_splat_operation, |_context, location, values, types| {
-        let operation = splat(values[2], types.tensor_f32, location);
+        let operation = splat(values[2], types.tensor_f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.splat"));
-        assert_eq!(operation.src(), values[2]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_f32);
+        assert_eq!(operation.src().unwrap(), values[2]);
+        assert_eq!(operation.src().unwrap(), values[2]);
     });
 
     tt_operation_test!(test_unsplat_operation, |_context, location, values, types| {
-        let operation = unsplat(values[4], types.f32, location);
+        let operation = unsplat(values[4], types.f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.unsplat"));
-        assert_eq!(operation.src(), values[4]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.f32);
+        assert_eq!(operation.src().unwrap(), values[4]);
+        assert_eq!(operation.src().unwrap(), values[4]);
     });
 
     tt_operation_test!(test_expand_dims_operation, |_context, location, values, types| {
-        let operation = expand_dims(values[4], 0, types.tensor_f32, location);
+        let operation = expand_dims(values[4], 0, types.tensor_f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.expand_dims"));
-        assert_eq!(operation.src(), values[4]);
-        assert_eq!(operation.axis().signless_value(), 0);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_f32);
+        assert_eq!(operation.src().unwrap(), values[4]);
+        assert_eq!(operation.axis().unwrap().signless_value(), 0);
+        assert_eq!(operation.src().unwrap(), values[4]);
     });
 
     tt_operation_test!(test_reshape_operation, |_context, location, values, types| {
-        let operation = reshape(values[4], true, true, types.tensor_f32, location);
+        let operation = reshape(values[4], true, true, types.tensor_f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.reshape"));
-        assert_eq!(operation.src(), values[4]);
+        assert_eq!(operation.src().unwrap(), values[4]);
         assert!(operation.allow_reorder());
         assert!(operation.efficient_layout());
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_f32);
+        assert_eq!(operation.as_ref().result(0).unwrap().r#type().unwrap(), types.tensor_f32);
     });
 
     tt_operation_test!(test_broadcast_operation, |_context, location, values, types| {
-        let operation = broadcast(values[4], types.tensor_f32, location);
+        let operation = broadcast(values[4], types.tensor_f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.broadcast"));
-        assert_eq!(operation.src(), values[4]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_f32);
+        assert_eq!(operation.src().unwrap(), values[4]);
+        assert_eq!(operation.src().unwrap(), values[4]);
     });
 
     tt_operation_test!(test_cat_operation, |_context, location, values, types| {
-        let operation = cat(values[4], values[11], types.tensor_f32, location);
+        let operation = cat(values[4], values[11], types.tensor_f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.cat"));
-        assert_eq!(operation.lhs(), values[4]);
-        assert_eq!(operation.rhs(), values[11]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_f32);
+        assert_eq!(operation.lhs().unwrap(), values[4]);
+        assert_eq!(operation.rhs().unwrap(), values[11]);
+        assert_eq!(operation.lhs().unwrap(), values[4]);
     });
 
     tt_operation_test!(test_join_operation, |_context, location, values, types| {
-        let operation = join(values[4], values[11], types.tensor_f32, location);
+        let operation = join(values[4], values[11], types.tensor_f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.join"));
-        assert_eq!(operation.lhs(), values[4]);
-        assert_eq!(operation.rhs(), values[11]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_f32);
+        assert_eq!(operation.lhs().unwrap(), values[4]);
+        assert_eq!(operation.rhs().unwrap(), values[11]);
+        assert_eq!(operation.lhs().unwrap(), values[4]);
     });
 
     tt_operation_test!(test_split_operation, |_context, location, values, types| {
-        let operation = split(values[4], &[types.tensor_f32, types.tensor_f32], location);
+        let operation = split(values[4], &[types.tensor_f32, types.tensor_f32], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.split"));
-        assert_eq!(operation.src(), values[4]);
-        assert_eq!(operation.out_lhs().r#type(), types.tensor_f32);
-        assert_eq!(operation.out_rhs().r#type(), types.tensor_f32);
+        assert_eq!(operation.src().unwrap(), values[4]);
+        assert_eq!(operation.src().unwrap(), values[4]);
+        assert_eq!(operation.out_lhs().unwrap().r#type().unwrap(), types.tensor_f32);
     });
 
     tt_operation_test!(test_trans_operation, |_context, location, values, types| {
-        let operation = trans(values[4], &[0], types.tensor_f32, location);
+        let operation = trans(values[4], &[0], types.tensor_f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.trans"));
-        assert_eq!(operation.src(), values[4]);
-        assert_eq!(operation.order().values().collect::<Vec<_>>(), vec![0]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_f32);
+        assert_eq!(operation.src().unwrap(), values[4]);
+        assert_eq!(operation.order().unwrap().values().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(operation.src().unwrap(), values[4]);
     });
 
     tt_operation_test!(test_get_program_id_operation, |_context, location, _values, types| {
-        let operation = get_program_id(ProgramIdDim::X, types.i32, location);
+        let operation = get_program_id(ProgramIdDim::X, types.i32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.get_program_id"));
-        assert_eq!(operation.axis().value(), ProgramIdDim::X);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.i32);
+        assert_eq!(operation.axis().unwrap().value().unwrap(), ProgramIdDim::X);
+        assert_eq!(operation.axis().unwrap().value().unwrap(), ProgramIdDim::X);
     });
 
     tt_operation_test!(test_get_num_programs_operation, |_context, location, _values, types| {
-        let operation = get_num_programs(ProgramIdDim::Y, types.i32, location);
+        let operation = get_num_programs(ProgramIdDim::Y, types.i32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.get_num_programs"));
-        assert_eq!(operation.axis().value(), ProgramIdDim::Y);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.i32);
+        assert_eq!(operation.axis().unwrap().value().unwrap(), ProgramIdDim::Y);
+        assert_eq!(operation.axis().unwrap().value().unwrap(), ProgramIdDim::Y);
     });
 
     tt_operation_test!(test_dot_operation, |_context, location, values, types| {
-        let operation = dot(values[4], values[11], values[4], InputPrecision::Tf32, 2, types.tensor_f32, location);
+        let operation =
+            dot(values[4], values[11], values[4], InputPrecision::Tf32, 2, types.tensor_f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.dot"));
-        assert_eq!(operation.a(), values[4]);
-        assert_eq!(operation.b(), values[11]);
-        assert_eq!(operation.c(), values[4]);
-        assert_eq!(operation.input_precision().value(), InputPrecision::Tf32);
-        assert_eq!(operation.max_num_imprecise_acc().signless_value(), 2);
-        assert_eq!(operation.d().r#type(), types.tensor_f32);
+        assert_eq!(operation.a().unwrap(), values[4]);
+        assert_eq!(operation.b().unwrap(), values[11]);
+        assert_eq!(operation.c().unwrap(), values[4]);
+        assert_eq!(operation.input_precision().unwrap().value().unwrap(), InputPrecision::Tf32);
+        assert_eq!(operation.max_num_imprecise_acc().unwrap().signless_value(), 2);
+        assert_eq!(operation.a().unwrap(), values[4]);
     });
 
     tt_operation_test!(test_dot_scaled_operation, |_context, location, values, types| {
@@ -3215,145 +3128,147 @@ mod tests {
             true,
             types.tensor_f32,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.dot_scaled"));
-        assert_eq!(operation.a(), values[4]);
-        assert_eq!(operation.b(), values[11]);
-        assert_eq!(operation.c(), values[4]);
-        assert_eq!(operation.a_scale(), Some(values[11]));
-        assert_eq!(operation.b_scale(), Some(values[4]));
-        assert_eq!(operation.a_elem_type().value(), ScaleDotElemType::E4M3);
-        assert_eq!(operation.b_elem_type().value(), ScaleDotElemType::E5M2);
-        assert!(operation.fast_math());
-        assert!(!operation.lhs_k_pack());
-        assert!(operation.rhs_k_pack());
-        assert_eq!(operation.d().r#type(), types.tensor_f32);
+        assert_eq!(operation.a().unwrap(), values[4]);
+        assert_eq!(operation.b().unwrap(), values[11]);
+        assert_eq!(operation.c().unwrap(), values[4]);
+        assert_eq!(operation.a_scale().unwrap(), Some(values[11]));
+        assert_eq!(operation.b_scale().unwrap(), Some(values[4]));
+        assert_eq!(operation.a_elem_type().unwrap().value().unwrap(), ScaleDotElemType::E4M3);
+        assert_eq!(operation.b_elem_type().unwrap().value().unwrap(), ScaleDotElemType::E5M2);
+        assert!(operation.fast_math().unwrap());
+        assert!(!operation.lhs_k_pack().unwrap());
+        assert!(operation.rhs_k_pack().unwrap());
+        assert_eq!(operation.a().unwrap(), values[4]);
     });
 
     tt_operation_test!(test_reduce_operation, |context, location, values, types| {
-        let operation = reduce(&[values[4]], 0, &[types.tensor_f32], context.region(), location);
+        let operation = reduce(&[values[4]], 0, &[types.tensor_f32], context.region(), location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.reduce"));
-        assert_eq!(operation.srcs(), vec![values[4]]);
-        assert_eq!(operation.axis().signless_value(), 0);
-        assert_eq!(operation.combine_op().blocks().count(), 0);
-        assert_eq!(operation.result_values()[0].r#type(), types.tensor_f32);
+        assert_eq!(operation.srcs().unwrap(), vec![values[4]]);
+        assert_eq!(operation.axis().unwrap().signless_value(), 0);
+        assert_eq!(operation.combine_op().unwrap().blocks().unwrap().count(), 0);
+        assert_eq!(operation.axis().unwrap().signless_value(), 0);
     });
 
     tt_operation_test!(test_reduce_return_operation, |_context, location, values, _types| {
-        let operation = reduce_return(&[values[2]], location);
+        let operation = reduce_return(&[values[2]], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.reduce.return"));
-        assert_eq!(operation.result_values(), vec![values[2]]);
+        assert_eq!(operation.result_values().unwrap(), vec![values[2]]);
     });
 
     tt_operation_test!(test_scan_operation, |context, location, values, types| {
-        let operation = scan(&[values[4]], 0, true, &[types.tensor_f32], context.region(), location);
+        let operation = scan(&[values[4]], 0, true, &[types.tensor_f32], context.region(), location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.scan"));
-        assert_eq!(operation.srcs(), vec![values[4]]);
-        assert_eq!(operation.axis().signless_value(), 0);
-        assert!(operation.reverse());
-        assert_eq!(operation.combine_op().blocks().count(), 0);
-        assert_eq!(operation.result_values()[0].r#type(), types.tensor_f32);
+        assert_eq!(operation.srcs().unwrap(), vec![values[4]]);
+        assert_eq!(operation.axis().unwrap().signless_value(), 0);
+        assert!(operation.reverse().unwrap());
+        assert_eq!(operation.combine_op().unwrap().blocks().unwrap().count(), 0);
+        assert_eq!(operation.axis().unwrap().signless_value(), 0);
     });
 
     tt_operation_test!(test_scan_return_operation, |_context, location, values, _types| {
-        let operation = scan_return(&[values[2]], location);
+        let operation = scan_return(&[values[2]], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.scan.return"));
-        assert_eq!(operation.result_values(), vec![values[2]]);
+        assert_eq!(operation.result_values().unwrap(), vec![values[2]]);
     });
 
     tt_operation_test!(test_map_elementwise_operation, |context, location, values, types| {
-        let operation = map_elementwise(&[values[4]], 1, &[types.tensor_f32], context.region(), location);
+        let operation = map_elementwise(&[values[4]], 1, &[types.tensor_f32], context.region(), location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.map_elementwise"));
-        assert_eq!(operation.srcs(), vec![values[4]]);
-        assert_eq!(operation.pack().signless_value(), 1);
-        assert_eq!(operation.scalar_op().blocks().count(), 0);
-        assert_eq!(operation.result_values()[0].r#type(), types.tensor_f32);
+        assert_eq!(operation.srcs().unwrap(), vec![values[4]]);
+        assert_eq!(operation.pack().unwrap().signless_value(), 1);
+        assert_eq!(operation.scalar_op().unwrap().blocks().unwrap().count(), 0);
+        assert_eq!(operation.pack().unwrap().signless_value(), 1);
     });
 
     tt_operation_test!(test_map_elementwise_return_operation, |_context, location, values, _types| {
-        let operation = map_elementwise_return(&[values[2]], location);
+        let operation = map_elementwise_return(&[values[2]], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.map_elementwise.return"));
-        assert_eq!(operation.result_values(), vec![values[2]]);
+        assert_eq!(operation.result_values().unwrap(), vec![values[2]]);
     });
 
     tt_operation_test!(test_extern_elementwise_operation, |_context, location, values, types| {
         let operation =
-            extern_elementwise(&[values[2]], "libdevice", "/tmp/libdevice.so", "expf", true, types.f32, location);
+            extern_elementwise(&[values[2]], "libdevice", "/tmp/libdevice.so", "expf", true, types.f32, location)
+                .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.extern_elementwise"));
-        assert_eq!(operation.srcs(), vec![values[2]]);
-        assert_eq!(operation.libname().string().as_str(), Ok("libdevice"));
-        assert_eq!(operation.libpath().string().as_str(), Ok("/tmp/libdevice.so"));
-        assert_eq!(operation.symbol().string().as_str(), Ok("expf"));
-        assert!(operation.pure());
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.f32);
+        assert_eq!(operation.srcs().unwrap(), vec![values[2]]);
+        assert_eq!(operation.libname().unwrap().string().as_str(), Ok("libdevice"));
+        assert_eq!(operation.libpath().unwrap().string().as_str(), Ok("/tmp/libdevice.so"));
+        assert_eq!(operation.symbol().unwrap().string().as_str(), Ok("expf"));
+        assert!(operation.pure().unwrap());
+        assert_eq!(operation.libname().unwrap().string().as_str(), Ok("libdevice"));
     });
 
     tt_operation_test!(test_make_range_operation, |_context, location, _values, types| {
-        let operation = make_range(0, 4, types.tensor_i32, location);
+        let operation = make_range(0, 4, types.tensor_i32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.make_range"));
-        assert_eq!(operation.start().signless_value(), 0);
-        assert_eq!(operation.end().signless_value(), 4);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_i32);
+        assert_eq!(operation.start().unwrap().signless_value(), 0);
+        assert_eq!(operation.end().unwrap().signless_value(), 4);
+        assert_eq!(operation.start().unwrap().signless_value(), 0);
     });
 
     tt_operation_test!(test_elementwise_inline_asm_operation, |_context, location, values, types| {
         let operation =
-            elementwise_inline_asm(&[values[2]], "mov.u32 $0, $1;", "=f,f", true, 1, &[types.f32], location);
+            elementwise_inline_asm(&[values[2]], "mov.u32 $0, $1;", "=f,f", true, 1, &[types.f32], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.elementwise_inline_asm"));
-        assert_eq!(operation.asm_string().string().as_str(), Ok("mov.u32 $0, $1;"));
-        assert_eq!(operation.constraints().string().as_str(), Ok("=f,f"));
-        assert!(operation.pure());
-        assert_eq!(operation.packed_element().signless_value(), 1);
-        assert_eq!(operation.args(), vec![values[2]]);
-        assert_eq!(operation.result_values()[0].r#type(), types.f32);
+        assert_eq!(operation.asm_string().unwrap().string().as_str(), Ok("mov.u32 $0, $1;"));
+        assert_eq!(operation.constraints().unwrap().string().as_str(), Ok("=f,f"));
+        assert!(operation.pure().unwrap());
+        assert_eq!(operation.packed_element().unwrap().signless_value(), 1);
+        assert_eq!(operation.args().unwrap(), vec![values[2]]);
+        assert_eq!(operation.result_values().unwrap()[0].r#type().unwrap(), types.f32);
     });
 
     tt_operation_test!(test_histogram_operation, |_context, location, values, types| {
-        let operation = histogram(values[5], Some(values[6]), types.tensor_i32, location);
+        let operation = histogram(values[5], Some(values[6]), types.tensor_i32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.histogram"));
-        assert_eq!(operation.src(), values[5]);
-        assert_eq!(operation.mask(), Some(values[6]));
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_i32);
+        assert_eq!(operation.src().unwrap(), values[5]);
+        assert_eq!(operation.mask().unwrap(), Some(values[6]));
+        assert_eq!(operation.as_ref().result(0).unwrap().r#type().unwrap(), types.tensor_i32);
     });
 
     tt_operation_test!(test_gather_operation, |_context, location, values, types| {
-        let operation = gather(values[4], values[5], 0, true, types.tensor_f32, location);
+        let operation = gather(values[4], values[5], 0, true, types.tensor_f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.gather"));
-        assert_eq!(operation.src(), values[4]);
-        assert_eq!(operation.indices(), values[5]);
-        assert_eq!(operation.axis().signless_value(), 0);
+        assert_eq!(operation.src().unwrap(), values[4]);
+        assert_eq!(operation.indices().unwrap(), values[5]);
+        assert_eq!(operation.axis().unwrap().signless_value(), 0);
         assert!(operation.efficient_layout());
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_f32);
+        assert_eq!(operation.as_ref().result(0).unwrap().r#type().unwrap(), types.tensor_f32);
     });
 
     tt_operation_test!(test_print_operation, |_context, location, values, _types| {
-        let operation = print(&[values[8], values[2]], "value", false, &[1, 0], location);
+        let operation = print(&[values[8], values[2]], "value", false, &[1, 0], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.print"));
-        assert_eq!(operation.prefix().string().as_str(), Ok("value"));
-        assert!(!operation.hex());
-        assert_eq!(operation.args(), vec![values[8], values[2]]);
-        assert_eq!(operation.is_signed().values().collect::<Vec<_>>(), vec![1, 0]);
+        assert_eq!(operation.prefix().unwrap().string().as_str(), Ok("value"));
+        assert!(!operation.hex().unwrap());
+        assert_eq!(operation.args().unwrap(), vec![values[8], values[2]]);
+        assert_eq!(operation.is_signed().unwrap().values().collect::<Vec<_>>(), vec![1, 0]);
     });
 
     tt_operation_test!(test_assert_operation, |_context, location, values, _types| {
-        let operation = assert(values[7], "failed", location);
+        let operation = assert(values[7], "failed", location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.assert"));
-        assert_eq!(operation.condition(), values[7]);
-        assert_eq!(operation.message().string().as_str(), Ok("failed"));
+        assert_eq!(operation.condition().unwrap(), values[7]);
+        assert_eq!(operation.message().unwrap().string().as_str(), Ok("failed"));
     });
 
     tt_operation_test!(test_make_tensor_descriptor_operation, |_context, location, values, types| {
@@ -3364,23 +3279,24 @@ mod tests {
             PaddingOption::Zero,
             types.tensor_desc,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.make_tensor_descriptor"));
-        assert_eq!(operation.base(), values[1]);
-        assert_eq!(operation.shape(), vec![values[0], values[15]]);
-        assert_eq!(operation.strides(), vec![values[0], values[15]]);
-        assert_eq!(operation.padding().value(), PaddingOption::Zero);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_desc);
+        assert_eq!(operation.base().unwrap(), values[1]);
+        assert_eq!(operation.shape().unwrap(), vec![values[0], values[15]]);
+        assert_eq!(operation.strides().unwrap(), vec![values[0], values[15]]);
+        assert_eq!(operation.padding().unwrap().value().unwrap(), PaddingOption::Zero);
+        assert_eq!(operation.padding().unwrap().value().unwrap(), PaddingOption::Zero);
     });
 
     tt_operation_test!(test_call_operation, |_context, location, values, types| {
-        let operation = call("callee", &[values[2]], &[types.f32], location);
+        let operation = call("callee", &[values[2]], &[types.f32], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.call"));
-        assert_eq!(operation.callee().reference().as_str(), Ok("callee"));
-        assert_eq!(CallOperation::operands(&operation), vec![values[2]]);
-        assert_eq!(operation.result_values()[0].r#type(), types.f32);
+        assert_eq!(operation.callee().unwrap().reference().as_str(), Ok("callee"));
+        assert_eq!(operation.operand_values().collect::<Result<Vec<_>, _>>().unwrap(), vec![values[2]]);
+        assert_eq!(operation.result_values().unwrap()[0].r#type().unwrap(), types.f32);
     });
 
     tt_operation_test!(test_func_operation, |context, location, _values, types| {
@@ -3392,22 +3308,26 @@ mod tests {
             Some(context.array_attribute(&[] as &[AttributeRef])),
             context.region(),
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.func"));
-        assert_eq!(operation.sym_name().string().as_str(), Ok("kernel"));
-        assert_eq!(operation.function_type().r#type(), types.function);
-        assert_eq!(operation.sym_visibility().and_then(|attribute| attribute.string().as_str().ok()), Some("private"));
-        assert!(operation.arg_attrs().unwrap().is_empty());
-        assert!(operation.res_attrs().unwrap().is_empty());
-        assert_eq!(operation.body().blocks().count(), 0);
+        assert_eq!(operation.sym_name().unwrap().string().as_str(), Ok("kernel"));
+        assert_eq!(operation.sym_name().unwrap().string().as_str(), Ok("kernel"));
+        assert_eq!(
+            operation.sym_visibility().unwrap().and_then(|attribute| attribute.string().as_str().ok()),
+            Some("private")
+        );
+        assert!(operation.arg_attrs().unwrap().unwrap().is_empty());
+        assert!(operation.res_attrs().unwrap().unwrap().is_empty());
+        assert_eq!(operation.body().unwrap().blocks().unwrap().count(), 0);
     });
 
     tt_operation_test!(test_return_operation, |_context, location, values, _types| {
-        let operation = r#return(&[values[2]], location);
+        let operation = r#return(&[values[2]], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.return"));
-        assert_eq!(operation.srcs(), vec![values[2]]);
+        assert_eq!(operation.srcs().unwrap(), vec![values[2]]);
     });
 
     tt_operation_test!(test_descriptor_load_operation, |_context, location, values, types| {
@@ -3418,53 +3338,55 @@ mod tests {
             EvictionPolicy::Normal,
             types.tensor_f32,
             location,
-        );
+        )
+        .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.descriptor_load"));
-        assert_eq!(operation.desc(), values[9]);
-        assert_eq!(operation.indices(), vec![values[0], values[15]]);
-        assert_eq!(operation.cache().value(), CacheModifier::CacheGlobal);
-        assert_eq!(operation.evict().value(), EvictionPolicy::Normal);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_f32);
+        assert_eq!(operation.desc().unwrap(), values[9]);
+        assert_eq!(operation.indices().unwrap(), vec![values[0], values[15]]);
+        assert_eq!(operation.cache().unwrap().value().unwrap(), CacheModifier::CacheGlobal);
+        assert_eq!(operation.evict().unwrap().value().unwrap(), EvictionPolicy::Normal);
+        assert_eq!(operation.cache().unwrap().value().unwrap(), CacheModifier::CacheGlobal);
     });
 
     tt_operation_test!(test_descriptor_store_operation, |_context, location, values, _types| {
-        let operation = descriptor_store(values[9], values[4], &[values[0], values[15]], location);
+        let operation = descriptor_store(values[9], values[4], &[values[0], values[15]], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.descriptor_store"));
-        assert_eq!(operation.desc(), values[9]);
-        assert_eq!(operation.src(), values[4]);
-        assert_eq!(operation.indices(), vec![values[0], values[15]]);
+        assert_eq!(operation.desc().unwrap(), values[9]);
+        assert_eq!(operation.src().unwrap(), values[4]);
+        assert_eq!(operation.indices().unwrap(), vec![values[0], values[15]]);
     });
 
     tt_operation_test!(test_descriptor_reduce_operation, |_context, location, values, _types| {
         let operation =
-            descriptor_reduce(DescriptorReduceKind::Add, values[9], values[4], &[values[0], values[15]], location);
+            descriptor_reduce(DescriptorReduceKind::Add, values[9], values[4], &[values[0], values[15]], location)
+                .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.descriptor_reduce"));
-        assert_eq!(operation.kind().value(), DescriptorReduceKind::Add);
-        assert_eq!(operation.desc(), values[9]);
-        assert_eq!(operation.src(), values[4]);
-        assert_eq!(operation.indices(), vec![values[0], values[15]]);
+        assert_eq!(operation.kind().unwrap().value().unwrap(), DescriptorReduceKind::Add);
+        assert_eq!(operation.desc().unwrap(), values[9]);
+        assert_eq!(operation.src().unwrap(), values[4]);
+        assert_eq!(operation.indices().unwrap(), vec![values[0], values[15]]);
     });
 
     tt_operation_test!(test_descriptor_gather_operation, |_context, location, values, types| {
-        let operation = descriptor_gather(values[9], values[5], values[0], types.tensor_f32, location);
+        let operation = descriptor_gather(values[9], values[5], values[0], types.tensor_f32, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.descriptor_gather"));
-        assert_eq!(operation.desc(), values[9]);
-        assert_eq!(operation.x_offsets(), values[5]);
-        assert_eq!(operation.y_offset(), values[0]);
-        assert_eq!(Operation::result(&operation, 0).unwrap().r#type(), types.tensor_f32);
+        assert_eq!(operation.desc().unwrap(), values[9]);
+        assert_eq!(operation.x_offsets().unwrap(), values[5]);
+        assert_eq!(operation.y_offset().unwrap(), values[0]);
+        assert_eq!(operation.desc().unwrap(), values[9]);
     });
 
     tt_operation_test!(test_descriptor_scatter_operation, |_context, location, values, _types| {
-        let operation = descriptor_scatter(values[9], values[5], values[0], values[4], location);
+        let operation = descriptor_scatter(values[9], values[5], values[0], values[4], location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tt.descriptor_scatter"));
-        assert_eq!(operation.desc(), values[9]);
-        assert_eq!(operation.x_offsets(), values[5]);
-        assert_eq!(operation.y_offset(), values[0]);
-        assert_eq!(operation.src(), values[4]);
+        assert_eq!(operation.desc().unwrap(), values[9]);
+        assert_eq!(operation.x_offsets().unwrap(), values[5]);
+        assert_eq!(operation.y_offset().unwrap(), values[0]);
+        assert_eq!(operation.src().unwrap(), values[4]);
     });
 }

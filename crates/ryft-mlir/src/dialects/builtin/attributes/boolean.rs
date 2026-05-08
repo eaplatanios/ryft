@@ -1,6 +1,6 @@
 use ryft_xla_sys::bindings::{MlirAttribute, mlirBoolAttrGet, mlirBoolAttrGetValue};
 
-use crate::{Attribute, Context, FromWithContext, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, TryFromWithContext, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that stores a boolean value.
 #[derive(Copy, Clone)]
@@ -21,9 +21,9 @@ impl<'c, 't> BooleanAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(BooleanAttributeRef<'c, 't> as Attribute, mlir_type = Attribute, mlir_subtype = Bool);
 
-impl<'c, 't> FromWithContext<'c, 't, bool> for BooleanAttributeRef<'c, 't> {
-    fn from_with_context(value: bool, context: &'c Context<'t>) -> Self {
-        context.boolean_attribute(value)
+impl<'c, 't> TryFromWithContext<'c, 't, bool> for BooleanAttributeRef<'c, 't> {
+    fn try_from_with_context(value: bool, context: &'c Context<'t>) -> Result<Self, Error> {
+        Ok(context.boolean_attribute(value))
     }
 }
 
@@ -35,10 +35,8 @@ impl<'t> Context<'t> {
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
-        unsafe {
-            BooleanAttributeRef::from_c_api(mlirBoolAttrGet(*self.handle.borrow(), if value { 1 } else { 0 }), self)
-                .unwrap()
-        }
+        let handle = unsafe { mlirBoolAttrGet(*self.handle.borrow(), if value { 1 } else { 0 }) };
+        BooleanAttributeRef { handle, context: self }
     }
 }
 
@@ -47,7 +45,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
-    use crate::{IntegerAttributeRef, IntoWithContext};
+    use crate::{IntegerAttributeRef, TryIntoWithContext};
 
     use super::*;
 
@@ -59,7 +57,7 @@ mod tests {
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.value(), true);
 
-        let attribute: BooleanAttributeRef<'_, '_> = false.into_with_context(&context);
+        let attribute: BooleanAttributeRef<'_, '_> = false.try_into_with_context(&context).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.value(), false);
     }

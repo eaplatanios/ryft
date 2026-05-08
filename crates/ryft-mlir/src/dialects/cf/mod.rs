@@ -4,10 +4,9 @@
 //!
 //! Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/ControlFlowDialect/)
 //! for more information.
-
 use ryft_xla_sys::bindings::mlirGetDialectHandle__cf__;
 
-use crate::DialectHandle;
+use crate::{DialectHandle, Error};
 
 pub mod operations;
 
@@ -15,8 +14,8 @@ pub use operations::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `cf` [`Dialect`](crate::Dialect).
-    pub fn cf() -> Self {
-        unsafe { Self::from_c_api(mlirGetDialectHandle__cf__()).unwrap() }
+    pub fn cf() -> Result<Self, Error> {
+        unsafe { Self::from_c_api(mlirGetDialectHandle__cf__()) }
     }
 }
 
@@ -28,7 +27,7 @@ mod tests {
 
     #[test]
     fn test_cf_dialect() {
-        let handle = DialectHandle::cf();
+        let handle = DialectHandle::cf().unwrap();
         assert_eq!(handle.namespace().unwrap(), "cf");
 
         // Check that registration works (both in the context and in a registry).
@@ -39,12 +38,11 @@ mod tests {
 
         // Check that loading works.
         let context = Context::new();
-        let dialect_1 = context.load_dialect(handle);
-        assert!(dialect_1.is_some());
-        assert_eq!(dialect_1.unwrap().namespace().unwrap(), "cf");
+        let dialect_1 = context.load_dialect(handle).unwrap();
+        assert_eq!(dialect_1.namespace().unwrap(), "cf");
 
         // Check that comparison works.
-        let dialect_2 = context.load_dialect(DialectHandle::cf());
+        let dialect_2 = context.load_dialect(DialectHandle::cf().unwrap()).unwrap();
         assert_eq!(dialect_1, dialect_2);
     }
 }

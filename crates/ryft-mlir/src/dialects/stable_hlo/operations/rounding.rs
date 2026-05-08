@@ -1,4 +1,4 @@
-use crate::{DetachedOp, DialectHandle, Location, Operation, OperationBuilder, Value, mlir_op, mlir_op_trait};
+use crate::{DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Value, mlir_op, mlir_op_trait};
 
 /// StableHLO [`Operation`] that rounds up the elements of its input tensor.
 /// The specific semantics depend on the element type:
@@ -29,19 +29,18 @@ mlir_op_trait!(Ceil, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`CeilOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`CeilOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn ceil<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     location: L,
-) -> DetachedCeilOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedCeilOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.ceil", location)
         .add_operand(input)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::ceil`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::ceil`"))
+        })
 }
 
 /// StableHLO [`Operation`] that rounds down the elements of its input tensor.
@@ -73,19 +72,18 @@ mlir_op_trait!(Floor, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`FloorOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`FloorOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn floor<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     location: L,
-) -> DetachedFloorOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedFloorOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.floor", location)
         .add_operand(input)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::floor`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::floor`"))
+        })
 }
 
 /// StableHLO [`Operation`] that rounds the elements of its input tensor to their nearest integer, breaking ties by
@@ -118,19 +116,20 @@ mlir_op_trait!(RoundWithAwayFromZeroTieBreak, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`RoundWithAwayFromZeroTieBreakOperation`] at the specified [`Location`]. Refer to
 /// the documentation of [`RoundWithAwayFromZeroTieBreakOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn round_with_away_from_zero_tie_break<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     location: L,
-) -> DetachedRoundWithAwayFromZeroTieBreakOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedRoundWithAwayFromZeroTieBreakOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.round_nearest_afz", location)
         .add_operand(input)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::round_nearest_afz`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::round_nearest_afz`"))
+        })
 }
 
 /// StableHLO [`Operation`] that rounds the elements of its input tensor to their nearest integer, breaking ties by
@@ -163,19 +162,20 @@ mlir_op_trait!(RoundWithNearestEvenTieBreak, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`RoundWithNearestEvenTieBreakOperation`] at the specified [`Location`]. Refer to
 /// the documentation of [`RoundWithNearestEvenTieBreakOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn round_with_nearest_even_tie_break<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     location: L,
-) -> DetachedRoundWithNearestEvenTieBreakOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedRoundWithNearestEvenTieBreakOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.round_nearest_even", location)
         .add_operand(input)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::round_nearest_even`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::round_nearest_even`"))
+        })
 }
 
 #[cfg(test)]
@@ -184,7 +184,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func;
-    use crate::{Block, Context, OneOperand, OneResult, Operation, Size, Type, Value};
+    use crate::{Block, Context, OneOperand, Operation, Size};
 
     use super::{ceil, floor, round_with_away_from_zero_tie_break, round_with_nearest_even_tie_break};
 
@@ -192,31 +192,36 @@ mod tests {
     fn test_ceil() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(5)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let op = ceil(input_value, location);
-            assert_eq!(op.input(), input_value);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "ceil_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let op = ceil(input_value, location).unwrap();
+                assert_eq!(op.input().unwrap(), input_value);
+                assert_eq!(op.input().unwrap(), input_value);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "ceil_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -234,31 +239,36 @@ mod tests {
     fn test_floor() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(5)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let op = floor(input_value, location);
-            assert_eq!(op.input(), input_value);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "floor_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let op = floor(input_value, location).unwrap();
+                assert_eq!(op.input().unwrap(), input_value);
+                assert_eq!(op.input().unwrap(), input_value);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "floor_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -276,31 +286,36 @@ mod tests {
     fn test_round_with_away_from_zero_tie_break() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(5)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let op = round_with_away_from_zero_tie_break(input_value, location);
-            assert_eq!(op.input(), input_value);
-            assert_eq!(op.output().r#type(), tensor_type.as_ref());
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "round_nearest_afz_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let op = round_with_away_from_zero_tie_break(input_value, location).unwrap();
+                assert_eq!(op.input().unwrap(), input_value);
+                assert_eq!(op.input().unwrap(), input_value);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "round_nearest_afz_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -318,31 +333,36 @@ mod tests {
     fn test_round_with_nearest_even_tie_break() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(6)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let op = round_with_nearest_even_tie_break(input_value, location);
-            assert_eq!(op.input(), input_value);
-            assert_eq!(op.output().r#type(), tensor_type.as_ref());
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "round_nearest_even_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let op = round_with_nearest_even_tie_break(input_value, location).unwrap();
+                assert_eq!(op.input().unwrap(), input_value);
+                assert_eq!(op.input().unwrap(), input_value);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "round_nearest_even_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

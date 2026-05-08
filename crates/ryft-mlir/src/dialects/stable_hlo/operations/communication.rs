@@ -3,14 +3,12 @@ use ryft_xla_sys::bindings::{
     stablehloChannelHandleGetType,
 };
 
-use crate::{
-    Attribute, AttributeRef, BooleanAttributeRef, Context, DenseIntegerElementsAttributeRef, DetachedOp,
-    DetachedRegion, DialectHandle, IntegerAttributeRef, IntoWithContext, Location, OneRegion, Operation,
-    OperationBuilder, RegionRef, Size, StringAttributeRef, StringRef, TensorTypeRef, Type, Value, mlir_op,
-    mlir_op_trait, mlir_subtype_trait_impls,
-};
-
 use crate::dialects::stable_hlo::ReplicaGroupMeshAxesAttributeRef;
+use crate::{
+    Attribute, AttributeRef, Context, DenseIntegerElementsAttributeRef, DetachedOp, DetachedRegion, DialectHandle,
+    Error, Location, OneRegion, Operation, OperationBuilder, RegionRef, Size, StringAttributeRef, StringRef,
+    TensorTypeRef, TryIntoWithContext, Type, Value, mlir_op, mlir_op_trait, mlir_subtype_trait_impls,
+};
 
 /// Represents the type of a StableHLO communication channel.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -59,11 +57,11 @@ impl<'c, 't> ChannelHandleAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for ChannelHandleAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { stablehloAttributeIsChannelHandle(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -84,9 +82,9 @@ impl<'t> Context<'t> {
         &'c self,
         channel_id: Option<usize>,
         channel_type: ChannelHandleType,
-    ) -> ChannelHandleAttributeRef<'c, 't> {
+    ) -> Result<ChannelHandleAttributeRef<'c, 't>, Error> {
         // Make sure that the StableHLO dialect is loaded into the current context to prevent segmentation faults.
-        self.load_dialect(DialectHandle::stable_hlo());
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -101,7 +99,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::internal("MLIR returned an invalid StableHLO channel handle attribute"))
         }
     }
 }
@@ -141,15 +139,16 @@ mlir_op_trait!(PartitionId, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`PartitionIdOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`PartitionIdOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
-pub fn partition_id<'c, 't, L: Location<'c, 't>>(location: L) -> DetachedPartitionIdOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+pub fn partition_id<'c, 't, L: Location<'c, 't>>(location: L) -> Result<DetachedPartitionIdOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.partition_id", location)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::partition_id`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::partition_id`"))
+        })
 }
 
 /// StableHLO [`Operation`] that produces the _replica ID_ of the current process. That ID is an unsigned 32-bit
@@ -187,15 +186,16 @@ mlir_op_trait!(ReplicaId, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ReplicaIdOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ReplicaIdOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
-pub fn replica_id<'c, 't, L: Location<'c, 't>>(location: L) -> DetachedReplicaIdOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+pub fn replica_id<'c, 't, L: Location<'c, 't>>(location: L) -> Result<DetachedReplicaIdOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.replica_id", location)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::replica_id`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::replica_id`"))
+        })
 }
 
 /// StableHLO [`Operation`] that ensures execution ordering of other [`Operation`]s. Specifically, it ensures that the
@@ -229,14 +229,17 @@ mlir_op_trait!(AfterAll, ZeroSuccessors);
 pub fn after_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     inputs: &[V],
     location: L,
-) -> DetachedAfterAllOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedAfterAllOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.after_all", location)
         .add_operands(inputs)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::after_all`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::after_all`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`HasChannelHandle::channel_id`],
@@ -246,40 +249,56 @@ pub const COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE: &str = "channel_handle";
 /// Trait that represents collective [`Operation`]s that support specifying and operating over specific channels.
 pub trait SupportsChannelHandle<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the ID of the channel that this [`Operation`] transfers data over, if one is specified.
-    fn channel_id(&self) -> Option<usize> {
-        self.attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)
+    fn channel_id(&self) -> Result<Option<usize>, Error> {
+        Ok(self
+            .attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<ChannelHandleAttributeRef>())
-            .and_then(|attribute| attribute.channel_id())
+            .and_then(|attribute| attribute.channel_id()))
     }
 
     /// Returns the type of the channel that this [`Operation`] transfers data over, if one is specified.
-    fn channel_type(&self) -> Option<ChannelHandleType> {
-        self.attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)
+    fn channel_type(&self) -> Result<Option<ChannelHandleType>, Error> {
+        Ok(self
+            .attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<ChannelHandleAttributeRef>())
-            .map(|attribute| attribute.channel_type())
+            .map(|attribute| attribute.channel_type()))
     }
 }
 
 /// Trait that represents collective [`Operation`]s that require specifying and operating over specific channels.
 pub trait HasChannelHandle<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the ID of the channel that this [`Operation`] transfers data over.
-    fn channel_id(&self) -> usize {
-        self.attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)
+    fn channel_id(&self) -> Result<usize, Error> {
+        self.attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<ChannelHandleAttributeRef>())
-            .and_then(|attribute| attribute.channel_id())
-            .unwrap_or_else(|| {
-                panic!("invalid '{COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE}' attribute in StableHLO collective operation")
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .channel_id()
+            .ok_or_else(|| {
+                Error::invalid_argument(
+                    "missing channel id in `channel_handle` attribute in StableHLO collective operation",
+                )
             })
     }
 
     /// Returns the type of the channel that this [`Operation`] transfers data over.
-    fn channel_type(&self) -> ChannelHandleType {
-        self.attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)
+    fn channel_type(&self) -> Result<ChannelHandleType, Error> {
+        Ok(self
+            .attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<ChannelHandleAttributeRef>())
-            .map(|attribute| attribute.channel_type())
-            .unwrap_or_else(|| {
-                panic!("invalid '{COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE}' attribute in StableHLO collective operation")
-            })
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .channel_type())
     }
 }
 
@@ -290,18 +309,21 @@ pub const COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE: &str = "source_target_pairs"
 pub trait HasSourceTargetPairs<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns a [`Vec`] that contains source-target device ID pairs for this [`SendRecvOperation`], if
     /// [`SendRecvOperation::is_host_transfer`] is `false`, and an empty vector otherwise.
-    fn source_target_pairs(&self) -> Vec<(usize, usize)> {
-        self.attribute(COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseIntegerElementsAttributeRef>())
-            .map(|attribute| {
-                let mut device_indices = unsafe { attribute.i64_elements() };
-                let mut source_target_pairs = Vec::new();
-                while let (Some(source), Some(target)) = (device_indices.next(), device_indices.next()) {
-                    source_target_pairs.push((source as usize, target as usize));
-                }
-                source_target_pairs
-            })
-            .unwrap_or(Vec::new())
+    fn source_target_pairs(&self) -> Result<Vec<(usize, usize)>, Error> {
+        if !self.has_attribute(COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE) {
+            return Ok(Vec::new());
+        }
+        let attribute = self.dense_integer_elements_attribute(COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE)?;
+        let mut device_indices = unsafe { attribute.i64_elements() };
+        let mut source_target_pairs = Vec::new();
+        while let Some(source) = device_indices.next() {
+            let source = source?;
+            let target = device_indices
+                .next()
+                .ok_or_else(|| Error::invalid_argument("invalid StableHLO source-target pairs attribute"))??;
+            source_target_pairs.push((source as usize, target as usize));
+        }
+        Ok(source_target_pairs)
     }
 }
 
@@ -312,10 +334,10 @@ impl<'t> Context<'t> {
         &'c self,
         pairs: &[(usize, usize)],
         location: L,
-    ) -> DenseIntegerElementsAttributeRef<'c, 't> {
+    ) -> Result<DenseIntegerElementsAttributeRef<'c, 't>, Error> {
         let i64_type = self.signless_integer_type(64);
         self.dense_integer_elements_attribute(
-            self.tensor_type(i64_type, &[Size::Static(pairs.len()), Size::Static(2)], None, location).unwrap(),
+            self.tensor_type(i64_type, &[Size::Static(pairs.len()), Size::Static(2)], None, location)?,
             pairs
                 .iter()
                 .flat_map(|(source, target)| [*source, *target])
@@ -323,7 +345,6 @@ impl<'t> Context<'t> {
                 .collect::<Vec<_>>()
                 .as_slice(),
         )
-        .unwrap()
     }
 }
 
@@ -336,13 +357,8 @@ pub trait SendRecvOperation<'o, 'c: 'o, 't: 'c>:
 {
     /// Returns `true` if this [`SendRecvOperation`] sends data to the host or receives data from the host
     /// (i.e., if it is not a device-to-device transfer).
-    fn is_host_transfer(&self) -> bool {
-        self.attribute(SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| {
-                panic!("invalid '{SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE}' attribute in StableHLO send/receive operation")
-            })
+    fn is_host_transfer(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE)?.value())
     }
 }
 
@@ -386,8 +402,6 @@ mlir_op_trait!(Send, @local SendRecvOperation);
 
 /// Constructs a new detached/owned [`SendOperation`] at the specified [`Location`]. Refer to the documentation of
 /// [`SendOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn send<'v, 'k, 'c: 'v + 'k, 't: 'c, V: Value<'v, 'c, 't>, K: Value<'k, 'c, 't>, L: Location<'c, 't>>(
     inputs: &[V],
     token: K,
@@ -396,28 +410,26 @@ pub fn send<'v, 'k, 'c: 'v + 'k, 't: 'c, V: Value<'v, 'c, 't>, K: Value<'k, 'c, 
     is_host_transfer: bool,
     source_target_pairs: Option<&[(usize, usize)]>,
     location: L,
-) -> DetachedSendOperation<'c, 't> {
+) -> Result<DetachedSendOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.send", location)
         .add_operands(inputs)
         .add_operand(token)
         .add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
-            context.stable_hlo_channel_handle(Some(channel_id), channel_type),
+            context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
         )
         .add_attribute(SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE, context.boolean_attribute(is_host_transfer));
     if let Some(source_target_pairs) = source_target_pairs {
         builder = builder.add_attribute(
             COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE,
-            context.stable_hlo_source_target_pairs_attribute(source_target_pairs, location),
+            context.stable_hlo_source_target_pairs_attribute(source_target_pairs, location)?,
         );
     }
-    builder
-        .enable_result_type_inference()
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::send`")
+    builder.enable_result_type_inference().build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::send`"))
+    })
 }
 
 /// StableHLO [`Operation`] that receives data over a channel specified by [`HasChannelHandle::channel_id`]. It takes a
@@ -461,8 +473,6 @@ mlir_op_trait!(Recv, @local SendRecvOperation);
 ///
 /// Note that `output_types` must only contain the output types for the tensors that are to be received and not the
 /// additional [`TokenTypeRef`](crate::dialects::stable_hlo::TokenTypeRef) that [`RecvOperation`] also returns.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn recv<'k, 'c: 'k, 't: 'c, K: Value<'k, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     token: K,
     channel_id: usize,
@@ -471,28 +481,27 @@ pub fn recv<'k, 'c: 'k, 't: 'c, K: Value<'k, 'c, 't>, T: Type<'c, 't>, L: Locati
     source_target_pairs: Option<&[(usize, usize)]>,
     output_types: &[T],
     location: L,
-) -> DetachedRecvOperation<'c, 't> {
+) -> Result<DetachedRecvOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.recv", location)
         .add_operand(token)
         .add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
-            context.stable_hlo_channel_handle(Some(channel_id), channel_type),
+            context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
         )
         .add_attribute(SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE, context.boolean_attribute(is_host_transfer));
     if let Some(source_target_pairs) = source_target_pairs {
         builder = builder.add_attribute(
             COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE,
-            context.stable_hlo_source_target_pairs_attribute(source_target_pairs, location),
+            context.stable_hlo_source_target_pairs_attribute(source_target_pairs, location)?,
         );
     }
-    builder
-        .add_results(output_types)
-        .add_result(context.stable_hlo_token_type())
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::recv`")
+    builder.add_results(output_types).add_result(context.stable_hlo_token_type()?).build().and_then(
+        |operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::recv`"))
+        },
+    )
 }
 
 /// Name of the [`Attribute`] that is used to store [`OutfeedOperation::outfeed_config`].
@@ -519,10 +528,8 @@ pub const OUTFEED_CONFIG_ATTRIBUTE: &str = "outfeed_config";
 /// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#outfeed) for more information.
 pub trait OutfeedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the configuration string of this [`OutfeedOperation`].
-    fn outfeed_config(&self) -> StringRef<'c> {
-        self.attribute(OUTFEED_CONFIG_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>().map(|attribute| attribute.string()))
-            .unwrap_or_else(|| panic!("invalid '{OUTFEED_CONFIG_ATTRIBUTE}' attribute in `stable_hlo::outfeed`"))
+    fn outfeed_config(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(OUTFEED_CONFIG_ATTRIBUTE)?.string())
     }
 }
 
@@ -533,8 +540,6 @@ mlir_op_trait!(Outfeed, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`OutfeedOperation`] at the specified [`Location`]. Refer to the documentation of
 /// [`OutfeedOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn outfeed<
     'v,
     'k,
@@ -542,23 +547,26 @@ pub fn outfeed<
     't: 'c,
     V: Value<'v, 'c, 't>,
     K: Value<'k, 'c, 't>,
-    N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     L: Location<'c, 't>,
 >(
     inputs: &[V],
     token: K,
     configuration: N,
     location: L,
-) -> DetachedOutfeedOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedOutfeedOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.outfeed", location)
         .add_operands(inputs)
         .add_operand(token)
-        .add_attribute(OUTFEED_CONFIG_ATTRIBUTE, configuration.into_with_context(location.context()))
+        .add_attribute(OUTFEED_CONFIG_ATTRIBUTE, configuration.try_into_with_context(location.context())?)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::outfeed`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::outfeed`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`InfeedOperation::infeed_config`].
@@ -584,10 +592,8 @@ pub const INFEED_CONFIG_ATTRIBUTE: &str = "infeed_config";
 /// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#infeed) for more information.
 pub trait InfeedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the configuration string of this [`InfeedOperation`].
-    fn infeed_config(&self) -> StringRef<'c> {
-        self.attribute(INFEED_CONFIG_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>().map(|attribute| attribute.string()))
-            .unwrap_or_else(|| panic!("invalid '{INFEED_CONFIG_ATTRIBUTE}' attribute in `stable_hlo::infeed`"))
+    fn infeed_config(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(INFEED_CONFIG_ATTRIBUTE)?.string())
     }
 }
 
@@ -601,14 +607,12 @@ mlir_op_trait!(Infeed, ZeroSuccessors);
 /// Note that `output_types` must only contain the output types for the tensors that are to be read from the infeed
 /// and not the additional [`TokenTypeRef`](crate::dialects::stable_hlo::TokenTypeRef) that [`InfeedOperation`] also
 /// returns.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn infeed<
     'v,
     'c: 'v,
     't: 'c,
     V: Value<'v, 'c, 't>,
-    N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     T: Type<'c, 't>,
     L: Location<'c, 't>,
 >(
@@ -616,17 +620,18 @@ pub fn infeed<
     configuration: N,
     output_types: &[T],
     location: L,
-) -> DetachedInfeedOperation<'c, 't> {
+) -> Result<DetachedInfeedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.infeed", location)
         .add_operand(token)
-        .add_attribute(INFEED_CONFIG_ATTRIBUTE, configuration.into_with_context(context))
+        .add_attribute(INFEED_CONFIG_ATTRIBUTE, configuration.try_into_with_context(context)?)
         .add_results(output_types)
-        .add_result(context.stable_hlo_token_type())
+        .add_result(context.stable_hlo_token_type()?)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::infeed`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::infeed`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`HasReplicaGroups::replica_groups`].
@@ -657,12 +662,16 @@ impl<'c, 't> ReplicaGroups<'c, 't> {
     }
 
     /// Returns the MLIR [`Attribute`] representation of these replica groups.
-    fn to_attribute<L: Location<'c, 't>>(&self, context: &'c Context<'t>, location: L) -> AttributeRef<'c, 't> {
+    fn to_attribute<L: Location<'c, 't>>(
+        &self,
+        context: &'c Context<'t>,
+        location: L,
+    ) -> Result<AttributeRef<'c, 't>, Error> {
         match self {
             Self::Dense(replica_groups) => {
-                context.stable_hlo_replica_groups_attribute(replica_groups, location).as_ref()
+                Ok(context.stable_hlo_replica_groups_attribute(replica_groups, location)?.as_ref())
             }
-            Self::MeshAxes(replica_groups) => replica_groups.as_ref(),
+            Self::MeshAxes(replica_groups) => Ok(replica_groups.as_ref()),
         }
     }
 }
@@ -679,56 +688,45 @@ pub trait HasReplicaGroups<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// [`HasReplicaGroups::use_global_device_ids`] is `true`.
     ///
     /// The returned [`ReplicaGroups`] may contain either explicit device-id groups or mesh-axis replica groups.
-    fn replica_groups(&self) -> ReplicaGroups<'c, 't> {
-        self.attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE)
+    fn replica_groups(&self) -> Result<ReplicaGroups<'c, 't>, Error> {
+        self.attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE)?
             .map(|attribute| {
                 if let Some(attribute) = attribute.cast::<DenseIntegerElementsAttributeRef>() {
-                    let attribute_type = attribute.r#type().cast::<TensorTypeRef>();
-                    let device_ids = unsafe { attribute.i64_elements() };
-                    ReplicaGroups::Dense(
-                        attribute_type
-                            .and_then(|tensor_type| {
-                                tensor_type.dimension(1).value().map(|max_group_size| {
-                                    let mut groups = Vec::new();
-                                    let mut device_ids = device_ids.peekable();
-                                    while device_ids.peek().is_some() {
-                                        // We filter for non-negative values after the chunking below because the value
-                                        // `-1` is used as a "null" device padding value for when dealing with
-                                        // non-uniform replica groups.
-                                        groups.push(
-                                            device_ids
-                                                .by_ref()
-                                                .take(max_group_size)
-                                                .filter(|id| *id >= 0)
-                                                .map(|id| id as usize)
-                                                .collect(),
-                                        );
-                                    }
-                                    groups
-                                })
-                            })
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "invalid '{COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE}' dense attribute in StableHLO \
-                                     collective operation",
-                                )
-                            }),
-                    )
+                    let Some(attribute_type) = attribute.r#type()?.cast::<TensorTypeRef>() else {
+                        return Err(Error::invalid_argument(
+                            "invalid `replica_groups` dense attribute in StableHLO collective operation",
+                        ));
+                    };
+                    let device_ids = unsafe { attribute.i64_elements().collect::<Result<Vec<_>, _>>()? };
+                    let Size::Static(max_group_size) = attribute_type.dimension(1)? else {
+                        return Err(Error::invalid_argument(
+                            "invalid `replica_groups` dense attribute in StableHLO collective operation",
+                        ));
+                    };
+                    Ok(ReplicaGroups::Dense({
+                        let mut groups = Vec::new();
+                        for device_ids in device_ids.chunks(max_group_size) {
+                            // We filter for non-negative values after the chunking below because the value `-1` is
+                            // used as a "null" device padding value for when dealing with non-uniform replica
+                            // groups.
+                            groups
+                                .push(device_ids.iter().copied().filter(|id| *id >= 0).map(|id| id as usize).collect());
+                        }
+                        groups
+                    }))
                 } else if let Some(attribute) = attribute.cast::<ReplicaGroupMeshAxesAttributeRef>() {
-                    ReplicaGroups::MeshAxes(attribute)
+                    Ok(ReplicaGroups::MeshAxes(attribute))
                 } else {
-                    panic!(
-                        "invalid '{COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE}' attribute in StableHLO collective operation",
-                    )
+                    Err(Error::invalid_argument("invalid `replica_groups` attribute in StableHLO collective operation"))
                 }
             })
-            .unwrap_or_else(|| ReplicaGroups::Dense(Vec::new()))
+            .unwrap_or_else(|| Ok(ReplicaGroups::Dense(Vec::new())))
     }
 
     /// Returns `true` if this [`Operation`] uses global device IDs. Defaults to `false` if not specified.
     /// If this is `true`, then [`HasReplicaGroups::replica_groups`] must be non-empty.
     fn use_global_device_ids(&self) -> bool {
-        self.attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE).is_some()
+        self.has_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE)
     }
 }
 
@@ -739,13 +737,12 @@ impl<'t> Context<'t> {
         &'c self,
         replica_groups: &[Vec<usize>],
         location: L,
-    ) -> DenseIntegerElementsAttributeRef<'c, 't> {
+    ) -> Result<DenseIntegerElementsAttributeRef<'c, 't>, Error> {
         let i64_type = self.signless_integer_type(64);
         let group_count = replica_groups.len();
-        let max_group_size = replica_groups.iter().map(|group| group.len()).max().unwrap();
-        let attribute_type = self
-            .tensor_type(i64_type, &[Size::Static(group_count), Size::Static(max_group_size)], None, location)
-            .unwrap();
+        let max_group_size = replica_groups.iter().map(|group| group.len()).max().unwrap_or(0);
+        let attribute_type =
+            self.tensor_type(i64_type, &[Size::Static(group_count), Size::Static(max_group_size)], None, location)?;
         let mut attribute_values = Vec::with_capacity(group_count * max_group_size);
         for group in replica_groups {
             let group_size = group.len();
@@ -759,7 +756,7 @@ impl<'t> Context<'t> {
                 }
             }
         }
-        self.dense_integer_elements_attribute(attribute_type, attribute_values.as_slice()).unwrap()
+        self.dense_integer_elements_attribute(attribute_type, attribute_values.as_slice())
     }
 }
 
@@ -799,13 +796,9 @@ pub trait AllGatherOperation<'o, 'c: 'o, 't: 'c>:
     Operation<'o, 'c, 't> + HasReplicaGroups<'o, 'c, 't> + SupportsChannelHandle<'o, 'c, 't>
 {
     /// Returns the dimension along which concatenation occurs in this [`AllGatherOperation`].
-    fn all_gather_dimension(&self) -> usize {
-        self.attribute(ALL_GATHER_DIMENSION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| {
-                panic!("invalid '{ALL_GATHER_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_gather`")
-            })
+    fn all_gather_dimension(&self) -> Result<usize, Error> {
+        usize::try_from(self.integer_attribute(ALL_GATHER_DIMENSION_ATTRIBUTE)?.signless_value())
+            .map_err(|_| Error::invalid_argument("invalid `all_gather_dim` attribute in `stable_hlo::all_gather`"))
     }
 }
 
@@ -817,8 +810,6 @@ mlir_op_trait!(AllGather, @local SupportsChannelHandle);
 
 /// Constructs a new detached/owned [`AllGatherOperation`] at the specified [`Location`]. Refer to the documentation
 /// of [`AllGatherOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[allow(clippy::too_many_arguments)]
 pub fn all_gather<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     inputs: &[V],
@@ -829,31 +820,30 @@ pub fn all_gather<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: 
     use_global_device_ids: bool,
     output_types: &[T],
     location: L,
-) -> DetachedAllGatherOperation<'c, 't> {
+) -> Result<DetachedAllGatherOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let i64_type = context.signless_integer_type(64);
     let mut builder = OperationBuilder::new("stablehlo.all_gather", location)
         .add_operands(inputs)
         .add_attribute(ALL_GATHER_DIMENSION_ATTRIBUTE, context.integer_attribute(i64_type, all_gather_dimension as i64))
-        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location));
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
     if let Some(channel_id) = channel_id {
+        let channel_type = channel_type
+            .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
-            context.stable_hlo_channel_handle(
-                Some(channel_id),
-                channel_type.expect("channel type is required when channel ID is provided"),
-            ),
+            context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
         );
     }
     if use_global_device_ids {
         builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .add_results(output_types)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::all_gather`")
+    builder.add_results(output_types).build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::all_gather`"))
+    })
 }
 
 /// StableHLO [`Operation`] that reduces values across all processes in a process group using a custom reduction
@@ -909,8 +899,6 @@ mlir_op_trait!(AllReduce, @local SupportsChannelHandle);
 
 /// Constructs a new detached/owned [`AllReduceOperation`] at the specified [`Location`]. Refer to the documentation
 /// of [`AllReduceOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn all_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     inputs: &[V],
     replica_groups: ReplicaGroups<'c, 't>,
@@ -919,30 +907,28 @@ pub fn all_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
     use_global_device_ids: bool,
     computation: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedAllReduceOperation<'c, 't> {
+) -> Result<DetachedAllReduceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.all_reduce", location)
         .add_operands(inputs)
-        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location));
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
     if let Some(channel_id) = channel_id {
+        let channel_type = channel_type
+            .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
-            context.stable_hlo_channel_handle(
-                Some(channel_id),
-                channel_type.expect("channel type is required when channel ID is provided"),
-            ),
+            context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
         );
     }
     if use_global_device_ids {
         builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .add_region(computation)
-        .enable_result_type_inference()
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::all_reduce`")
+    builder.add_region(computation).enable_result_type_inference().build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::all_reduce`"))
+    })
 }
 
 /// Name of the [`Attribute`] that is used to store [`AllToAllOperation::split_dimension`].
@@ -995,33 +981,21 @@ pub trait AllToAllOperation<'o, 'c: 'o, 't: 'c>:
     Operation<'o, 'c, 't> + HasReplicaGroups<'o, 'c, 't> + SupportsChannelHandle<'o, 'c, 't>
 {
     /// Returns the dimension along which operands are split in this [`AllToAllOperation`].
-    fn split_dimension(&self) -> usize {
-        self.attribute(ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| {
-                panic!("invalid '{ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`")
-            })
+    fn split_dimension(&self) -> Result<usize, Error> {
+        usize::try_from(self.integer_attribute(ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE)?.signless_value())
+            .map_err(|_| Error::invalid_argument("invalid `split_dimension` attribute in `stable_hlo::all_to_all`"))
     }
 
     /// Returns the number of parts each operand is divided into in this [`AllToAllOperation`].
-    fn split_count(&self) -> usize {
-        self.attribute(ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| {
-                panic!("invalid '{ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`")
-            })
+    fn split_count(&self) -> Result<usize, Error> {
+        usize::try_from(self.integer_attribute(ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE)?.signless_value())
+            .map_err(|_| Error::invalid_argument("invalid `split_count` attribute in `stable_hlo::all_to_all`"))
     }
 
     /// Returns the dimension along which scattered parts are concatenated in this [`AllToAllOperation`].
-    fn concatenation_dimension(&self) -> usize {
-        self.attribute(ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| {
-                panic!("invalid '{ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`")
-            })
+    fn concatenation_dimension(&self) -> Result<usize, Error> {
+        usize::try_from(self.integer_attribute(ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE)?.signless_value())
+            .map_err(|_| Error::invalid_argument("invalid `concat_dimension` attribute in `stable_hlo::all_to_all`"))
     }
 }
 
@@ -1033,8 +1007,6 @@ mlir_op_trait!(AllToAll, @local SupportsChannelHandle);
 
 /// Constructs a new detached/owned [`AllToAllOperation`] at the specified [`Location`]. Refer to the documentation
 /// of [`AllToAllOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[allow(clippy::too_many_arguments)]
 pub fn all_to_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     inputs: &[V],
@@ -1046,9 +1018,9 @@ pub fn all_to_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
     channel_type: Option<ChannelHandleType>,
     use_global_device_ids: bool,
     location: L,
-) -> DetachedAllToAllOperation<'c, 't> {
+) -> Result<DetachedAllToAllOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let i64_type = context.signless_integer_type(64);
     let mut builder = OperationBuilder::new("stablehlo.all_to_all", location)
         .add_operands(inputs)
@@ -1061,24 +1033,23 @@ pub fn all_to_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
             ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE,
             context.integer_attribute(i64_type, concatenation_dimension as i64),
         )
-        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location));
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
     if let Some(channel_id) = channel_id {
+        let channel_type = channel_type
+            .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
-            context.stable_hlo_channel_handle(
-                Some(channel_id),
-                channel_type.expect("channel type is required when channel ID is provided"),
-            ),
+            context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
         );
     }
     if use_global_device_ids {
         builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .enable_result_type_inference()
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::all_to_all`")
+    builder.enable_result_type_inference().build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::all_to_all`"))
+    })
 }
 
 /// StableHLO [`Operation`] that broadcasts data from a source process to target processes within each process group
@@ -1124,34 +1095,31 @@ mlir_op_trait!(CollectiveBroadcast, @local SupportsChannelHandle);
 
 /// Constructs a new detached/owned [`CollectiveBroadcastOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`CollectiveBroadcastOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn collective_broadcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     replica_groups: ReplicaGroups<'c, 't>,
     channel_id: Option<usize>,
     channel_type: Option<ChannelHandleType>,
     location: L,
-) -> DetachedCollectiveBroadcastOperation<'c, 't> {
+) -> Result<DetachedCollectiveBroadcastOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.collective_broadcast", location)
         .add_operand(input)
-        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location));
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
     if let Some(channel_id) = channel_id {
+        let channel_type = channel_type
+            .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
-            context.stable_hlo_channel_handle(
-                Some(channel_id),
-                channel_type.expect("channel type is required when channel ID is provided"),
-            ),
+            context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
         );
     }
-    builder
-        .enable_result_type_inference()
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::collective_broadcast`")
+    builder.enable_result_type_inference().build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::collective_broadcast`"))
+    })
 }
 
 /// StableHLO [`Operation`] that permutes data between processes according to specified
@@ -1196,35 +1164,32 @@ mlir_op_trait!(CollectivePermute, @local SupportsChannelHandle);
 
 /// Constructs a new detached/owned [`CollectivePermuteOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`CollectivePermuteOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn collective_permute<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     source_target_pairs: &[(usize, usize)],
     channel_id: Option<usize>,
     channel_type: Option<ChannelHandleType>,
     location: L,
-) -> DetachedCollectivePermuteOperation<'c, 't> {
+) -> Result<DetachedCollectivePermuteOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.collective_permute", location).add_operand(input).add_attribute(
         COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE,
-        context.stable_hlo_source_target_pairs_attribute(source_target_pairs, location),
+        context.stable_hlo_source_target_pairs_attribute(source_target_pairs, location)?,
     );
     if let Some(channel_id) = channel_id {
+        let channel_type = channel_type
+            .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
-            context.stable_hlo_channel_handle(
-                Some(channel_id),
-                channel_type.expect("channel type is required when channel ID is provided"),
-            ),
+            context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
         );
     }
-    builder
-        .enable_result_type_inference()
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::collective_permute`")
+    builder.enable_result_type_inference().build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::collective_permute`"))
+    })
 }
 
 /// Name of the [`Attribute`] that is used to store [`ReduceScatterOperation::dimension`].
@@ -1268,18 +1233,15 @@ pub trait ReduceScatterOperation<'o, 'c: 'o, 't: 'c>:
     Operation<'o, 'c, 't> + OneRegion<'o, 'c, 't> + HasReplicaGroups<'o, 'c, 't> + SupportsChannelHandle<'o, 'c, 't>
 {
     /// Returns the dimension along which to scatter the reduction result for this [`ReduceScatterOperation`].
-    fn dimension(&self) -> usize {
-        self.attribute(REDUCE_SCATTER_DIMENSION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| {
-                panic!("invalid '{REDUCE_SCATTER_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::reduce_scatter`")
-            })
+    fn dimension(&self) -> Result<usize, Error> {
+        usize::try_from(self.integer_attribute(REDUCE_SCATTER_DIMENSION_ATTRIBUTE)?.signless_value()).map_err(|_| {
+            Error::invalid_argument("invalid `scatter_dimension` attribute in `stable_hlo::reduce_scatter`")
+        })
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the reduction computation
     /// used by this [`ReduceScatterOperation`].
-    fn computation(&self) -> RegionRef<'o, 'c, 't> {
+    fn computation(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
         self.body_region()
     }
 }
@@ -1296,8 +1258,6 @@ mlir_op_trait!(ReduceScatter, @local SupportsChannelHandle);
 
 /// Constructs a new detached/owned [`ReduceScatterOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ReduceScatterOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[allow(clippy::too_many_arguments)]
 pub fn reduce_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     operand: V,
@@ -1309,34 +1269,32 @@ pub fn reduce_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>,
     computation: DetachedRegion<'c, 't>,
     output_type: T,
     location: L,
-) -> DetachedReduceScatterOperation<'c, 't> {
+) -> Result<DetachedReduceScatterOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.reduce_scatter", location)
         .add_operand(operand)
         .add_attribute(
             REDUCE_SCATTER_DIMENSION_ATTRIBUTE,
             location.context().integer_attribute(context.signless_integer_type(64), dimension as i64),
         )
-        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location));
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
     if let Some(channel_id) = channel_id {
+        let channel_type = channel_type
+            .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
-            context.stable_hlo_channel_handle(
-                Some(channel_id),
-                channel_type.expect("channel type is required when channel ID is provided"),
-            ),
+            context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
         );
     }
     if use_global_device_ids {
         builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .add_region(computation)
-        .add_result(output_type)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::reduce_scatter`")
+    builder.add_region(computation).add_result(output_type).build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::reduce_scatter`"))
+    })
 }
 
 #[cfg(test)]
@@ -1353,11 +1311,11 @@ mod tests {
     #[test]
     fn test_channel_handle_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToHost);
+        let attribute = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToHost).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.channel_id(), Some(42));
         assert_eq!(attribute.channel_type(), ChannelHandleType::DeviceToHost);
-        let attribute = context.stable_hlo_channel_handle(Some(24), ChannelHandleType::Unknown);
+        let attribute = context.stable_hlo_channel_handle(Some(24), ChannelHandleType::Unknown).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.channel_id(), Some(24));
         assert_eq!(attribute.channel_type(), ChannelHandleType::Unknown);
@@ -1368,31 +1326,31 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToDevice);
-        let attribute_2 = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToDevice);
+        let attribute_1 = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToDevice).unwrap();
+        let attribute_2 = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToDevice).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::Unknown);
+        let attribute_2 = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::Unknown).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToDevice);
+        let attribute_2 = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToDevice).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_channel_handle_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToDevice);
+        let attribute = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToDevice).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo.channel_handle<handle = 42, type = 1>");
     }
 
     #[test]
     fn test_channel_handle_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToDevice);
+        let attribute = context.stable_hlo_channel_handle(Some(42), ChannelHandleType::DeviceToDevice).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -1400,21 +1358,26 @@ mod tests {
     fn test_partition_id() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let ui32_type = context.unsigned_integer_type(32);
         let tensor_type = context.tensor_type(ui32_type, &[], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = block.append_operation(partition_id(location));
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "test_partition_id",
-                func::FuncAttributes { arguments: vec![], results: vec![tensor_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = block.append_operation(partition_id(location).unwrap()).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_partition_id",
+                    func::FuncAttributes { arguments: vec![], results: vec![tensor_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1432,21 +1395,26 @@ mod tests {
     fn test_replica_id() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let ui32_type = context.unsigned_integer_type(32);
         let tensor_type = context.tensor_type(ui32_type, &[], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = block.append_operation(replica_id(location));
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "test_replica_id",
-                func::FuncAttributes { arguments: vec![], results: vec![tensor_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = block.append_operation(replica_id(location).unwrap()).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_replica_id",
+                    func::FuncAttributes { arguments: vec![], results: vec![tensor_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1464,25 +1432,31 @@ mod tests {
     fn test_after_all() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let token_type = context.stable_hlo_token_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(token_type, location), (token_type, location)]);
-            let op = after_all(block.arguments().collect::<Vec<_>>().as_slice(), location);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "test_after_all",
-                func::FuncAttributes {
-                    arguments: vec![token_type.into(), token_type.into()],
-                    results: vec![token_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let module = context.module(location).unwrap();
+        let token_type = context.stable_hlo_token_type().unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(token_type, location), (token_type, location)]);
+                let op =
+                    after_all(block.arguments().collect::<Result<Vec<_>, _>>().unwrap().as_slice(), location).unwrap();
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_after_all",
+                    func::FuncAttributes {
+                        arguments: vec![token_type.into(), token_type.into()],
+                        results: vec![token_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1500,39 +1474,45 @@ mod tests {
     fn test_send() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let token_type = context.stable_hlo_token_type();
+        let module = context.module(location).unwrap();
+        let token_type = context.stable_hlo_token_type().unwrap();
         let i64_type = context.signless_integer_type(64);
         let tensor_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type.as_ref(), location), (token_type.as_ref(), location)]);
-            let op = send(
-                &[block.argument(0).unwrap()],
-                block.argument(1).unwrap(),
-                0,
-                ChannelHandleType::DeviceToDevice,
-                false,
-                Some(&[(0, 1), (1, 2)]),
-                location,
-            );
-            assert_eq!(op.channel_id(), 0);
-            assert_eq!(op.channel_type(), ChannelHandleType::DeviceToDevice);
-            assert!(!op.is_host_transfer());
-            assert_eq!(op.source_target_pairs(), vec![(0, 1), (1, 2)]);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "test_send",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), token_type.into()],
-                    results: vec![token_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type.as_ref(), location), (token_type.as_ref(), location)]);
+                let op = send(
+                    &[block.argument(0).unwrap()],
+                    block.argument(1).unwrap(),
+                    0,
+                    ChannelHandleType::DeviceToDevice,
+                    false,
+                    Some(&[(0, 1), (1, 2)]),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.channel_id().unwrap(), 0);
+                assert_eq!(op.channel_type().unwrap(), ChannelHandleType::DeviceToDevice);
+                assert!(!op.is_host_transfer().unwrap());
+                assert_eq!(op.source_target_pairs().unwrap(), vec![(0, 1), (1, 2)]);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_send",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), token_type.into()],
+                        results: vec![token_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1554,39 +1534,58 @@ mod tests {
     fn test_recv() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let token_type = context.stable_hlo_token_type();
+        let module = context.module(location).unwrap();
+        let token_type = context.stable_hlo_token_type().unwrap();
         let i64_type = context.signless_integer_type(64);
         let tensor_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(token_type, location)]);
-            let op = recv(
-                block.argument(0).unwrap(),
-                0,
-                ChannelHandleType::DeviceToDevice,
-                false,
-                Some(&[(0, 1), (1, 2)]),
-                &[tensor_type],
-                location,
-            );
-            assert_eq!(op.channel_id(), 0);
-            assert_eq!(op.channel_type(), ChannelHandleType::DeviceToDevice);
-            assert!(!op.is_host_transfer());
-            assert_eq!(op.source_target_pairs(), vec![(0, 1), (1, 2)]);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(op.results().collect::<Vec<_>>().as_slice(), location));
-            func::func(
-                "test_recv",
-                func::FuncAttributes {
-                    arguments: vec![token_type.into()],
-                    results: vec![tensor_type.into(), token_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(token_type, location)]);
+                let op = recv(
+                    block.argument(0).unwrap(),
+                    0,
+                    ChannelHandleType::DeviceToDevice,
+                    false,
+                    Some(&[(0, 1), (1, 2)]),
+                    &[tensor_type],
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.channel_id().unwrap(), 0);
+                assert_eq!(op.channel_type().unwrap(), ChannelHandleType::DeviceToDevice);
+                assert!(!op.is_host_transfer().unwrap());
+                assert_eq!(op.source_target_pairs().unwrap(), vec![(0, 1), (1, 2)]);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(
+                        func::r#return(
+                            op.results()
+                                .collect::<Result<Vec<_>, _>>()
+                                .unwrap()
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                func::func(
+                    "test_recv",
+                    func::FuncAttributes {
+                        arguments: vec![token_type.into()],
+                        results: vec![tensor_type.into(), token_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1608,28 +1607,34 @@ mod tests {
     fn test_outfeed() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let token_type = context.stable_hlo_token_type();
+        let module = context.module(location).unwrap();
+        let token_type = context.stable_hlo_token_type().unwrap();
         let i64_type = context.signless_integer_type(64);
         let tensor_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type.as_ref(), location), (token_type.as_ref(), location)]);
-            let op = outfeed(&[block.argument(0).unwrap()], block.argument(1).unwrap(), "config", location);
-            assert_eq!(op.outfeed_config().as_str().unwrap(), "config");
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "test_outfeed",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), token_type.into()],
-                    results: vec![token_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type.as_ref(), location), (token_type.as_ref(), location)]);
+                let op =
+                    outfeed(&[block.argument(0).unwrap()], block.argument(1).unwrap(), "config", location).unwrap();
+                assert_eq!(op.outfeed_config().unwrap().as_str().unwrap(), "config");
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_outfeed",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), token_type.into()],
+                        results: vec![token_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1649,28 +1654,46 @@ mod tests {
     fn test_infeed() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let token_type = context.stable_hlo_token_type();
+        let module = context.module(location).unwrap();
+        let token_type = context.stable_hlo_token_type().unwrap();
         let i64_type = context.signless_integer_type(64);
         let tensor_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(token_type, location)]);
-            let op = infeed(block.argument(0).unwrap(), "config", &[tensor_type], location);
-            assert_eq!(op.infeed_config().as_str().unwrap(), "config");
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(op.results().collect::<Vec<_>>().as_slice(), location));
-            func::func(
-                "test_infeed",
-                func::FuncAttributes {
-                    arguments: vec![token_type.into()],
-                    results: vec![tensor_type.into(), token_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(token_type, location)]);
+                let op = infeed(block.argument(0).unwrap(), "config", &[tensor_type], location).unwrap();
+                assert_eq!(op.infeed_config().unwrap().as_str().unwrap(), "config");
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(
+                        func::r#return(
+                            op.results()
+                                .collect::<Result<Vec<_>, _>>()
+                                .unwrap()
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                func::func(
+                    "test_infeed",
+                    func::FuncAttributes {
+                        arguments: vec![token_type.into()],
+                        results: vec![tensor_type.into(), token_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1690,43 +1713,49 @@ mod tests {
     fn test_all_gather() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let input_tensor_type =
             context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
         let output_tensor_type =
             context.tensor_type(i64_type, &[Size::Static(2), Size::Static(4)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_tensor_type, location)]);
-            let op = all_gather(
-                &[block.argument(0).unwrap()],
-                1,
-                ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
-                Some(0),
-                Some(ChannelHandleType::DeviceToDevice),
-                true,
-                &[output_tensor_type],
-                location,
-            );
-            assert_eq!(op.all_gather_dimension(), 1);
-            assert_eq!(op.replica_groups(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]]));
-            assert_eq!(op.channel_id(), Some(0));
-            assert_eq!(op.channel_type(), Some(ChannelHandleType::DeviceToDevice));
-            assert!(op.use_global_device_ids());
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "test_all_gather",
-                func::FuncAttributes {
-                    arguments: vec![input_tensor_type.into()],
-                    results: vec![output_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_tensor_type, location)]);
+                let op = all_gather(
+                    &[block.argument(0).unwrap()],
+                    1,
+                    ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
+                    Some(0),
+                    Some(ChannelHandleType::DeviceToDevice),
+                    true,
+                    &[output_tensor_type],
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.all_gather_dimension().unwrap(), 1);
+                assert_eq!(op.replica_groups().unwrap(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]]));
+                assert_eq!(op.channel_id().unwrap(), Some(0));
+                assert_eq!(op.channel_type().unwrap(), Some(ChannelHandleType::DeviceToDevice));
+                assert!(op.use_global_device_ids());
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_all_gather",
+                    func::FuncAttributes {
+                        arguments: vec![input_tensor_type.into()],
+                        results: vec![output_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1745,44 +1774,51 @@ mod tests {
         );
 
         // Test using mesh axis replica groups.
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let input_tensor_type =
             context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
         let output_tensor_type =
             context.tensor_type(i64_type, &[Size::Static(2), Size::Static(4)], None, location).unwrap();
-        let mesh_axis_x = context.stable_hlo_mesh_axis("x", 2);
-        let mesh_axis_y = context.stable_hlo_mesh_axis("y", 2);
-        let mesh = context.stable_hlo_mesh(context.array_attribute(&[mesh_axis_x, mesh_axis_y]), None);
-        let replica_axis = context.stable_hlo_axis_ref("x", None);
-        let replica_groups = context.stable_hlo_replica_group_mesh_axes(mesh, context.array_attribute(&[replica_axis]));
-        module.body().append_operation({
-            let mut block = context.block(&[(input_tensor_type, location)]);
-            let op = all_gather(
-                &[block.argument(0).unwrap()],
-                1,
-                replica_groups.into(),
-                None,
-                None,
-                false,
-                &[output_tensor_type],
-                location,
-            );
-            assert_eq!(op.replica_groups(), ReplicaGroups::MeshAxes(replica_groups));
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "test_all_gather_with_mesh_axis_replica_groups",
-                func::FuncAttributes {
-                    arguments: vec![input_tensor_type.into()],
-                    results: vec![output_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let mesh_axis_x = context.stable_hlo_mesh_axis("x", 2).unwrap();
+        let mesh_axis_y = context.stable_hlo_mesh_axis("y", 2).unwrap();
+        let mesh = context.stable_hlo_mesh(context.array_attribute(&[mesh_axis_x, mesh_axis_y]), None).unwrap();
+        let replica_axis = context.stable_hlo_axis_ref("x", None).unwrap();
+        let replica_groups =
+            context.stable_hlo_replica_group_mesh_axes(mesh, context.array_attribute(&[replica_axis])).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_tensor_type, location)]);
+                let op = all_gather(
+                    &[block.argument(0).unwrap()],
+                    1,
+                    replica_groups.into(),
+                    None,
+                    None,
+                    false,
+                    &[output_tensor_type],
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.replica_groups().unwrap(), ReplicaGroups::MeshAxes(replica_groups));
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_all_gather_with_mesh_axis_replica_groups",
+                    func::FuncAttributes {
+                        arguments: vec![input_tensor_type.into()],
+                        results: vec![output_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1806,51 +1842,60 @@ mod tests {
     fn test_all_reduce() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
         let scalar_tensor_type = context.tensor_type(f32_type, &[], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let mut computation_region = context.region();
-            let mut computation_block =
-                context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
-            let add_op = stable_hlo::add(
-                computation_block.argument(0).unwrap(),
-                computation_block.argument(1).unwrap(),
-                location,
-            );
-            let add_op = computation_block.append_operation(add_op);
-            computation_block.append_operation(stable_hlo::r#return(&[add_op.result(0).unwrap()], location));
-            computation_region.append_block(computation_block);
-            let computation = computation_region.into();
-            let op = all_reduce(
-                &[block.argument(0).unwrap()],
-                ReplicaGroups::dense(&[&[0, 2], &[1]]),
-                Some(1),
-                Some(ChannelHandleType::DeviceToDevice),
-                true,
-                computation,
-                location,
-            );
-            assert_eq!(op.replica_groups(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1]]));
-            assert_eq!(op.channel_id(), Some(1));
-            assert_eq!(op.channel_type(), Some(ChannelHandleType::DeviceToDevice));
-            assert!(op.use_global_device_ids());
-            let result = block.append_operation(op);
-            block.append_operation(func::r#return(&[result.result(0).unwrap()], location));
-            func::func(
-                "test_all_reduce",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let mut computation_region = context.region();
+                let mut computation_block =
+                    context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
+                let add_op = stable_hlo::add(
+                    computation_block.argument(0).unwrap(),
+                    computation_block.argument(1).unwrap(),
+                    location,
+                )
+                .unwrap();
+                let add_op = computation_block.append_operation(add_op).unwrap();
+                computation_block
+                    .append_operation(stable_hlo::r#return(&[add_op.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                computation_region.append_block(computation_block).unwrap();
+                let computation = computation_region.into();
+                let op = all_reduce(
+                    &[block.argument(0).unwrap()],
+                    ReplicaGroups::dense(&[&[0, 2], &[1]]),
+                    Some(1),
+                    Some(ChannelHandleType::DeviceToDevice),
+                    true,
+                    computation,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.replica_groups().unwrap(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1]]));
+                assert_eq!(op.channel_id().unwrap(), Some(1));
+                assert_eq!(op.channel_type().unwrap(), Some(ChannelHandleType::DeviceToDevice));
+                assert!(op.use_global_device_ids());
+                let result = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[result.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_all_reduce",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1876,45 +1921,51 @@ mod tests {
     fn test_all_to_all() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let input_tensor_type =
             context.tensor_type(i64_type, &[Size::Static(2), Size::Static(4)], None, location).unwrap();
         let output_tensor_type =
             context.tensor_type(i64_type, &[Size::Static(4), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_tensor_type, location)]);
-            let op = all_to_all(
-                &[block.argument(0).unwrap()],
-                1,
-                2,
-                0,
-                ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
-                Some(1),
-                Some(ChannelHandleType::DeviceToDevice),
-                true,
-                location,
-            );
-            assert_eq!(op.split_dimension(), 1);
-            assert_eq!(op.split_count(), 2);
-            assert_eq!(op.concatenation_dimension(), 0);
-            assert_eq!(op.replica_groups(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]]));
-            assert_eq!(op.channel_id(), Some(1));
-            assert_eq!(op.channel_type(), Some(ChannelHandleType::DeviceToDevice));
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "test_all_to_all",
-                func::FuncAttributes {
-                    arguments: vec![input_tensor_type.into()],
-                    results: vec![output_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_tensor_type, location)]);
+                let op = all_to_all(
+                    &[block.argument(0).unwrap()],
+                    1,
+                    2,
+                    0,
+                    ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
+                    Some(1),
+                    Some(ChannelHandleType::DeviceToDevice),
+                    true,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.split_dimension().unwrap(), 1);
+                assert_eq!(op.split_count().unwrap(), 2);
+                assert_eq!(op.concatenation_dimension().unwrap(), 0);
+                assert_eq!(op.replica_groups().unwrap(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]]));
+                assert_eq!(op.channel_id().unwrap(), Some(1));
+                assert_eq!(op.channel_type().unwrap(), Some(ChannelHandleType::DeviceToDevice));
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_all_to_all",
+                    func::FuncAttributes {
+                        arguments: vec![input_tensor_type.into()],
+                        results: vec![output_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1938,35 +1989,41 @@ mod tests {
     fn test_collective_broadcast() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let tensor_type = context.tensor_type(i64_type, &[Size::Static(1), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let op = collective_broadcast(
-                block.argument(0).unwrap(),
-                ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
-                Some(1),
-                Some(ChannelHandleType::DeviceToDevice),
-                location,
-            );
-            assert_eq!(op.replica_groups(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]]));
-            assert_eq!(op.channel_id(), Some(1));
-            assert_eq!(op.channel_type(), Some(ChannelHandleType::DeviceToDevice));
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "test_collective_broadcast",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let op = collective_broadcast(
+                    block.argument(0).unwrap(),
+                    ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
+                    Some(1),
+                    Some(ChannelHandleType::DeviceToDevice),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.replica_groups().unwrap(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]]));
+                assert_eq!(op.channel_id().unwrap(), Some(1));
+                assert_eq!(op.channel_type().unwrap(), Some(ChannelHandleType::DeviceToDevice));
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_collective_broadcast",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1987,35 +2044,41 @@ mod tests {
     fn test_collective_permute() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let tensor_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let op = collective_permute(
-                block.argument(0).unwrap(),
-                &[(0, 1), (1, 2)],
-                Some(0),
-                Some(ChannelHandleType::DeviceToDevice),
-                location,
-            );
-            assert_eq!(op.source_target_pairs(), vec![(0, 1), (1, 2)]);
-            assert_eq!(op.channel_id(), Some(0));
-            assert_eq!(op.channel_type(), Some(ChannelHandleType::DeviceToDevice));
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "test_collective_permute",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let op = collective_permute(
+                    block.argument(0).unwrap(),
+                    &[(0, 1), (1, 2)],
+                    Some(0),
+                    Some(ChannelHandleType::DeviceToDevice),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.source_target_pairs().unwrap(), vec![(0, 1), (1, 2)]);
+                assert_eq!(op.channel_id().unwrap(), Some(0));
+                assert_eq!(op.channel_type().unwrap(), Some(ChannelHandleType::DeviceToDevice));
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_collective_permute",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2036,56 +2099,67 @@ mod tests {
     fn test_reduce_scatter() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let input_type = context.tensor_type(i32_type, &[Size::Static(2), Size::Static(4)], None, location).unwrap();
         let initial_value_type = context.tensor_type(i32_type, &[], None, location).unwrap();
         let output_type = context.tensor_type(i32_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location)]);
-            let input = block.argument(0).unwrap();
-            let mut region = context.region();
-            let mut region_block = context.block(&[(initial_value_type, location), (initial_value_type, location)]);
-            let lhs = region_block.argument(0).unwrap();
-            let rhs = region_block.argument(1).unwrap();
-            let add_op = stable_hlo::add(lhs, rhs, location);
-            let add_op = region_block.append_operation(add_op);
-            let return_op = stable_hlo::r#return(&[add_op.result(0).unwrap()], location);
-            region_block.append_operation(return_op);
-            region.append_block(region_block);
-            let reduce_scatter_op = reduce_scatter(
-                input,
-                1,
-                ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
-                Some(1),
-                Some(ChannelHandleType::DeviceToDevice),
-                false,
-                region.into(),
-                output_type,
-                location,
-            );
-            assert_eq!(reduce_scatter_op.dimension(), 1);
-            assert_eq!(reduce_scatter_op.replica_groups(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]]));
-            assert_eq!(reduce_scatter_op.channel_id(), Some(1));
-            assert_eq!(reduce_scatter_op.channel_type(), Some(ChannelHandleType::DeviceToDevice));
-            assert_eq!(reduce_scatter_op.use_global_device_ids(), false);
-            assert_eq!(reduce_scatter_op.computation().blocks().count(), 1);
-            assert_eq!(reduce_scatter_op.operands().count(), 1);
-            assert_eq!(reduce_scatter_op.results().count(), 1);
-            let reduce_scatter_op = block.append_operation(reduce_scatter_op);
-            block.append_operation(func::r#return(&[reduce_scatter_op.result(0).unwrap()], location));
-            func::func(
-                "reduce_scatter_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location)]);
+                let input = block.argument(0).unwrap();
+                let mut region = context.region();
+                let mut region_block = context.block(&[(initial_value_type, location), (initial_value_type, location)]);
+                let lhs = region_block.argument(0).unwrap();
+                let rhs = region_block.argument(1).unwrap();
+                let add_op = stable_hlo::add(lhs, rhs, location).unwrap();
+                let add_op = region_block.append_operation(add_op).unwrap();
+                let return_op = stable_hlo::r#return(&[add_op.result(0).unwrap()], location).unwrap();
+                region_block.append_operation(return_op).unwrap();
+                region.append_block(region_block).unwrap();
+                let reduce_scatter_op = reduce_scatter(
+                    input,
+                    1,
+                    ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
+                    Some(1),
+                    Some(ChannelHandleType::DeviceToDevice),
+                    false,
+                    region.into(),
+                    output_type,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(reduce_scatter_op.dimension().unwrap(), 1);
+                assert_eq!(
+                    reduce_scatter_op.replica_groups().unwrap(),
+                    ReplicaGroups::Dense(vec![vec![0, 2], vec![1, 3]])
+                );
+                assert_eq!(reduce_scatter_op.channel_id().unwrap(), Some(1));
+                assert_eq!(reduce_scatter_op.channel_type().unwrap(), Some(ChannelHandleType::DeviceToDevice));
+                assert_eq!(reduce_scatter_op.use_global_device_ids(), false);
+                assert_eq!(reduce_scatter_op.computation().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(reduce_scatter_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(reduce_scatter_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let reduce_scatter_op = block.append_operation(reduce_scatter_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[reduce_scatter_op.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "reduce_scatter_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

@@ -11,7 +11,7 @@ use ryft_xla_sys::bindings::{
     mlirSimplifyAffineExpr,
 };
 
-use crate::{AffineMap, Context, mlir_subtype_trait_impls};
+use crate::{AffineMap, Context, Error, mlir_subtype_trait_impls};
 
 /// [`AffineExpression`]s are used to represent the mathematical functions that define [`AffineMap`]s.
 ///
@@ -24,7 +24,7 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Option<Self>;
+    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Result<Self, Error>;
 
     /// Returns the [`MlirAffineExpr`] that corresponds to this instance and which can be passed to functions
     /// in the MLIR C API.
@@ -46,12 +46,12 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     /// Tries to cast this type to an instance of `A` (e.g., an instance of [`ConstantAffineExpressionRef`]).
     /// If this is not an instance of the specified type, this function will return [`None`].
     fn cast<A: AffineExpression<'c, 't>>(&self) -> Option<A> {
-        unsafe { A::from_c_api(self.to_c_api(), self.context()) }
+        unsafe { A::from_c_api(self.to_c_api(), self.context()).ok() }
     }
 
     /// Up-casts this affine expression to an instance of [`AffineExpression`].
     fn as_ref(&self) -> AffineExpressionRef<'c, 't> {
-        unsafe { AffineExpressionRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
+        AffineExpressionRef { handle: unsafe { self.to_c_api() }, context: self.context() }
     }
 
     /// Returns `true` if this expression is made out of only symbols and constants (i.e., it does not involve any
@@ -97,26 +97,18 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
         dimension_count: usize,
         shift: usize,
     ) -> AffineExpressionRef<'c, 't> {
-        unsafe {
-            AffineExpressionRef::from_c_api(
-                mlirAffineExprShiftDims(self.to_c_api(), dimension_count as u32, shift as u32, offset as u32),
-                self.context(),
-            )
-            .unwrap()
-        }
+        let handle =
+            unsafe { mlirAffineExprShiftDims(self.to_c_api(), dimension_count as u32, shift as u32, offset as u32) };
+        AffineExpressionRef { handle, context: self.context() }
     }
 
     /// Returns a new [`AffineExpression`] that is the same as this one but with some of its
     /// [`SymbolAffineExpressionRef`]s shifted by `shift`. Specifically, all [`SymbolAffineExpressionRef`]s for symbols
     /// in the range `[offset, symbol_count)` are shifted by `shift`.
     fn with_shifted_symbols(&self, offset: usize, symbol_count: usize, shift: usize) -> AffineExpressionRef<'c, 't> {
-        unsafe {
-            AffineExpressionRef::from_c_api(
-                mlirAffineExprShiftSymbols(self.to_c_api(), symbol_count as u32, shift as u32, offset as u32),
-                self.context(),
-            )
-            .unwrap()
-        }
+        let handle =
+            unsafe { mlirAffineExprShiftSymbols(self.to_c_api(), symbol_count as u32, shift as u32, offset as u32) };
+        AffineExpressionRef { handle, context: self.context() }
     }
 
     /// Returns a new [`ModAffineExpressionRef`]that represents the application of the modulus operator
@@ -162,10 +154,8 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     /// Composed Expression: `d0 * 2 + d1 + d2 + s1`
     /// ```
     fn compose(&self, map: AffineMap<'c, 't>) -> AffineExpressionRef<'c, 't> {
-        unsafe {
-            AffineExpressionRef::from_c_api(mlirAffineExprCompose(self.to_c_api(), map.to_c_api()), self.context())
-                .unwrap()
-        }
+        let handle = unsafe { mlirAffineExprCompose(self.to_c_api(), map.to_c_api()) };
+        AffineExpressionRef { handle, context: self.context() }
     }
 
     /// Simplifies this affine expression by flattening it and performing some amount of simple analysis, returning the
@@ -173,13 +163,8 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     /// this expression is a semi-affine expression, then a simplified semi-affine expression will be constructed with
     /// a sorted list of dimensions and symbols.
     fn simplify(&self, dimension_count: usize, symbol_count: usize) -> AffineExpressionRef<'c, 't> {
-        unsafe {
-            AffineExpressionRef::from_c_api(
-                mlirSimplifyAffineExpr(self.to_c_api(), dimension_count as u32, symbol_count as u32),
-                self.context(),
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirSimplifyAffineExpr(self.to_c_api(), dimension_count as u32, symbol_count as u32) };
+        AffineExpressionRef { handle, context: self.context() }
     }
 }
 
@@ -215,8 +200,12 @@ pub struct AffineExpressionRef<'c, 't> {
 }
 
 impl<'c, 't> AffineExpression<'c, 't> for AffineExpressionRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR affine expression handle"))
+        } else {
+            Ok(Self { handle, context })
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAffineExpr {
@@ -263,13 +252,8 @@ mlir_affine_expression_operator_impls!(DimensionAffineExpressionRef);
 impl<'t> Context<'t> {
     /// Creates a new [`DimensionAffineExpressionRef`] with the specified position.
     pub fn dimension_affine_expression<'c>(&'c self, position: usize) -> DimensionAffineExpressionRef<'c, 't> {
-        unsafe {
-            DimensionAffineExpressionRef::from_c_api(
-                mlirAffineDimExprGet(*self.handle.borrow_mut(), position.cast_signed()),
-                self,
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirAffineDimExprGet(*self.handle.borrow_mut(), position.cast_signed()) };
+        DimensionAffineExpressionRef { handle, context: self }
     }
 }
 
@@ -304,13 +288,8 @@ mlir_affine_expression_operator_impls!(SymbolAffineExpressionRef);
 impl<'t> Context<'t> {
     /// Creates a new [`SymbolAffineExpressionRef`] with the specified position.
     pub fn symbol_affine_expression<'c>(&'c self, position: usize) -> SymbolAffineExpressionRef<'c, 't> {
-        unsafe {
-            SymbolAffineExpressionRef::from_c_api(
-                mlirAffineSymbolExprGet(*self.handle.borrow_mut(), position.cast_signed()),
-                self,
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirAffineSymbolExprGet(*self.handle.borrow_mut(), position.cast_signed()) };
+        SymbolAffineExpressionRef { handle, context: self }
     }
 }
 
@@ -345,10 +324,8 @@ mlir_affine_expression_operator_impls!(ConstantAffineExpressionRef);
 impl<'t> Context<'t> {
     /// Creates a new [`ConstantAffineExpressionRef`] with the specified value.
     pub fn constant_affine_expression<'c>(&'c self, value: i64) -> ConstantAffineExpressionRef<'c, 't> {
-        unsafe {
-            ConstantAffineExpressionRef::from_c_api(mlirAffineConstantExprGet(*self.handle.borrow_mut(), value), self)
-                .unwrap()
-        }
+        let handle = unsafe { mlirAffineConstantExprGet(*self.handle.borrow_mut(), value) };
+        ConstantAffineExpressionRef { handle, context: self }
     }
 }
 
@@ -370,12 +347,14 @@ pub struct BinaryOperationAffineExpressionRef<'c, 't> {
 impl<'c, 't> BinaryOperationAffineExpressionRef<'c, 't> {
     /// Returns the left-hand side (LHS) operand of this [`BinaryOperationAffineExpressionRef`].
     pub fn lhs_operand(&self) -> AffineExpressionRef<'c, 't> {
-        unsafe { AffineExpressionRef::from_c_api(mlirAffineBinaryOpExprGetLHS(self.handle), self.context).unwrap() }
+        let handle = unsafe { mlirAffineBinaryOpExprGetLHS(self.handle) };
+        AffineExpressionRef { handle, context: self.context }
     }
 
     /// Returns the right-hand side (RHS) operand of this [`BinaryOperationAffineExpressionRef`].
     pub fn rhs_operand(&self) -> AffineExpressionRef<'c, 't> {
-        unsafe { AffineExpressionRef::from_c_api(mlirAffineBinaryOpExprGetRHS(self.handle), self.context).unwrap() }
+        let handle = unsafe { mlirAffineBinaryOpExprGetRHS(self.handle) };
+        AffineExpressionRef { handle, context: self.context }
     }
 }
 
@@ -403,10 +382,8 @@ pub struct AddAffineExpressionRef<'c, 't> {
 impl<'c, 't> AddAffineExpressionRef<'c, 't> {
     /// Creates a new [`AddAffineExpressionRef`] using the provided [`AffineExpression`]s as its operands.
     pub fn new<LHS: AffineExpression<'c, 't>, RHS: AffineExpression<'c, 't>>(lhs: LHS, rhs: RHS) -> Self {
-        unsafe {
-            AddAffineExpressionRef::from_c_api(mlirAffineAddExprGet(lhs.to_c_api(), rhs.to_c_api()), lhs.context())
-                .unwrap()
-        }
+        let handle = unsafe { mlirAffineAddExprGet(lhs.to_c_api(), rhs.to_c_api()) };
+        AddAffineExpressionRef { handle, context: lhs.context() }
     }
 }
 
@@ -434,10 +411,8 @@ pub struct MulAffineExpressionRef<'c, 't> {
 impl<'c, 't> MulAffineExpressionRef<'c, 't> {
     /// Creates a new [`MulAffineExpressionRef`] using the provided [`AffineExpression`]s as its operands.
     pub fn new<LHS: AffineExpression<'c, 't>, RHS: AffineExpression<'c, 't>>(lhs: LHS, rhs: RHS) -> Self {
-        unsafe {
-            MulAffineExpressionRef::from_c_api(mlirAffineMulExprGet(lhs.to_c_api(), rhs.to_c_api()), lhs.context())
-                .unwrap()
-        }
+        let handle = unsafe { mlirAffineMulExprGet(lhs.to_c_api(), rhs.to_c_api()) };
+        MulAffineExpressionRef { handle, context: lhs.context() }
     }
 }
 
@@ -465,10 +440,8 @@ pub struct ModAffineExpressionRef<'c, 't> {
 impl<'c, 't> ModAffineExpressionRef<'c, 't> {
     /// Creates a new [`ModAffineExpressionRef`]using the provided [`AffineExpression`]s as its operands.
     pub fn new<LHS: AffineExpression<'c, 't>, RHS: AffineExpression<'c, 't>>(lhs: LHS, rhs: RHS) -> Self {
-        unsafe {
-            ModAffineExpressionRef::from_c_api(mlirAffineModExprGet(lhs.to_c_api(), rhs.to_c_api()), lhs.context())
-                .unwrap()
-        }
+        let handle = unsafe { mlirAffineModExprGet(lhs.to_c_api(), rhs.to_c_api()) };
+        ModAffineExpressionRef { handle, context: lhs.context() }
     }
 }
 
@@ -497,22 +470,19 @@ pub struct FloorDivAffineExpressionRef<'c, 't> {
 impl<'c, 't> FloorDivAffineExpressionRef<'c, 't> {
     /// Creates a new [`FloorDivAffineExpressionRef`] using the provided [`AffineExpression`]s as its operands.
     pub fn new<LHS: AffineExpression<'c, 't>, RHS: AffineExpression<'c, 't>>(lhs: LHS, rhs: RHS) -> Self {
-        unsafe {
-            FloorDivAffineExpressionRef::from_c_api(
-                mlirAffineFloorDivExprGet(lhs.to_c_api(), rhs.to_c_api()),
-                lhs.context(),
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirAffineFloorDivExprGet(lhs.to_c_api(), rhs.to_c_api()) };
+        Self { handle, context: lhs.context() }
     }
 }
 
 impl<'c, 't> AffineExpression<'c, 't> for FloorDivAffineExpressionRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirAffineExprIsAFloorDiv(handle) } {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAffineExpr, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR affine expression handle"))
+        } else if unsafe { mlirAffineExprIsAFloorDiv(handle) } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR floor-div affine expression handle"))
         }
     }
 
@@ -546,13 +516,8 @@ pub struct CeilDivAffineExpressionRef<'c, 't> {
 impl<'c, 't> CeilDivAffineExpressionRef<'c, 't> {
     /// Creates a new [`CeilDivAffineExpressionRef`] using the provided [`AffineExpression`]s as its operands.
     pub fn new<LHS: AffineExpression<'c, 't>, RHS: AffineExpression<'c, 't>>(lhs: LHS, rhs: RHS) -> Self {
-        unsafe {
-            CeilDivAffineExpressionRef::from_c_api(
-                mlirAffineCeilDivExprGet(lhs.to_c_api(), rhs.to_c_api()),
-                lhs.context(),
-            )
-            .unwrap()
-        }
+        let handle = unsafe { mlirAffineCeilDivExprGet(lhs.to_c_api(), rhs.to_c_api()) };
+        CeilDivAffineExpressionRef { handle, context: lhs.context() }
     }
 }
 
@@ -787,7 +752,7 @@ mod tests {
         assert_eq!(dimension_0_erased_casted, dimension_0);
         assert!(!symbol_0.is::<DimensionAffineExpressionRef>());
         let bad_handle = MlirAffineExpr { ptr: std::ptr::null() };
-        assert!(unsafe { AffineExpressionRef::from_c_api(bad_handle, &context).is_none() });
+        assert!(unsafe { AffineExpressionRef::from_c_api(bad_handle, &context).is_err() });
     }
 
     #[test]

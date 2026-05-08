@@ -18,7 +18,7 @@ use ryft_xla_sys::mlir::dialects::llvm::{
     mlirTypeIsALlvmTokenType, mlirTypeIsALlvmVoidType, mlirTypeIsALlvmX86AmxType,
 };
 
-use crate::{Context, DialectHandle, LogicalResult, StringRef, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
+use crate::{Context, DialectHandle, Error, LogicalResult, StringRef, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
 
 macro_rules! llvm_trivial_type {
     ($type_name:ident, $context_method:ident, $is_type:path, $get:path, $description:literal $(,)*) => {
@@ -35,14 +35,14 @@ macro_rules! llvm_trivial_type {
         }
 
         impl<'c, 't> Type<'c, 't> for $type_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR type handle"));
                 }
                 if unsafe { $is_type(handle) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR type handle"))
                 }
             }
 
@@ -61,12 +61,10 @@ macro_rules! llvm_trivial_type {
             #[doc = "Creates a new LLVM "]
             #[doc = $description]
             #[doc = " type owned by this [`Context`]."]
-            pub fn $context_method<'c>(&'c self) -> $type_name<'c, 't> {
-                self.load_dialect(DialectHandle::llvm());
-                unsafe {
-                    $type_name::from_c_api($get(*self.handle.borrow()), self)
-                        .expect(concat!("invalid LLVM ", $description, " type"))
-                }
+            pub fn $context_method<'c>(&'c self) -> Result<$type_name<'c, 't>, Error> {
+                self.load_dialect(DialectHandle::llvm()?)?;
+                unsafe { $type_name::from_c_api($get(*self.handle.borrow()), self) }
+                    .map_err(|_| Error::invalid_argument(concat!("invalid LLVM ", $description, " type")))
             }
         }
     };
@@ -89,8 +87,8 @@ pub struct PointerTypeRef<'c, 't> {
 
 impl PointerTypeRef<'_, '_> {
     /// Gets the [`TypeId`] that corresponds to [`PointerTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirLLVMPointerTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirLLVMPointerTypeGetTypeID()) }
     }
 
     /// Returns the address space of this pointer type.
@@ -100,11 +98,15 @@ impl PointerTypeRef<'_, '_> {
 }
 
 impl<'c, 't> Type<'c, 't> for PointerTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
-        if unsafe { mlirTypeIsALLVMPointerType(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirTypeIsALLVMPointerType(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR type handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -146,8 +148,8 @@ pub struct ArrayTypeRef<'c, 't> {
 
 impl<'c, 't> ArrayTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`ArrayTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirLLVMArrayTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirLLVMArrayTypeGetTypeID()) }
     }
 
     /// Returns the number of elements in this array type.
@@ -156,17 +158,22 @@ impl<'c, 't> ArrayTypeRef<'c, 't> {
     }
 
     /// Returns the element [`Type`] of this array type.
-    pub fn element_type(&self) -> TypeRef<'c, 't> {
-        unsafe { TypeRef::from_c_api(mlirLLVMArrayTypeGetElementType(self.handle), self.context).unwrap() }
+    pub fn element_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        unsafe { TypeRef::from_c_api(mlirLLVMArrayTypeGetElementType(self.handle), self.context) }
+            .map_err(|_| Error::internal("invalid LLVM array element type"))
     }
 }
 
 impl<'c, 't> Type<'c, 't> for ArrayTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
-        if unsafe { mlirTypeIsALLVMArrayType(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirTypeIsALLVMArrayType(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR type handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -197,14 +204,13 @@ pub struct FunctionTypeRef<'c, 't> {
 
 impl<'c, 't> FunctionTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`FunctionTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirLLVMFunctionTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirLLVMFunctionTypeGetTypeID()) }
     }
 
     /// Returns the number of input parameters of this function type.
     pub fn input_count(&self) -> usize {
-        usize::try_from(unsafe { mlirLLVMFunctionTypeGetNumInputs(self.handle) })
-            .expect("invalid `!llvm.func` input count")
+        unsafe { mlirLLVMFunctionTypeGetNumInputs(self.handle) }.cast_unsigned()
     }
 
     /// Returns `true` if this function type accepts a variadic argument tail.
@@ -213,32 +219,43 @@ impl<'c, 't> FunctionTypeRef<'c, 't> {
     }
 
     /// Returns the input parameter [`Type`]s of this function type.
-    pub fn inputs(&self) -> impl Iterator<Item = TypeRef<'c, 't>> {
-        (0..self.input_count()).map(|index| self.input(index))
+    pub fn inputs(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
+        (0..self.input_count()).map(|index| {
+            unsafe { TypeRef::from_c_api(mlirLLVMFunctionTypeGetInput(self.handle, index.cast_signed()), self.context) }
+                .map_err(|_| Error::internal("invalid LLVM function input type"))
+        })
     }
 
-    /// Returns the `index`-th input parameter [`Type`] of this function type.
-    pub fn input(&self, index: usize) -> TypeRef<'c, 't> {
-        if index >= self.input_count() {
-            panic!("LLVM function type input index is out of bounds");
+    /// Returns the `index`-th input parameter [`Type`] of this function type, or an error if the index is out of
+    /// bounds.
+    pub fn input(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        let input_count = self.input_count();
+        if index >= input_count {
+            return Err(Error::invalid_argument(format!(
+                "llvm function type input index {index} is out of bounds for input count {input_count}"
+            )));
         }
-        unsafe {
-            TypeRef::from_c_api(mlirLLVMFunctionTypeGetInput(self.handle, index.cast_signed()), self.context).unwrap()
-        }
+        unsafe { TypeRef::from_c_api(mlirLLVMFunctionTypeGetInput(self.handle, index.cast_signed()), self.context) }
+            .map_err(|_| Error::internal("invalid LLVM function input type"))
     }
 
     /// Returns the return [`Type`] of this function type.
-    pub fn return_type(&self) -> TypeRef<'c, 't> {
-        unsafe { TypeRef::from_c_api(mlirLLVMFunctionTypeGetReturnType(self.handle), self.context).unwrap() }
+    pub fn return_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        unsafe { TypeRef::from_c_api(mlirLLVMFunctionTypeGetReturnType(self.handle), self.context) }
+            .map_err(|_| Error::internal("invalid LLVM function return type"))
     }
 }
 
 impl<'c, 't> Type<'c, 't> for FunctionTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
-        if unsafe { mlirTypeIsALLVMFunctionType(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirTypeIsALLVMFunctionType(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR type handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -270,8 +287,8 @@ pub struct StructTypeRef<'c, 't> {
 
 impl<'c, 't> StructTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`StructTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirLLVMStructTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirLLVMStructTypeGetTypeID()) }
     }
 
     /// Returns `true` if this struct type is literal rather than identified.
@@ -308,28 +325,38 @@ impl<'c, 't> StructTypeRef<'c, 't> {
         if self.is_opaque() {
             None
         } else {
-            Some(
-                usize::try_from(unsafe { mlirLLVMStructTypeGetNumElementTypes(self.handle) })
-                    .expect("invalid `!llvm.struct` element count"),
-            )
+            Some(unsafe { mlirLLVMStructTypeGetNumElementTypes(self.handle) }.cast_unsigned())
         }
     }
 
     /// Returns the body element [`Type`]s of this struct type.
-    pub fn element_types(&self) -> Option<impl Iterator<Item = TypeRef<'c, 't>>> {
-        self.element_count().map(|element_count| (0..element_count).map(|index| self.element_type(index)))
+    pub fn element_types(&self) -> Option<impl Iterator<Item = Result<TypeRef<'c, 't>, Error>>> {
+        self.element_count().map(|element_count| {
+            (0..element_count).map(|index| {
+                unsafe {
+                    TypeRef::from_c_api(
+                        mlirLLVMStructTypeGetElementType(self.handle, index.cast_signed()),
+                        self.context,
+                    )
+                }
+                .map_err(|_| Error::internal("invalid LLVM struct element type"))
+            })
+        })
     }
 
-    /// Returns the `index`-th body element [`Type`] of this struct type.
-    pub fn element_type(&self, index: usize) -> TypeRef<'c, 't> {
-        let element_count = self.element_count().expect("opaque `!llvm.struct` does not have body elements");
+    /// Returns the `index`-th body element [`Type`] of this struct type, or an error if the struct is opaque or the
+    /// index is out of bounds.
+    pub fn element_type(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        let Some(element_count) = self.element_count() else {
+            return Err(Error::invalid_argument("opaque `!llvm.struct` does not have body elements"));
+        };
         if index >= element_count {
-            panic!("LLVM struct type element index is out of bounds");
+            return Err(Error::invalid_argument(format!(
+                "llvm struct type element index {index} is out of bounds for element count {element_count}"
+            )));
         }
-        unsafe {
-            TypeRef::from_c_api(mlirLLVMStructTypeGetElementType(self.handle, index.cast_signed()), self.context)
-                .unwrap()
-        }
+        unsafe { TypeRef::from_c_api(mlirLLVMStructTypeGetElementType(self.handle, index.cast_signed()), self.context) }
+            .map_err(|_| Error::internal("invalid LLVM struct element type"))
     }
 
     /// Sets the body of this identified struct type if MLIR allows it.
@@ -348,11 +375,15 @@ impl<'c, 't> StructTypeRef<'c, 't> {
 }
 
 impl<'c, 't> Type<'c, 't> for StructTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
-        if unsafe { mlirTypeIsALLVMStructType(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirTypeIsALLVMStructType(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR type handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -389,52 +420,68 @@ impl<'c, 't> TargetExtTypeRef<'c, 't> {
 
     /// Returns the number of type parameters.
     pub fn type_parameter_count(&self) -> usize {
-        usize::try_from(unsafe { mlirLlvmTargetExtTypeGetNumTypeParams(self.handle) })
-            .expect("invalid `!llvm.target` type parameter count")
+        unsafe { mlirLlvmTargetExtTypeGetNumTypeParams(self.handle) }.cast_unsigned()
     }
 
     /// Returns the type parameters.
-    pub fn type_parameters(&self) -> impl Iterator<Item = TypeRef<'c, 't>> {
-        (0..self.type_parameter_count()).map(|index| self.type_parameter(index))
+    pub fn type_parameters(&self) -> impl Iterator<Item = Result<TypeRef<'c, 't>, Error>> {
+        (0..self.type_parameter_count()).map(|index| {
+            unsafe {
+                TypeRef::from_c_api(mlirLlvmTargetExtTypeGetTypeParam(self.handle, index.cast_signed()), self.context)
+            }
+            .map_err(|_| Error::internal("invalid LLVM target extension type parameter"))
+        })
     }
 
-    /// Returns the `index`-th type parameter.
-    pub fn type_parameter(&self, index: usize) -> TypeRef<'c, 't> {
-        if index >= self.type_parameter_count() {
-            panic!("LLVM target extension type parameter index is out of bounds");
+    /// Returns the `index`-th type parameter, or an error if the index is out of bounds.
+    pub fn type_parameter(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        let type_parameter_count = self.type_parameter_count();
+        if index >= type_parameter_count {
+            return Err(Error::invalid_argument(format!(
+                "llvm target extension type parameter index {index} is out of bounds for type parameter count \
+                 {type_parameter_count}"
+            )));
         }
         unsafe {
             TypeRef::from_c_api(mlirLlvmTargetExtTypeGetTypeParam(self.handle, index.cast_signed()), self.context)
-                .expect("invalid `!llvm.target` type parameter")
         }
+        .map_err(|_| Error::internal("invalid LLVM target extension type parameter"))
     }
 
     /// Returns the number of integer parameters.
     pub fn integer_parameter_count(&self) -> usize {
-        usize::try_from(unsafe { mlirLlvmTargetExtTypeGetNumIntParams(self.handle) })
-            .expect("invalid `!llvm.target` integer parameter count")
+        unsafe { mlirLlvmTargetExtTypeGetNumIntParams(self.handle) }.cast_unsigned()
     }
 
     /// Returns the integer parameters.
     pub fn integer_parameters(&self) -> impl Iterator<Item = u32> {
-        (0..self.integer_parameter_count()).map(|index| self.integer_parameter(index))
+        (0..self.integer_parameter_count())
+            .map(|index| unsafe { mlirLlvmTargetExtTypeGetIntParam(self.handle, index.cast_signed()) })
     }
 
-    /// Returns the `index`-th integer parameter.
-    pub fn integer_parameter(&self, index: usize) -> u32 {
-        if index >= self.integer_parameter_count() {
-            panic!("LLVM target extension integer parameter index is out of bounds");
+    /// Returns the `index`-th integer parameter, or an error if the index is out of bounds.
+    pub fn integer_parameter(&self, index: usize) -> Result<u32, Error> {
+        let integer_parameter_count = self.integer_parameter_count();
+        if index >= integer_parameter_count {
+            return Err(Error::invalid_argument(format!(
+                "llvm target extension integer parameter index {index} is out of bounds for integer parameter count \
+                 {integer_parameter_count}"
+            )));
         }
-        unsafe { mlirLlvmTargetExtTypeGetIntParam(self.handle, index.cast_signed()) }
+        Ok(unsafe { mlirLlvmTargetExtTypeGetIntParam(self.handle, index.cast_signed()) })
     }
 }
 
 impl<'c, 't> Type<'c, 't> for TargetExtTypeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR type handle"));
         }
-        if unsafe { mlirTypeIsALlvmTargetExtType(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirTypeIsALlvmTargetExtType(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR type handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirType {
@@ -459,27 +506,23 @@ llvm_trivial_type!(
 
 impl<'t> Context<'t> {
     /// Creates a new LLVM [`PointerTypeRef`] owned by this [`Context`].
-    pub fn llvm_pointer_type<'c>(&'c self, address_space: u32) -> PointerTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
-        unsafe {
-            PointerTypeRef::from_c_api(mlirLLVMPointerTypeGet(*self.handle.borrow(), address_space), self)
-                .expect("invalid LLVM pointer type")
-        }
+    pub fn llvm_pointer_type<'c>(&'c self, address_space: u32) -> Result<PointerTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
+        unsafe { PointerTypeRef::from_c_api(mlirLLVMPointerTypeGet(*self.handle.borrow(), address_space), self) }
+            .map_err(|_| Error::invalid_argument("invalid LLVM pointer type"))
     }
 
     /// Creates a new LLVM [`ArrayTypeRef`] owned by this [`Context`].
-    pub fn llvm_array_type<'c, T: Type<'c, 't>>(&'c self, element_type: T, element_count: u64) -> ArrayTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
-        unsafe {
-            ArrayTypeRef::from_c_api(
-                mlirLLVMArrayTypeGet(
-                    element_type.to_c_api(),
-                    u32::try_from(element_count).expect("invalid LLVM array element count"),
-                ),
-                self,
-            )
-            .expect("invalid LLVM array type")
-        }
+    pub fn llvm_array_type<'c, T: Type<'c, 't>>(
+        &'c self,
+        element_type: T,
+        element_count: u64,
+    ) -> Result<ArrayTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
+        let element_count =
+            u32::try_from(element_count).map_err(|_| Error::invalid_argument("invalid LLVM array element count"))?;
+        unsafe { ArrayTypeRef::from_c_api(mlirLLVMArrayTypeGet(element_type.to_c_api(), element_count), self) }
+            .map_err(|_| Error::invalid_argument("invalid LLVM array type"))
     }
 
     /// Creates a new LLVM [`FunctionTypeRef`] owned by this [`Context`].
@@ -488,8 +531,8 @@ impl<'t> Context<'t> {
         return_type: R,
         input_types: &[A],
         is_variadic: bool,
-    ) -> FunctionTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    ) -> Result<FunctionTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         let input_types = input_types.iter().map(|input_type| unsafe { input_type.to_c_api() }).collect::<Vec<_>>();
         unsafe {
             FunctionTypeRef::from_c_api(
@@ -501,8 +544,8 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .expect("invalid LLVM function type")
         }
+        .map_err(|_| Error::invalid_argument("invalid LLVM function type"))
     }
 
     /// Creates a new literal LLVM [`StructTypeRef`] owned by this [`Context`].
@@ -510,8 +553,8 @@ impl<'t> Context<'t> {
         &'c self,
         element_types: &[T],
         is_packed: bool,
-    ) -> StructTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    ) -> Result<StructTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         let element_types =
             element_types.iter().map(|element_type| unsafe { element_type.to_c_api() }).collect::<Vec<_>>();
         unsafe {
@@ -524,20 +567,20 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .expect("invalid LLVM literal struct type")
         }
+        .map_err(|_| Error::invalid_argument("invalid LLVM literal struct type"))
     }
 
     /// Creates or retrieves an identified LLVM [`StructTypeRef`] with no body.
-    pub fn llvm_identified_struct_type<'c, S: AsRef<str>>(&'c self, name: S) -> StructTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    pub fn llvm_identified_struct_type<'c, S: AsRef<str>>(&'c self, name: S) -> Result<StructTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         unsafe {
             StructTypeRef::from_c_api(
                 mlirLLVMStructTypeIdentifiedGet(*self.handle.borrow(), StringRef::from(name.as_ref()).to_c_api()),
                 self,
             )
-            .expect("invalid LLVM identified struct type")
         }
+        .map_err(|_| Error::invalid_argument("invalid LLVM identified struct type"))
     }
 
     /// Creates a fresh identified LLVM [`StructTypeRef`] with a body.
@@ -546,8 +589,8 @@ impl<'t> Context<'t> {
         name: S,
         element_types: &[T],
         is_packed: bool,
-    ) -> StructTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    ) -> Result<StructTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         let element_types =
             element_types.iter().map(|element_type| unsafe { element_type.to_c_api() }).collect::<Vec<_>>();
         unsafe {
@@ -561,20 +604,20 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .expect("invalid LLVM new identified struct type")
         }
+        .map_err(|_| Error::invalid_argument("invalid LLVM new identified struct type"))
     }
 
     /// Creates or retrieves an intentionally opaque identified LLVM [`StructTypeRef`].
-    pub fn llvm_opaque_struct_type<'c, S: AsRef<str>>(&'c self, name: S) -> StructTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    pub fn llvm_opaque_struct_type<'c, S: AsRef<str>>(&'c self, name: S) -> Result<StructTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         unsafe {
             StructTypeRef::from_c_api(
                 mlirLLVMStructTypeOpaqueGet(*self.handle.borrow(), StringRef::from(name.as_ref()).to_c_api()),
                 self,
             )
-            .expect("invalid LLVM opaque struct type")
         }
+        .map_err(|_| Error::invalid_argument("invalid LLVM opaque struct type"))
     }
 
     /// Creates a new LLVM [`TargetExtTypeRef`] owned by this [`Context`].
@@ -589,8 +632,8 @@ impl<'t> Context<'t> {
         name: S,
         type_parameters: &[TypeRef<'c, 't>],
         integer_parameters: &[u32],
-    ) -> TargetExtTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    ) -> Result<TargetExtTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         let name = StringRef::from(name.as_ref());
         let type_parameters = type_parameters
             .iter()
@@ -608,8 +651,8 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .expect("invalid LLVM target extension type")
         }
+        .map_err(|_| Error::invalid_argument("invalid LLVM target extension type"))
     }
 }
 
@@ -624,229 +667,229 @@ mod tests {
     #[test]
     fn test_pointer_type() {
         let context = Context::new();
-        let pointer_type = context.llvm_pointer_type(3);
+        let pointer_type = context.llvm_pointer_type(3).unwrap();
         assert_eq!(&context, pointer_type.context());
-        assert_eq!(pointer_type.dialect().namespace().unwrap(), "llvm");
-        assert_eq!(pointer_type.type_id(), PointerTypeRef::type_id());
+        assert_eq!(pointer_type.dialect().unwrap().namespace().unwrap(), "llvm");
+        assert_eq!(pointer_type.type_id().unwrap(), PointerTypeRef::type_id().unwrap());
         assert_eq!(pointer_type.address_space(), 3);
     }
 
     #[test]
     fn test_pointer_type_equality() {
         let context = Context::new();
-        let pointer_type_1 = context.llvm_pointer_type(0);
-        let pointer_type_2 = context.llvm_pointer_type(0);
+        let pointer_type_1 = context.llvm_pointer_type(0).unwrap();
+        let pointer_type_2 = context.llvm_pointer_type(0).unwrap();
         assert_eq!(pointer_type_1, pointer_type_2);
 
-        let pointer_type_2 = context.llvm_pointer_type(1);
+        let pointer_type_2 = context.llvm_pointer_type(1).unwrap();
         assert_ne!(pointer_type_1, pointer_type_2);
 
         let context = Context::new();
-        let pointer_type_2 = context.llvm_pointer_type(0);
+        let pointer_type_2 = context.llvm_pointer_type(0).unwrap();
         assert_ne!(pointer_type_1, pointer_type_2);
     }
 
     #[test]
     fn test_pointer_type_display_and_debug() {
         let context = Context::new();
-        test_type_display_and_debug(context.llvm_pointer_type(0), "!llvm.ptr");
-        test_type_display_and_debug(context.llvm_pointer_type(3), "!llvm.ptr<3>");
+        test_type_display_and_debug(context.llvm_pointer_type(0).unwrap(), "!llvm.ptr");
+        test_type_display_and_debug(context.llvm_pointer_type(3).unwrap(), "!llvm.ptr<3>");
     }
 
     #[test]
     fn test_pointer_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
-        assert_eq!(context.parse_type("!llvm.ptr").unwrap(), context.llvm_pointer_type(0));
-        assert_eq!(context.parse_type("!llvm.ptr<3>").unwrap(), context.llvm_pointer_type(3));
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
+        assert_eq!(context.parse_type("!llvm.ptr").unwrap(), context.llvm_pointer_type(0).unwrap());
+        assert_eq!(context.parse_type("!llvm.ptr<3>").unwrap(), context.llvm_pointer_type(3).unwrap());
     }
 
     #[test]
     fn test_pointer_type_casting() {
         let context = Context::new();
-        test_type_casting(context.llvm_pointer_type(0));
+        test_type_casting(context.llvm_pointer_type(0).unwrap());
     }
 
     #[test]
     fn test_void_type() {
         let context = Context::new();
-        let void_type = context.llvm_void_type();
+        let void_type = context.llvm_void_type().unwrap();
         assert_eq!(&context, void_type.context());
-        assert_eq!(void_type.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(void_type.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_void_type_equality() {
         let context = Context::new();
-        let void_type_1 = context.llvm_void_type();
-        let void_type_2 = context.llvm_void_type();
+        let void_type_1 = context.llvm_void_type().unwrap();
+        let void_type_2 = context.llvm_void_type().unwrap();
         assert_eq!(void_type_1, void_type_2);
 
         let context = Context::new();
-        let void_type_2 = context.llvm_void_type();
+        let void_type_2 = context.llvm_void_type().unwrap();
         assert_ne!(void_type_1, void_type_2);
     }
 
     #[test]
     fn test_void_type_display_and_debug() {
         let context = Context::new();
-        test_type_display_and_debug(context.llvm_void_type(), "!llvm.void");
+        test_type_display_and_debug(context.llvm_void_type().unwrap(), "!llvm.void");
     }
 
     #[test]
     fn test_void_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
-        assert_eq!(context.parse_type("!llvm.void").unwrap(), context.llvm_void_type());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
+        assert_eq!(context.parse_type("!llvm.void").unwrap(), context.llvm_void_type().unwrap());
     }
 
     #[test]
     fn test_void_type_casting() {
         let context = Context::new();
-        test_type_casting(context.llvm_void_type());
+        test_type_casting(context.llvm_void_type().unwrap());
     }
 
     #[test]
     fn test_token_type() {
         let context = Context::new();
-        let token_type = context.llvm_token_type();
+        let token_type = context.llvm_token_type().unwrap();
         assert_eq!(&context, token_type.context());
-        assert_eq!(token_type.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(token_type.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_token_type_equality() {
         let context = Context::new();
-        let token_type_1 = context.llvm_token_type();
-        let token_type_2 = context.llvm_token_type();
+        let token_type_1 = context.llvm_token_type().unwrap();
+        let token_type_2 = context.llvm_token_type().unwrap();
         assert_eq!(token_type_1, token_type_2);
 
         let context = Context::new();
-        let token_type_2 = context.llvm_token_type();
+        let token_type_2 = context.llvm_token_type().unwrap();
         assert_ne!(token_type_1, token_type_2);
     }
 
     #[test]
     fn test_token_type_display_and_debug() {
         let context = Context::new();
-        test_type_display_and_debug(context.llvm_token_type(), "!llvm.token");
+        test_type_display_and_debug(context.llvm_token_type().unwrap(), "!llvm.token");
     }
 
     #[test]
     fn test_token_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
-        assert_eq!(context.parse_type("!llvm.token").unwrap(), context.llvm_token_type());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
+        assert_eq!(context.parse_type("!llvm.token").unwrap(), context.llvm_token_type().unwrap());
     }
 
     #[test]
     fn test_token_type_casting() {
         let context = Context::new();
-        test_type_casting(context.llvm_token_type());
+        test_type_casting(context.llvm_token_type().unwrap());
     }
 
     #[test]
     fn test_label_type() {
         let context = Context::new();
-        let label_type = context.llvm_label_type();
+        let label_type = context.llvm_label_type().unwrap();
         assert_eq!(&context, label_type.context());
-        assert_eq!(label_type.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(label_type.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_label_type_equality() {
         let context = Context::new();
-        let label_type_1 = context.llvm_label_type();
-        let label_type_2 = context.llvm_label_type();
+        let label_type_1 = context.llvm_label_type().unwrap();
+        let label_type_2 = context.llvm_label_type().unwrap();
         assert_eq!(label_type_1, label_type_2);
 
         let context = Context::new();
-        let label_type_2 = context.llvm_label_type();
+        let label_type_2 = context.llvm_label_type().unwrap();
         assert_ne!(label_type_1, label_type_2);
     }
 
     #[test]
     fn test_label_type_display_and_debug() {
         let context = Context::new();
-        test_type_display_and_debug(context.llvm_label_type(), "!llvm.label");
+        test_type_display_and_debug(context.llvm_label_type().unwrap(), "!llvm.label");
     }
 
     #[test]
     fn test_label_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
-        assert_eq!(context.parse_type("!llvm.label").unwrap(), context.llvm_label_type());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
+        assert_eq!(context.parse_type("!llvm.label").unwrap(), context.llvm_label_type().unwrap());
     }
 
     #[test]
     fn test_label_type_casting() {
         let context = Context::new();
-        test_type_casting(context.llvm_label_type());
+        test_type_casting(context.llvm_label_type().unwrap());
     }
 
     #[test]
     fn test_metadata_type() {
         let context = Context::new();
-        let metadata_type = context.llvm_metadata_type();
+        let metadata_type = context.llvm_metadata_type().unwrap();
         assert_eq!(&context, metadata_type.context());
-        assert_eq!(metadata_type.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(metadata_type.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_metadata_type_equality() {
         let context = Context::new();
-        let metadata_type_1 = context.llvm_metadata_type();
-        let metadata_type_2 = context.llvm_metadata_type();
+        let metadata_type_1 = context.llvm_metadata_type().unwrap();
+        let metadata_type_2 = context.llvm_metadata_type().unwrap();
         assert_eq!(metadata_type_1, metadata_type_2);
 
         let context = Context::new();
-        let metadata_type_2 = context.llvm_metadata_type();
+        let metadata_type_2 = context.llvm_metadata_type().unwrap();
         assert_ne!(metadata_type_1, metadata_type_2);
     }
 
     #[test]
     fn test_metadata_type_display_and_debug() {
         let context = Context::new();
-        test_type_display_and_debug(context.llvm_metadata_type(), "!llvm.metadata");
+        test_type_display_and_debug(context.llvm_metadata_type().unwrap(), "!llvm.metadata");
     }
 
     #[test]
     fn test_metadata_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
-        assert_eq!(context.parse_type("!llvm.metadata").unwrap(), context.llvm_metadata_type());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
+        assert_eq!(context.parse_type("!llvm.metadata").unwrap(), context.llvm_metadata_type().unwrap());
     }
 
     #[test]
     fn test_metadata_type_casting() {
         let context = Context::new();
-        test_type_casting(context.llvm_metadata_type());
+        test_type_casting(context.llvm_metadata_type().unwrap());
     }
 
     #[test]
     fn test_array_type() {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
-        let array_type = context.llvm_array_type(i32_type, 4);
+        let array_type = context.llvm_array_type(i32_type, 4).unwrap();
         assert_eq!(&context, array_type.context());
-        assert_eq!(array_type.dialect().namespace().unwrap(), "llvm");
-        assert_eq!(array_type.type_id(), ArrayTypeRef::type_id());
+        assert_eq!(array_type.dialect().unwrap().namespace().unwrap(), "llvm");
+        assert_eq!(array_type.type_id().unwrap(), ArrayTypeRef::type_id().unwrap());
         assert_eq!(array_type.element_count(), 4);
-        assert_eq!(array_type.element_type(), i32_type);
+        assert_eq!(array_type.element_type().unwrap(), i32_type);
     }
 
     #[test]
     fn test_array_type_equality() {
         let context = Context::new();
-        let array_type_1 = context.llvm_array_type(context.signless_integer_type(32), 4);
-        let array_type_2 = context.llvm_array_type(context.signless_integer_type(32), 4);
+        let array_type_1 = context.llvm_array_type(context.signless_integer_type(32), 4).unwrap();
+        let array_type_2 = context.llvm_array_type(context.signless_integer_type(32), 4).unwrap();
         assert_eq!(array_type_1, array_type_2);
 
-        let array_type_2 = context.llvm_array_type(context.signless_integer_type(32), 8);
+        let array_type_2 = context.llvm_array_type(context.signless_integer_type(32), 8).unwrap();
         assert_ne!(array_type_1, array_type_2);
 
         let context = Context::new();
-        let array_type_2 = context.llvm_array_type(context.signless_integer_type(32), 4);
+        let array_type_2 = context.llvm_array_type(context.signless_integer_type(32), 4).unwrap();
         assert_ne!(array_type_1, array_type_2);
     }
 
@@ -854,7 +897,7 @@ mod tests {
     fn test_array_type_display_and_debug() {
         let context = Context::new();
         test_type_display_and_debug(
-            context.llvm_array_type(context.signless_integer_type(32), 4),
+            context.llvm_array_type(context.signless_integer_type(32), 4).unwrap(),
             "!llvm.array<4 x i32>",
         );
     }
@@ -862,49 +905,57 @@ mod tests {
     #[test]
     fn test_array_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
-        let array_type = context.llvm_array_type(context.signless_integer_type(32), 4);
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
+        let array_type = context.llvm_array_type(context.signless_integer_type(32), 4).unwrap();
         assert_eq!(context.parse_type("!llvm.array<4 x i32>").unwrap(), array_type);
     }
 
     #[test]
     fn test_array_type_casting() {
         let context = Context::new();
-        test_type_casting(context.llvm_array_type(context.signless_integer_type(32), 4));
+        test_type_casting(context.llvm_array_type(context.signless_integer_type(32), 4).unwrap());
     }
 
     #[test]
     fn test_function_type() {
         let context = Context::new();
-        let pointer_type = context.llvm_pointer_type(0);
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let function_type =
-            context.llvm_function_type(context.llvm_void_type(), &[pointer_type.as_ref(), i32_type.as_ref()], false);
+        let function_type = context
+            .llvm_function_type(context.llvm_void_type().unwrap(), &[pointer_type.as_ref(), i32_type.as_ref()], false)
+            .unwrap();
         assert_eq!(&context, function_type.context());
-        assert_eq!(function_type.dialect().namespace().unwrap(), "llvm");
-        assert_eq!(function_type.type_id(), FunctionTypeRef::type_id());
+        assert_eq!(function_type.dialect().unwrap().namespace().unwrap(), "llvm");
+        assert_eq!(function_type.type_id().unwrap(), FunctionTypeRef::type_id().unwrap());
         assert_eq!(function_type.input_count(), 2);
         assert!(!function_type.is_variadic());
-        assert_eq!(function_type.inputs().collect::<Vec<_>>(), vec![pointer_type.as_ref(), i32_type.as_ref()]);
-        assert_eq!(function_type.input(0), pointer_type);
-        assert_eq!(function_type.input(1), i32_type);
-        assert_eq!(function_type.return_type(), context.llvm_void_type());
+        assert_eq!(
+            function_type.inputs().map(|input| input.unwrap()).collect::<Vec<_>>(),
+            vec![pointer_type.as_ref(), i32_type.as_ref()]
+        );
+        assert_eq!(function_type.input(0).unwrap(), pointer_type);
+        assert_eq!(function_type.input(1).unwrap(), i32_type);
+        assert!(function_type.input(2).is_err());
+        assert_eq!(function_type.return_type().unwrap(), context.llvm_void_type().unwrap());
     }
 
     #[test]
     fn test_function_type_equality() {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
-        let function_type_1 = context.llvm_function_type(context.llvm_void_type(), &[i32_type], false);
-        let function_type_2 = context.llvm_function_type(context.llvm_void_type(), &[i32_type], false);
+        let function_type_1 =
+            context.llvm_function_type(context.llvm_void_type().unwrap(), &[i32_type], false).unwrap();
+        let function_type_2 =
+            context.llvm_function_type(context.llvm_void_type().unwrap(), &[i32_type], false).unwrap();
         assert_eq!(function_type_1, function_type_2);
 
-        let function_type_2 = context.llvm_function_type(i32_type, &[i32_type], false);
+        let function_type_2 = context.llvm_function_type(i32_type, &[i32_type], false).unwrap();
         assert_ne!(function_type_1, function_type_2);
 
         let context = Context::new();
-        let function_type_2 =
-            context.llvm_function_type(context.llvm_void_type(), &[context.signless_integer_type(32)], false);
+        let function_type_2 = context
+            .llvm_function_type(context.llvm_void_type().unwrap(), &[context.signless_integer_type(32)], false)
+            .unwrap();
         assert_ne!(function_type_1, function_type_2);
     }
 
@@ -913,7 +964,7 @@ mod tests {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
         test_type_display_and_debug(
-            context.llvm_function_type(context.llvm_void_type(), &[i32_type], true),
+            context.llvm_function_type(context.llvm_void_type().unwrap(), &[i32_type], true).unwrap(),
             "!llvm.func<void (i32, ...)>",
         );
     }
@@ -921,11 +972,11 @@ mod tests {
     #[test]
     fn test_function_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let i32_type = context.signless_integer_type(32);
         assert_eq!(
             context.parse_type("!llvm.func<void (i32, ...)>").unwrap(),
-            context.llvm_function_type(context.llvm_void_type(), &[i32_type], true),
+            context.llvm_function_type(context.llvm_void_type().unwrap(), &[i32_type], true).unwrap(),
         );
     }
 
@@ -933,18 +984,18 @@ mod tests {
     fn test_function_type_casting() {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
-        test_type_casting(context.llvm_function_type(context.llvm_void_type(), &[i32_type], false));
+        test_type_casting(context.llvm_function_type(context.llvm_void_type().unwrap(), &[i32_type], false).unwrap());
     }
 
     #[test]
     fn test_struct_type() {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
-        let pointer_type = context.llvm_pointer_type(0);
-        let struct_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), pointer_type.as_ref()], true);
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
+        let struct_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), pointer_type.as_ref()], true).unwrap();
         assert_eq!(&context, struct_type.context());
-        assert_eq!(struct_type.dialect().namespace().unwrap(), "llvm");
-        assert_eq!(struct_type.type_id(), StructTypeRef::type_id());
+        assert_eq!(struct_type.dialect().unwrap().namespace().unwrap(), "llvm");
+        assert_eq!(struct_type.type_id().unwrap(), StructTypeRef::type_id().unwrap());
         assert!(struct_type.is_literal());
         assert!(!struct_type.is_identified());
         assert!(struct_type.is_packed());
@@ -952,18 +1003,19 @@ mod tests {
         assert_eq!(struct_type.identifier(), None);
         assert_eq!(struct_type.element_count(), Some(2));
         assert_eq!(
-            struct_type.element_types().unwrap().collect::<Vec<_>>(),
+            struct_type.element_types().unwrap().map(|r#type| r#type.unwrap()).collect::<Vec<_>>(),
             vec![i32_type.as_ref(), pointer_type.as_ref()],
         );
-        assert_eq!(struct_type.element_type(0), i32_type);
-        assert_eq!(struct_type.element_type(1), pointer_type);
+        assert_eq!(struct_type.element_type(0).unwrap(), i32_type);
+        assert_eq!(struct_type.element_type(1).unwrap(), pointer_type);
+        assert!(struct_type.element_type(2).is_err());
     }
 
     #[test]
     fn test_identified_struct_type() {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
-        let struct_type = context.llvm_identified_struct_type("node");
+        let struct_type = context.llvm_identified_struct_type("node").unwrap();
         assert!(struct_type.is_identified());
         assert!(struct_type.is_opaque());
         assert_eq!(struct_type.identifier().unwrap().as_str().unwrap(), "node");
@@ -972,29 +1024,31 @@ mod tests {
         assert!(struct_type.set_body(&[i32_type], false).is_success());
         assert!(!struct_type.is_opaque());
         assert_eq!(struct_type.element_count(), Some(1));
-        assert_eq!(struct_type.element_type(0), i32_type);
+        assert_eq!(struct_type.element_type(0).unwrap(), i32_type);
+        assert!(struct_type.element_type(1).is_err());
     }
 
     #[test]
     fn test_new_identified_struct_type() {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
-        let struct_type = context.llvm_new_identified_struct_type("new_node", &[i32_type], true);
+        let struct_type = context.llvm_new_identified_struct_type("new_node", &[i32_type], true).unwrap();
         assert_eq!(&context, struct_type.context());
-        assert_eq!(struct_type.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(struct_type.dialect().unwrap().namespace().unwrap(), "llvm");
         assert!(struct_type.is_identified());
         assert!(!struct_type.is_literal());
         assert!(struct_type.is_packed());
         assert!(!struct_type.is_opaque());
         assert_eq!(struct_type.identifier().unwrap().as_str().unwrap(), "new_node");
         assert_eq!(struct_type.element_count(), Some(1));
-        assert_eq!(struct_type.element_type(0), i32_type);
+        assert_eq!(struct_type.element_type(0).unwrap(), i32_type);
+        assert!(struct_type.element_type(1).is_err());
     }
 
     #[test]
     fn test_opaque_struct_type() {
         let context = Context::new();
-        let struct_type = context.llvm_opaque_struct_type("opaque_node");
+        let struct_type = context.llvm_opaque_struct_type("opaque_node").unwrap();
         assert!(struct_type.is_identified());
         assert!(struct_type.is_opaque());
         assert_eq!(struct_type.identifier().unwrap().as_str().unwrap(), "opaque_node");
@@ -1006,15 +1060,15 @@ mod tests {
     fn test_struct_type_equality() {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
-        let struct_type_1 = context.llvm_literal_struct_type(&[i32_type], false);
-        let struct_type_2 = context.llvm_literal_struct_type(&[i32_type], false);
+        let struct_type_1 = context.llvm_literal_struct_type(&[i32_type], false).unwrap();
+        let struct_type_2 = context.llvm_literal_struct_type(&[i32_type], false).unwrap();
         assert_eq!(struct_type_1, struct_type_2);
 
-        let struct_type_2 = context.llvm_literal_struct_type(&[i32_type], true);
+        let struct_type_2 = context.llvm_literal_struct_type(&[i32_type], true).unwrap();
         assert_ne!(struct_type_1, struct_type_2);
 
         let context = Context::new();
-        let struct_type_2 = context.llvm_literal_struct_type(&[context.signless_integer_type(32)], false);
+        let struct_type_2 = context.llvm_literal_struct_type(&[context.signless_integer_type(32)], false).unwrap();
         assert_ne!(struct_type_1, struct_type_2);
     }
 
@@ -1022,10 +1076,16 @@ mod tests {
     fn test_struct_type_display_and_debug() {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
-        test_type_display_and_debug(context.llvm_literal_struct_type(&[i32_type], false), "!llvm.struct<(i32)>");
-        test_type_display_and_debug(context.llvm_literal_struct_type(&[i32_type], true), "!llvm.struct<packed (i32)>");
         test_type_display_and_debug(
-            context.llvm_opaque_struct_type("opaque_node"),
+            context.llvm_literal_struct_type(&[i32_type], false).unwrap(),
+            "!llvm.struct<(i32)>",
+        );
+        test_type_display_and_debug(
+            context.llvm_literal_struct_type(&[i32_type], true).unwrap(),
+            "!llvm.struct<packed (i32)>",
+        );
+        test_type_display_and_debug(
+            context.llvm_opaque_struct_type("opaque_node").unwrap(),
             "!llvm.struct<\"opaque_node\", opaque>",
         );
     }
@@ -1033,54 +1093,60 @@ mod tests {
     #[test]
     fn test_struct_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let i32_type = context.signless_integer_type(32);
         assert_eq!(
             context.parse_type("!llvm.struct<(i32)>").unwrap(),
-            context.llvm_literal_struct_type(&[i32_type], false),
+            context.llvm_literal_struct_type(&[i32_type], false).unwrap(),
         );
         assert_eq!(
             context.parse_type("!llvm.struct<packed (i32)>").unwrap(),
-            context.llvm_literal_struct_type(&[i32_type], true),
+            context.llvm_literal_struct_type(&[i32_type], true).unwrap(),
         );
     }
 
     #[test]
     fn test_struct_type_casting() {
         let context = Context::new();
-        test_type_casting(context.llvm_literal_struct_type(&[context.signless_integer_type(32)], false));
+        test_type_casting(context.llvm_literal_struct_type(&[context.signless_integer_type(32)], false).unwrap());
     }
 
     #[test]
     fn test_target_ext_type() {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
-        let target_ext_type = context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]);
+        let target_ext_type = context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]).unwrap();
         assert_eq!(&context, target_ext_type.context());
-        assert_eq!(target_ext_type.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(target_ext_type.dialect().unwrap().namespace().unwrap(), "llvm");
         assert_eq!(target_ext_type.name().as_str().unwrap(), "target1");
         assert_eq!(target_ext_type.type_parameter_count(), 1);
-        assert_eq!(target_ext_type.type_parameters().collect::<Vec<_>>(), vec![i32_type.as_ref()]);
-        assert_eq!(target_ext_type.type_parameter(0), i32_type);
+        assert_eq!(
+            target_ext_type.type_parameters().map(|r#type| r#type.unwrap()).collect::<Vec<_>>(),
+            vec![i32_type.as_ref()]
+        );
+        assert_eq!(target_ext_type.type_parameter(0).unwrap(), i32_type);
+        assert!(target_ext_type.type_parameter(1).is_err());
         assert_eq!(target_ext_type.integer_parameter_count(), 1);
         assert_eq!(target_ext_type.integer_parameters().collect::<Vec<_>>(), vec![1]);
-        assert_eq!(target_ext_type.integer_parameter(0), 1);
+        assert_eq!(target_ext_type.integer_parameter(0).unwrap(), 1);
+        assert!(target_ext_type.integer_parameter(1).is_err());
     }
 
     #[test]
     fn test_target_ext_type_equality() {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
-        let target_ext_type_1 = context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]);
-        let target_ext_type_2 = context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]);
+        let target_ext_type_1 = context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]).unwrap();
+        let target_ext_type_2 = context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]).unwrap();
         assert_eq!(target_ext_type_1, target_ext_type_2);
 
-        let target_ext_type_2 = context.llvm_target_ext_type("target2", &[], &[]);
+        let target_ext_type_2 = context.llvm_target_ext_type("target2", &[], &[]).unwrap();
         assert_ne!(target_ext_type_1, target_ext_type_2);
 
         let context = Context::new();
-        let target_ext_type_2 =
-            context.llvm_target_ext_type("target1", &[context.signless_integer_type(32).as_ref()], &[1]);
+        let target_ext_type_2 = context
+            .llvm_target_ext_type("target1", &[context.signless_integer_type(32).as_ref()], &[1])
+            .unwrap();
         assert_ne!(target_ext_type_1, target_ext_type_2);
     }
 
@@ -1089,7 +1155,7 @@ mod tests {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
         test_type_display_and_debug(
-            context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]),
+            context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]).unwrap(),
             "!llvm.target<\"target1\", i32, 1>",
         );
     }
@@ -1097,11 +1163,11 @@ mod tests {
     #[test]
     fn test_target_ext_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let i32_type = context.signless_integer_type(32);
         assert_eq!(
             context.parse_type("!llvm.target<\"target1\", i32, 1>").unwrap(),
-            context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]),
+            context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]).unwrap(),
         );
     }
 
@@ -1109,84 +1175,84 @@ mod tests {
     fn test_target_ext_type_casting() {
         let context = Context::new();
         let i32_type = context.signless_integer_type(32);
-        test_type_casting(context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]));
+        test_type_casting(context.llvm_target_ext_type("target1", &[i32_type.as_ref()], &[1]).unwrap());
     }
 
     #[test]
     fn test_x86_amx_type() {
         let context = Context::new();
-        let x86_amx_type = context.llvm_x86_amx_type();
+        let x86_amx_type = context.llvm_x86_amx_type().unwrap();
         assert_eq!(&context, x86_amx_type.context());
-        assert_eq!(x86_amx_type.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(x86_amx_type.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_x86_amx_type_equality() {
         let context = Context::new();
-        let x86_amx_type_1 = context.llvm_x86_amx_type();
-        let x86_amx_type_2 = context.llvm_x86_amx_type();
+        let x86_amx_type_1 = context.llvm_x86_amx_type().unwrap();
+        let x86_amx_type_2 = context.llvm_x86_amx_type().unwrap();
         assert_eq!(x86_amx_type_1, x86_amx_type_2);
 
         let context = Context::new();
-        let x86_amx_type_2 = context.llvm_x86_amx_type();
+        let x86_amx_type_2 = context.llvm_x86_amx_type().unwrap();
         assert_ne!(x86_amx_type_1, x86_amx_type_2);
     }
 
     #[test]
     fn test_x86_amx_type_display_and_debug() {
         let context = Context::new();
-        test_type_display_and_debug(context.llvm_x86_amx_type(), "!llvm.x86_amx");
+        test_type_display_and_debug(context.llvm_x86_amx_type().unwrap(), "!llvm.x86_amx");
     }
 
     #[test]
     fn test_x86_amx_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
-        assert_eq!(context.parse_type("!llvm.x86_amx").unwrap(), context.llvm_x86_amx_type());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
+        assert_eq!(context.parse_type("!llvm.x86_amx").unwrap(), context.llvm_x86_amx_type().unwrap());
     }
 
     #[test]
     fn test_x86_amx_type_casting() {
         let context = Context::new();
-        test_type_casting(context.llvm_x86_amx_type());
+        test_type_casting(context.llvm_x86_amx_type().unwrap());
     }
 
     #[test]
     fn test_ppc_fp128_type() {
         let context = Context::new();
-        let ppc_fp128_type = context.llvm_ppc_fp128_type();
+        let ppc_fp128_type = context.llvm_ppc_fp128_type().unwrap();
         assert_eq!(&context, ppc_fp128_type.context());
-        assert_eq!(ppc_fp128_type.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(ppc_fp128_type.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_ppc_fp128_type_equality() {
         let context = Context::new();
-        let ppc_fp128_type_1 = context.llvm_ppc_fp128_type();
-        let ppc_fp128_type_2 = context.llvm_ppc_fp128_type();
+        let ppc_fp128_type_1 = context.llvm_ppc_fp128_type().unwrap();
+        let ppc_fp128_type_2 = context.llvm_ppc_fp128_type().unwrap();
         assert_eq!(ppc_fp128_type_1, ppc_fp128_type_2);
 
         let context = Context::new();
-        let ppc_fp128_type_2 = context.llvm_ppc_fp128_type();
+        let ppc_fp128_type_2 = context.llvm_ppc_fp128_type().unwrap();
         assert_ne!(ppc_fp128_type_1, ppc_fp128_type_2);
     }
 
     #[test]
     fn test_ppc_fp128_type_display_and_debug() {
         let context = Context::new();
-        test_type_display_and_debug(context.llvm_ppc_fp128_type(), "!llvm.ppc_fp128");
+        test_type_display_and_debug(context.llvm_ppc_fp128_type().unwrap(), "!llvm.ppc_fp128");
     }
 
     #[test]
     fn test_ppc_fp128_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
-        assert_eq!(context.parse_type("!llvm.ppc_fp128").unwrap(), context.llvm_ppc_fp128_type());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
+        assert_eq!(context.parse_type("!llvm.ppc_fp128").unwrap(), context.llvm_ppc_fp128_type().unwrap());
     }
 
     #[test]
     fn test_ppc_fp128_type_casting() {
         let context = Context::new();
-        test_type_casting(context.llvm_ppc_fp128_type());
+        test_type_casting(context.llvm_ppc_fp128_type().unwrap());
     }
 }

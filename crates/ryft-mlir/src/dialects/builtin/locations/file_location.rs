@@ -5,7 +5,7 @@ use ryft_xla_sys::bindings::{
     mlirLocationFileLineColRangeGetStartLine, mlirLocationFileLineColRangeGetTypeID,
 };
 
-use crate::{Context, Identifier, Location, StringRef, TypeId, mlir_subtype_trait_impls};
+use crate::{Context, Error, Identifier, Location, StringRef, TypeId, mlir_subtype_trait_impls};
 
 /// [`Location`] at specific lines and columns within a file. These properties are available via functions in
 /// this struct (e.g., [`FileLocationRef::file_name`], [`FileLocationRef::start_line`],
@@ -23,8 +23,8 @@ pub struct FileLocationRef<'c, 't> {
 
 impl<'c, 't> FileLocationRef<'c, 't> {
     /// Returns the [`TypeId`] that corresponds to [`FileLocationRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirLocationFileLineColRangeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirLocationFileLineColRangeGetTypeID()) }
     }
 
     /// Returns the file name of this [`FileLocationRef`].
@@ -70,16 +70,13 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
-            FileLocationRef::from_c_api(
-                mlirLocationFileLineColGet(
-                    *self.handle.borrow(),
-                    StringRef::from(filename.as_ref()).to_c_api(),
-                    line as u32,
-                    column as u32,
-                ),
-                self,
-            )
-            .unwrap()
+            let handle = mlirLocationFileLineColGet(
+                *self.handle.borrow(),
+                StringRef::from(filename.as_ref()).to_c_api(),
+                line as u32,
+                column as u32,
+            );
+            FileLocationRef { handle, context: self }
         }
     }
 
@@ -99,18 +96,15 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
-            FileLocationRef::from_c_api(
-                mlirLocationFileLineColRangeGet(
-                    *self.handle.borrow(),
-                    StringRef::from(filename.as_ref()).to_c_api(),
-                    start_line as u32,
-                    start_column as u32,
-                    end_line as u32,
-                    end_column as u32,
-                ),
-                self,
-            )
-            .unwrap()
+            let handle = mlirLocationFileLineColRangeGet(
+                *self.handle.borrow(),
+                StringRef::from(filename.as_ref()).to_c_api(),
+                start_line as u32,
+                start_column as u32,
+                end_line as u32,
+                end_column as u32,
+            );
+            FileLocationRef { handle, context: self }
         }
     }
 }
@@ -125,9 +119,9 @@ mod tests {
 
     #[test]
     fn test_file_location_type_id() {
-        let file_location_type_id = FileLocationRef::type_id();
-        assert_eq!(FileLocationRef::type_id(), FileLocationRef::type_id());
-        assert_eq!(file_location_type_id, FileLocationRef::type_id());
+        let file_location_type_id = FileLocationRef::type_id().unwrap();
+        assert_eq!(FileLocationRef::type_id().unwrap(), FileLocationRef::type_id().unwrap());
+        assert_eq!(file_location_type_id, FileLocationRef::type_id().unwrap());
     }
 
     #[test]
