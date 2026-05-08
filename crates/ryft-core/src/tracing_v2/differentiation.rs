@@ -173,11 +173,7 @@ pub trait Differentiable<T: Type>: Traceable<T> {
     fn tangent_type(&self) -> Result<Self::Tangent, TracingError>;
 }
 
-impl<'engine, E> Differentiable<E::Type> for Tracer<'engine, E>
-where
-    E: TracingEngine,
-    E::Value: Differentiable<E::Type>,
-{
+impl<'engine, E: TracingEngine<Value: Differentiable<E::Type>>> Differentiable<E::Type> for Tracer<'engine, E> {
     type Tangent = Self;
 
     #[inline]
