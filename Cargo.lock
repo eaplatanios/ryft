@@ -1852,7 +1852,6 @@ dependencies = [
  "half",
  "indoc",
  "ndarray",
- "paste",
  "pretty_assertions",
  "ryft-core",
  "ryft-macros",
