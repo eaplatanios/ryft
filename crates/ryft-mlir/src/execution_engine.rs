@@ -95,9 +95,9 @@ pub enum OptimizationLevel {
 ///     )?;
 ///
 /// // Convert the MLIR into LLVM IR to prevent undefined behavior when we invoke [`ExecutionEngine::initialize`].
-/// let mut pass_manager = context.pass_manager();
-/// pass_manager.add_pass(builtin::passes::create_conversion_to_llvm_pass());
-/// assert!(pass_manager.run(&module.as_operation()).is_success());
+/// let mut pass_manager = context.pass_manager()?;
+/// pass_manager.add_pass(builtin::passes::create_conversion_to_llvm_pass()?);
+/// assert!(pass_manager.run(&module.as_operation()?).is_success());
 ///
 /// // Construct a new [`ExecutionEngine`] for our [`Module`]. Note that we are setting `enable_object_dump` to `true`
 /// // here so that we can illustrate the use of [`InitializedExecutionEngine::dump_to_object_file`] later on, but you
