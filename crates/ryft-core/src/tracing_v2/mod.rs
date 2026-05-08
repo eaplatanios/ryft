@@ -24,7 +24,6 @@ pub use differentiation::{
     Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
     DifferentiableTracingEngine, DifferentiationError, JvpContext, JvpTracer, LinearizableEngine, TangentValue,
 };
-pub use forward::jvp;
 pub use linear::{
     ConcreteValueAndGrad, CoordinateValue, DenseJacobian, TracedValueAndGrad, ValueAndGradDispatch, grad_with_aux,
     jacrev, linearize, value_and_grad, value_and_grad_with_aux, vjp,

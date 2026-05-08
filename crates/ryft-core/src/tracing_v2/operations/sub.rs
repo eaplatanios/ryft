@@ -68,14 +68,14 @@ mod tests {
 
     use crate::tracing::Program;
     use crate::tracing::engines::ScalarEngine;
-    use crate::tracing_v2::{LinearScalarOperation, jvp, linearize};
+    use crate::tracing_v2::{DifferentiableEngine, LinearScalarOperation, linearize};
     use crate::types::DataType;
 
     #[test]
     fn test_sub_jvp_matches_the_difference_rule() {
         let engine = ScalarEngine::<f64>::new();
         let (primal, tangent): (f64, f64) =
-            jvp(&engine, |(left, right)| left - right, (5.0f64, 2.0f64), (3.0f64, 1.0f64)).unwrap();
+            engine.jvp(|(left, right)| left - right, (5.0f64, 2.0f64), (3.0f64, 1.0f64)).unwrap();
 
         assert_eq!(primal, 3.0);
         assert_eq!(tangent, 2.0);

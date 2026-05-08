@@ -70,7 +70,7 @@ mod tests {
 
     use crate::tracing::Program;
     use crate::tracing::engines::ScalarEngine;
-    use crate::tracing_v2::{LinearScalarOperation, jvp, linearize};
+    use crate::tracing_v2::{DifferentiableEngine, LinearScalarOperation, linearize};
     use crate::types::DataType;
 
     fn approx_eq(left: f64, right: f64) {
@@ -82,7 +82,7 @@ mod tests {
     fn test_div_jvp_matches_the_quotient_rule() {
         let engine = ScalarEngine::<f64>::new();
         let (primal, tangent): (f64, f64) =
-            jvp(&engine, |(left, right)| left / right, (6.0f64, 2.0f64), (3.0f64, 4.0f64)).unwrap();
+            engine.jvp(|(left, right)| left / right, (6.0f64, 2.0f64), (3.0f64, 4.0f64)).unwrap();
 
         approx_eq(primal, 3.0);
         approx_eq(tangent, -4.5);

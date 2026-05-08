@@ -7,7 +7,7 @@ use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
 use crate::tracing_v2::{
-    DifferentiableEngine, LinearScalarOperation, ScalarOperation, Sin, jvp, linearize, value_and_grad, vjp,
+    DifferentiableEngine, LinearScalarOperation, ScalarOperation, Sin, linearize, value_and_grad, vjp,
 };
 use crate::types::{DataType, Type};
 
@@ -100,13 +100,12 @@ where
 }
 
 fn first_derivative_traced(x: Tracer<ScalarEngine<f64>>) -> Tracer<ScalarEngine<f64>> {
-    ScalarEngine::<f64>::new()
-        .grad(quartic_plus_sin, x)
-        .expect("scalar first traced derivative should succeed")
+    x.engine().grad(quartic_plus_sin, x).expect("scalar first traced derivative should succeed")
 }
 
 fn hessian_style_second_derivative_traced(x: Tracer<ScalarEngine<f64>>) -> Tracer<ScalarEngine<f64>> {
-    jvp(&ScalarEngine::<f64>::new(), first_derivative_traced, x.clone(), x.one_like())
+    x.engine()
+        .jvp(first_derivative_traced, x.clone(), x.one_like())
         .expect("scalar Hessian-style benchmark should succeed")
         .1
 }

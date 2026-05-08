@@ -297,7 +297,7 @@ mod tests {
     use crate::tracing_v2::operations::custom::CustomTracedLinearizationRule;
     use crate::tracing_v2::{
         ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, CustomOperationError, CustomPrimitive,
-        DifferentiableEngine, DifferentiableOperation, JvpContext, JvpTracer, jacrev, jvp, vmap,
+        DifferentiableEngine, DifferentiableOperation, JvpContext, JvpTracer, jacrev, vmap,
     };
     use crate::types::TypeError;
 
@@ -663,8 +663,7 @@ mod tests {
     #[test]
     fn test_custom_primitive_missing_jvp_rule_reports_targeted_error() {
         let primitive = CustomPrimitive::<ArrayType, TestArray>::new(ShiftOp::new(2.0));
-        let result: Result<(TestArray, TestArray), TracingError> = jvp(
-            &TestArrayEngine,
+        let result: Result<(TestArray, TestArray), TracingError> = TestArrayEngine.jvp(
             {
                 let primitive = primitive.clone();
                 move |x| stage_custom_traced_unary(x, primitive.clone())
@@ -706,8 +705,7 @@ mod tests {
                 {
                     let primitive = primitive.clone();
                     move |x: Tracer<TestArrayEngine>| {
-                        let (primal, tangent) = jvp(
-                            &TestArrayEngine,
+                        let (primal, tangent) = x.engine().jvp(
                             {
                                 let primitive = primitive.clone();
                                 move |inner| stage_custom_traced_unary(inner, primitive.clone())

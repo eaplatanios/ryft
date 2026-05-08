@@ -211,7 +211,7 @@ pub trait LinearizableEngine: Engine {
 /// Extension of [`LinearizableEngine`] for backends that support automatic differentiation.
 ///
 /// Engines that only need ordinary tracing implement [`TracingEngine`] without this extension. AD
-/// transforms such as [`DifferentiableEngine::grad`], [`jvp`](crate::tracing_v2::jvp), and
+/// transforms such as [`DifferentiableEngine::jvp`], [`DifferentiableEngine::grad`], and
 /// [`vjp`](crate::tracing_v2::vjp) require this trait so non-differentiable backends do not need to
 /// define fake tangent carriers.
 ///
@@ -235,6 +235,31 @@ pub trait DifferentiableEngine: LinearizableEngine {
 
     /// Returns the linearizable engine used for tangent and cotangent programs.
     fn linear_engine(&self) -> &Self::LinearEngine;
+
+    /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
+    ///
+    /// The returned pair is `(primal_output, tangent_output)`. This is the canonical user-facing forward-mode
+    /// Jacobian-Vector Product (JVP) entry point for differentiable engines.
+    #[allow(private_bounds, private_interfaces)]
+    fn jvp<
+        'engine,
+        F: FnOnce(D::FunctionInput) -> D::FunctionOutput,
+        Input: Parameterized<D, ParameterStructure: std::fmt::Debug + PartialEq>,
+        Output: Parameterized<D>,
+        D: crate::tracing_v2::forward::JvpDispatch<'engine, Self, Input, Output, Marker>,
+        Marker,
+    >(
+        &'engine self,
+        function: F,
+        primals: Input,
+        tangents: Input::To<D::Tangent>,
+    ) -> Result<(Output, Output::To<D::Tangent>), TracingError>
+    where
+        Input::Family: ParameterizedFamily<D::Tangent>,
+        Output::Family: ParameterizedFamily<D::Tangent>,
+    {
+        crate::tracing_v2::forward::jvp_at(self, function, primals, tangents)
+    }
 
     /// Computes the reverse-mode gradient of a scalar-output function.
     ///
@@ -785,7 +810,6 @@ mod tests {
 
     use crate::operations::constants::{One, Zero, ZeroLike};
     use crate::tracing::engines::ScalarEngine;
-    use crate::tracing_v2::jvp;
     use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
     use super::{DifferentiableEngine, TangentValue};
@@ -832,13 +856,13 @@ mod tests {
     fn test_scalar_engine_half_engines_run_jvp() {
         let bf16_engine = ScalarEngine::<bf16>::new();
         assert_eq!(
-            jvp(&bf16_engine, |x| x.clone() + x, bf16::from_f32(3.0), bf16::ONE),
+            bf16_engine.jvp(|x| x.clone() + x, bf16::from_f32(3.0), bf16::ONE),
             Ok((bf16::from_f32(6.0), bf16::from_f32(2.0)))
         );
 
         let f16_engine = ScalarEngine::<f16>::new();
         assert_eq!(
-            jvp(&f16_engine, |x| x.clone() + x, f16::from_f32(3.0), f16::ONE),
+            f16_engine.jvp(|x| x.clone() + x, f16::from_f32(3.0), f16::ONE),
             Ok((f16::from_f32(6.0), f16::from_f32(2.0)))
         );
     }

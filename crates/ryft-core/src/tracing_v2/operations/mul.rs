@@ -62,7 +62,7 @@ mod tests {
 
     use crate::tracing::Program;
     use crate::tracing::engines::ScalarEngine;
-    use crate::tracing_v2::{LinearScalarOperation, Sin, jvp, linearize};
+    use crate::tracing_v2::{DifferentiableEngine, LinearScalarOperation, Sin, linearize};
     use crate::types::DataType;
 
     fn approx_eq(left: f64, right: f64) {
@@ -73,8 +73,7 @@ mod tests {
     #[test]
     fn test_mul_jvp_matches_the_product_rule() {
         let engine = ScalarEngine::<f64>::new();
-        let (primal, tangent) =
-            jvp(&engine, |(left, right)| left * right, (2.0f64, 5.0f64), (3.0f64, -1.0f64)).unwrap();
+        let (primal, tangent) = engine.jvp(|(left, right)| left * right, (2.0f64, 5.0f64), (3.0f64, -1.0f64)).unwrap();
 
         approx_eq(primal, 10.0);
         approx_eq(tangent, 13.0);

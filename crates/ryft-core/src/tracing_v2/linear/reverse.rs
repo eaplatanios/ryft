@@ -45,9 +45,10 @@ impl<F> Grad<F> {
 
 /// Traces `function` once and returns both its primal output and a reusable pushforward program.
 ///
-/// [`linearize`] is the staged counterpart to [`crate::tracing_v2::jvp`]. Instead of immediately
-/// applying a tangent input, it captures the Jacobian-vector product as a staged [`Program`] over
-/// linear operations that can be replayed later on any tangent with the same parameter structure.
+/// [`linearize`] is the staged counterpart to [`DifferentiableEngine::jvp`]. Instead of
+/// immediately applying a tangent input, it captures the Jacobian-vector product as a staged
+/// [`Program`] over linear operations that can be replayed later on any tangent with the same
+/// parameter structure.
 pub fn linearize<
     'engine,
     E: DifferentiableEngine<Value = V> + 'static,

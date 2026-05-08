@@ -78,7 +78,7 @@ mod tests {
     use ryft_core::operations::arithmetic::ADD_OPERATION_NAME;
     use ryft_core::tracing::TracingError;
     use ryft_core::tracing::engines::{Engine, TracingEngine};
-    use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiationError, MatrixOps, Sin, jvp};
+    use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiationError, MatrixOps, Sin};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::Array;
@@ -141,7 +141,7 @@ mod tests {
         let tangent = Array::from_shape_vec([2], vec![5.0, 7.0]).unwrap();
 
         let (primal_output, tangent_output): (Array<f64>, Array<f64>) =
-            jvp(&engine, |x| x.clone() * x, primal, tangent).unwrap();
+            engine.jvp(|x| x.clone() * x, primal, tangent).unwrap();
 
         assert_eq!(primal_output.as_ndarray(), &arr1(&[4.0, 9.0]).into_dyn());
         assert_eq!(tangent_output.as_ndarray(), &arr1(&[20.0, 42.0]).into_dyn());

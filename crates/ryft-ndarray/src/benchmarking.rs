@@ -8,7 +8,7 @@ use ryft_core::tracing::{Program, Traceable};
 use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use ryft_core::tracing_v2::{MatrixOps, Sin, jvp, vjp};
+use ryft_core::tracing_v2::{DifferentiableEngine, MatrixOps, Sin, vjp};
 use ryft_core::types::ArrayType;
 
 use crate::{Array, LinearNdarrayOperation, NdArrayEngine, NdarrayOperation};
@@ -120,7 +120,10 @@ fn first_matrix_jvp_traced<'engine>(
     inputs: (MatrixTracer<'engine>, MatrixTracer<'engine>, MatrixTracer<'engine>, MatrixTracer<'engine>),
 ) -> MatrixTracer<'engine> {
     let seeds = (inputs.0.one_like(), inputs.1.zero_like(), inputs.2.zero_like(), inputs.3.zero_like());
-    jvp(&NdArrayEngine::<f64>::new(), three_matmul_sine, inputs, seeds)
+    inputs
+        .0
+        .engine()
+        .jvp(three_matmul_sine, inputs, seeds)
         .expect("nested matrix JVP benchmark should stage")
         .1
 }
@@ -134,7 +137,10 @@ fn matrix_hessian_style_second_derivative<'engine>(
     inputs: (MatrixTracer<'engine>, MatrixTracer<'engine>, MatrixTracer<'engine>, MatrixTracer<'engine>),
 ) -> MatrixTracer<'engine> {
     let seeds = (inputs.0.one_like(), inputs.1.zero_like(), inputs.2.zero_like(), inputs.3.zero_like());
-    jvp(&NdArrayEngine::<f64>::new(), first_matrix_jvp_traced, inputs, seeds)
+    inputs
+        .0
+        .engine()
+        .jvp(first_matrix_jvp_traced, inputs, seeds)
         .expect("matrix Hessian-style benchmark should succeed")
         .1
 }

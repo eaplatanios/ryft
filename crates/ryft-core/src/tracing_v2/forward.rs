@@ -17,13 +17,14 @@ use crate::types::Typed;
 
 /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
 ///
-/// The returned pair is `(primal_output, tangent_output)`. Architecturally, [`jvp`] is the most
-/// direct forward-mode transform in the crate: it either traces the body once to build a staged
-/// pushforward or stages the whole JVP into an outer trace if the inputs are already symbolic.
-/// Primitive-specific local JVP rules live in [`crate::tracing_v2::operations`]; [`jvp`] is the
-/// orchestration layer that selects the concrete or traced execution path.
+/// The returned pair is `(primal_output, tangent_output)`. Architecturally,
+/// [`DifferentiableEngine::jvp`] is the most direct forward-mode transform in the crate: it either
+/// traces the body once to build a staged pushforward or stages the whole JVP into an outer trace if
+/// the inputs are already symbolic. Primitive-specific local JVP rules live in
+/// [`crate::tracing_v2::operations`]; this kernel is the orchestration layer that selects the
+/// concrete or traced execution path.
 #[allow(private_bounds, private_interfaces)]
-pub fn jvp<
+pub(crate) fn jvp_at<
     'engine,
     E: Engine,
     F: FnOnce(D::FunctionInput) -> D::FunctionOutput,
@@ -44,15 +45,16 @@ where
     D::invoke(engine, function, primals, tangents)
 }
 
-/// Marker selecting concrete-value [`jvp`] dispatch.
+/// Marker selecting concrete-value [`DifferentiableEngine::jvp`] dispatch.
 #[doc(hidden)]
 pub struct JvpDispatchValueMarker;
 
-/// Marker selecting already-traced [`jvp`] dispatch.
+/// Marker selecting already-traced [`DifferentiableEngine::jvp`] dispatch.
 #[doc(hidden)]
 pub struct JvpDispatchTracerMarker;
 
-/// Dispatch trait used by [`jvp`] so it can operate both on concrete values and on already traced values.
+/// Dispatch trait used by [`DifferentiableEngine::jvp`] so it can operate both on concrete values
+/// and on already traced values.
 ///
 /// The public transform is intentionally small; this trait is where the concrete, traced, and
 /// batched execution strategies branch apart.
@@ -70,7 +72,7 @@ where
     /// Output type produced by the user-provided function.
     type FunctionOutput;
 
-    /// Invokes [`jvp`] for one leaf regime.
+    /// Invokes [`DifferentiableEngine::jvp`] for one leaf regime.
     fn invoke<F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput>(
         engine: &'engine E,
         function: F,
@@ -79,8 +81,9 @@ where
     ) -> Result<(Output, Output::To<Self::Tangent>), TracingError>;
 }
 
-/// Concrete-value dispatch for [`jvp`]: traces the user function with [`Tracer`] to build a staged
-/// pushforward via [`linearize`] and evaluates it at the supplied tangents.
+/// Concrete-value dispatch for [`DifferentiableEngine::jvp`]: traces the user function with
+/// [`Tracer`] to build a staged pushforward via [`linearize`] and evaluates it at the supplied
+/// tangents.
 impl<
     'engine,
     E: DifferentiableEngine<Value = V> + 'static,
@@ -144,9 +147,9 @@ where
     }
 }
 
-/// Already-traced dispatch for [`jvp`]: replays the user function symbolically inside an enclosing
-/// [`Tracer`] scope, staging both the primal output and tangent propagation as part of the outer
-/// compiled program.
+/// Already-traced dispatch for [`DifferentiableEngine::jvp`]: replays the user function
+/// symbolically inside an enclosing [`Tracer`] scope, staging both the primal output and tangent
+/// propagation as part of the outer compiled program.
 impl<
     'engine,
     E: DifferentiableTracingEngine<Value = V> + TracingEngine + 'static,
@@ -720,13 +723,13 @@ mod tests {
     fn concrete_jvp_supports_distinct_primal_and_tangent_types() {
         let engine = DistinctPrimalEngine::new();
 
-        let (primal, tangent): (DistinctPrimal, DistinctTangent) = jvp(
-            &engine,
-            |(left, right)| left + right,
-            (DistinctPrimal(2.0), DistinctPrimal(5.0)),
-            (DistinctTangent(3.0), DistinctTangent(7.0)),
-        )
-        .unwrap();
+        let (primal, tangent): (DistinctPrimal, DistinctTangent) = engine
+            .jvp(
+                |(left, right)| left + right,
+                (DistinctPrimal(2.0), DistinctPrimal(5.0)),
+                (DistinctTangent(3.0), DistinctTangent(7.0)),
+            )
+            .unwrap();
 
         assert_eq!(primal, DistinctPrimal(7.0));
         assert_eq!(tangent, DistinctTangent(10.0));
@@ -753,13 +756,13 @@ mod tests {
         assert_eq!(output, DistinctPrimal(4.0));
         assert_eq!(pullback.interpret(DistinctTangent(4.0)).unwrap(), DistinctTangent(8.0));
 
-        let (product_primal, product_tangent): (DistinctPrimal, DistinctTangent) = jvp(
-            &engine,
-            |(left, right)| left * right,
-            (DistinctPrimal(2.0), DistinctPrimal(5.0)),
-            (DistinctTangent(3.0), DistinctTangent(7.0)),
-        )
-        .unwrap();
+        let (product_primal, product_tangent): (DistinctPrimal, DistinctTangent) = engine
+            .jvp(
+                |(left, right)| left * right,
+                (DistinctPrimal(2.0), DistinctPrimal(5.0)),
+                (DistinctTangent(3.0), DistinctTangent(7.0)),
+            )
+            .unwrap();
         assert_eq!(product_primal, DistinctPrimal(10.0));
         assert_eq!(product_tangent, DistinctTangent(29.0));
 
@@ -778,7 +781,7 @@ mod tests {
     fn jvp_rejects_mismatched_parameter_structures() {
         let engine = ScalarEngine::<f64>::new();
         let result: Result<(f64, f64), TracingError> =
-            jvp(&engine, |xs| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
+            engine.jvp(|xs| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
         assert!(matches!(
             result,
             Err(TracingError::Parameter(ParameterError::MismatchedParameterStructures {
@@ -813,7 +816,7 @@ mod tests {
         let empty_tangents: Vec<Tracer<'_, ScalarEngine<f64>>> = Vec::new();
 
         let result: Result<(Vec<Tracer<'_, ScalarEngine<f64>>>, Vec<Tracer<'_, ScalarEngine<f64>>>), TracingError> =
-            jvp(&engine, |inputs: Vec<Tracer<'_, ScalarEngine<f64>>>| inputs, empty_primals, empty_tangents);
+            engine.jvp(|inputs: Vec<Tracer<'_, ScalarEngine<f64>>>| inputs, empty_primals, empty_tangents);
 
         assert!(matches!(
             result,
