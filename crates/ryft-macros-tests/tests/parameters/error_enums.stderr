@@ -35,6 +35,20 @@ error[E0392]: type parameter `P` is never used
    |
    = help: consider removing `P`, referring to it in a field, or using a marker such as `PhantomData`
 
+error[E0277]: the trait bound `EnumWithUnusedParameterType<Placeholder>: Clone` is not satisfied
+ --> tests/parameters/error_enums.rs:9:10
+  |
+9 | #[derive(Parameterized)]
+  |          ^^^^^^^^^^^^^ the trait `Clone` is not implemented for `EnumWithUnusedParameterType<Placeholder>`
+  |
+  = help: see issue #48214
+  = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider annotating `EnumWithUnusedParameterType<Placeholder>` with `#[derive(Clone)]`
+  |
+10+ #[derive(Clone)]
+11| enum EnumWithUnusedParameterType<P: Parameter> {
+  |
+
 error[E0310]: the parameter type `P` may not live long enough
   --> tests/parameters/error_enums.rs:18:37
    |

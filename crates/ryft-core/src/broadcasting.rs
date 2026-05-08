@@ -2,15 +2,13 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
-use crate::{
-    parameters::{ParameterError, Parameterized},
-    sharding::{Sharding, ShardingDimension, ShardingError},
-    types::data_types::DataTypeError,
-    types::{ArrayType, DataType, Shape, Size},
-};
+use crate::parameters::{ParameterError, Parameterized};
+use crate::sharding::{Sharding, ShardingDimension, ShardingError};
+use crate::types::data_types::DataTypeError;
+use crate::types::{ArrayType, DataType, Shape, Size};
 
 /// Represents broadcasting-related errors.
-#[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BroadcastingError {
     #[error("cannot broadcast an empty collection of types")]
     EmptyBroadcastingInput,
@@ -221,7 +219,7 @@ impl Broadcastable for Shape {
     }
 }
 
-impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T {
+impl<T: Parameterized<ArrayType>> Broadcastable for T {
     fn broadcast(&self, other: &Self) -> Result<Self, BroadcastingError> {
         let broadcast_to = |lhs: &Self, rhs: &Self| -> Result<Self, BroadcastingError> {
             let structure = rhs.parameter_structure();
@@ -714,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_parameterized_array_type_broadcastable() {
-        #[derive(Parameterized, Clone, Debug, Eq, PartialEq)]
+        #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
         #[ryft(crate = "crate::parameters")]
         enum TestEnum<P: Parameter> {
             Wrapped { inner: P },

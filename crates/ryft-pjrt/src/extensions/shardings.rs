@@ -168,7 +168,7 @@ pub(crate) mod ffi {
     pub const PJRT_API_SHARDINGS_EXTENSION_VERSION: usize = 1;
 
     #[repr(C)]
-    #[derive(Debug, Copy, Clone)]
+    #[derive(Copy, Clone, Debug)]
     pub struct PJRT_Shardings_PJRT_Executable_ParameterShardings_Args {
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
@@ -195,7 +195,7 @@ pub(crate) mod ffi {
         unsafe extern "C" fn(args: *mut PJRT_Shardings_PJRT_Executable_ParameterShardings_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
-    #[derive(Debug, Copy, Clone)]
+    #[derive(Copy, Clone, Debug)]
     pub struct PJRT_Shardings_PJRT_Executable_OutputShardings_Args {
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,

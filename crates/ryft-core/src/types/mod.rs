@@ -1,3 +1,8 @@
+use std::borrow::Cow;
+use std::fmt::{Debug, Display};
+
+use thiserror::Error;
+
 pub mod array_types;
 pub mod data_types;
 pub mod layouts;
@@ -6,11 +11,23 @@ pub use array_types::*;
 pub use data_types::*;
 pub use layouts::*;
 
+/// Error returned when type inference fails.
+#[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
+#[error("{message}")]
+pub struct TypeError {
+    pub message: String,
+}
+
 /// Lightweight type-level description of a family of runtime values. A [`Type`] captures the structural metadata that
 /// Ryft needs to reason about values without inspecting the values themselves. Examples include scalar data types such
 /// as [`DataType`], array-like types that combine an element [`DataType`] with shape information, and richer type
 /// descriptors for traced values.
-pub trait Type {
+///
+/// Note that [`Type`] requires [`Clone`] so that descriptors can be duplicated into staged
+/// [`Program`](crate::Program)s, returned via [`Cow`] from [`Typed::r#type`], and stored in tracing data structures.
+/// It also requires [`Debug`] and [`Display`] so diagnostics and rendered programs can show type descriptors
+/// consistently without forcing every call site to repeat those bounds.
+pub trait Type: Clone + Debug + Display {
     /// Returns `true` if values described by this [`Type`] are compatible with the provided [`Type`]. The precise
     /// notion of compatibility is type-specific. For example, scalar data types may treat compatibility as promotion
     /// while array-like types may account for broadcasting and nested structure.
@@ -23,6 +40,39 @@ pub trait Type {
 /// checking, and other forms of abstract reasoning.
 pub trait Typed<T: Type> {
     /// Returns the [`Type`] description of this value. The returned [`Type`] should capture the structural information
-    /// that Ryft needs to reason about the value without having to inspect its contents.
-    fn tpe(&self) -> T;
+    /// that Ryft needs to reason about the value without having to inspect its contents. Note that returning a [`Cow`]
+    /// lets implementors lend out a stored [`Type`] by borrow when one is cached on the value, while still supporting
+    /// values that compute their [`Type`] on the fly (and return [`Cow::Owned`]). Callers that need ownership can call
+    /// [`Cow::into_owned`] to clone on demand.
+    fn r#type(&self) -> Cow<'_, T>;
 }
+
+macro_rules! impl_typed_for_scalar {
+    ($ty:ty, $data_type:path) => {
+        impl Typed<DataType> for $ty {
+            fn r#type(&self) -> Cow<'_, DataType> {
+                Cow::Owned($data_type)
+            }
+        }
+
+        impl Typed<ArrayType> for $ty {
+            fn r#type(&self) -> Cow<'_, ArrayType> {
+                Cow::Owned(ArrayType::scalar($data_type))
+            }
+        }
+    };
+}
+
+impl_typed_for_scalar!(bool, DataType::Boolean);
+impl_typed_for_scalar!(i8, DataType::I8);
+impl_typed_for_scalar!(i16, DataType::I16);
+impl_typed_for_scalar!(i32, DataType::I32);
+impl_typed_for_scalar!(i64, DataType::I64);
+impl_typed_for_scalar!(u8, DataType::U8);
+impl_typed_for_scalar!(u16, DataType::U16);
+impl_typed_for_scalar!(u32, DataType::U32);
+impl_typed_for_scalar!(u64, DataType::U64);
+impl_typed_for_scalar!(half::bf16, DataType::BF16);
+impl_typed_for_scalar!(half::f16, DataType::F16);
+impl_typed_for_scalar!(f32, DataType::F32);
+impl_typed_for_scalar!(f64, DataType::F64);

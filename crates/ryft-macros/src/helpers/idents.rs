@@ -1,4 +1,5 @@
-use syn::{visit::Visit, visit_mut::VisitMut};
+use syn::visit::Visit;
+use syn::visit_mut::VisitMut;
 
 /// Helper private module making sure that [`IdentHelpers`] is a sealed trait. Refer to
 /// [this page](https://predr.ag/blog/definitive-guide-to-sealed-traits-in-rust/) for more information

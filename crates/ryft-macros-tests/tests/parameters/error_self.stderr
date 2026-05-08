@@ -121,6 +121,23 @@ note: required for `Generics<Placeholder, T>` to implement `ParameterizedFamily<
    |                             ----- unsatisfied trait bound introduced in this `derive` macro
    = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
+error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placeholder, T>`
+  --> tests/parameters/error_self.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^ expected `Generics<Placeholder, T>`, found `Generics<P, T>`
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                     - found this type parameter
+   |
+   = note: expected struct `Generics<Placeholder, T>`
+              found struct `Generics<P, T>`
+note: required by a bound in `Generics`
+  --> tests/parameters/error_self.rs:10:44
+   |
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                                            ^^^^^^^^^^^^ required by this bound in `Generics`
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+
 error: generic `Self` types are currently not permitted in anonymous constants
   --> tests/parameters/error_self.rs:28:15
    |
@@ -133,6 +150,20 @@ error: generic `Self` types are currently not permitted in anonymous constants
 29 |     _f5: [(); Self::assoc()],
    |               ^^^^
 
+error[E0277]: the trait bound `Struct<Placeholder>: Clone` is not satisfied
+  --> tests/parameters/error_self.rs:23:10
+   |
+23 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Clone` is not implemented for `Struct<Placeholder>`
+  --> tests/parameters/error_self.rs:24:1
+   |
+24 | pub struct Struct<P: Parameter> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: see issue #48214
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+
 error: generic `Self` types are currently not permitted in anonymous constants
   --> tests/parameters/error_self.rs:44:77
    |
@@ -144,6 +175,20 @@ error: generic `Self` types are currently not permitted in anonymous constants
    |
 44 | pub struct Tuple<P: Parameter>(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]);
    |                                                                                                ^^^^
+
+error[E0277]: the trait bound `Tuple<Placeholder>: Clone` is not satisfied
+  --> tests/parameters/error_self.rs:43:10
+   |
+43 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Clone` is not implemented for `Tuple<Placeholder>`
+  --> tests/parameters/error_self.rs:44:1
+   |
+44 | pub struct Tuple<P: Parameter>(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: see issue #48214
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: generic `Self` types are currently not permitted in anonymous constants
   --> tests/parameters/error_self.rs:63:19
@@ -169,21 +214,18 @@ error: generic `Self` types are currently not permitted in anonymous constants
 66 |     Tuple(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]),
    |                                                                           ^^^^
 
-error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placeholder, T>`
-  --> tests/parameters/error_self.rs:9:10
+error[E0277]: the trait bound `Enum<Placeholder>: Clone` is not satisfied
+  --> tests/parameters/error_self.rs:57:10
    |
- 9 | #[derive(Parameterized)]
-   |          ^^^^^^^^^^^^^ expected `Generics<Placeholder, T>`, found `Generics<P, T>`
-10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
-   |                     - found this type parameter
+57 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^ unsatisfied trait bound
    |
-   = note: expected struct `Generics<Placeholder, T>`
-              found struct `Generics<P, T>`
-note: required by a bound in `Generics`
-  --> tests/parameters/error_self.rs:10:44
+help: the trait `Clone` is not implemented for `Enum<Placeholder>`
+  --> tests/parameters/error_self.rs:58:1
    |
-10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
-   |                                            ^^^^^^^^^^^^ required by this bound in `Generics`
+58 | pub enum Enum<P: Parameter> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: see issue #48214
    = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0308]: mismatched types

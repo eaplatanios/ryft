@@ -370,8 +370,8 @@ pub mod ffi {
 pub(crate) mod tests {
     use std::any::Any;
     use std::collections::HashMap;
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::{Arc, OnceLock};
 
     use indoc::indoc;
 
@@ -535,9 +535,9 @@ pub(crate) mod tests {
         let device = executable.addressable_devices().unwrap()[0].clone();
         let inputs = ExecutionDeviceInputs {
             inputs: &[ExecutionInput {
-                buffer: client
-                    .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device, None)
-                    .unwrap(),
+                buffer: Arc::new(
+                    client.buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device, None).unwrap(),
+                ),
                 donatable: false,
             }],
             ..Default::default()
@@ -728,15 +728,19 @@ pub(crate) mod tests {
         let inputs = ExecutionDeviceInputs {
             inputs: &[
                 ExecutionInput {
-                    buffer: client
-                        .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
-                        .unwrap(),
+                    buffer: Arc::new(
+                        client
+                            .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+                            .unwrap(),
+                    ),
                     donatable: false,
                 },
                 ExecutionInput {
-                    buffer: client
-                        .buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
-                        .unwrap(),
+                    buffer: Arc::new(
+                        client
+                            .buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+                            .unwrap(),
+                    ),
                     donatable: false,
                 },
             ],

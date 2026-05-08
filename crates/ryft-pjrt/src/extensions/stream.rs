@@ -162,10 +162,8 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
-    use crate::BufferType;
-    use crate::Error;
-    use crate::tests::TestPlatform;
-    use crate::tests::test_for_each_platform;
+    use crate::tests::{TestPlatform, test_for_each_platform};
+    use crate::{BufferType, Error};
 
     #[test]
     fn test_stream_extension() {

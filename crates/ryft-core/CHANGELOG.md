@@ -11,10 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Added `Parameterized::broadcast_to_parameter_structure`.
-- Added the `Type` and `Broadcastable` traits.
-- Added the `DataType`, `Size`, `Shape`, `TileDimension`, `Tile`, `TiledLayout`, `StridedLayout`, `Layout`, `ArrayType`,
-  `MeshAxisType`, `MeshAxis`, `LogicalMesh`, `MeshDeviceId`, `MeshProcessIndex`, `MeshDevice`, `DeviceMesh`,
-  `ShardingDimension`, `Sharding`, and `ShardingVisualization` types.
+- Added `ryft_core::broadcasting`, `ryft_core::sharding`, `ryft_core::types`, and `ryft_core::utilities`.
 - Introduced more fine-grained error types like `ParameterError`, `DataTypeError`, `LayoutError`, `BroadcastingError`,
   and `ShardingError`.
 
