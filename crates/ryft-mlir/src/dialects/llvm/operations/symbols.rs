@@ -1,5 +1,6 @@
 use crate::{
-    AttributeRef, DetachedOp, DetachedRegion, DialectHandle, Location, Operation, OperationBuilder, TypeRef, mlir_op,
+    AttributeRef, DetachedOp, DetachedRegion, DialectHandle, Error, Location, Operation, OperationBuilder, TypeRef,
+    mlir_op,
 };
 
 /// Canonical MLIR operation name for [`AliasOperation`].
@@ -13,18 +14,36 @@ pub trait AliasOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `alias_type` attribute.
-    fn alias_type(&self) -> AttributeRef<'c, 't> {
-        self.attribute("alias_type").unwrap()
+    fn alias_type(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("alias_type")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "alias_type",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `sym_name` attribute.
-    fn sym_name(&self) -> AttributeRef<'c, 't> {
-        self.attribute("sym_name").unwrap()
+    fn sym_name(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("sym_name")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "sym_name",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `linkage` attribute.
-    fn linkage(&self) -> AttributeRef<'c, 't> {
-        self.attribute("linkage").unwrap()
+    fn linkage(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("linkage")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "linkage",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns whether the `dso_local` unit attribute is present.
@@ -38,12 +57,12 @@ pub trait AliasOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the optional `unnamed_addr` attribute.
-    fn unnamed_addr(&self) -> Option<AttributeRef<'c, 't>> {
+    fn unnamed_addr(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("unnamed_addr")
     }
 
     /// Returns the optional `visibility_` attribute.
-    fn visibility_(&self) -> Option<AttributeRef<'c, 't>> {
+    fn visibility_(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("visibility_")
     }
 }
@@ -61,9 +80,9 @@ pub fn alias<'c, 't: 'c, L: Location<'c, 't>>(
     visibility_: Option<AttributeRef<'c, 't>>,
     initializer: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedAliasOperation<'c, 't> {
+) -> Result<DetachedAliasOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ALIAS_OPERATION_NAME, location);
     builder = builder.add_attribute("alias_type", alias_type);
     builder = builder.add_attribute("sym_name", sym_name);
@@ -81,10 +100,9 @@ pub fn alias<'c, 't: 'c, L: Location<'c, 't>>(
         builder = builder.add_attribute("visibility_", visibility_);
     }
     builder = builder.add_region(initializer);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::alias`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::alias`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`ComdatOperation`].
@@ -98,8 +116,14 @@ pub trait ComdatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `sym_name` attribute.
-    fn sym_name(&self) -> AttributeRef<'c, 't> {
-        self.attribute("sym_name").unwrap()
+    fn sym_name(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("sym_name")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "sym_name",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 }
 
@@ -110,16 +134,15 @@ pub fn comdat<'c, 't: 'c, L: Location<'c, 't>>(
     sym_name: AttributeRef<'c, 't>,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedComdatOperation<'c, 't> {
+) -> Result<DetachedComdatOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(COMDAT_OPERATION_NAME, location);
     builder = builder.add_attribute("sym_name", sym_name);
     builder = builder.add_region(body);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::comdat`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::comdat`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`ComdatSelectorOperation`].
@@ -133,13 +156,25 @@ pub trait ComdatSelectorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `sym_name` attribute.
-    fn sym_name(&self) -> AttributeRef<'c, 't> {
-        self.attribute("sym_name").unwrap()
+    fn sym_name(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("sym_name")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "sym_name",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `comdat` attribute.
-    fn comdat(&self) -> AttributeRef<'c, 't> {
-        self.attribute("comdat").unwrap()
+    fn comdat(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("comdat")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "comdat",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 }
 
@@ -150,16 +185,17 @@ pub fn comdat_selector<'c, 't: 'c, L: Location<'c, 't>>(
     sym_name: AttributeRef<'c, 't>,
     comdat: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedComdatSelectorOperation<'c, 't> {
+) -> Result<DetachedComdatSelectorOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(COMDAT_SELECTOR_OPERATION_NAME, location);
     builder = builder.add_attribute("sym_name", sym_name);
     builder = builder.add_attribute("comdat", comdat);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::comdat_selector`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::comdat_selector`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`DsoLocalEquivalentOperation`].
@@ -173,13 +209,19 @@ pub trait DsoLocalEquivalentOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't>
     }
 
     /// Returns the `function_name` attribute.
-    fn function_name(&self) -> AttributeRef<'c, 't> {
-        self.attribute("function_name").unwrap()
+    fn function_name(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("function_name")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "function_name",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's first result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -190,16 +232,17 @@ pub fn dso_local_equivalent<'c, 't: 'c, L: Location<'c, 't>>(
     result_type: TypeRef<'c, 't>,
     function_name: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedDsoLocalEquivalentOperation<'c, 't> {
+) -> Result<DetachedDsoLocalEquivalentOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(DSO_LOCAL_EQUIVALENT_OPERATION_NAME, location);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("function_name", function_name);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::dso_local_equivalent`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::dso_local_equivalent`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`GlobalCtorsOperation`].
@@ -213,18 +256,36 @@ pub trait GlobalCtorsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `ctors` attribute.
-    fn ctors(&self) -> AttributeRef<'c, 't> {
-        self.attribute("ctors").unwrap()
+    fn ctors(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("ctors")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "ctors",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `priorities` attribute.
-    fn priorities(&self) -> AttributeRef<'c, 't> {
-        self.attribute("priorities").unwrap()
+    fn priorities(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("priorities")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "priorities",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `data` attribute.
-    fn data(&self) -> AttributeRef<'c, 't> {
-        self.attribute("data").unwrap()
+    fn data(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("data")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "data",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 }
 
@@ -236,17 +297,16 @@ pub fn global_ctors<'c, 't: 'c, L: Location<'c, 't>>(
     priorities: AttributeRef<'c, 't>,
     data: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedGlobalCtorsOperation<'c, 't> {
+) -> Result<DetachedGlobalCtorsOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(GLOBAL_CTORS_OPERATION_NAME, location);
     builder = builder.add_attribute("ctors", ctors);
     builder = builder.add_attribute("priorities", priorities);
     builder = builder.add_attribute("data", data);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::global_ctors`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::global_ctors`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`GlobalDtorsOperation`].
@@ -260,18 +320,36 @@ pub trait GlobalDtorsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `dtors` attribute.
-    fn dtors(&self) -> AttributeRef<'c, 't> {
-        self.attribute("dtors").unwrap()
+    fn dtors(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("dtors")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "dtors",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `priorities` attribute.
-    fn priorities(&self) -> AttributeRef<'c, 't> {
-        self.attribute("priorities").unwrap()
+    fn priorities(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("priorities")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "priorities",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `data` attribute.
-    fn data(&self) -> AttributeRef<'c, 't> {
-        self.attribute("data").unwrap()
+    fn data(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("data")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "data",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 }
 
@@ -283,17 +361,16 @@ pub fn global_dtors<'c, 't: 'c, L: Location<'c, 't>>(
     priorities: AttributeRef<'c, 't>,
     data: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedGlobalDtorsOperation<'c, 't> {
+) -> Result<DetachedGlobalDtorsOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(GLOBAL_DTORS_OPERATION_NAME, location);
     builder = builder.add_attribute("dtors", dtors);
     builder = builder.add_attribute("priorities", priorities);
     builder = builder.add_attribute("data", data);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::global_dtors`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::global_dtors`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`GlobalOperation`].
@@ -307,8 +384,14 @@ pub trait GlobalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `global_type` attribute.
-    fn global_type(&self) -> AttributeRef<'c, 't> {
-        self.attribute("global_type").unwrap()
+    fn global_type(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("global_type")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "global_type",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns whether the `constant` unit attribute is present.
@@ -317,13 +400,25 @@ pub trait GlobalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `sym_name` attribute.
-    fn sym_name(&self) -> AttributeRef<'c, 't> {
-        self.attribute("sym_name").unwrap()
+    fn sym_name(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("sym_name")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "sym_name",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `linkage` attribute.
-    fn linkage(&self) -> AttributeRef<'c, 't> {
-        self.attribute("linkage").unwrap()
+    fn linkage(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("linkage")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "linkage",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns whether the `dso_local` unit attribute is present.
@@ -342,47 +437,47 @@ pub trait GlobalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the optional `value` attribute.
-    fn value(&self) -> Option<AttributeRef<'c, 't>> {
+    fn value(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("value")
     }
 
     /// Returns the optional `alignment` attribute.
-    fn alignment(&self) -> Option<AttributeRef<'c, 't>> {
+    fn alignment(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("alignment")
     }
 
     /// Returns the optional `addr_space` attribute.
-    fn addr_space(&self) -> Option<AttributeRef<'c, 't>> {
+    fn addr_space(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("addr_space")
     }
 
     /// Returns the optional `unnamed_addr` attribute.
-    fn unnamed_addr(&self) -> Option<AttributeRef<'c, 't>> {
+    fn unnamed_addr(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("unnamed_addr")
     }
 
     /// Returns the optional `section` attribute.
-    fn section(&self) -> Option<AttributeRef<'c, 't>> {
+    fn section(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("section")
     }
 
     /// Returns the optional `comdat` attribute.
-    fn comdat(&self) -> Option<AttributeRef<'c, 't>> {
+    fn comdat(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("comdat")
     }
 
     /// Returns the optional `dbg_exprs` attribute.
-    fn dbg_exprs(&self) -> Option<AttributeRef<'c, 't>> {
+    fn dbg_exprs(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("dbg_exprs")
     }
 
     /// Returns the optional `visibility_` attribute.
-    fn visibility_(&self) -> Option<AttributeRef<'c, 't>> {
+    fn visibility_(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("visibility_")
     }
 
     /// Returns the optional `target_specific_attrs` attribute.
-    fn target_specific_attrs(&self) -> Option<AttributeRef<'c, 't>> {
+    fn target_specific_attrs(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("target_specific_attrs")
     }
 }
@@ -409,9 +504,9 @@ pub fn global<'c, 't: 'c, L: Location<'c, 't>>(
     target_specific_attrs: Option<AttributeRef<'c, 't>>,
     initializer: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedGlobalOperation<'c, 't> {
+) -> Result<DetachedGlobalOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(GLOBAL_OPERATION_NAME, location);
     builder = builder.add_attribute("global_type", global_type);
     if constant {
@@ -456,10 +551,9 @@ pub fn global<'c, 't: 'c, L: Location<'c, 't>>(
         builder = builder.add_attribute("target_specific_attrs", target_specific_attrs);
     }
     builder = builder.add_region(initializer);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::global`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::global`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`IfuncOperation`].
@@ -473,28 +567,58 @@ pub trait IfuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `sym_name` attribute.
-    fn sym_name(&self) -> AttributeRef<'c, 't> {
-        self.attribute("sym_name").unwrap()
+    fn sym_name(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("sym_name")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "sym_name",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `i_func_type` attribute.
-    fn i_func_type(&self) -> AttributeRef<'c, 't> {
-        self.attribute("i_func_type").unwrap()
+    fn i_func_type(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("i_func_type")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "i_func_type",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `resolver` attribute.
-    fn resolver(&self) -> AttributeRef<'c, 't> {
-        self.attribute("resolver").unwrap()
+    fn resolver(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("resolver")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "resolver",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `resolver_type` attribute.
-    fn resolver_type(&self) -> AttributeRef<'c, 't> {
-        self.attribute("resolver_type").unwrap()
+    fn resolver_type(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("resolver_type")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "resolver_type",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `linkage` attribute.
-    fn linkage(&self) -> AttributeRef<'c, 't> {
-        self.attribute("linkage").unwrap()
+    fn linkage(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("linkage")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "linkage",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns whether the `dso_local` unit attribute is present.
@@ -503,17 +627,17 @@ pub trait IfuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the optional `address_space` attribute.
-    fn address_space(&self) -> Option<AttributeRef<'c, 't>> {
+    fn address_space(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("address_space")
     }
 
     /// Returns the optional `unnamed_addr` attribute.
-    fn unnamed_addr(&self) -> Option<AttributeRef<'c, 't>> {
+    fn unnamed_addr(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("unnamed_addr")
     }
 
     /// Returns the optional `visibility_` attribute.
-    fn visibility_(&self) -> Option<AttributeRef<'c, 't>> {
+    fn visibility_(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("visibility_")
     }
 }
@@ -532,9 +656,9 @@ pub fn ifunc<'c, 't: 'c, L: Location<'c, 't>>(
     unnamed_addr: Option<AttributeRef<'c, 't>>,
     visibility_: Option<AttributeRef<'c, 't>>,
     location: L,
-) -> DetachedIfuncOperation<'c, 't> {
+) -> Result<DetachedIfuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(IFUNC_OPERATION_NAME, location);
     builder = builder.add_attribute("sym_name", sym_name);
     builder = builder.add_attribute("i_func_type", i_func_type);
@@ -553,10 +677,9 @@ pub fn ifunc<'c, 't: 'c, L: Location<'c, 't>>(
     if let Some(visibility_) = visibility_ {
         builder = builder.add_attribute("visibility_", visibility_);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::ifunc`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::ifunc`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`LlvmFuncOperation`].
@@ -570,22 +693,34 @@ pub trait LlvmFuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `sym_name` attribute.
-    fn sym_name(&self) -> AttributeRef<'c, 't> {
-        self.attribute("sym_name").unwrap()
+    fn sym_name(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("sym_name")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "sym_name",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the optional `sym_visibility` attribute.
-    fn sym_visibility(&self) -> Option<AttributeRef<'c, 't>> {
+    fn sym_visibility(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("sym_visibility")
     }
 
     /// Returns the `function_type` attribute.
-    fn function_type(&self) -> AttributeRef<'c, 't> {
-        self.attribute("function_type").unwrap()
+    fn function_type(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("function_type")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "function_type",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the optional `linkage` attribute.
-    fn linkage(&self) -> Option<AttributeRef<'c, 't>> {
+    fn linkage(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("linkage")
     }
 }
@@ -600,9 +735,9 @@ pub fn func<'c, 't: 'c, L: Location<'c, 't>>(
     linkage: Option<AttributeRef<'c, 't>>,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedLlvmFuncOperation<'c, 't> {
+) -> Result<DetachedLlvmFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LLVM_FUNC_OPERATION_NAME, location);
     builder = builder.add_attribute("sym_name", sym_name);
     if let Some(sym_visibility) = sym_visibility {
@@ -613,10 +748,9 @@ pub fn func<'c, 't: 'c, L: Location<'c, 't>>(
         builder = builder.add_attribute("linkage", linkage);
     }
     builder = builder.add_region(body);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::func`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::func`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`LinkerOptionsOperation`].
@@ -630,8 +764,14 @@ pub trait LinkerOptionsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `options` attribute.
-    fn options(&self) -> AttributeRef<'c, 't> {
-        self.attribute("options").unwrap()
+    fn options(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("options")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "options",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 }
 
@@ -641,15 +781,16 @@ mlir_op!(LinkerOptions);
 pub fn linker_options<'c, 't: 'c, L: Location<'c, 't>>(
     options: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedLinkerOptionsOperation<'c, 't> {
+) -> Result<DetachedLinkerOptionsOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LINKER_OPTIONS_OPERATION_NAME, location);
     builder = builder.add_attribute("options", options);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::linker_options`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::linker_options`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`ModuleFlagsOperation`].
@@ -663,8 +804,14 @@ pub trait ModuleFlagsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `flags` attribute.
-    fn flags(&self) -> AttributeRef<'c, 't> {
-        self.attribute("flags").unwrap()
+    fn flags(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("flags")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "flags",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 }
 
@@ -674,15 +821,14 @@ mlir_op!(ModuleFlags);
 pub fn module_flags<'c, 't: 'c, L: Location<'c, 't>>(
     flags: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedModuleFlagsOperation<'c, 't> {
+) -> Result<DetachedModuleFlagsOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MODULE_FLAGS_OPERATION_NAME, location);
     builder = builder.add_attribute("flags", flags);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::module_flags`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::module_flags`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`NamedMetadataOperation`].
@@ -696,13 +842,25 @@ pub trait NamedMetadataOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `metadata_name` attribute.
-    fn metadata_name(&self) -> AttributeRef<'c, 't> {
-        self.attribute("metadata_name").unwrap()
+    fn metadata_name(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("metadata_name")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "metadata_name",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the `nodes` attribute.
-    fn nodes(&self) -> AttributeRef<'c, 't> {
-        self.attribute("nodes").unwrap()
+    fn nodes(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("nodes")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "nodes",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 }
 
@@ -713,16 +871,17 @@ pub fn named_metadata<'c, 't: 'c, L: Location<'c, 't>>(
     metadata_name: AttributeRef<'c, 't>,
     nodes: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedNamedMetadataOperation<'c, 't> {
+) -> Result<DetachedNamedMetadataOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(NAMED_METADATA_OPERATION_NAME, location);
     builder = builder.add_attribute("metadata_name", metadata_name);
     builder = builder.add_attribute("nodes", nodes);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::named_metadata`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::named_metadata`"))
+    })
 }
 
 #[cfg(test)]
@@ -741,54 +900,68 @@ mod tests {
     fn test_alias() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let pointer_type = context.llvm_pointer_type(0);
+        let module = context.module(location).unwrap();
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation(global(
-            context.type_attribute(i32_type).as_ref(),
-            false,
-            context.string_attribute("target").as_ref(),
-            context.llvm_linkage_attribute(Linkage::External).as_ref(),
-            false,
-            false,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            context.region(),
-            location,
-        ));
+        module
+            .body()
+            .unwrap()
+            .append_operation(
+                global(
+                    context.type_attribute(i32_type).as_ref(),
+                    false,
+                    context.string_attribute("target").as_ref(),
+                    context.llvm_linkage_attribute(Linkage::External).unwrap().as_ref(),
+                    false,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    context.region(),
+                    location,
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let mut initializer = context.region();
         let mut block = context.block_with_no_arguments();
-        let address = block.append_operation(address_of("target", pointer_type, location));
-        block.append_operation(llvm_return(Some(address.result(0).unwrap().into()), location));
-        initializer.append_block(block);
-        module.body().append_operation({
-            let op = alias(
-                context.type_attribute(pointer_type).as_ref(),
-                context.string_attribute("target_alias").as_ref(),
-                context.llvm_linkage_attribute(Linkage::Internal).as_ref(),
-                false,
-                false,
-                None,
-                None,
-                initializer,
-                location,
-            );
-            assert_eq!(op.operation_name(), "llvm.mlir.alias");
-            assert_eq!(op.alias_type(), context.type_attribute(pointer_type).as_ref());
-            assert_eq!(op.sym_name(), context.string_attribute("target_alias").as_ref());
-            assert_eq!(op.linkage(), context.llvm_linkage_attribute(Linkage::Internal).as_ref());
-            assert_eq!(op.regions().count(), 1);
-            op
-        });
-        assert!(module.verify());
+        let address = block.append_operation(address_of("target", pointer_type, location).unwrap()).unwrap();
+        block
+            .append_operation(llvm_return(Some(address.result(0).unwrap().into()), location).unwrap())
+            .unwrap();
+        initializer.append_block(block).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let op = alias(
+                    context.type_attribute(pointer_type).as_ref(),
+                    context.string_attribute("target_alias").as_ref(),
+                    context.llvm_linkage_attribute(Linkage::Internal).unwrap().as_ref(),
+                    false,
+                    false,
+                    None,
+                    None,
+                    initializer,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.mlir.alias");
+                assert_eq!(op.alias_type().unwrap(), context.type_attribute(pointer_type).as_ref());
+                assert_eq!(op.sym_name().unwrap(), context.string_attribute("target_alias").as_ref());
+                assert_eq!(op.linkage().unwrap(), context.llvm_linkage_attribute(Linkage::Internal).unwrap().as_ref());
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                op
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -807,28 +980,33 @@ mod tests {
     fn test_comdat() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let mut body = context.region();
         let mut block = context.block_with_no_arguments();
         let selector = comdat_selector(
             context.string_attribute("any").as_ref(),
             context.integer_attribute(context.signless_integer_type(64), 0).as_ref(),
             location,
-        );
+        )
+        .unwrap();
         assert_eq!(selector.operation_name(), "llvm.comdat_selector");
-        assert_eq!(selector.sym_name(), context.string_attribute("any").as_ref());
-        block.append_operation(selector);
-        body.append_block(block);
-        module.body().append_operation({
-            let op = comdat(context.string_attribute("__llvm_comdat").as_ref(), body, location);
-            assert_eq!(op.operation_name(), "llvm.comdat");
-            assert_eq!(op.sym_name(), context.string_attribute("__llvm_comdat").as_ref());
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 0);
-            assert_eq!(op.regions().count(), 1);
-            op
-        });
-        assert!(module.verify());
+        assert_eq!(selector.sym_name().unwrap(), context.string_attribute("any").as_ref());
+        block.append_operation(selector).unwrap();
+        body.append_block(block).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let op = comdat(context.string_attribute("__llvm_comdat").as_ref(), body, location).unwrap();
+                assert_eq!(op.operation_name(), "llvm.comdat");
+                assert_eq!(op.sym_name().unwrap(), context.string_attribute("__llvm_comdat").as_ref());
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                op
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -845,20 +1023,23 @@ mod tests {
     fn test_comdat_selector() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let mut body = context.region();
         let mut block = context.block_with_no_arguments();
         let comdat_kind = context.integer_attribute(context.signless_integer_type(64), 0);
-        let selector = comdat_selector(context.string_attribute("any").as_ref(), comdat_kind.as_ref(), location);
+        let selector =
+            comdat_selector(context.string_attribute("any").as_ref(), comdat_kind.as_ref(), location).unwrap();
         assert_eq!(selector.operation_name(), "llvm.comdat_selector");
-        assert_eq!(selector.sym_name(), context.string_attribute("any").as_ref());
-        assert_eq!(selector.comdat(), comdat_kind.as_ref());
-        block.append_operation(selector);
-        body.append_block(block);
+        assert_eq!(selector.sym_name().unwrap(), context.string_attribute("any").as_ref());
+        assert_eq!(selector.comdat().unwrap(), comdat_kind.as_ref());
+        block.append_operation(selector).unwrap();
+        body.append_block(block).unwrap();
         module
             .body()
-            .append_operation(comdat(context.string_attribute("__llvm_comdat").as_ref(), body, location));
-        assert!(module.verify());
+            .unwrap()
+            .append_operation(comdat(context.string_attribute("__llvm_comdat").as_ref(), body, location).unwrap())
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -875,38 +1056,56 @@ mod tests {
     fn test_dso_local_equivalent() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let pointer_type = context.llvm_pointer_type(0);
-        let function_type = context.llvm_function_type(context.llvm_void_type(), &[] as &[TypeRef], false);
-        module.body().append_operation(super::func(
-            context.string_attribute("callee").as_ref(),
-            None,
-            context.type_attribute(function_type).as_ref(),
-            Some(context.llvm_linkage_attribute(Linkage::External).as_ref()),
-            context.region(),
-            location,
-        ));
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = dso_local_equivalent(
-                pointer_type.as_ref(),
-                context.flat_symbol_ref_attribute("callee").as_ref(),
-                location,
-            );
-            assert_eq!(op.operation_name(), "llvm.dso_local_equivalent");
-            assert_eq!(op.output_type(), pointer_type);
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_dso_local_equivalent_test",
-                func::FuncAttributes { arguments: vec![], results: vec![pointer_type.into()], ..Default::default() },
-                block.into(),
-                location,
+        let module = context.module(location).unwrap();
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
+        let function_type =
+            context.llvm_function_type(context.llvm_void_type().unwrap(), &[] as &[TypeRef], false).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(
+                super::func(
+                    context.string_attribute("callee").as_ref(),
+                    None,
+                    context.type_attribute(function_type).as_ref(),
+                    Some(context.llvm_linkage_attribute(Linkage::External).unwrap().as_ref()),
+                    context.region(),
+                    location,
+                )
+                .unwrap(),
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = dso_local_equivalent(
+                    pointer_type.as_ref(),
+                    context.flat_symbol_ref_attribute("callee").as_ref(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.dso_local_equivalent");
+                assert_eq!(op.output_type().unwrap(), pointer_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_dso_local_equivalent_test",
+                    func::FuncAttributes {
+                        arguments: vec![],
+                        results: vec![pointer_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -925,33 +1124,45 @@ mod tests {
     fn test_global_ctors() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let function_type = context.llvm_function_type(context.llvm_void_type(), &[] as &[TypeRef], false);
+        let module = context.module(location).unwrap();
+        let function_type =
+            context.llvm_function_type(context.llvm_void_type().unwrap(), &[] as &[TypeRef], false).unwrap();
         let mut ctor_body = context.region();
         let mut ctor_block = context.block_with_no_arguments();
-        ctor_block.append_operation(super::super::core::r#return(None, location));
-        ctor_body.append_block(ctor_block);
-        module.body().append_operation(super::func(
-            context.string_attribute("ctor").as_ref(),
-            None,
-            context.type_attribute(function_type).as_ref(),
-            Some(context.llvm_linkage_attribute(Linkage::External).as_ref()),
-            ctor_body,
-            location,
-        ));
-        module.body().append_operation({
-            let ctors = context.array_attribute(&[context.flat_symbol_ref_attribute("ctor").as_ref()]);
-            let priorities =
-                context.array_attribute(&[context.integer_attribute(context.signless_integer_type(32), 0).as_ref()]);
-            let data = context.array_attribute(&[context.llvm_zero_attribute().as_ref()]);
-            let op = global_ctors(ctors.as_ref(), priorities.as_ref(), data.as_ref(), location);
-            assert_eq!(op.operation_name(), "llvm.mlir.global_ctors");
-            assert_eq!(op.ctors(), ctors);
-            assert_eq!(op.priorities(), priorities);
-            assert_eq!(op.data(), data);
-            op
-        });
-        assert!(module.verify());
+        ctor_block.append_operation(super::super::core::r#return(None, location).unwrap()).unwrap();
+        ctor_body.append_block(ctor_block).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(
+                super::func(
+                    context.string_attribute("ctor").as_ref(),
+                    None,
+                    context.type_attribute(function_type).as_ref(),
+                    Some(context.llvm_linkage_attribute(Linkage::External).unwrap().as_ref()),
+                    ctor_body,
+                    location,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let ctors = context.array_attribute(&[context.flat_symbol_ref_attribute("ctor").as_ref()]);
+                let priorities = context
+                    .array_attribute(&[context.integer_attribute(context.signless_integer_type(32), 0).as_ref()]);
+                let data = context.array_attribute(&[context.llvm_zero_attribute().unwrap().as_ref()]);
+                let op = global_ctors(ctors.as_ref(), priorities.as_ref(), data.as_ref(), location).unwrap();
+                assert_eq!(op.operation_name(), "llvm.mlir.global_ctors");
+                assert_eq!(op.ctors().unwrap(), ctors);
+                assert_eq!(op.priorities().unwrap(), priorities);
+                assert_eq!(op.data().unwrap(), data);
+                op
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -969,33 +1180,45 @@ mod tests {
     fn test_global_dtors() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let function_type = context.llvm_function_type(context.llvm_void_type(), &[] as &[TypeRef], false);
+        let module = context.module(location).unwrap();
+        let function_type =
+            context.llvm_function_type(context.llvm_void_type().unwrap(), &[] as &[TypeRef], false).unwrap();
         let mut dtor_body = context.region();
         let mut dtor_block = context.block_with_no_arguments();
-        dtor_block.append_operation(super::super::core::r#return(None, location));
-        dtor_body.append_block(dtor_block);
-        module.body().append_operation(super::func(
-            context.string_attribute("dtor").as_ref(),
-            None,
-            context.type_attribute(function_type).as_ref(),
-            Some(context.llvm_linkage_attribute(Linkage::External).as_ref()),
-            dtor_body,
-            location,
-        ));
-        module.body().append_operation({
-            let dtors = context.array_attribute(&[context.flat_symbol_ref_attribute("dtor").as_ref()]);
-            let priorities =
-                context.array_attribute(&[context.integer_attribute(context.signless_integer_type(32), 0).as_ref()]);
-            let data = context.array_attribute(&[context.llvm_zero_attribute().as_ref()]);
-            let op = global_dtors(dtors.as_ref(), priorities.as_ref(), data.as_ref(), location);
-            assert_eq!(op.operation_name(), "llvm.mlir.global_dtors");
-            assert_eq!(op.dtors(), dtors);
-            assert_eq!(op.priorities(), priorities);
-            assert_eq!(op.data(), data);
-            op
-        });
-        assert!(module.verify());
+        dtor_block.append_operation(super::super::core::r#return(None, location).unwrap()).unwrap();
+        dtor_body.append_block(dtor_block).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(
+                super::func(
+                    context.string_attribute("dtor").as_ref(),
+                    None,
+                    context.type_attribute(function_type).as_ref(),
+                    Some(context.llvm_linkage_attribute(Linkage::External).unwrap().as_ref()),
+                    dtor_body,
+                    location,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let dtors = context.array_attribute(&[context.flat_symbol_ref_attribute("dtor").as_ref()]);
+                let priorities = context
+                    .array_attribute(&[context.integer_attribute(context.signless_integer_type(32), 0).as_ref()]);
+                let data = context.array_attribute(&[context.llvm_zero_attribute().unwrap().as_ref()]);
+                let op = global_dtors(dtors.as_ref(), priorities.as_ref(), data.as_ref(), location).unwrap();
+                assert_eq!(op.operation_name(), "llvm.mlir.global_dtors");
+                assert_eq!(op.dtors().unwrap(), dtors);
+                assert_eq!(op.priorities().unwrap(), priorities);
+                assert_eq!(op.data().unwrap(), data);
+                op
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1013,37 +1236,42 @@ mod tests {
     fn test_global() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let value = context.integer_attribute(i32_type, 42);
-            let op = global(
-                context.type_attribute(i32_type).as_ref(),
-                true,
-                context.string_attribute("value").as_ref(),
-                context.llvm_linkage_attribute(Linkage::Internal).as_ref(),
-                false,
-                false,
-                false,
-                Some(value.as_ref()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                context.region(),
-                location,
-            );
-            assert_eq!(op.operation_name(), "llvm.mlir.global");
-            assert_eq!(op.global_type(), context.type_attribute(i32_type).as_ref());
-            assert!(op.constant());
-            assert_eq!(op.value(), Some(value.as_ref()));
-            op
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let value = context.integer_attribute(i32_type, 42);
+                let op = global(
+                    context.type_attribute(i32_type).as_ref(),
+                    true,
+                    context.string_attribute("value").as_ref(),
+                    context.llvm_linkage_attribute(Linkage::Internal).unwrap().as_ref(),
+                    false,
+                    false,
+                    false,
+                    Some(value.as_ref()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    context.region(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.mlir.global");
+                assert_eq!(op.global_type().unwrap(), context.type_attribute(i32_type).as_ref());
+                assert!(op.constant());
+                assert_eq!(op.value().unwrap(), Some(value.as_ref()));
+                op
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1058,52 +1286,76 @@ mod tests {
     fn test_ifunc() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let pointer_type = context.llvm_pointer_type(0);
-        let implementation_type = context.llvm_function_type(context.llvm_void_type(), &[] as &[TypeRef], false);
-        let resolver_type = context.llvm_function_type(pointer_type, &[] as &[TypeRef], false);
-        module.body().append_operation(super::func(
-            context.string_attribute("implementation").as_ref(),
-            None,
-            context.type_attribute(implementation_type).as_ref(),
-            Some(context.llvm_linkage_attribute(Linkage::External).as_ref()),
-            context.region(),
-            location,
-        ));
+        let module = context.module(location).unwrap();
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
+        let implementation_type =
+            context.llvm_function_type(context.llvm_void_type().unwrap(), &[] as &[TypeRef], false).unwrap();
+        let resolver_type = context.llvm_function_type(pointer_type, &[] as &[TypeRef], false).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(
+                super::func(
+                    context.string_attribute("implementation").as_ref(),
+                    None,
+                    context.type_attribute(implementation_type).as_ref(),
+                    Some(context.llvm_linkage_attribute(Linkage::External).unwrap().as_ref()),
+                    context.region(),
+                    location,
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let mut resolver_body = context.region();
         let mut resolver_block = context.block_with_no_arguments();
-        let address = resolver_block.append_operation(address_of("implementation", pointer_type, location));
-        resolver_block.append_operation(llvm_return(Some(address.result(0).unwrap().into()), location));
-        resolver_body.append_block(resolver_block);
-        module.body().append_operation(super::func(
-            context.string_attribute("resolver").as_ref(),
-            None,
-            context.type_attribute(resolver_type).as_ref(),
-            Some(context.llvm_linkage_attribute(Linkage::Internal).as_ref()),
-            resolver_body,
-            location,
-        ));
-        module.body().append_operation({
-            let op = ifunc(
-                context.string_attribute("selected").as_ref(),
-                context.type_attribute(implementation_type).as_ref(),
-                context.flat_symbol_ref_attribute("resolver").as_ref(),
-                context.type_attribute(pointer_type).as_ref(),
-                context.llvm_linkage_attribute(Linkage::Internal).as_ref(),
-                true,
-                None,
-                None,
-                None,
-                location,
-            );
-            assert_eq!(op.operation_name(), "llvm.mlir.ifunc");
-            assert_eq!(op.sym_name(), context.string_attribute("selected").as_ref());
-            assert_eq!(op.i_func_type(), context.type_attribute(implementation_type).as_ref());
-            assert_eq!(op.resolver(), context.flat_symbol_ref_attribute("resolver").as_ref());
-            assert!(op.dso_local());
-            op
-        });
-        assert!(module.verify());
+        let address = resolver_block
+            .append_operation(address_of("implementation", pointer_type, location).unwrap())
+            .unwrap();
+        resolver_block
+            .append_operation(llvm_return(Some(address.result(0).unwrap().into()), location).unwrap())
+            .unwrap();
+        resolver_body.append_block(resolver_block).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(
+                super::func(
+                    context.string_attribute("resolver").as_ref(),
+                    None,
+                    context.type_attribute(resolver_type).as_ref(),
+                    Some(context.llvm_linkage_attribute(Linkage::Internal).unwrap().as_ref()),
+                    resolver_body,
+                    location,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let op = ifunc(
+                    context.string_attribute("selected").as_ref(),
+                    context.type_attribute(implementation_type).as_ref(),
+                    context.flat_symbol_ref_attribute("resolver").as_ref(),
+                    context.type_attribute(pointer_type).as_ref(),
+                    context.llvm_linkage_attribute(Linkage::Internal).unwrap().as_ref(),
+                    true,
+                    None,
+                    None,
+                    None,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.mlir.ifunc");
+                assert_eq!(op.sym_name().unwrap(), context.string_attribute("selected").as_ref());
+                assert_eq!(op.i_func_type().unwrap(), context.type_attribute(implementation_type).as_ref());
+                assert_eq!(op.resolver().unwrap(), context.flat_symbol_ref_attribute("resolver").as_ref());
+                assert!(op.dso_local());
+                op
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1123,29 +1375,36 @@ mod tests {
     fn test_func() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let function_type = context.llvm_function_type(i32_type, &[i32_type], false);
+        let function_type = context.llvm_function_type(i32_type, &[i32_type], false).unwrap();
         let mut body = context.region();
         let mut block = context.block(&[(i32_type.as_ref(), location)]);
-        block.append_operation(super::super::core::r#return(Some(block.argument(0).unwrap().into()), location));
-        body.append_block(block);
-        module.body().append_operation({
-            let op = super::func(
-                context.string_attribute("identity").as_ref(),
-                None,
-                context.type_attribute(function_type).as_ref(),
-                Some(context.llvm_linkage_attribute(Linkage::Internal).as_ref()),
-                body,
-                location,
-            );
-            assert_eq!(op.operation_name(), "llvm.func");
-            assert_eq!(op.sym_name(), context.string_attribute("identity").as_ref());
-            assert_eq!(op.function_type(), context.type_attribute(function_type).as_ref());
-            assert!(op.linkage().is_some());
-            op
-        });
-        assert!(module.verify());
+        block
+            .append_operation(super::super::core::r#return(Some(block.argument(0).unwrap().into()), location).unwrap())
+            .unwrap();
+        body.append_block(block).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let op = super::func(
+                    context.string_attribute("identity").as_ref(),
+                    None,
+                    context.type_attribute(function_type).as_ref(),
+                    Some(context.llvm_linkage_attribute(Linkage::Internal).unwrap().as_ref()),
+                    body,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.func");
+                assert_eq!(op.sym_name().unwrap(), context.string_attribute("identity").as_ref());
+                assert_eq!(op.function_type().unwrap(), context.type_attribute(function_type).as_ref());
+                assert!(op.linkage().unwrap().is_some());
+                op
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1162,18 +1421,22 @@ mod tests {
     fn test_linker_options() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        module.body().append_operation({
-            let options = context.array_attribute(&[
-                context.string_attribute("framework").as_ref(),
-                context.string_attribute("Accelerate").as_ref(),
-            ]);
-            let op = linker_options(options.as_ref(), location);
-            assert_eq!(op.operation_name(), "llvm.linker_options");
-            assert_eq!(op.options(), options);
-            op
-        });
-        assert!(module.verify());
+        let module = context.module(location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let options = context.array_attribute(&[
+                    context.string_attribute("framework").as_ref(),
+                    context.string_attribute("Accelerate").as_ref(),
+                ]);
+                let op = linker_options(options.as_ref(), location).unwrap();
+                assert_eq!(op.operation_name(), "llvm.linker_options");
+                assert_eq!(op.options().unwrap(), options);
+                op
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1188,15 +1451,19 @@ mod tests {
     fn test_module_flags() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        module.body().append_operation({
-            let flags = context.array_attribute(&[] as &[AttributeRef]);
-            let op = module_flags(flags.as_ref(), location);
-            assert_eq!(op.operation_name(), "llvm.module_flags");
-            assert_eq!(op.flags(), flags);
-            op
-        });
-        assert!(module.verify());
+        let module = context.module(location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let flags = context.array_attribute(&[] as &[AttributeRef]);
+                let op = module_flags(flags.as_ref(), location).unwrap();
+                assert_eq!(op.operation_name(), "llvm.module_flags");
+                assert_eq!(op.flags().unwrap(), flags);
+                op
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1211,16 +1478,21 @@ mod tests {
     fn test_named_metadata() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        module.body().append_operation({
-            let nodes = context.array_attribute(&[] as &[AttributeRef]);
-            let op = named_metadata(context.string_attribute("llvm.ident").as_ref(), nodes.as_ref(), location);
-            assert_eq!(op.operation_name(), "llvm.named_metadata");
-            assert_eq!(op.metadata_name(), context.string_attribute("llvm.ident").as_ref());
-            assert_eq!(op.nodes(), nodes);
-            op
-        });
-        assert!(module.verify());
+        let module = context.module(location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let nodes = context.array_attribute(&[] as &[AttributeRef]);
+                let op =
+                    named_metadata(context.string_attribute("llvm.ident").as_ref(), nodes.as_ref(), location).unwrap();
+                assert_eq!(op.operation_name(), "llvm.named_metadata");
+                assert_eq!(op.metadata_name().unwrap(), context.string_attribute("llvm.ident").as_ref());
+                assert_eq!(op.nodes().unwrap(), nodes);
+                op
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

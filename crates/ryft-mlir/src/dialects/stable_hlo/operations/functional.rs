@@ -1,10 +1,8 @@
 #![allow(deprecated)]
 
-use ryft_xla_sys::bindings::mlirOperationGetOperand;
-
 use crate::{
-    Attribute, DenseInteger64ArrayAttributeRef, DetachedOp, DetachedRegion, DialectHandle, FromWithContext, Location,
-    OneRegion, Operation, OperationBuilder, RegionRef, Value, ValueRef, mlir_op, mlir_op_trait,
+    DetachedOp, DetachedRegion, DialectHandle, Error, Location, OneRegion, Operation, OperationBuilder, RegionRef,
+    Value, ValueRef, mlir_op, mlir_op_trait,
 };
 
 use super::{HasPadding, PADDING_ATTRIBUTE};
@@ -47,20 +45,20 @@ pub const MAP_DIMENSIONS_ATTRIBUTE: &str = "dimensions";
 )]
 pub trait MapOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion<'o, 'c, 't> {
     /// Returns the dimensions over which this [`MapOperation`] applies the underlying function.
-    fn dimensions(&self) -> Vec<usize> {
-        self.attribute(MAP_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| {
-                attribute
-                    .cast::<DenseInteger64ArrayAttributeRef>()
-                    .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn dimensions(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(MAP_DIMENSIONS_ATTRIBUTE)?
+            .values()
+            .map(usize::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                Error::invalid_argument(format!("invalid '{MAP_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::map`"))
             })
-            .unwrap_or_else(|| panic!("invalid '{MAP_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::map`"))
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the mapping computation
     /// used by this [`MapOperation`].
-    fn computation(&self) -> RegionRef<'o, 'c, 't> {
-        self.body_region()
+    fn computation(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -73,8 +71,6 @@ mlir_op_trait!(Map, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`MapOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`MapOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[deprecated(
     note = "Per [StableHLO v1.0 Cleanup #2283](https://github.com/openxla/stablehlo/pull/2283), this operation is \
     being explored for deprecation as it appears to be unused by both frameworks and compilers. As such, it has \
@@ -85,22 +81,21 @@ pub fn map<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     dimensions: &[usize],
     computation: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedMapOperation<'c, 't> {
+) -> Result<DetachedMapOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.map", location)
         .add_operands(inputs)
         .add_attribute(
             MAP_DIMENSIONS_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+            context.dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .add_region(computation)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::map`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::map`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`ReduceOperation::dimensions`].
@@ -138,11 +133,9 @@ pub trait ReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`](crate::Context)
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn inputs<'r>(&'r self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
+    fn inputs<'r>(&'r self) -> impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>> {
         let operand_count = self.operand_count();
-        (0..operand_count / 2).map(|index| unsafe {
-            ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context()).unwrap()
-        })
+        self.operand_values().take(operand_count / 2)
     }
 
     /// Returns an [`Iterator`] over the initial values of this [`ReduceOperation`].
@@ -150,28 +143,28 @@ pub trait ReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`](crate::Context)
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn initial_values<'r>(&'r self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
+    fn initial_values<'r>(&'r self) -> impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>> {
         let operand_count = self.operand_count();
-        (operand_count / 2..operand_count).map(|index| unsafe {
-            ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context()).unwrap()
-        })
+        self.operand_values().skip(operand_count / 2)
     }
 
     /// Returns the dimensions over which this [`ReduceOperation`] applies the underlying function.
-    fn dimensions(&self) -> Vec<usize> {
-        self.attribute(REDUCE_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| {
-                attribute
-                    .cast::<DenseInteger64ArrayAttributeRef>()
-                    .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn dimensions(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(REDUCE_DIMENSIONS_ATTRIBUTE)?
+            .values()
+            .map(usize::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                Error::invalid_argument(format!(
+                    "invalid '{REDUCE_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce`"
+                ))
             })
-            .unwrap_or_else(|| panic!("invalid '{REDUCE_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce`"))
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the reduction computation
     /// used by this [`ReduceOperation`].
-    fn computation(&self) -> RegionRef<'o, 'c, 't> {
-        self.body_region()
+    fn computation(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -183,8 +176,6 @@ mlir_op_trait!(Reduce, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ReduceOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ReduceOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn reduce<
     'input,
     'initial_value,
@@ -199,23 +190,22 @@ pub fn reduce<
     dimensions: &[usize],
     computation: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedReduceOperation<'c, 't> {
+) -> Result<DetachedReduceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.reduce", location)
         .add_operands(inputs)
         .add_operands(initial_values)
         .add_attribute(
             REDUCE_DIMENSIONS_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+            context.dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .add_region(computation)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::reduce`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::reduce`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`ReduceWindowOperation::window_dimensions`].
@@ -267,11 +257,9 @@ pub trait ReduceWindowOperation<'o, 'c: 'o, 't: 'c>:
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`](crate::Context)
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn inputs<'r>(&'r self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
+    fn inputs<'r>(&'r self) -> impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>> {
         let operand_count = self.operand_count();
-        (0..operand_count / 2).map(|index| unsafe {
-            ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context()).unwrap()
-        })
+        self.operand_values().take(operand_count / 2)
     }
 
     /// Returns an [`Iterator`] over the initial values of this [`ReduceWindowOperation`].
@@ -279,48 +267,83 @@ pub trait ReduceWindowOperation<'o, 'c: 'o, 't: 'c>:
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`](crate::Context)
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn initial_values<'r>(&'r self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
+    fn initial_values<'r>(&'r self) -> impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>> {
         let operand_count = self.operand_count();
-        (operand_count / 2..operand_count).map(|index| unsafe {
-            ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context()).unwrap()
-        })
+        self.operand_values().skip(operand_count / 2)
     }
 
     /// Returns the window dimensions for this [`ReduceWindowOperation`].
-    fn window_dimensions(&self) -> Vec<usize> {
-        self.attribute(REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
-            .unwrap_or_else(|| {
-                panic!("invalid '{REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce_window`")
+    fn window_dimensions(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE)?
+            .values()
+            .map(usize::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                Error::invalid_argument(format!(
+                    "invalid '{REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce_window`"
+                ))
             })
     }
 
     /// Returns the window strides for this [`ReduceWindowOperation`], if specified.
-    fn window_strides(&self) -> Option<Vec<usize>> {
-        self.attribute(REDUCE_WINDOW_STRIDES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn window_strides(&self) -> Result<Option<Vec<usize>>, Error> {
+        if self.has_attribute(REDUCE_WINDOW_STRIDES_ATTRIBUTE) {
+            self.dense_integer_64_array_attribute(REDUCE_WINDOW_STRIDES_ATTRIBUTE)?
+                .values()
+                .map(usize::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some)
+                .map_err(|_| {
+                    Error::invalid_argument(format!(
+                        "invalid '{REDUCE_WINDOW_STRIDES_ATTRIBUTE}' attribute in `stable_hlo::reduce_window`"
+                    ))
+                })
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the base dilations for this [`ReduceWindowOperation`], if specified.
-    fn base_dilations(&self) -> Option<Vec<usize>> {
-        self.attribute(REDUCE_WINDOW_BASE_DILATIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn base_dilations(&self) -> Result<Option<Vec<usize>>, Error> {
+        if self.has_attribute(REDUCE_WINDOW_BASE_DILATIONS_ATTRIBUTE) {
+            self.dense_integer_64_array_attribute(REDUCE_WINDOW_BASE_DILATIONS_ATTRIBUTE)?
+                .values()
+                .map(usize::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some)
+                .map_err(|_| {
+                    Error::invalid_argument(format!(
+                        "invalid '{REDUCE_WINDOW_BASE_DILATIONS_ATTRIBUTE}' attribute in \
+                         `stable_hlo::reduce_window`"
+                    ))
+                })
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the window dilations for this [`ReduceWindowOperation`], if specified.
-    fn window_dilations(&self) -> Option<Vec<usize>> {
-        self.attribute(REDUCE_WINDOW_DILATIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn window_dilations(&self) -> Result<Option<Vec<usize>>, Error> {
+        if self.has_attribute(REDUCE_WINDOW_DILATIONS_ATTRIBUTE) {
+            self.dense_integer_64_array_attribute(REDUCE_WINDOW_DILATIONS_ATTRIBUTE)?
+                .values()
+                .map(usize::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some)
+                .map_err(|_| {
+                    Error::invalid_argument(format!(
+                        "invalid '{REDUCE_WINDOW_DILATIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce_window`"
+                    ))
+                })
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the reduction computation
     /// used by this [`ReduceWindowOperation`].
-    fn computation(&self) -> RegionRef<'o, 'c, 't> {
-        self.body_region()
+    fn computation(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -333,8 +356,6 @@ mlir_op_trait!(ReduceWindow, @local HasPadding);
 
 /// Constructs a new detached/owned [`ReduceWindowOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ReduceWindowOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[allow(clippy::too_many_arguments)]
 pub fn reduce_window<
     'input,
@@ -354,60 +375,52 @@ pub fn reduce_window<
     padding: Option<&[(usize, usize)]>,
     computation: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedReduceWindowOperation<'c, 't> {
+) -> Result<DetachedReduceWindowOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.reduce_window", location)
         .add_operands(inputs)
         .add_operands(initial_values)
         .add_attribute(
             REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE,
-            DenseInteger64ArrayAttributeRef::from_with_context(
+            context.dense_i64_array_attribute(
                 window_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice(),
-                context,
-            ),
+            )?,
         );
 
     if let Some(window_strides) = window_strides {
         builder = builder.add_attribute(
             REDUCE_WINDOW_STRIDES_ATTRIBUTE,
-            DenseInteger64ArrayAttributeRef::from_with_context(
-                window_strides.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice(),
-                context,
-            ),
+            context
+                .dense_i64_array_attribute(window_strides.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         );
     }
 
     if let Some(base_dilations) = base_dilations {
         builder = builder.add_attribute(
             REDUCE_WINDOW_BASE_DILATIONS_ATTRIBUTE,
-            DenseInteger64ArrayAttributeRef::from_with_context(
-                base_dilations.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice(),
-                context,
-            ),
+            context
+                .dense_i64_array_attribute(base_dilations.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         );
     }
 
     if let Some(window_dilations) = window_dilations {
         builder = builder.add_attribute(
             REDUCE_WINDOW_DILATIONS_ATTRIBUTE,
-            DenseInteger64ArrayAttributeRef::from_with_context(
-                window_dilations.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice(),
-                context,
-            ),
+            context
+                .dense_i64_array_attribute(window_dilations.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         );
     }
 
     if let Some(padding) = padding {
-        builder = builder.add_attribute(PADDING_ATTRIBUTE, location.context().stable_hlo_padding(padding, location));
+        builder = builder.add_attribute(PADDING_ATTRIBUTE, location.context().stable_hlo_padding(padding, location)?);
     }
 
-    builder
-        .add_region(computation)
-        .enable_result_type_inference()
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::reduce_window`")
+    builder.add_region(computation).enable_result_type_inference().build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::reduce_window`"))
+    })
 }
 
 #[cfg(test)]
@@ -424,48 +437,57 @@ mod tests {
     fn test_map() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let input_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
         let scalar_i64_type = context.tensor_type(i64_type, &[], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (input_type, location)]);
-            let mut computation_region = context.region();
-            let mut computation_block = context.block(&[(scalar_i64_type, location), (scalar_i64_type, location)]);
-            let multiply_op = stable_hlo::multiply(
-                computation_block.argument(0).unwrap(),
-                computation_block.argument(1).unwrap(),
-                location,
-            );
-            let multiply_op = computation_block.append_operation(multiply_op);
-            let multiply_result = multiply_op.result(0).unwrap().as_ref();
-            computation_block.append_operation(stable_hlo::r#return(&[multiply_result], location));
-            computation_region.append_block(computation_block);
-            let map_op = map(
-                &[block.argument(0).unwrap(), block.argument(1).unwrap()],
-                &[0, 1],
-                computation_region.into(),
-                location,
-            );
-            assert_eq!(map_op.dimensions(), vec![0, 1]);
-            assert_eq!(map_op.computation().blocks().count(), 1);
-            assert_eq!(map_op.operands().count(), 2);
-            assert_eq!(map_op.results().count(), 1);
-            assert_eq!(map_op.regions().count(), 1);
-            let map_op = block.append_operation(map_op);
-            block.append_operation(func::r#return(&[map_op.result(0).unwrap()], location));
-            func::func(
-                "map_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), input_type.into()],
-                    results: vec![input_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (input_type, location)]);
+                let mut computation_region = context.region();
+                let mut computation_block = context.block(&[(scalar_i64_type, location), (scalar_i64_type, location)]);
+                let multiply_op = stable_hlo::multiply(
+                    computation_block.argument(0).unwrap(),
+                    computation_block.argument(1).unwrap(),
+                    location,
+                )
+                .unwrap();
+                let multiply_op = computation_block.append_operation(multiply_op).unwrap();
+                let multiply_result = multiply_op.result(0).unwrap().as_ref();
+                computation_block
+                    .append_operation(stable_hlo::r#return(&[multiply_result], location).unwrap())
+                    .unwrap();
+                computation_region.append_block(computation_block).unwrap();
+                let map_op = map(
+                    &[block.argument(0).unwrap(), block.argument(1).unwrap()],
+                    &[0, 1],
+                    computation_region.into(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(map_op.dimensions().unwrap(), vec![0, 1]);
+                assert_eq!(map_op.computation().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(map_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(map_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(map_op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let map_op = block.append_operation(map_op).unwrap();
+                block.append_operation(func::r#return(&[map_op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "map_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), input_type.into()],
+                        results: vec![input_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -487,45 +509,50 @@ mod tests {
     fn test_reduce() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let input_type = context.tensor_type(i32_type, &[Size::Static(3), Size::Static(4)], None, location).unwrap();
         let initial_value_type = context.tensor_type(i32_type, &[], None, location).unwrap();
         let output_type = context.tensor_type(i32_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (initial_value_type, location)]);
-            let input = block.argument(0).unwrap();
-            let initial_value = block.argument(1).unwrap();
-            let mut region = context.region();
-            let mut region_block = context.block(&[(initial_value_type, location), (initial_value_type, location)]);
-            let lhs = region_block.argument(0).unwrap();
-            let rhs = region_block.argument(1).unwrap();
-            let add_op = stable_hlo::add(lhs, rhs, location);
-            let add_op = region_block.append_operation(add_op);
-            let return_op = stable_hlo::r#return(&[add_op.result(0).unwrap()], location);
-            region_block.append_operation(return_op);
-            region.append_block(region_block);
-            let reduce_op = reduce(&[input], &[initial_value], &[1], region.into(), location);
-            assert_eq!(reduce_op.inputs().collect::<Vec<_>>(), vec![input]);
-            assert_eq!(reduce_op.initial_values().collect::<Vec<_>>(), vec![initial_value]);
-            assert_eq!(reduce_op.dimensions(), vec![1]);
-            assert_eq!(reduce_op.computation().blocks().count(), 1);
-            assert_eq!(reduce_op.operands().count(), 2);
-            assert_eq!(reduce_op.results().count(), 1);
-            let reduce_op = block.append_operation(reduce_op);
-            block.append_operation(func::r#return(&[reduce_op.result(0).unwrap()], location));
-            func::func(
-                "reduce_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), initial_value_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (initial_value_type, location)]);
+                let input = block.argument(0).unwrap();
+                let initial_value = block.argument(1).unwrap();
+                let mut region = context.region();
+                let mut region_block = context.block(&[(initial_value_type, location), (initial_value_type, location)]);
+                let lhs = region_block.argument(0).unwrap();
+                let rhs = region_block.argument(1).unwrap();
+                let add_op = stable_hlo::add(lhs, rhs, location).unwrap();
+                let add_op = region_block.append_operation(add_op).unwrap();
+                let return_op = stable_hlo::r#return(&[add_op.result(0).unwrap()], location).unwrap();
+                region_block.append_operation(return_op).unwrap();
+                region.append_block(region_block).unwrap();
+                let reduce_op = reduce(&[input], &[initial_value], &[1], region.into(), location).unwrap();
+                assert_eq!(reduce_op.inputs().collect::<Result<Vec<_>, _>>().unwrap(), vec![input]);
+                assert_eq!(reduce_op.initial_values().collect::<Result<Vec<_>, _>>().unwrap(), vec![initial_value]);
+                assert_eq!(reduce_op.dimensions().unwrap(), vec![1]);
+                assert_eq!(reduce_op.computation().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(reduce_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(reduce_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let reduce_op = block.append_operation(reduce_op).unwrap();
+                block.append_operation(func::r#return(&[reduce_op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "reduce_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), initial_value_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -545,7 +572,7 @@ mod tests {
     fn test_reduce_window() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let input_type = context
             .tensor_type(
@@ -564,54 +591,65 @@ mod tests {
                 location,
             )
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (initial_value_type, location)]);
-            let input = block.argument(0).unwrap();
-            let initial_value = block.argument(1).unwrap();
-            let mut region = context.region();
-            let mut region_block = context.block(&[(initial_value_type, location), (initial_value_type, location)]);
-            let lhs = region_block.argument(0).unwrap();
-            let rhs = region_block.argument(1).unwrap();
-            let max_op = stable_hlo::maximum(lhs, rhs, location);
-            let max_op = region_block.append_operation(max_op);
-            let return_op = stable_hlo::r#return(&[max_op.result(0).unwrap()], location);
-            region_block.append_operation(return_op);
-            region.append_block(region_block);
-            let reduce_window_op = reduce_window(
-                &[input],
-                &[initial_value],
-                &[1, 2, 2, 1],
-                Some(&[1, 2, 2, 1]),
-                Some(&[1, 1, 1, 1]),
-                Some(&[1, 1, 1, 1]),
-                Some(&[(4, 2), (0, 2), (0, 0), (0, 0)]),
-                region.into(),
-                location,
-            );
-            assert_eq!(reduce_window_op.inputs().collect::<Vec<_>>(), vec![input]);
-            assert_eq!(reduce_window_op.initial_values().collect::<Vec<_>>(), vec![initial_value]);
-            assert_eq!(reduce_window_op.window_dimensions(), vec![1, 2, 2, 1]);
-            assert_eq!(reduce_window_op.window_strides(), Some(vec![1, 2, 2, 1]));
-            assert_eq!(reduce_window_op.base_dilations(), Some(vec![1, 1, 1, 1]));
-            assert_eq!(reduce_window_op.window_dilations(), Some(vec![1, 1, 1, 1]));
-            assert_eq!(reduce_window_op.padding(), Some(vec![(4, 2), (0, 2), (0, 0), (0, 0)]));
-            assert_eq!(reduce_window_op.computation().blocks().count(), 1);
-            assert_eq!(reduce_window_op.operands().count(), 2);
-            assert_eq!(reduce_window_op.results().count(), 1);
-            let reduce_window_op = block.append_operation(reduce_window_op);
-            block.append_operation(func::r#return(&[reduce_window_op.result(0).unwrap()], location));
-            func::func(
-                "reduce_window_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), initial_value_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (initial_value_type, location)]);
+                let input = block.argument(0).unwrap();
+                let initial_value = block.argument(1).unwrap();
+                let mut region = context.region();
+                let mut region_block = context.block(&[(initial_value_type, location), (initial_value_type, location)]);
+                let lhs = region_block.argument(0).unwrap();
+                let rhs = region_block.argument(1).unwrap();
+                let max_op = stable_hlo::maximum(lhs, rhs, location).unwrap();
+                let max_op = region_block.append_operation(max_op).unwrap();
+                let return_op = stable_hlo::r#return(&[max_op.result(0).unwrap()], location).unwrap();
+                region_block.append_operation(return_op).unwrap();
+                region.append_block(region_block).unwrap();
+                let reduce_window_op = reduce_window(
+                    &[input],
+                    &[initial_value],
+                    &[1, 2, 2, 1],
+                    Some(&[1, 2, 2, 1]),
+                    Some(&[1, 1, 1, 1]),
+                    Some(&[1, 1, 1, 1]),
+                    Some(&[(4, 2), (0, 2), (0, 0), (0, 0)]),
+                    region.into(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(reduce_window_op.inputs().collect::<Result<Vec<_>, _>>().unwrap(), vec![input]);
+                assert_eq!(
+                    reduce_window_op.initial_values().collect::<Result<Vec<_>, _>>().unwrap(),
+                    vec![initial_value],
+                );
+                assert_eq!(reduce_window_op.window_dimensions().unwrap(), vec![1, 2, 2, 1]);
+                assert_eq!(reduce_window_op.window_strides().unwrap(), Some(vec![1, 2, 2, 1]));
+                assert_eq!(reduce_window_op.base_dilations().unwrap(), Some(vec![1, 1, 1, 1]));
+                assert_eq!(reduce_window_op.window_dilations().unwrap(), Some(vec![1, 1, 1, 1]));
+                assert_eq!(reduce_window_op.padding().unwrap(), Some(vec![(4, 2), (0, 2), (0, 0), (0, 0)]));
+                assert_eq!(reduce_window_op.computation().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(reduce_window_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(reduce_window_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let reduce_window_op = block.append_operation(reduce_window_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[reduce_window_op.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "reduce_window_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), initial_value_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

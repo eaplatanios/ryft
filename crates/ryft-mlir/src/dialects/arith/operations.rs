@@ -1,15 +1,15 @@
 use crate::{
-    Attribute, AttributeRef, DetachedOp, DialectHandle, IntegerAttributeRef, Location, Operation, OperationBuilder,
-    TensorTypeRef, Type, TypeRef, UnrankedTensorTypeRef, Value, ValueRef, VectorTypeRef, mlir_binary_op,
-    mlir_generic_unary_op, mlir_op, mlir_op_trait, mlir_unary_op,
+    Attribute, AttributeRef, DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, TensorTypeRef,
+    Type, TypeRef, UnrankedTensorTypeRef, Value, ValueRef, VectorTypeRef, mlir_binary_op, mlir_generic_unary_op,
+    mlir_op, mlir_op_trait, mlir_unary_op,
 };
 
 pub const CONSTANT_VALUE_ATTRIBUTE: &str = "value";
 
 pub trait ConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
-    fn value(&self) -> AttributeRef<'c, 't> {
-        self.attribute(CONSTANT_VALUE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("invalid '{CONSTANT_VALUE_ATTRIBUTE}' attribute in `arith::constant`"))
+    fn value(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute(CONSTANT_VALUE_ATTRIBUTE)?
+            .ok_or_else(|| Error::invalid_argument("missing `value` attribute in `arith::constant`"))
     }
 }
 
@@ -23,15 +23,16 @@ mlir_op_trait!(Constant, ZeroSuccessors);
 pub fn constant<'c, 't: 'c, V: Attribute<'c, 't>, L: Location<'c, 't>>(
     value: V,
     location: L,
-) -> DetachedConstantOperation<'c, 't> {
+) -> Result<DetachedConstantOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith());
+    context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.constant", location)
         .add_attribute("value", value)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `arith::constant`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `arith::constant`"))
+        })
 }
 
 mlir_generic_unary_op!(arith, bitcast);
@@ -55,23 +56,23 @@ mlir_binary_op!(arith, addi);
 /// Operation trait for the `arith.addui_extended` operation.
 pub trait AdduiExtendedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this operation.
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side input of this operation.
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the fixed-width sum result.
-    fn sum(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn sum(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the boolean-like overflow result.
-    fn overflow(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(1).unwrap().as_ref()
+    fn overflow(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(1)?.as_ref())
     }
 }
 
@@ -92,19 +93,19 @@ pub fn addui_extended<
     lhs: LHS,
     rhs: RHS,
     location: L,
-) -> DetachedAdduiExtendedOperation<'c, 't> {
+) -> Result<DetachedAdduiExtendedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith());
-    let input_type = lhs.r#type();
+    context.load_dialect(DialectHandle::arith()?)?;
+    let input_type = lhs.r#type()?;
     let i1_type = context.signless_integer_type(1);
     let overflow_type: TypeRef<'c, 't> = if let Some(tensor_type) = input_type.cast::<TensorTypeRef>() {
         let shape = tensor_type.dimensions().collect::<Vec<_>>();
-        context.tensor_type(i1_type, &shape, tensor_type.encoding(), location).unwrap().as_ref()
+        context.tensor_type(i1_type, &shape, tensor_type.encoding()?, location)?.as_ref()
     } else if input_type.is::<UnrankedTensorTypeRef>() {
-        context.unranked_tensor_type(i1_type, location).unwrap().as_ref()
+        context.unranked_tensor_type(i1_type, location)?.as_ref()
     } else if let Some(vector_type) = input_type.cast::<VectorTypeRef>() {
         let shape = vector_type.dimensions().collect::<Vec<_>>();
-        context.vector_type(i1_type, &shape, location).unwrap().as_ref()
+        context.vector_type(i1_type, &shape, location)?.as_ref()
     } else {
         i1_type.as_ref()
     };
@@ -112,8 +113,11 @@ pub fn addui_extended<
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_results(&[input_type, overflow_type])
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `arith::addui_extended`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `arith::addui_extended`"))
+        })
 }
 
 mlir_binary_op!(arith, andi);
@@ -137,23 +141,23 @@ mlir_binary_op!(arith, muli);
 /// Operation trait for the `arith.mulsi_extended` operation.
 pub trait MulsiExtendedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this operation.
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side input of this operation.
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the low half of the product.
-    fn low(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn low(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the high half of the product.
-    fn high(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(1).unwrap().as_ref()
+    fn high(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(1)?.as_ref())
     }
 }
 
@@ -174,37 +178,40 @@ pub fn mulsi_extended<
     lhs: LHS,
     rhs: RHS,
     location: L,
-) -> DetachedMulsiExtendedOperation<'c, 't> {
+) -> Result<DetachedMulsiExtendedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith());
+    context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.mulsi_extended", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `arith::mulsi_extended`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `arith::mulsi_extended`"))
+        })
 }
 
 /// Operation trait for the `arith.mului_extended` operation.
 pub trait MuluiExtendedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this operation.
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side input of this operation.
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the low half of the product.
-    fn low(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn low(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the high half of the product.
-    fn high(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(1).unwrap().as_ref()
+    fn high(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(1)?.as_ref())
     }
 }
 
@@ -225,15 +232,18 @@ pub fn mului_extended<
     lhs: LHS,
     rhs: RHS,
     location: L,
-) -> DetachedMuluiExtendedOperation<'c, 't> {
+) -> Result<DetachedMuluiExtendedOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith());
+    context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.mului_extended", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `arith::mului_extended`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `arith::mului_extended`"))
+        })
 }
 
 mlir_binary_op!(arith, ori);
@@ -271,37 +281,35 @@ pub enum FloatingPointComparisonPredicate {
 }
 
 pub trait CmpfOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
-    fn predicate(&self) -> FloatingPointComparisonPredicate {
-        self.attribute(CMP_PREDICATE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .and_then(|attribute| match attribute.signless_value() {
-                0 => Some(FloatingPointComparisonPredicate::AlwaysFalse),
-                15 => Some(FloatingPointComparisonPredicate::AlwaysTrue),
-                1 => Some(FloatingPointComparisonPredicate::Equal),
-                13 => Some(FloatingPointComparisonPredicate::NotEqual),
-                8 => Some(FloatingPointComparisonPredicate::UnorderedOrEqual),
-                6 => Some(FloatingPointComparisonPredicate::NotUnorderedOrEqual),
-                2 => Some(FloatingPointComparisonPredicate::GreaterThan),
-                9 => Some(FloatingPointComparisonPredicate::UnorderedOrGreaterThan),
-                3 => Some(FloatingPointComparisonPredicate::GreaterThanOrEqual),
-                10 => Some(FloatingPointComparisonPredicate::UnorderedGreaterThanOrEqual),
-                4 => Some(FloatingPointComparisonPredicate::LessThan),
-                11 => Some(FloatingPointComparisonPredicate::UnorderedOrLessThan),
-                5 => Some(FloatingPointComparisonPredicate::LessThanOrEqual),
-                12 => Some(FloatingPointComparisonPredicate::UnorderedLessThanOrEqual),
-                7 => Some(FloatingPointComparisonPredicate::Ordered),
-                14 => Some(FloatingPointComparisonPredicate::Unordered),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("invalid '{CMP_PREDICATE_ATTRIBUTE}' attribute in `arith::cmpf`"))
+    fn predicate(&self) -> Result<FloatingPointComparisonPredicate, Error> {
+        match self.integer_attribute(CMP_PREDICATE_ATTRIBUTE)?.signless_value() {
+            0 => Some(FloatingPointComparisonPredicate::AlwaysFalse),
+            15 => Some(FloatingPointComparisonPredicate::AlwaysTrue),
+            1 => Some(FloatingPointComparisonPredicate::Equal),
+            13 => Some(FloatingPointComparisonPredicate::NotEqual),
+            8 => Some(FloatingPointComparisonPredicate::UnorderedOrEqual),
+            6 => Some(FloatingPointComparisonPredicate::NotUnorderedOrEqual),
+            2 => Some(FloatingPointComparisonPredicate::GreaterThan),
+            9 => Some(FloatingPointComparisonPredicate::UnorderedOrGreaterThan),
+            3 => Some(FloatingPointComparisonPredicate::GreaterThanOrEqual),
+            10 => Some(FloatingPointComparisonPredicate::UnorderedGreaterThanOrEqual),
+            4 => Some(FloatingPointComparisonPredicate::LessThan),
+            11 => Some(FloatingPointComparisonPredicate::UnorderedOrLessThan),
+            5 => Some(FloatingPointComparisonPredicate::LessThanOrEqual),
+            12 => Some(FloatingPointComparisonPredicate::UnorderedLessThanOrEqual),
+            7 => Some(FloatingPointComparisonPredicate::Ordered),
+            14 => Some(FloatingPointComparisonPredicate::Unordered),
+            _ => None,
+        }
+        .ok_or_else(|| Error::invalid_argument("invalid `predicate` attribute in `arith::cmpf`"))
     }
 }
 
@@ -322,9 +330,9 @@ pub fn cmpf<
     rhs: RHS,
     predicate: FloatingPointComparisonPredicate,
     location: L,
-) -> DetachedCmpfOperation<'c, 't> {
+) -> Result<DetachedCmpfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith());
+    context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.cmpf", location)
         .add_attribute(
             CMP_PREDICATE_ATTRIBUTE,
@@ -334,8 +342,9 @@ pub fn cmpf<
         .add_operand(rhs)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `arith::cmpf`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `arith::cmpf`"))
+        })
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -354,31 +363,29 @@ pub enum IntegerComparisonPredicate {
 }
 
 pub trait CmpiOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
-    fn predicate(&self) -> IntegerComparisonPredicate {
-        self.attribute(CMP_PREDICATE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .and_then(|attribute| match attribute.signless_value() {
-                0 => Some(IntegerComparisonPredicate::Equal),
-                1 => Some(IntegerComparisonPredicate::NotEqual),
-                2 => Some(IntegerComparisonPredicate::SignedLessThan),
-                3 => Some(IntegerComparisonPredicate::SignedLessThanOrEqual),
-                4 => Some(IntegerComparisonPredicate::SignedGreaterThan),
-                5 => Some(IntegerComparisonPredicate::SignedGreaterThanOrEqual),
-                6 => Some(IntegerComparisonPredicate::UnsignedLessThan),
-                7 => Some(IntegerComparisonPredicate::UnsignedLessThanOrEqual),
-                8 => Some(IntegerComparisonPredicate::UnsignedGreaterThan),
-                9 => Some(IntegerComparisonPredicate::UnsignedGreaterThanOrEqual),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("invalid '{CMP_PREDICATE_ATTRIBUTE}' attribute in `arith::cmpi`"))
+    fn predicate(&self) -> Result<IntegerComparisonPredicate, Error> {
+        match self.integer_attribute(CMP_PREDICATE_ATTRIBUTE)?.signless_value() {
+            0 => Some(IntegerComparisonPredicate::Equal),
+            1 => Some(IntegerComparisonPredicate::NotEqual),
+            2 => Some(IntegerComparisonPredicate::SignedLessThan),
+            3 => Some(IntegerComparisonPredicate::SignedLessThanOrEqual),
+            4 => Some(IntegerComparisonPredicate::SignedGreaterThan),
+            5 => Some(IntegerComparisonPredicate::SignedGreaterThanOrEqual),
+            6 => Some(IntegerComparisonPredicate::UnsignedLessThan),
+            7 => Some(IntegerComparisonPredicate::UnsignedLessThanOrEqual),
+            8 => Some(IntegerComparisonPredicate::UnsignedGreaterThan),
+            9 => Some(IntegerComparisonPredicate::UnsignedGreaterThanOrEqual),
+            _ => None,
+        }
+        .ok_or_else(|| Error::invalid_argument("invalid `predicate` attribute in `arith::cmpi`"))
     }
 }
 
@@ -399,9 +406,9 @@ pub fn cmpi<
     rhs: RHS,
     predicate: IntegerComparisonPredicate,
     location: L,
-) -> DetachedCmpiOperation<'c, 't> {
+) -> Result<DetachedCmpiOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::arith());
+    context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.cmpi", location)
         .add_attribute(
             CMP_PREDICATE_ATTRIBUTE,
@@ -411,21 +418,22 @@ pub fn cmpi<
         .add_operand(rhs)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `arith::cmpi`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `arith::cmpi`"))
+        })
 }
 
 pub trait SelectOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
-    fn predicate(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn predicate(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
-    fn on_true(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn on_true(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
-    fn on_false(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn on_false(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 }
 
@@ -448,16 +456,17 @@ pub fn select<
     on_true: T,
     on_false: F,
     location: L,
-) -> DetachedSelectOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::arith());
+) -> Result<DetachedSelectOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.select", location)
         .add_operand(predicate)
         .add_operand(on_true)
         .add_operand(on_false)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `arith::select`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `arith::select`"))
+        })
 }
 
 #[cfg(test)]
@@ -466,7 +475,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func;
-    use crate::{Block, Context, OneOperand, OneResult, Operation, Type};
+    use crate::{Block, Context, OneOperand, Operation, Type};
 
     use super::*;
 
@@ -474,26 +483,31 @@ mod tests {
     fn test_constant() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let value = context.integer_attribute(context.index_type(), 42);
-            let op = constant(value, location);
-            assert_eq!(op.value(), value);
-            assert_eq!(op.output().r#type(), index_type);
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "constant_test",
-                func::FuncAttributes { arguments: vec![], results: vec![index_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let value = context.integer_attribute(context.index_type(), 42);
+                let op = constant(value, location).unwrap();
+                assert_eq!(op.value().unwrap(), value);
+                assert_eq!(op.value().unwrap(), value);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "constant_test",
+                    func::FuncAttributes { arguments: vec![], results: vec![index_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -511,34 +525,39 @@ mod tests {
     fn test_cmpf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = cmpf(lhs, rhs, FloatingPointComparisonPredicate::Unordered, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.predicate(), FloatingPointComparisonPredicate::Unordered);
-            assert_eq!(op.output().r#type(), i1_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "cmpf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![i1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = cmpf(lhs, rhs, FloatingPointComparisonPredicate::Unordered, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.predicate().unwrap(), FloatingPointComparisonPredicate::Unordered);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "cmpf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![i1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -556,34 +575,39 @@ mod tests {
     fn test_cmpi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = cmpi(lhs, rhs, IntegerComparisonPredicate::UnsignedGreaterThanOrEqual, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.predicate(), IntegerComparisonPredicate::UnsignedGreaterThanOrEqual);
-            assert_eq!(op.output().r#type(), i1_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "cmpi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = cmpi(lhs, rhs, IntegerComparisonPredicate::UnsignedGreaterThanOrEqual, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.predicate().unwrap(), IntegerComparisonPredicate::UnsignedGreaterThanOrEqual);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "cmpi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -601,31 +625,36 @@ mod tests {
     fn test_bitcast() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = bitcast(input, f32_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "bitcast_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = bitcast(input, f32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "bitcast_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -643,31 +672,36 @@ mod tests {
     fn test_extf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let f64_type = context.float64_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = extf(input, f64_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), f64_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "extf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = extf(input, f64_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "extf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into()],
+                        results: vec![f64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -685,31 +719,36 @@ mod tests {
     fn test_extsi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = extsi(input, i64_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), i64_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "extsi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![i64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = extsi(input, i64_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "extsi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![i64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -727,31 +766,36 @@ mod tests {
     fn test_extui() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = extui(input, i64_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), i64_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "extui_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![i64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = extui(input, i64_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "extui_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![i64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -769,31 +813,36 @@ mod tests {
     fn test_fptosi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = fptosi(input, i32_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "fptosi_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = fptosi(input, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "fptosi_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -811,31 +860,36 @@ mod tests {
     fn test_fptoui() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = fptoui(input, i32_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "fptoui_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = fptoui(input, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "fptoui_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -853,31 +907,36 @@ mod tests {
     fn test_index_cast() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = index_cast(input, i32_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "index_cast_test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = index_cast(input, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "index_cast_test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -895,31 +954,36 @@ mod tests {
     fn test_index_castui() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = index_castui(input, i32_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "index_castui_test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = index_castui(input, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "index_castui_test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -937,31 +1001,36 @@ mod tests {
     fn test_sitofp() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = sitofp(input, f32_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "sitofp_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = sitofp(input, f32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "sitofp_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -979,31 +1048,36 @@ mod tests {
     fn test_truncf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = truncf(input, f32_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "truncf_test",
-                func::FuncAttributes {
-                    arguments: vec![f64_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = truncf(input, f32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "truncf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f64_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1021,31 +1095,36 @@ mod tests {
     fn test_trunci() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i64_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = trunci(input, i32_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "trunci_test",
-                func::FuncAttributes {
-                    arguments: vec![i64_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i64_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = trunci(input, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "trunci_test",
+                    func::FuncAttributes {
+                        arguments: vec![i64_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1063,31 +1142,36 @@ mod tests {
     fn test_uitofp() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = uitofp(input, f32_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "uitofp_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = uitofp(input, f32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "uitofp_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1105,30 +1189,35 @@ mod tests {
     fn test_negf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = negf(input, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "negf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = negf(input, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "negf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1146,32 +1235,37 @@ mod tests {
     fn test_addf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = addf(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "addf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = addf(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "addf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1189,32 +1283,37 @@ mod tests {
     fn test_addi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = addi(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "addi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = addi(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "addi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1232,35 +1331,40 @@ mod tests {
     fn test_addui_extended() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = addui_extended(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.sum().r#type(), i32_type);
-            assert_eq!(op.overflow().r#type(), i1_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 2);
-            let results = op.results().collect::<Vec<_>>();
-            block.append_operation(op);
-            block.append_operation(func::r#return(&results, location));
-            func::func(
-                "addui_extended_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into(), i1_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = addui_extended(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                let results = op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>();
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&results, location).unwrap()).unwrap();
+                func::func(
+                    "addui_extended_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into(), i1_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1278,32 +1382,37 @@ mod tests {
     fn test_andi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = andi(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "andi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = andi(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "andi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1321,32 +1430,37 @@ mod tests {
     fn test_ceildivsi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = ceildivsi(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "ceildivsi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = ceildivsi(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "ceildivsi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1364,32 +1478,37 @@ mod tests {
     fn test_ceildivui() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = ceildivui(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "ceildivui_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = ceildivui(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "ceildivui_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1407,32 +1526,37 @@ mod tests {
     fn test_divf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = divf(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "divf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = divf(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "divf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1450,32 +1574,37 @@ mod tests {
     fn test_divsi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = divsi(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "divsi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = divsi(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "divsi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1493,32 +1622,37 @@ mod tests {
     fn test_divui() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = divui(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "divui_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = divui(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "divui_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1536,32 +1670,37 @@ mod tests {
     fn test_floordivsi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = floordivsi(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "floordivsi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = floordivsi(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "floordivsi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1579,32 +1718,37 @@ mod tests {
     fn test_maximumf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = maximumf(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "maximumf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = maximumf(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "maximumf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1622,32 +1766,37 @@ mod tests {
     fn test_maxnumf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = maxnumf(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "maxnumf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = maxnumf(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "maxnumf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1665,32 +1814,37 @@ mod tests {
     fn test_maxsi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = maxsi(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "maxsi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = maxsi(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "maxsi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1708,32 +1862,37 @@ mod tests {
     fn test_maxui() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = maxui(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "maxui_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = maxui(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "maxui_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1751,32 +1910,37 @@ mod tests {
     fn test_minimumf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = minimumf(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "minimumf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = minimumf(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "minimumf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1794,32 +1958,37 @@ mod tests {
     fn test_minnumf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = minnumf(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "minnumf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = minnumf(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "minnumf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1837,32 +2006,37 @@ mod tests {
     fn test_minsi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = minsi(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "minsi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = minsi(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "minsi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1880,32 +2054,37 @@ mod tests {
     fn test_minui() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = minui(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "minui_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = minui(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "minui_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1923,32 +2102,37 @@ mod tests {
     fn test_mulf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = mulf(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "mulf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = mulf(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "mulf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1966,32 +2150,37 @@ mod tests {
     fn test_muli() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = muli(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "muli_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = muli(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "muli_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2009,34 +2198,39 @@ mod tests {
     fn test_mulsi_extended() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = mulsi_extended(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.low().r#type(), i32_type);
-            assert_eq!(op.high().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 2);
-            let results = op.results().collect::<Vec<_>>();
-            block.append_operation(op);
-            block.append_operation(func::r#return(&results, location));
-            func::func(
-                "mulsi_extended_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into(), i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = mulsi_extended(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                let results = op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>();
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&results, location).unwrap()).unwrap();
+                func::func(
+                    "mulsi_extended_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into(), i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2054,34 +2248,39 @@ mod tests {
     fn test_mului_extended() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = mului_extended(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.low().r#type(), i32_type);
-            assert_eq!(op.high().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 2);
-            let results = op.results().collect::<Vec<_>>();
-            block.append_operation(op);
-            block.append_operation(func::r#return(&results, location));
-            func::func(
-                "mului_extended_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into(), i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = mului_extended(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                let results = op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>();
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&results, location).unwrap()).unwrap();
+                func::func(
+                    "mului_extended_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into(), i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2099,32 +2298,37 @@ mod tests {
     fn test_ori() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = ori(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "ori_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = ori(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "ori_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2142,32 +2346,37 @@ mod tests {
     fn test_remf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = remf(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "remf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = remf(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "remf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2185,32 +2394,37 @@ mod tests {
     fn test_remsi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = remsi(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "remsi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = remsi(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "remsi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2228,32 +2442,37 @@ mod tests {
     fn test_remui() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = remui(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "remui_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = remui(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "remui_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2271,32 +2490,37 @@ mod tests {
     fn test_shli() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = shli(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "shli_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = shli(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "shli_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2314,32 +2538,37 @@ mod tests {
     fn test_shrsi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = shrsi(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "shrsi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = shrsi(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "shrsi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2357,32 +2586,37 @@ mod tests {
     fn test_shrui() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = shrui(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "shrui_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = shrui(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "shrui_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2400,32 +2634,37 @@ mod tests {
     fn test_subf() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = subf(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), f32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "subf_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = subf(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "subf_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2443,32 +2682,37 @@ mod tests {
     fn test_subi() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = subi(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "subi_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = subi(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "subi_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2486,32 +2730,37 @@ mod tests {
     fn test_xori() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = xori(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), i32_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "xori_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = xori(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "xori_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2529,35 +2778,40 @@ mod tests {
     fn test_select() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1).as_ref();
         let f32_type = context.float32_type().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(i1_type, location), (f32_type, location), (f32_type, location)]);
-            let predicate = block.argument(0).unwrap();
-            let on_true = block.argument(1).unwrap();
-            let on_false = block.argument(2).unwrap();
-            let op = select(predicate, on_true, on_false, location);
-            assert_eq!(op.predicate(), predicate);
-            assert_eq!(op.on_true(), on_true);
-            assert_eq!(op.on_false(), on_false);
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.result(0).unwrap().r#type(), f32_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "select_test",
-                func::FuncAttributes {
-                    arguments: vec![i1_type.into(), f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i1_type, location), (f32_type, location), (f32_type, location)]);
+                let predicate = block.argument(0).unwrap();
+                let on_true = block.argument(1).unwrap();
+                let on_false = block.argument(2).unwrap();
+                let op = select(predicate, on_true, on_false, location).unwrap();
+                assert_eq!(op.predicate().unwrap(), predicate);
+                assert_eq!(op.on_true().unwrap(), on_true);
+                assert_eq!(op.on_false().unwrap(), on_false);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), f32_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "select_test",
+                    func::FuncAttributes {
+                        arguments: vec![i1_type.into(), f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

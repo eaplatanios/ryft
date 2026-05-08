@@ -6,5 +6,5 @@ pub trait ToMlir {
     type Output<'c, 't: 'c>;
 
     /// Converts `self` into its MLIR representation in the [`Context`](ryft_mlir::Context) associated with `location`.
-    fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(&self, location: L) -> Self::Output<'c, 't>;
+    fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(&self, location: L) -> Result<Self::Output<'c, 't>, ryft_mlir::Error>;
 }

@@ -178,11 +178,12 @@ impl StableHloCustomLowering<ShardMapTensor> for WithShardingConstraintOperation
         _output_types: &[ArrayType],
         lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ryft_mlir::ValueRef<'b, 'c, 't>>, LoweringError> {
+        let sharding = self.sharding.to_mlir(lowerer.location)?;
         let operation = lowerer.block.append_operation(ryft_mlir::dialects::shardy::sharding_constraint(
             input_values[0],
-            self.sharding.to_mlir(lowerer.location),
+            sharding,
             lowerer.location,
-        ));
+        )?)?;
         Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
     }
 }

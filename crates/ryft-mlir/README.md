@@ -18,7 +18,7 @@ parse a StableHLO module, and verify it:
 ```rust
 use ryft_mlir::*;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::new();
     context.load_dialect(DialectHandle::func());
     context.load_dialect(DialectHandle::stable_hlo());
@@ -32,10 +32,10 @@ fn main() {
               }
             }
             "#,
-        )
-        .unwrap();
+        )?;
     assert!(module.verify());
     println!("{module}");
+    Ok(())
 }
 ```
 
@@ -56,7 +56,7 @@ The following is an example showing how to run optimization passes on an MLIR mo
 ```rust
 use ryft_mlir::*;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::new();
     context.load_dialect(DialectHandle::arith());
     context.load_dialect(DialectHandle::func());
@@ -72,25 +72,17 @@ fn main() {
               }
             }
             "#,
-        )
-        .unwrap();
+        )?;
     let mut pass_manager = context.pass_manager();
     pass_manager.add_pass(ryft::mlir::dialects::builtin::passes::create_transforms_cse_pass());
     pass_manager.add_pass(ryft::mlir::dialects::builtin::passes::create_transforms_canonicalizer_pass());
     assert!(pass_manager.run(&module.as_operation()).is_success());
+    Ok(())
 }
 ```
 
 ## Roadmap / TODOs
 
-- [ ] Add `Context` constructors like `i32_type`, etc. Maybe also `bool_type` as an alias for `i1_type`?
-- [ ] Clean up the API we have around elements attributes and use stronger typing, if possible.
-- [ ] `BooleanAttributeRef::is<IntegerAttributeRef>` panics (and the same for a 1-bit integer attribute in reverse).
-- [ ] Remove uses of `.expect` and `panic!` (and `.unwrap` where it makes sense), and rely on error propagation
-  instead, similar to what we are doing in `ryft_pjrt`. Note that this is quite challenging in this case since MLIR
-  raises a lot of runtime errors and this is meant to be a library providing Rust bindings for MLIR. The original
-  thinking was that libraries building on top of `ryft_mlir` would create safer wrappers with more robust error handling
-  that is also aware of the specifics of any custom MLIR dialects they may be using.
 - Support more MLIR dialects:
     - [x] `affine`
     - [x] `arith`
@@ -106,13 +98,10 @@ fn main() {
     - [x] `llvm`
     - [x] `memref`
     - [ ] `mhlo`
-    - [x] [`mosaic_gpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td)
-    - [x] [`mosaic_tpu`](https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/tpu/tpu.td)
+    - [x] `mosaic_gpu`
+    - [x] `mosaic_tpu`
     - [x] `nvgpu`
-    - [ ] `pdl`
-        - [ ] Add support for types: `PDLAttributeType`, `PDLOperationType`, `PDLRangeType`, `PDLType`,
-          `PDLTypeType`, `PDLValueType`.
-        - [ ] Add support for operations.
+    - [x] `pdl`
     - [x] `quant`
     - [x] `scf`
     - [x] `shape`

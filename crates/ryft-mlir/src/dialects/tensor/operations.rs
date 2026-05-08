@@ -1,7 +1,6 @@
 use crate::{
-    ArrayAttributeRef, Attribute, DenseInteger32ArrayAttributeRef, DenseInteger64ArrayAttributeRef, DetachedOp,
-    DetachedRegion, DialectHandle, IntegerAttributeRef, Location, OneResult, Operation, OperationBuilder, RegionRef,
-    Size, Type, Value, ValueRef, mlir_op, mlir_op_trait,
+    ArrayAttributeRef, Attribute, DenseInteger64ArrayAttributeRef, DetachedOp, DetachedRegion, DialectHandle, Error,
+    Location, OneResult, Operation, OperationBuilder, RegionRef, Size, Type, Value, ValueRef, mlir_op, mlir_op_trait,
 };
 
 /// An index entry that is either known statically or provided by an SSA value at runtime.
@@ -35,12 +34,12 @@ impl<'v, 'c: 'v, 't: 'c> StaticOrDynamicIndex<'v, 'c, 't> {
 /// Operation trait for `tensor.bitcast`.
 pub trait BitcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the tensor being bitcast.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the bitcast tensor.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -58,26 +57,27 @@ pub fn bitcast<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     result_type: T,
     location: L,
-) -> DetachedBitcastOperation<'c, 't> {
+) -> Result<DetachedBitcastOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.bitcast", location)
         .add_operand(source)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::bitcast`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::bitcast`"))
+        })
 }
 
 /// Operation trait for `tensor.cast`.
 pub trait CastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the tensor being cast.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the cast tensor.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -95,15 +95,16 @@ pub fn cast<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     result_type: T,
     location: L,
-) -> DetachedCastOperation<'c, 't> {
+) -> Result<DetachedCastOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.cast", location)
         .add_operand(source)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::cast`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::cast`"))
+        })
 }
 
 /// Name of the `tensor.concat` dimension attribute.
@@ -112,20 +113,17 @@ pub const DIM_ATTRIBUTE: &str = "dim";
 /// Operation trait for `tensor.concat`.
 pub trait ConcatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the concatenation dimension.
-    fn dimension(&self) -> i64 {
-        self.attribute(DIM_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
-            .unwrap_or_else(|| panic!("invalid '{DIM_ATTRIBUTE}' attribute in `tensor.concat`"))
+    fn dimension(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(DIM_ATTRIBUTE)?.signless_value())
     }
 
     /// Returns the input tensors being concatenated.
-    fn inputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn inputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the concatenated tensor.
-    fn concatenated(&self) -> ValueRef<'o, 'c, 't> {
+    fn concatenated(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -144,32 +142,33 @@ pub fn concat<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     dimension: i64,
     result_type: T,
     location: L,
-) -> DetachedConcatOperation<'c, 't> {
+) -> Result<DetachedConcatOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.concat", location)
         .add_operands(inputs)
         .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), dimension))
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::concat`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::concat`"))
+        })
 }
 
 /// Operation trait for `tensor.dim`.
 pub trait DimOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the tensor whose dimension is queried.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the dimension index.
-    fn index(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn index(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the dimension size.
-    fn size(&self) -> ValueRef<'o, 'c, 't> {
+    fn size(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -185,27 +184,28 @@ pub fn dim<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     index: ValueRef<'v, 'c, 't>,
     location: L,
-) -> DetachedDimOperation<'c, 't> {
+) -> Result<DetachedDimOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.dim", location)
         .add_operand(source)
         .add_operand(index)
         .add_result(context.index_type())
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::dim`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::dim`"))
+        })
 }
 
 /// Operation trait for `tensor.empty`.
 pub trait EmptyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the dynamic size operands.
-    fn dynamic_sizes(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn dynamic_sizes(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the materialized tensor.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -223,31 +223,32 @@ pub fn empty<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     dynamic_sizes: &[ValueRef<'v, 'c, 't>],
     result_type: T,
     location: L,
-) -> DetachedEmptyOperation<'c, 't> {
+) -> Result<DetachedEmptyOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.empty", location)
         .add_operands(dynamic_sizes)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::empty`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::empty`"))
+        })
 }
 
 /// Operation trait for `tensor.extract`.
 pub trait ExtractOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the tensor being read.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the index operands.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (1..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (1..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the extracted element.
-    fn element(&self) -> ValueRef<'o, 'c, 't> {
+    fn element(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -266,16 +267,17 @@ pub fn extract<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     indices: &[ValueRef<'v, 'c, 't>],
     result_type: T,
     location: L,
-) -> DetachedExtractOperation<'c, 't> {
+) -> Result<DetachedExtractOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.extract", location)
         .add_operand(tensor)
         .add_operands(indices)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::extract`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::extract`"))
+        })
 }
 
 /// Name of the operand segment-size attribute used by Tensor operations with variadic operand groups.
@@ -293,102 +295,87 @@ pub const STATIC_STRIDES_ATTRIBUTE: &str = "static_strides";
 /// Operation trait for `tensor.extract_slice`.
 pub trait ExtractSliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the source tensor.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the mixed static and dynamic offsets.
-    fn offsets(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `tensor.extract_slice`")
-            });
+    fn offsets(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
         let dynamic_start = 1;
-        let dynamic_end = dynamic_start + segment_sizes[1] as usize;
+        let dynamic_end =
+            dynamic_start + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
         let dynamic_offsets =
-            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_offsets = self
-            .attribute(STATIC_OFFSETS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{STATIC_OFFSETS_ATTRIBUTE}' attribute in `tensor.extract_slice`"));
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_offsets = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_OFFSETS_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_offsets = dynamic_offsets.into_iter();
         static_offsets
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_offsets.next().expect("missing dynamic offset operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_offsets.next().map(StaticOrDynamicIndex::Dynamic).ok_or_else(|| {
+                        Error::invalid_argument("missing dynamic offset operand in `tensor.extract_slice`")
+                    })
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
 
     /// Returns the mixed static and dynamic sizes.
-    fn sizes(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `tensor.extract_slice`")
-            });
-        let dynamic_start = 1 + segment_sizes[1] as usize;
-        let dynamic_end = dynamic_start + segment_sizes[2] as usize;
+    fn sizes(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
+        let offset_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        let dynamic_start = 1 + offset_count;
+        let dynamic_end =
+            dynamic_start + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
         let dynamic_sizes =
-            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_sizes = self
-            .attribute(STATIC_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{STATIC_SIZES_ATTRIBUTE}' attribute in `tensor.extract_slice`"));
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_sizes = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_SIZES_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_sizes = dynamic_sizes.into_iter();
         static_sizes
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_sizes.next().expect("missing dynamic size operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_sizes.next().map(StaticOrDynamicIndex::Dynamic).ok_or_else(|| {
+                        Error::invalid_argument("missing dynamic size operand in `tensor.extract_slice`")
+                    })
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
 
     /// Returns the mixed static and dynamic strides.
-    fn strides(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `tensor.extract_slice`")
-            });
-        let dynamic_start = 1 + segment_sizes[1] as usize + segment_sizes[2] as usize;
-        let dynamic_end = dynamic_start + segment_sizes[3] as usize;
+    fn strides(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
+        let offset_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        let size_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
+        let dynamic_start = 1 + offset_count + size_count;
+        let dynamic_end =
+            dynamic_start + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)?;
         let dynamic_strides =
-            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_strides = self
-            .attribute(STATIC_STRIDES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{STATIC_STRIDES_ATTRIBUTE}' attribute in `tensor.extract_slice`"));
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_strides = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_STRIDES_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_strides = dynamic_strides.into_iter();
         static_strides
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_strides.next().expect("missing dynamic stride operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_strides.next().map(StaticOrDynamicIndex::Dynamic).ok_or_else(|| {
+                        Error::invalid_argument("missing dynamic stride operand in `tensor.extract_slice`")
+                    })
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
 
     /// Returns the extracted slice.
-    fn slice(&self) -> ValueRef<'o, 'c, 't> {
+    fn slice(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -409,9 +396,9 @@ pub fn extract_slice<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     strides: &[StaticOrDynamicIndex<'v, 'c, 't>],
     result_type: T,
     location: L,
-) -> DetachedExtractSliceOperation<'c, 't> {
+) -> Result<DetachedExtractSliceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
     let static_offsets = offsets.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
     let dynamic_offsets = offsets.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
@@ -422,37 +409,38 @@ pub fn extract_slice<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     OperationBuilder::new("tensor.extract_slice", location)
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context
-                .dense_i32_array_attribute(&[
-                    1,
-                    dynamic_offsets.len() as i32,
-                    dynamic_sizes.len() as i32,
-                    dynamic_strides.len() as i32,
-                ])
-                .unwrap(),
+            context.dense_i32_array_attribute(&[
+                1,
+                dynamic_offsets.len() as i32,
+                dynamic_sizes.len() as i32,
+                dynamic_strides.len() as i32,
+            ])?,
         )
-        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets).unwrap())
-        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes).unwrap())
-        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides).unwrap())
+        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)
+        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)
+        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)
         .add_operand(source)
         .add_operands(&dynamic_offsets)
         .add_operands(&dynamic_sizes)
         .add_operands(&dynamic_strides)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::extract_slice`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::extract_slice`"))
+        })
 }
 
 /// Operation trait for `tensor.from_elements`.
 pub trait FromElementsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the scalar elements used to construct the tensor.
-    fn elements(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn elements(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the constructed tensor.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -470,15 +458,18 @@ pub fn from_elements<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     elements: &[ValueRef<'v, 'c, 't>],
     result_type: T,
     location: L,
-) -> DetachedFromElementsOperation<'c, 't> {
+) -> Result<DetachedFromElementsOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.from_elements", location)
         .add_operands(elements)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::from_elements`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::from_elements`"))
+        })
 }
 
 /// Name of the `tensor.gather` dimension-list attribute.
@@ -490,20 +481,18 @@ pub const UNIQUE_ATTRIBUTE: &str = "unique";
 /// Operation trait for `tensor.gather`.
 pub trait GatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the source tensor.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the indices tensor.
-    fn indices(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn indices(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the gathered source dimensions.
-    fn gather_dimensions(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(GATHER_DIMS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{GATHER_DIMS_ATTRIBUTE}' attribute in `tensor.gather`"))
+    fn gather_dimensions(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(GATHER_DIMS_ATTRIBUTE)
     }
 
     /// Returns whether coordinates are statically guaranteed to be unique.
@@ -512,7 +501,7 @@ pub trait GatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult
     }
 
     /// Returns the gathered tensor.
-    fn gathered(&self) -> ValueRef<'o, 'c, 't> {
+    fn gathered(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -533,37 +522,36 @@ pub fn gather<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     unique: bool,
     result_type: T,
     location: L,
-) -> DetachedGatherOperation<'c, 't> {
+) -> Result<DetachedGatherOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     let mut builder = OperationBuilder::new("tensor.gather", location)
         .add_operand(source)
         .add_operand(indices)
-        .add_attribute(GATHER_DIMS_ATTRIBUTE, context.dense_i64_array_attribute(gather_dimensions).unwrap())
+        .add_attribute(GATHER_DIMS_ATTRIBUTE, context.dense_i64_array_attribute(gather_dimensions)?)
         .add_result(result_type);
     if unique {
         builder = builder.add_attribute(UNIQUE_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::gather`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::gather`"))
+    })
 }
 
 /// Operation trait for `tensor.generate`.
 pub trait GenerateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the dynamic extent operands.
-    fn dynamic_extents(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn dynamic_extents(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the region that yields tensor elements.
-    fn body_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns the generated tensor.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -580,37 +568,38 @@ pub fn generate<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     result_type: T,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedGenerateOperation<'c, 't> {
+) -> Result<DetachedGenerateOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.generate", location)
         .add_operands(dynamic_extents)
         .add_result(result_type)
         .add_region(body)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::generate`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::generate`"))
+        })
 }
 
 /// Operation trait for `tensor.insert`.
 pub trait InsertOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the scalar value being inserted.
-    fn scalar(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn scalar(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the destination tensor.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the index operands.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (2..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (2..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the tensor containing the inserted scalar.
-    fn updated(&self) -> ValueRef<'o, 'c, 't> {
+    fn updated(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -629,123 +618,110 @@ pub fn insert<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     destination: ValueRef<'v, 'c, 't>,
     indices: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedInsertOperation<'c, 't> {
+) -> Result<DetachedInsertOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.insert", location)
         .add_operand(scalar)
         .add_operand(destination)
         .add_operands(indices)
-        .add_result(destination.r#type())
+        .add_result(destination.r#type()?)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::insert`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::insert`"))
+        })
 }
 
 /// Operation trait for `tensor.insert_slice`.
 pub trait InsertSliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the inserted source tensor.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the destination tensor.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the mixed static and dynamic offsets.
-    fn offsets(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `tensor.insert_slice`")
-            });
+    fn offsets(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
         let dynamic_start = 2;
-        let dynamic_end = dynamic_start + segment_sizes[2] as usize;
+        let dynamic_end =
+            dynamic_start + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
         let dynamic_offsets =
-            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_offsets = self
-            .attribute(STATIC_OFFSETS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{STATIC_OFFSETS_ATTRIBUTE}' attribute in `tensor.insert_slice`"));
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_offsets = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_OFFSETS_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_offsets = dynamic_offsets.into_iter();
         static_offsets
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_offsets.next().expect("missing dynamic offset operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_offsets.next().map(StaticOrDynamicIndex::Dynamic).ok_or_else(|| {
+                        Error::invalid_argument("missing dynamic offset operand in `tensor.insert_slice`")
+                    })
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
 
     /// Returns the mixed static and dynamic sizes.
-    fn sizes(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `tensor.insert_slice`")
-            });
-        let dynamic_start = 2 + segment_sizes[2] as usize;
-        let dynamic_end = dynamic_start + segment_sizes[3] as usize;
+    fn sizes(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
+        let offset_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
+        let dynamic_start = 2 + offset_count;
+        let dynamic_end =
+            dynamic_start + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)?;
         let dynamic_sizes =
-            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_sizes = self
-            .attribute(STATIC_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{STATIC_SIZES_ATTRIBUTE}' attribute in `tensor.insert_slice`"));
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_sizes = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_SIZES_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_sizes = dynamic_sizes.into_iter();
         static_sizes
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_sizes.next().expect("missing dynamic size operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_sizes
+                        .next()
+                        .map(StaticOrDynamicIndex::Dynamic)
+                        .ok_or_else(|| Error::invalid_argument("missing dynamic size operand in `tensor.insert_slice`"))
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
 
     /// Returns the mixed static and dynamic strides.
-    fn strides(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `tensor.insert_slice`")
-            });
-        let dynamic_start = 2 + segment_sizes[2] as usize + segment_sizes[3] as usize;
-        let dynamic_end = dynamic_start + segment_sizes[4] as usize;
+    fn strides(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
+        let offset_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
+        let size_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)?;
+        let dynamic_start = 2 + offset_count + size_count;
+        let dynamic_end =
+            dynamic_start + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 4)?;
         let dynamic_strides =
-            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_strides = self
-            .attribute(STATIC_STRIDES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{STATIC_STRIDES_ATTRIBUTE}' attribute in `tensor.insert_slice`"));
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_strides = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_STRIDES_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_strides = dynamic_strides.into_iter();
         static_strides
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_strides.next().expect("missing dynamic stride operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_strides.next().map(StaticOrDynamicIndex::Dynamic).ok_or_else(|| {
+                        Error::invalid_argument("missing dynamic stride operand in `tensor.insert_slice`")
+                    })
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
 
     /// Returns the updated tensor.
-    fn updated(&self) -> ValueRef<'o, 'c, 't> {
+    fn updated(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -766,9 +742,9 @@ pub fn insert_slice<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     sizes: &[StaticOrDynamicIndex<'v, 'c, 't>],
     strides: &[StaticOrDynamicIndex<'v, 'c, 't>],
     location: L,
-) -> DetachedInsertSliceOperation<'c, 't> {
+) -> Result<DetachedInsertSliceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
     let static_offsets = offsets.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
     let dynamic_offsets = offsets.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
@@ -779,39 +755,40 @@ pub fn insert_slice<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     OperationBuilder::new("tensor.insert_slice", location)
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context
-                .dense_i32_array_attribute(&[
-                    1,
-                    1,
-                    dynamic_offsets.len() as i32,
-                    dynamic_sizes.len() as i32,
-                    dynamic_strides.len() as i32,
-                ])
-                .unwrap(),
+            context.dense_i32_array_attribute(&[
+                1,
+                1,
+                dynamic_offsets.len() as i32,
+                dynamic_sizes.len() as i32,
+                dynamic_strides.len() as i32,
+            ])?,
         )
-        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets).unwrap())
-        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes).unwrap())
-        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides).unwrap())
+        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)
+        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)
+        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)
         .add_operand(source)
         .add_operand(destination)
         .add_operands(&dynamic_offsets)
         .add_operands(&dynamic_sizes)
         .add_operands(&dynamic_strides)
-        .add_result(destination.r#type())
+        .add_result(destination.r#type()?)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::insert_slice`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::insert_slice`"))
+        })
 }
 
 /// Operation trait for `tensor.rank`.
 pub trait RankOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the tensor whose rank is queried.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the tensor rank.
-    fn rank(&self) -> ValueRef<'o, 'c, 't> {
+    fn rank(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -828,31 +805,32 @@ mlir_op_trait!(Rank, ZeroSuccessors);
 pub fn rank<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     tensor: ValueRef<'v, 'c, 't>,
     location: L,
-) -> DetachedRankOperation<'c, 't> {
+) -> Result<DetachedRankOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.rank", location)
         .add_operand(tensor)
         .add_result(context.index_type())
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::rank`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::rank`"))
+        })
 }
 
 /// Operation trait for `tensor.reshape`.
 pub trait ReshapeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the source tensor.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the tensor containing the new shape.
-    fn shape(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn shape(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the reshaped tensor.
-    fn reshaped(&self) -> ValueRef<'o, 'c, 't> {
+    fn reshaped(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -871,16 +849,17 @@ pub fn reshape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     shape: ValueRef<'v, 'c, 't>,
     result_type: T,
     location: L,
-) -> DetachedReshapeOperation<'c, 't> {
+) -> Result<DetachedReshapeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.reshape", location)
         .add_operand(source)
         .add_operand(shape)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::reshape`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::reshape`"))
+        })
 }
 
 /// Name of the reassociation groups attribute.
@@ -892,19 +871,17 @@ pub const STATIC_OUTPUT_SHAPE_ATTRIBUTE: &str = "static_output_shape";
 /// Operation trait shared by Tensor reassociative reshape operations.
 pub trait ReassociativeReshapeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the source tensor.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the reassociation groups.
-    fn reassociation(&self) -> ArrayAttributeRef<'c, 't> {
-        self.attribute(REASSOCIATION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<ArrayAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{REASSOCIATION_ATTRIBUTE}' attribute in `{}`", self.name()))
+    fn reassociation(&self) -> Result<ArrayAttributeRef<'c, 't>, Error> {
+        self.array_attribute(REASSOCIATION_ATTRIBUTE)
     }
 
     /// Returns the reshaped tensor.
-    fn reshaped(&self) -> ValueRef<'o, 'c, 't> {
+    fn reshaped(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -912,22 +889,22 @@ pub trait ReassociativeReshapeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, '
 /// Operation trait for `tensor.expand_shape`.
 pub trait ExpandShapeOperation<'o, 'c: 'o, 't: 'c>: ReassociativeReshapeOperation<'o, 'c, 't> {
     /// Returns the mixed static and dynamic output-shape entries.
-    fn output_shape(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
+    fn output_shape(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
         let dynamic_shape =
-            (1..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_shape = self
-            .attribute(STATIC_OUTPUT_SHAPE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{STATIC_OUTPUT_SHAPE_ATTRIBUTE}' attribute in `tensor.expand_shape`"));
+            (1..self.operand_count()).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_shape = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_OUTPUT_SHAPE_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_shape = dynamic_shape.into_iter();
         static_shape
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_shape.next().expect("missing dynamic output-shape operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_shape.next().map(StaticOrDynamicIndex::Dynamic).ok_or_else(|| {
+                        Error::invalid_argument("missing dynamic output-shape operand in `tensor.expand_shape`")
+                    })
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
@@ -949,9 +926,9 @@ pub fn expand_shape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     output_shape: &[StaticOrDynamicIndex<'v, 'c, 't>],
     result_type: T,
     location: L,
-) -> DetachedExpandShapeOperation<'c, 't> {
+) -> Result<DetachedExpandShapeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
     let index_attribute_type = context.signless_integer_type(64);
     let reassociation = reassociation
@@ -971,11 +948,14 @@ pub fn expand_shape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         .add_operand(source)
         .add_operands(&dynamic_output_shape)
         .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))
-        .add_attribute(STATIC_OUTPUT_SHAPE_ATTRIBUTE, context.dense_i64_array_attribute(&static_output_shape).unwrap())
+        .add_attribute(STATIC_OUTPUT_SHAPE_ATTRIBUTE, context.dense_i64_array_attribute(&static_output_shape)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::expand_shape`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::expand_shape`"))
+        })
 }
 
 /// Operation trait for `tensor.collapse_shape`.
@@ -996,9 +976,9 @@ pub fn collapse_shape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     reassociation: &[&[i64]],
     result_type: T,
     location: L,
-) -> DetachedCollapseShapeOperation<'c, 't> {
+) -> Result<DetachedCollapseShapeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     let index_attribute_type = context.signless_integer_type(64);
     let reassociation = reassociation
         .iter()
@@ -1015,8 +995,11 @@ pub fn collapse_shape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::collapse_shape`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::collapse_shape`"))
+        })
 }
 
 /// Name of the static low-padding entries attribute.
@@ -1031,62 +1014,57 @@ pub const NOFOLD_ATTRIBUTE: &str = "nofold";
 /// Operation trait for `tensor.pad`.
 pub trait PadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the source tensor.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the mixed static and dynamic low-padding entries.
-    fn low(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `tensor.pad`"));
+    fn low(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
         let dynamic_start = 1;
-        let dynamic_end = dynamic_start + segment_sizes[1] as usize;
+        let dynamic_end =
+            dynamic_start + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
         let dynamic_low =
-            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_low = self
-            .attribute(STATIC_LOW_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{STATIC_LOW_ATTRIBUTE}' attribute in `tensor.pad`"));
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_low = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_LOW_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_low = dynamic_low.into_iter();
         static_low
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_low.next().expect("missing dynamic low-padding operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_low
+                        .next()
+                        .map(StaticOrDynamicIndex::Dynamic)
+                        .ok_or_else(|| Error::invalid_argument("missing dynamic low-padding operand in `tensor.pad`"))
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
 
     /// Returns the mixed static and dynamic high-padding entries.
-    fn high(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `tensor.pad`"));
-        let dynamic_start = 1 + segment_sizes[1] as usize;
-        let dynamic_end = dynamic_start + segment_sizes[2] as usize;
+    fn high(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
+        let low_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        let dynamic_start = 1 + low_count;
+        let dynamic_end =
+            dynamic_start + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
         let dynamic_high =
-            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_high = self
-            .attribute(STATIC_HIGH_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("invalid '{STATIC_HIGH_ATTRIBUTE}' attribute in `tensor.pad`"));
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_high = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_HIGH_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_high = dynamic_high.into_iter();
         static_high
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_high.next().expect("missing dynamic high-padding operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_high
+                        .next()
+                        .map(StaticOrDynamicIndex::Dynamic)
+                        .ok_or_else(|| Error::invalid_argument("missing dynamic high-padding operand in `tensor.pad`"))
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
@@ -1097,12 +1075,12 @@ pub trait PadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o
     }
 
     /// Returns the region that yields padding values.
-    fn body_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns the padded tensor.
-    fn padded(&self) -> ValueRef<'o, 'c, 't> {
+    fn padded(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -1125,9 +1103,9 @@ pub fn pad<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     result_type: T,
     region: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedPadOperation<'c, 't> {
+) -> Result<DetachedPadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
     let static_low = low.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
     let dynamic_low = low.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
@@ -1136,12 +1114,10 @@ pub fn pad<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tensor.pad", location)
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context
-                .dense_i32_array_attribute(&[1, dynamic_low.len() as i32, dynamic_high.len() as i32])
-                .unwrap(),
+            context.dense_i32_array_attribute(&[1, dynamic_low.len() as i32, dynamic_high.len() as i32])?,
         )
-        .add_attribute(STATIC_LOW_ATTRIBUTE, context.dense_i64_array_attribute(&static_low).unwrap())
-        .add_attribute(STATIC_HIGH_ATTRIBUTE, context.dense_i64_array_attribute(&static_high).unwrap())
+        .add_attribute(STATIC_LOW_ATTRIBUTE, context.dense_i64_array_attribute(&static_low)?)
+        .add_attribute(STATIC_HIGH_ATTRIBUTE, context.dense_i64_array_attribute(&static_high)?)
         .add_operand(source)
         .add_operands(&dynamic_low)
         .add_operands(&dynamic_high)
@@ -1150,116 +1126,94 @@ pub fn pad<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     if nofold {
         builder = builder.add_attribute(NOFOLD_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::pad`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::pad`"))
+    })
 }
 
 /// Operation trait for `tensor.parallel_insert_slice`.
 pub trait ParallelInsertSliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the inserted source tensor.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the destination tensor.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the mixed static and dynamic offsets.
-    fn offsets(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `tensor.parallel_insert_slice`")
-            });
+    fn offsets(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
         let dynamic_start = 2;
-        let dynamic_end = dynamic_start + segment_sizes[2] as usize;
+        let dynamic_end =
+            dynamic_start + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
         let dynamic_offsets =
-            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_offsets = self
-            .attribute(STATIC_OFFSETS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{STATIC_OFFSETS_ATTRIBUTE}' attribute in `tensor.parallel_insert_slice`")
-            });
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_offsets = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_OFFSETS_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_offsets = dynamic_offsets.into_iter();
         static_offsets
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_offsets.next().expect("missing dynamic offset operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_offsets.next().map(StaticOrDynamicIndex::Dynamic).ok_or_else(|| {
+                        Error::invalid_argument("missing dynamic offset operand in `tensor.parallel_insert_slice`")
+                    })
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
 
     /// Returns the mixed static and dynamic sizes.
-    fn sizes(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `tensor.parallel_insert_slice`")
-            });
-        let dynamic_start = 2 + segment_sizes[2] as usize;
-        let dynamic_end = dynamic_start + segment_sizes[3] as usize;
+    fn sizes(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
+        let offset_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
+        let dynamic_start = 2 + offset_count;
+        let dynamic_end =
+            dynamic_start + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)?;
         let dynamic_sizes =
-            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_sizes = self
-            .attribute(STATIC_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{STATIC_SIZES_ATTRIBUTE}' attribute in `tensor.parallel_insert_slice`")
-            });
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_sizes = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_SIZES_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_sizes = dynamic_sizes.into_iter();
         static_sizes
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_sizes.next().expect("missing dynamic size operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_sizes.next().map(StaticOrDynamicIndex::Dynamic).ok_or_else(|| {
+                        Error::invalid_argument("missing dynamic size operand in `tensor.parallel_insert_slice`")
+                    })
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
 
     /// Returns the mixed static and dynamic strides.
-    fn strides(&self) -> Vec<StaticOrDynamicIndex<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `tensor.parallel_insert_slice`")
-            });
-        let dynamic_start = 2 + segment_sizes[2] as usize + segment_sizes[3] as usize;
-        let dynamic_end = dynamic_start + segment_sizes[4] as usize;
+    fn strides(&self) -> Result<Vec<StaticOrDynamicIndex<'o, 'c, 't>>, Error> {
+        let offset_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?;
+        let size_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)?;
+        let dynamic_start = 2 + offset_count + size_count;
+        let dynamic_end =
+            dynamic_start + self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 4)?;
         let dynamic_strides =
-            (dynamic_start..dynamic_end).map(|index| self.operand_value(index).unwrap()).collect::<Vec<_>>();
-        let static_strides = self
-            .attribute(STATIC_STRIDES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{STATIC_STRIDES_ATTRIBUTE}' attribute in `tensor.parallel_insert_slice`")
-            });
+            (dynamic_start..dynamic_end).map(|index| self.operand_value(index)).collect::<Result<Vec<_>, _>>()?;
+        let static_strides = Vec::<i64>::from(self.dense_integer_64_array_attribute(STATIC_STRIDES_ATTRIBUTE)?);
         let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
         let mut dynamic_strides = dynamic_strides.into_iter();
         static_strides
             .into_iter()
             .map(|index| {
-                (index == dynamic_index)
-                    .then(|| dynamic_strides.next().expect("missing dynamic stride operand"))
-                    .map_or_else(|| StaticOrDynamicIndex::Static(index), StaticOrDynamicIndex::Dynamic)
+                if index == dynamic_index {
+                    dynamic_strides.next().map(StaticOrDynamicIndex::Dynamic).ok_or_else(|| {
+                        Error::invalid_argument("missing dynamic stride operand in `tensor.parallel_insert_slice`")
+                    })
+                } else {
+                    Ok(StaticOrDynamicIndex::Static(index))
+                }
             })
             .collect()
     }
@@ -1277,9 +1231,9 @@ pub fn parallel_insert_slice<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     sizes: &[StaticOrDynamicIndex<'v, 'c, 't>],
     strides: &[StaticOrDynamicIndex<'v, 'c, 't>],
     location: L,
-) -> DetachedParallelInsertSliceOperation<'c, 't> {
+) -> Result<DetachedParallelInsertSliceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     let dynamic_index = unsafe { Size::Dynamic.to_c_api() };
     let static_offsets = offsets.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
     let dynamic_offsets = offsets.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
@@ -1290,27 +1244,28 @@ pub fn parallel_insert_slice<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     OperationBuilder::new("tensor.parallel_insert_slice", location)
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context
-                .dense_i32_array_attribute(&[
-                    1,
-                    1,
-                    dynamic_offsets.len() as i32,
-                    dynamic_sizes.len() as i32,
-                    dynamic_strides.len() as i32,
-                ])
-                .unwrap(),
+            context.dense_i32_array_attribute(&[
+                1,
+                1,
+                dynamic_offsets.len() as i32,
+                dynamic_sizes.len() as i32,
+                dynamic_strides.len() as i32,
+            ])?,
         )
-        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets).unwrap())
-        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes).unwrap())
-        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides).unwrap())
+        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)
+        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)
+        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)
         .add_operand(source)
         .add_operand(destination)
         .add_operands(&dynamic_offsets)
         .add_operands(&dynamic_sizes)
         .add_operands(&dynamic_strides)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::parallel_insert_slice`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::parallel_insert_slice`"))
+        })
 }
 
 /// Name of the `tensor.scatter` dimension-list attribute.
@@ -1319,25 +1274,23 @@ pub const SCATTER_DIMS_ATTRIBUTE: &str = "scatter_dims";
 /// Operation trait for `tensor.scatter`.
 pub trait ScatterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the source tensor.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the destination tensor.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the indices tensor.
-    fn indices(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn indices(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the scattered destination dimensions.
-    fn scatter_dimensions(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(SCATTER_DIMS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{SCATTER_DIMS_ATTRIBUTE}' attribute in `tensor.scatter`"))
+    fn scatter_dimensions(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(SCATTER_DIMS_ATTRIBUTE)
     }
 
     /// Returns whether coordinates are statically guaranteed to be unique.
@@ -1346,7 +1299,7 @@ pub trait ScatterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResul
     }
 
     /// Returns the scattered tensor.
-    fn scattered(&self) -> ValueRef<'o, 'c, 't> {
+    fn scattered(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -1367,38 +1320,37 @@ pub fn scatter<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     scatter_dimensions: &[i64],
     unique: bool,
     location: L,
-) -> DetachedScatterOperation<'c, 't> {
+) -> Result<DetachedScatterOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     let mut builder = OperationBuilder::new("tensor.scatter", location)
         .add_operand(source)
         .add_operand(destination)
         .add_operand(indices)
-        .add_attribute(SCATTER_DIMS_ATTRIBUTE, context.dense_i64_array_attribute(scatter_dimensions).unwrap())
-        .add_result(destination.r#type());
+        .add_attribute(SCATTER_DIMS_ATTRIBUTE, context.dense_i64_array_attribute(scatter_dimensions)?)
+        .add_result(destination.r#type()?);
     if unique {
         builder = builder.add_attribute(UNIQUE_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::scatter`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::scatter`"))
+    })
 }
 
 /// Operation trait for `tensor.splat`.
 pub trait SplatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the scalar input.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the dynamic size operands.
-    fn dynamic_sizes(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (1..self.operand_count()).map(|index| self.operand_value(index).unwrap()).collect()
+    fn dynamic_sizes(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (1..self.operand_count()).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the splatted tensor.
-    fn aggregate(&self) -> ValueRef<'o, 'c, 't> {
+    fn aggregate(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -1417,23 +1369,24 @@ pub fn splat<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     dynamic_sizes: &[ValueRef<'v, 'c, 't>],
     result_type: T,
     location: L,
-) -> DetachedSplatOperation<'c, 't> {
+) -> Result<DetachedSplatOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.splat", location)
         .add_operand(input)
         .add_operands(dynamic_sizes)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::splat`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::splat`"))
+        })
 }
 
 /// Operation trait for `tensor.yield`.
 pub trait YieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the yielded value.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 }
 
@@ -1451,14 +1404,15 @@ mlir_op_trait!(Yield, ZeroSuccessors);
 pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     value: ValueRef<'v, 'c, 't>,
     location: L,
-) -> DetachedYieldOperation<'c, 't> {
+) -> Result<DetachedYieldOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::tensor());
+    context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.yield", location)
         .add_operand(value)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `tensor::yield`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::yield`"))
+        })
 }
 
 #[cfg(test)]
@@ -1475,31 +1429,36 @@ mod tests {
     fn test_bitcast() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let source_type =
             context.tensor_type(context.signless_integer_type(32), &[Size::Static(2)], None, location).unwrap();
         let result_type =
             context.tensor_type(context.unsigned_integer_type(32), &[Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type, location)]);
-            let source = block.argument(0).unwrap().into();
-            let op = bitcast(source, result_type, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.destination().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "bitcast_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type, location)]);
+                let source = block.argument(0).unwrap().into();
+                let op = bitcast(source, result_type, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.source().unwrap(), source);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "bitcast_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1517,31 +1476,36 @@ mod tests {
     fn test_cast() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let source_type = context.unranked_tensor_type(context.float32_type(), location).unwrap();
         let result_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Dynamic], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type, location)]);
-            let source = block.argument(0).unwrap().into();
-            let op = cast(source, result_type, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.destination().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "cast_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type, location)]);
+                let source = block.argument(0).unwrap().into();
+                let op = cast(source, result_type, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.source().unwrap(), source);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "cast_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1559,33 +1523,38 @@ mod tests {
     fn test_concat() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let lhs_type = context.tensor_type(f32_type, &[Size::Static(2)], None, location).unwrap();
         let rhs_type = context.tensor_type(f32_type, &[Size::Static(3)], None, location).unwrap();
         let result_type = context.tensor_type(f32_type, &[Size::Static(5)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(lhs_type, location), (rhs_type, location)]);
-            let lhs = block.argument(0).unwrap().into();
-            let rhs = block.argument(1).unwrap().into();
-            let op = concat(&[lhs, rhs], 0, result_type, location);
-            assert_eq!(op.inputs(), vec![lhs, rhs]);
-            assert_eq!(op.dimension(), 0);
-            assert_eq!(op.concatenated().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "concat_test",
-                func::FuncAttributes {
-                    arguments: vec![lhs_type.into(), rhs_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(lhs_type, location), (rhs_type, location)]);
+                let lhs = block.argument(0).unwrap().into();
+                let rhs = block.argument(1).unwrap().into();
+                let op = concat(&[lhs, rhs], 0, result_type, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), vec![lhs, rhs]);
+                assert_eq!(op.dimension().unwrap(), 0);
+                assert_eq!(op.dimension().unwrap(), 0);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "concat_test",
+                    func::FuncAttributes {
+                        arguments: vec![lhs_type.into(), rhs_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1603,33 +1572,38 @@ mod tests {
     fn test_dim() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let tensor_type = context
             .tensor_type(context.float32_type(), &[Size::Static(4), Size::Dynamic], None, location)
             .unwrap();
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type.as_ref(), location), (index_type.as_ref(), location)]);
-            let source = block.argument(0).unwrap().into();
-            let index = block.argument(1).unwrap().into();
-            let op = dim(source, index, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.index(), index);
-            assert_eq!(op.size().r#type(), index_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "dim_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), index_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type.as_ref(), location), (index_type.as_ref(), location)]);
+                let source = block.argument(0).unwrap().into();
+                let index = block.argument(1).unwrap().into();
+                let op = dim(source, index, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.index().unwrap(), index);
+                assert_eq!(op.source().unwrap(), source);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "dim_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), index_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1647,31 +1621,36 @@ mod tests {
     fn test_empty() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let result_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Static(4)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type, location)]);
-            let dynamic_size = block.argument(0).unwrap().into();
-            let op = empty(&[dynamic_size], result_type, location);
-            assert_eq!(op.dynamic_sizes(), vec![dynamic_size]);
-            assert_eq!(op.tensor().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "empty_test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type, location)]);
+                let dynamic_size = block.argument(0).unwrap().into();
+                let op = empty(&[dynamic_size], result_type, location).unwrap();
+                assert_eq!(op.dynamic_sizes().unwrap(), vec![dynamic_size]);
+                assert_eq!(op.tensor().unwrap().r#type().unwrap(), result_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "empty_test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1689,37 +1668,42 @@ mod tests {
     fn test_extract() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let index_type = context.index_type();
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(4), Size::Static(4)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (tensor_type.as_ref(), location),
-                (index_type.as_ref(), location),
-                (index_type.as_ref(), location),
-            ]);
-            let tensor = block.argument(0).unwrap().into();
-            let index_0 = block.argument(1).unwrap().into();
-            let index_1 = block.argument(2).unwrap().into();
-            let op = extract(tensor, &[index_0, index_1], i32_type, location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.indices(), vec![index_0, index_1]);
-            assert_eq!(op.element().r#type(), i32_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "extract_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), index_type.into(), index_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (tensor_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                ]);
+                let tensor = block.argument(0).unwrap().into();
+                let index_0 = block.argument(1).unwrap().into();
+                let index_1 = block.argument(2).unwrap().into();
+                let op = extract(tensor, &[index_0, index_1], i32_type, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.indices().unwrap(), vec![index_0, index_1]);
+                assert_eq!(op.tensor().unwrap(), tensor);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "extract_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), index_type.into(), index_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1737,7 +1721,7 @@ mod tests {
     fn test_extract_slice() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let source_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Static(16)], None, location)
@@ -1745,33 +1729,38 @@ mod tests {
         let result_type = context
             .tensor_type(context.float32_type(), &[Size::Static(4), Size::Static(8)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type.as_ref(), location), (index_type.as_ref(), location)]);
-            let source = block.argument(0).unwrap().into();
-            let dynamic_offset = block.argument(1).unwrap().into();
-            let offsets = [StaticOrDynamicIndex::Dynamic(dynamic_offset), StaticOrDynamicIndex::Static(2)];
-            let sizes = [StaticOrDynamicIndex::Static(4), StaticOrDynamicIndex::Static(8)];
-            let strides = [StaticOrDynamicIndex::Static(1), StaticOrDynamicIndex::Static(1)];
-            let op = extract_slice(source, &offsets, &sizes, &strides, result_type, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.offsets(), offsets);
-            assert_eq!(op.sizes(), sizes);
-            assert_eq!(op.strides(), strides);
-            assert_eq!(op.slice().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "extract_slice_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into(), index_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type.as_ref(), location), (index_type.as_ref(), location)]);
+                let source = block.argument(0).unwrap().into();
+                let dynamic_offset = block.argument(1).unwrap().into();
+                let offsets = [StaticOrDynamicIndex::Dynamic(dynamic_offset), StaticOrDynamicIndex::Static(2)];
+                let sizes = [StaticOrDynamicIndex::Static(4), StaticOrDynamicIndex::Static(8)];
+                let strides = [StaticOrDynamicIndex::Static(1), StaticOrDynamicIndex::Static(1)];
+                let op = extract_slice(source, &offsets, &sizes, &strides, result_type, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.offsets().unwrap(), offsets);
+                assert_eq!(op.sizes().unwrap(), sizes);
+                assert_eq!(op.strides().unwrap(), strides);
+                assert_eq!(op.source().unwrap(), source);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "extract_slice_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into(), index_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1789,30 +1778,35 @@ mod tests {
     fn test_from_elements() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let result_type = context.tensor_type(i32_type, &[Size::Static(2)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
-            let element_0 = block.argument(0).unwrap().into();
-            let element_1 = block.argument(1).unwrap().into();
-            let op = from_elements(&[element_0, element_1], result_type, location);
-            assert_eq!(op.elements(), vec![element_0, element_1]);
-            assert_eq!(op.tensor().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "from_elements_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), i32_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (i32_type, location)]);
+                let element_0 = block.argument(0).unwrap().into();
+                let element_1 = block.argument(1).unwrap().into();
+                let op = from_elements(&[element_0, element_1], result_type, location).unwrap();
+                assert_eq!(op.elements().unwrap(), vec![element_0, element_1]);
+                assert_eq!(op.tensor().unwrap().r#type().unwrap(), result_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "from_elements_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), i32_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1830,7 +1824,7 @@ mod tests {
     fn test_gather() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let index_type = context.index_type();
         let source_type = context.tensor_type(f32_type, &[Size::Static(4), Size::Static(4)], None, location).unwrap();
@@ -1839,30 +1833,35 @@ mod tests {
         let result_type = context
             .tensor_type(f32_type, &[Size::Static(2), Size::Static(4), Size::Static(1)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type, location), (indices_type, location)]);
-            let source = block.argument(0).unwrap().into();
-            let indices = block.argument(1).unwrap().into();
-            let op = gather(source, indices, &[1], true, result_type, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.indices(), indices);
-            assert_eq!(op.gather_dimensions().values().collect::<Vec<_>>(), vec![1]);
-            assert!(op.unique());
-            assert_eq!(op.gathered().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "gather_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into(), indices_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type, location), (indices_type, location)]);
+                let source = block.argument(0).unwrap().into();
+                let indices = block.argument(1).unwrap().into();
+                let op = gather(source, indices, &[1], true, result_type, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.indices().unwrap(), indices);
+                assert_eq!(op.gather_dimensions().unwrap().values().collect::<Vec<_>>(), vec![1]);
+                assert!(op.unique());
+                assert_eq!(op.gathered().unwrap().r#type().unwrap(), result_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "gather_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into(), indices_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1880,38 +1879,43 @@ mod tests {
     fn test_generate() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let f32_type = context.float32_type();
         let result_type = context.tensor_type(f32_type, &[Size::Dynamic], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type.as_ref(), location), (f32_type.as_ref(), location)]);
-            let dynamic_extent = block.argument(0).unwrap().into();
-            let element = block.argument(1).unwrap().into();
-            let mut body = context.region();
-            let mut body_block = context.block(&[(index_type, location)]);
-            let yield_op = r#yield(element, location);
-            assert_eq!(yield_op.value(), element);
-            body_block.append_operation(yield_op);
-            body.append_block(body_block);
-            let op = generate(&[dynamic_extent], result_type, body, location);
-            assert_eq!(op.dynamic_extents(), vec![dynamic_extent]);
-            assert_eq!(op.body_region().blocks().count(), 1);
-            assert_eq!(op.tensor().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "generate_test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into(), f32_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type.as_ref(), location), (f32_type.as_ref(), location)]);
+                let dynamic_extent = block.argument(0).unwrap().into();
+                let element = block.argument(1).unwrap().into();
+                let mut body = context.region();
+                let mut body_block = context.block(&[(index_type, location)]);
+                let yield_op = r#yield(element, location).unwrap();
+                assert_eq!(yield_op.value().unwrap(), element);
+                body_block.append_operation(yield_op).unwrap();
+                body.append_block(body_block).unwrap();
+                let op = generate(&[dynamic_extent], result_type, body, location).unwrap();
+                assert_eq!(op.dynamic_extents().unwrap(), vec![dynamic_extent]);
+                assert_eq!(op.body_region().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.body_region().unwrap().blocks().unwrap().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "generate_test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into(), f32_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1932,40 +1936,45 @@ mod tests {
     fn test_insert() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let index_type = context.index_type();
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(4), Size::Static(4)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (i32_type.as_ref(), location),
-                (tensor_type.as_ref(), location),
-                (index_type.as_ref(), location),
-                (index_type.as_ref(), location),
-            ]);
-            let scalar = block.argument(0).unwrap().into();
-            let destination = block.argument(1).unwrap().into();
-            let index_0 = block.argument(2).unwrap().into();
-            let index_1 = block.argument(3).unwrap().into();
-            let op = insert(scalar, destination, &[index_0, index_1], location);
-            assert_eq!(op.scalar(), scalar);
-            assert_eq!(op.destination(), destination);
-            assert_eq!(op.indices(), vec![index_0, index_1]);
-            assert_eq!(op.updated().r#type(), tensor_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "insert_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), tensor_type.into(), index_type.into(), index_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (i32_type.as_ref(), location),
+                    (tensor_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                ]);
+                let scalar = block.argument(0).unwrap().into();
+                let destination = block.argument(1).unwrap().into();
+                let index_0 = block.argument(2).unwrap().into();
+                let index_1 = block.argument(3).unwrap().into();
+                let op = insert(scalar, destination, &[index_0, index_1], location).unwrap();
+                assert_eq!(op.scalar().unwrap(), scalar);
+                assert_eq!(op.destination().unwrap(), destination);
+                assert_eq!(op.indices().unwrap(), vec![index_0, index_1]);
+                assert_eq!(op.scalar().unwrap(), scalar);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "insert_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), tensor_type.into(), index_type.into(), index_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1983,7 +1992,7 @@ mod tests {
     fn test_insert_slice() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let source_type = context
             .tensor_type(context.float32_type(), &[Size::Static(4), Size::Static(8)], None, location)
@@ -1991,39 +2000,44 @@ mod tests {
         let destination_type = context
             .tensor_type(context.float32_type(), &[Size::Dynamic, Size::Static(16)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (source_type.as_ref(), location),
-                (destination_type.as_ref(), location),
-                (index_type.as_ref(), location),
-            ]);
-            let source = block.argument(0).unwrap().into();
-            let destination = block.argument(1).unwrap().into();
-            let dynamic_offset = block.argument(2).unwrap().into();
-            let offsets = [StaticOrDynamicIndex::Dynamic(dynamic_offset), StaticOrDynamicIndex::Static(2)];
-            let sizes = [StaticOrDynamicIndex::Static(4), StaticOrDynamicIndex::Static(8)];
-            let strides = [StaticOrDynamicIndex::Static(1), StaticOrDynamicIndex::Static(1)];
-            let op = insert_slice(source, destination, &offsets, &sizes, &strides, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.destination(), destination);
-            assert_eq!(op.offsets(), offsets);
-            assert_eq!(op.sizes(), sizes);
-            assert_eq!(op.strides(), strides);
-            assert_eq!(op.updated().r#type(), destination_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "insert_slice_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into(), destination_type.into(), index_type.into()],
-                    results: vec![destination_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (source_type.as_ref(), location),
+                    (destination_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                ]);
+                let source = block.argument(0).unwrap().into();
+                let destination = block.argument(1).unwrap().into();
+                let dynamic_offset = block.argument(2).unwrap().into();
+                let offsets = [StaticOrDynamicIndex::Dynamic(dynamic_offset), StaticOrDynamicIndex::Static(2)];
+                let sizes = [StaticOrDynamicIndex::Static(4), StaticOrDynamicIndex::Static(8)];
+                let strides = [StaticOrDynamicIndex::Static(1), StaticOrDynamicIndex::Static(1)];
+                let op = insert_slice(source, destination, &offsets, &sizes, &strides, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.destination().unwrap(), destination);
+                assert_eq!(op.offsets().unwrap(), offsets);
+                assert_eq!(op.sizes().unwrap(), sizes);
+                assert_eq!(op.strides().unwrap(), strides);
+                assert_eq!(op.source().unwrap(), source);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "insert_slice_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into(), destination_type.into(), index_type.into()],
+                        results: vec![destination_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2041,29 +2055,34 @@ mod tests {
     fn test_rank() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let tensor_type = context.unranked_tensor_type(context.float32_type(), location).unwrap();
         let index_type = context.index_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().into();
-            let op = rank(tensor, location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.rank().r#type(), index_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "rank_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().into();
+                let op = rank(tensor, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.tensor().unwrap(), tensor);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "rank_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2081,34 +2100,39 @@ mod tests {
     fn test_reshape() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let i32_type = context.signless_integer_type(32);
         let source_type = context.tensor_type(f32_type, &[Size::Static(4), Size::Static(1)], None, location).unwrap();
         let shape_type = context.tensor_type(i32_type, &[Size::Static(1)], None, location).unwrap();
         let result_type = context.tensor_type(f32_type, &[Size::Static(4)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type, location), (shape_type, location)]);
-            let source = block.argument(0).unwrap().into();
-            let shape = block.argument(1).unwrap().into();
-            let op = reshape(source, shape, result_type, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.shape(), shape);
-            assert_eq!(op.reshaped().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "reshape_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into(), shape_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type, location), (shape_type, location)]);
+                let source = block.argument(0).unwrap().into();
+                let shape = block.argument(1).unwrap().into();
+                let op = reshape(source, shape, result_type, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.shape().unwrap(), shape);
+                assert_eq!(op.source().unwrap(), source);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "reshape_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into(), shape_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2126,40 +2150,45 @@ mod tests {
     fn test_expand_shape() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let f32_type = context.float32_type();
         let source_type = context.tensor_type(f32_type, &[Size::Dynamic, Size::Static(32)], None, location).unwrap();
         let result_type = context
             .tensor_type(f32_type, &[Size::Dynamic, Size::Static(4), Size::Static(32)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type.as_ref(), location), (index_type.as_ref(), location)]);
-            let source = block.argument(0).unwrap().into();
-            let dynamic_output = block.argument(1).unwrap().into();
-            let output_shape = [
-                StaticOrDynamicIndex::Dynamic(dynamic_output),
-                StaticOrDynamicIndex::Static(4),
-                StaticOrDynamicIndex::Static(32),
-            ];
-            let op = expand_shape(source, &[&[0, 1], &[2]], &output_shape, result_type, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.output_shape(), output_shape);
-            assert_eq!(op.reshaped().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "expand_shape_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into(), index_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type.as_ref(), location), (index_type.as_ref(), location)]);
+                let source = block.argument(0).unwrap().into();
+                let dynamic_output = block.argument(1).unwrap().into();
+                let output_shape = [
+                    StaticOrDynamicIndex::Dynamic(dynamic_output),
+                    StaticOrDynamicIndex::Static(4),
+                    StaticOrDynamicIndex::Static(32),
+                ];
+                let op = expand_shape(source, &[&[0, 1], &[2]], &output_shape, result_type, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.output_shape().unwrap(), output_shape);
+                assert_eq!(op.source().unwrap(), source);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "expand_shape_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into(), index_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2177,32 +2206,37 @@ mod tests {
     fn test_collapse_shape() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let source_type = context
             .tensor_type(f32_type, &[Size::Dynamic, Size::Static(4), Size::Static(32)], None, location)
             .unwrap();
         let result_type = context.tensor_type(f32_type, &[Size::Dynamic, Size::Static(32)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type, location)]);
-            let source = block.argument(0).unwrap().into();
-            let op = collapse_shape(source, &[&[0, 1], &[2]], result_type, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.reshaped().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "collapse_shape_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type, location)]);
+                let source = block.argument(0).unwrap().into();
+                let op = collapse_shape(source, &[&[0, 1], &[2]], result_type, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.source().unwrap(), source);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "collapse_shape_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2220,43 +2254,48 @@ mod tests {
     fn test_pad() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let source_type = context.tensor_type(f32_type, &[Size::Static(2)], None, location).unwrap();
         let result_type = context.tensor_type(f32_type, &[Size::Static(4)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type.as_ref(), location), (f32_type.as_ref(), location)]);
-            let source = block.argument(0).unwrap().into();
-            let value = block.argument(1).unwrap().into();
-            let low = [StaticOrDynamicIndex::Static(1)];
-            let high = [StaticOrDynamicIndex::Static(1)];
-            let mut region = context.region();
-            let mut region_block = context.block(&[(context.index_type(), location)]);
-            let yield_op = r#yield(value, location);
-            assert_eq!(yield_op.value(), value);
-            region_block.append_operation(yield_op);
-            region.append_block(region_block);
-            let op = pad(source, &low, &high, false, result_type, region, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.low(), low);
-            assert_eq!(op.high(), high);
-            assert!(!op.nofold());
-            assert_eq!(op.body_region().blocks().count(), 1);
-            assert_eq!(op.padded().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "pad_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into(), f32_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type.as_ref(), location), (f32_type.as_ref(), location)]);
+                let source = block.argument(0).unwrap().into();
+                let value = block.argument(1).unwrap().into();
+                let low = [StaticOrDynamicIndex::Static(1)];
+                let high = [StaticOrDynamicIndex::Static(1)];
+                let mut region = context.region();
+                let mut region_block = context.block(&[(context.index_type(), location)]);
+                let yield_op = r#yield(value, location).unwrap();
+                assert_eq!(yield_op.value().unwrap(), value);
+                region_block.append_operation(yield_op).unwrap();
+                region.append_block(region_block).unwrap();
+                let op = pad(source, &low, &high, false, result_type, region, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.low().unwrap(), low);
+                assert_eq!(op.high().unwrap(), high);
+                assert!(!op.nofold());
+                assert_eq!(op.body_region().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.body_region().unwrap().blocks().unwrap().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pad_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into(), f32_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2277,49 +2316,54 @@ mod tests {
     fn test_parallel_insert_slice() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let source_type = context.tensor_type(f32_type, &[Size::Static(1)], None, location).unwrap();
         let destination_type = context.tensor_type(f32_type, &[Size::Static(4)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type, location), (destination_type, location)]);
-            let source = block.argument(0).unwrap().into();
-            let destination = block.argument(1).unwrap().into();
-            let mut body = context.region();
-            let mut body_block =
-                context.block(&[(context.index_type().as_ref(), location), (destination_type.as_ref(), location)]);
-            let induction_variable = body_block.argument(0).unwrap().into();
-            let output_argument = body_block.argument(1).unwrap().into();
-            let offsets = [StaticOrDynamicIndex::Dynamic(induction_variable)];
-            let sizes = [StaticOrDynamicIndex::Static(1)];
-            let strides = [StaticOrDynamicIndex::Static(1)];
-            let mut in_parallel_region = context.region();
-            let mut in_parallel_block = context.block_with_no_arguments();
-            let op = parallel_insert_slice(source, output_argument, &offsets, &sizes, &strides, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.destination(), output_argument);
-            assert_eq!(op.offsets(), offsets);
-            assert_eq!(op.sizes(), sizes);
-            assert_eq!(op.strides(), strides);
-            in_parallel_block.append_operation(op);
-            in_parallel_region.append_block(in_parallel_block);
-            body_block.append_operation(scf::in_parallel(in_parallel_region, location));
-            body.append_block(body_block);
-            let op = scf::for_all(&[], &[], &[], &[0], &[4], &[1], &[destination], None, body, location);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "parallel_insert_slice_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into(), destination_type.into()],
-                    results: vec![destination_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type, location), (destination_type, location)]);
+                let source = block.argument(0).unwrap().into();
+                let destination = block.argument(1).unwrap().into();
+                let mut body = context.region();
+                let mut body_block =
+                    context.block(&[(context.index_type().as_ref(), location), (destination_type.as_ref(), location)]);
+                let induction_variable = body_block.argument(0).unwrap().into();
+                let output_argument = body_block.argument(1).unwrap().into();
+                let offsets = [StaticOrDynamicIndex::Dynamic(induction_variable)];
+                let sizes = [StaticOrDynamicIndex::Static(1)];
+                let strides = [StaticOrDynamicIndex::Static(1)];
+                let mut in_parallel_region = context.region();
+                let mut in_parallel_block = context.block_with_no_arguments();
+                let op = parallel_insert_slice(source, output_argument, &offsets, &sizes, &strides, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.destination().unwrap(), output_argument);
+                assert_eq!(op.offsets().unwrap(), offsets);
+                assert_eq!(op.sizes().unwrap(), sizes);
+                assert_eq!(op.strides().unwrap(), strides);
+                in_parallel_block.append_operation(op).unwrap();
+                in_parallel_region.append_block(in_parallel_block).unwrap();
+                body_block.append_operation(scf::in_parallel(in_parallel_region, location).unwrap()).unwrap();
+                body.append_block(body_block).unwrap();
+                let op = scf::for_all(&[], &[], &[], &[0], &[4], &[1], &[destination], None, body, location).unwrap();
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "parallel_insert_slice_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into(), destination_type.into()],
+                        results: vec![destination_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2341,7 +2385,7 @@ mod tests {
     fn test_scatter() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let index_type = context.index_type();
         let source_type = context
@@ -2351,33 +2395,38 @@ mod tests {
             context.tensor_type(f32_type, &[Size::Static(4), Size::Static(4)], None, location).unwrap();
         let indices_type =
             context.tensor_type(index_type, &[Size::Static(2), Size::Static(1)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(source_type, location), (destination_type, location), (indices_type, location)]);
-            let source = block.argument(0).unwrap().into();
-            let destination = block.argument(1).unwrap().into();
-            let indices = block.argument(2).unwrap().into();
-            let op = scatter(source, destination, indices, &[1], true, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.destination(), destination);
-            assert_eq!(op.indices(), indices);
-            assert_eq!(op.scatter_dimensions().values().collect::<Vec<_>>(), vec![1]);
-            assert!(op.unique());
-            assert_eq!(op.scattered().r#type(), destination_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "scatter_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into(), destination_type.into(), indices_type.into()],
-                    results: vec![destination_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(source_type, location), (destination_type, location), (indices_type, location)]);
+                let source = block.argument(0).unwrap().into();
+                let destination = block.argument(1).unwrap().into();
+                let indices = block.argument(2).unwrap().into();
+                let op = scatter(source, destination, indices, &[1], true, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.destination().unwrap(), destination);
+                assert_eq!(op.indices().unwrap(), indices);
+                assert_eq!(op.scatter_dimensions().unwrap().values().collect::<Vec<_>>(), vec![1]);
+                assert!(op.unique());
+                assert_eq!(op.scattered().unwrap().r#type().unwrap(), destination_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "scatter_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into(), destination_type.into(), indices_type.into()],
+                        results: vec![destination_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2395,32 +2444,37 @@ mod tests {
     fn test_splat() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let f32_type = context.float32_type();
         let result_type = context.tensor_type(f32_type, &[Size::Dynamic, Size::Static(4)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type.as_ref(), location), (index_type.as_ref(), location)]);
-            let input = block.argument(0).unwrap().into();
-            let dynamic_size = block.argument(1).unwrap().into();
-            let op = splat(input, &[dynamic_size], result_type, location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.dynamic_sizes(), vec![dynamic_size]);
-            assert_eq!(op.aggregate().r#type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "splat_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), index_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type.as_ref(), location), (index_type.as_ref(), location)]);
+                let input = block.argument(0).unwrap().into();
+                let dynamic_size = block.argument(1).unwrap().into();
+                let op = splat(input, &[dynamic_size], result_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.dynamic_sizes().unwrap(), vec![dynamic_size]);
+                assert_eq!(op.input().unwrap(), input);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "splat_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), index_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2438,32 +2492,37 @@ mod tests {
     fn test_yield() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let result_type = context.tensor_type(f32_type, &[], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type.as_ref(), location)]);
-            let value = block.argument(0).unwrap().into();
-            let mut body = context.region();
-            let mut body_block = context.block_with_no_arguments();
-            let yield_op = r#yield(value, location);
-            assert_eq!(yield_op.value(), value);
-            body_block.append_operation(yield_op);
-            body.append_block(body_block);
-            let op = block.append_operation(generate(&[], result_type, body, location));
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "yield_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type.as_ref(), location)]);
+                let value = block.argument(0).unwrap().into();
+                let mut body = context.region();
+                let mut body_block = context.block_with_no_arguments();
+                let yield_op = r#yield(value, location).unwrap();
+                assert_eq!(yield_op.value().unwrap(), value);
+                body_block.append_operation(yield_op).unwrap();
+                body.append_block(body_block).unwrap();
+                let op = block.append_operation(generate(&[], result_type, body, location).unwrap()).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "yield_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

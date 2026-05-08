@@ -1,6 +1,6 @@
 use crate::{
-    Attribute, DetachedOp, DialectHandle, Location, Operation, OperationBuilder, Value, ValueRef, mlir_enum_attribute,
-    mlir_op, mlir_op_trait,
+    Attribute, DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Value, ValueRef,
+    mlir_enum_attribute, mlir_op, mlir_op_trait,
 };
 
 mlir_enum_attribute!(
@@ -96,31 +96,41 @@ pub const COMPARISON_TYPE_ATTRIBUTE: &str = "compare_type";
 /// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#compare) for more information.
 pub trait CompareOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`CompareOperation`].
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side input of this [`CompareOperation`].
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the [`ComparisonDirection`] of this [`CompareOperation`].
-    fn comparison_direction(&self) -> ComparisonDirection {
-        self.as_ref()
-            .attribute(COMPARISON_DIRECTION_ATTRIBUTE)
+    fn comparison_direction(&self) -> Result<ComparisonDirection, Error> {
+        self.attribute(COMPARISON_DIRECTION_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<ComparisonDirectionAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("`{COMPARISON_DIRECTION_ATTRIBUTE}` attribute not found or had incorrect type"))
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    COMPARISON_DIRECTION_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns the [`ComparisonType`] of this [`CompareOperation`].
-    fn comparison_type(&self) -> ComparisonType {
-        self.as_ref()
-            .attribute(COMPARISON_TYPE_ATTRIBUTE)
+    fn comparison_type(&self) -> Result<ComparisonType, Error> {
+        self.attribute(COMPARISON_TYPE_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<ComparisonTypeAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("`{COMPARISON_TYPE_ATTRIBUTE}` attribute not found or had incorrect type"))
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    COMPARISON_TYPE_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 }
 
@@ -131,8 +141,6 @@ mlir_op_trait!(Compare, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`CompareOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`CompareOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn compare<
     'lhs,
     'rhs,
@@ -147,20 +155,23 @@ pub fn compare<
     comparison_direction: ComparisonDirection,
     comparison_type: ComparisonType,
     location: L,
-) -> DetachedCompareOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedCompareOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.compare", location)
         .add_operand(lhs)
         .add_operand(rhs)
         .add_attribute(
             COMPARISON_DIRECTION_ATTRIBUTE,
-            location.context().stable_hlo_comparison_direction(comparison_direction),
+            location.context().stable_hlo_comparison_direction(comparison_direction)?,
         )
-        .add_attribute(COMPARISON_TYPE_ATTRIBUTE, location.context().stable_hlo_comparison_type(comparison_type))
+        .add_attribute(COMPARISON_TYPE_ATTRIBUTE, location.context().stable_hlo_comparison_type(comparison_type)?)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::compare`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::compare`"))
+        })
 }
 
 /// StableHLO [`Operation`] that clamps each element of [`ClampOperation::input`] between a [`ClampOperation::min`] and
@@ -176,18 +187,18 @@ pub fn compare<
 /// Refer to the [StableHLO specification](https://openxla.org/stablehlo/spec#clamp) for more information.
 pub trait ClampOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the minimum bound of this [`ClampOperation`].
-    fn min(&self) -> ValueRef<'o, 'c, 't> {
-        Operation::operand_value(self, 0).unwrap()
+    fn min(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the input (i.e., value to be clamped) of this [`ClampOperation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        Operation::operand_value(self, 1).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the maximum bound of this [`ClampOperation`].
-    fn max(&self) -> ValueRef<'o, 'c, 't> {
-        Operation::operand_value(self, 2).unwrap()
+    fn max(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 }
 
@@ -198,8 +209,6 @@ mlir_op_trait!(Clamp, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ClampOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ClampOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn clamp<
     'min,
     'input,
@@ -215,16 +224,17 @@ pub fn clamp<
     input: Input,
     max: Max,
     location: L,
-) -> DetachedClampOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedClampOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.clamp", location)
         .add_operand(min)
         .add_operand(input)
         .add_operand(max)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::clamp`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::clamp`"))
+        })
 }
 
 /// StableHLO [`Operation`] that computes the element-wise maximum between two tensors. The operation computes the
@@ -252,13 +262,13 @@ pub fn clamp<
 /// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#maximum) for more information.
 pub trait MaximumOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`MaximumOperation`].
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side input of this [`MaximumOperation`].
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 }
 
@@ -269,8 +279,6 @@ mlir_op_trait!(Maximum, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`MaximumOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`MaximumOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn maximum<
     'lhs,
     'rhs,
@@ -283,15 +291,18 @@ pub fn maximum<
     lhs: LHS,
     rhs: RHS,
     location: L,
-) -> DetachedMaximumOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedMaximumOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.maximum", location)
         .add_operand(lhs)
         .add_operand(rhs)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::maximum`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::maximum`"))
+        })
 }
 
 /// StableHLO [`Operation`] that computes the element-wise minimum between two tensors. The operation computes the
@@ -319,13 +330,13 @@ pub fn maximum<
 /// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#minimum) for more information.
 pub trait MinimumOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`MinimumOperation`].
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side input of this [`MinimumOperation`].
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 }
 
@@ -336,8 +347,6 @@ mlir_op_trait!(Minimum, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`MinimumOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`MinimumOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn minimum<
     'lhs,
     'rhs,
@@ -350,15 +359,18 @@ pub fn minimum<
     lhs: LHS,
     rhs: RHS,
     location: L,
-) -> DetachedMinimumOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedMinimumOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.minimum", location)
         .add_operand(lhs)
         .add_operand(rhs)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::minimum`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::minimum`"))
+        })
 }
 
 #[cfg(test)]
@@ -368,7 +380,7 @@ mod tests {
 
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
     use crate::dialects::func;
-    use crate::{Attribute, Block, Context, OneResult, Operation, Size, Value};
+    use crate::{Attribute, Block, Context, Operation, Size};
 
     use super::{
         ClampOperation, CompareOperation, ComparisonDirection, ComparisonType, MaximumOperation, MinimumOperation,
@@ -378,9 +390,9 @@ mod tests {
     #[test]
     fn test_comparison_direction_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual);
+        let attribute = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), ComparisonDirection::NotEqual);
+        assert_eq!(attribute.value().unwrap(), ComparisonDirection::NotEqual);
     }
 
     #[test]
@@ -388,40 +400,40 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual);
-        let attribute_2 = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual);
+        let attribute_1 = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual).unwrap();
+        let attribute_2 = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_comparison_direction(ComparisonDirection::LessThanOrEqual);
+        let attribute_2 = context.stable_hlo_comparison_direction(ComparisonDirection::LessThanOrEqual).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual);
+        let attribute_2 = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_comparison_direction_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual);
+        let attribute = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo<comparison_direction NE>");
     }
 
     #[test]
     fn test_comparison_direction_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual);
+        let attribute = context.stable_hlo_comparison_direction(ComparisonDirection::NotEqual).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_comparison_type_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_comparison_type(ComparisonType::TotalOrder);
+        let attribute = context.stable_hlo_comparison_type(ComparisonType::TotalOrder).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), ComparisonType::TotalOrder);
+        assert_eq!(attribute.value().unwrap(), ComparisonType::TotalOrder);
     }
 
     #[test]
@@ -429,31 +441,31 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_comparison_type(ComparisonType::TotalOrder);
-        let attribute_2 = context.stable_hlo_comparison_type(ComparisonType::TotalOrder);
+        let attribute_1 = context.stable_hlo_comparison_type(ComparisonType::TotalOrder).unwrap();
+        let attribute_2 = context.stable_hlo_comparison_type(ComparisonType::TotalOrder).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_comparison_type(ComparisonType::Float);
+        let attribute_2 = context.stable_hlo_comparison_type(ComparisonType::Float).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_comparison_type(ComparisonType::TotalOrder);
+        let attribute_2 = context.stable_hlo_comparison_type(ComparisonType::TotalOrder).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_comparison_type_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_comparison_type(ComparisonType::TotalOrder);
+        let attribute = context.stable_hlo_comparison_type(ComparisonType::TotalOrder).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo<comparison_type TOTALORDER>");
     }
 
     #[test]
     fn test_comparison_type_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_comparison_type(ComparisonType::TotalOrder);
+        let attribute = context.stable_hlo_comparison_type(ComparisonType::TotalOrder).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -461,37 +473,44 @@ mod tests {
     fn test_compare() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let i1_type = context.signless_integer_type(1);
         let input_tensor_type = context.tensor_type(f32_type, &[Size::Static(3)], None, location).unwrap();
         let output_tensor_type = context.tensor_type(i1_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_tensor_type, location), (input_tensor_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = compare(lhs, rhs, ComparisonDirection::GreaterThanOrEqual, ComparisonType::TotalOrder, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), output_tensor_type);
-            assert_eq!(op.comparison_direction(), ComparisonDirection::GreaterThanOrEqual);
-            assert_eq!(op.comparison_type(), ComparisonType::TotalOrder);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "compare_test",
-                func::FuncAttributes {
-                    arguments: vec![input_tensor_type.into(), input_tensor_type.into()],
-                    results: vec![output_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_tensor_type, location), (input_tensor_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op =
+                    compare(lhs, rhs, ComparisonDirection::GreaterThanOrEqual, ComparisonType::TotalOrder, location)
+                        .unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.comparison_direction().unwrap(), ComparisonDirection::GreaterThanOrEqual);
+                assert_eq!(op.comparison_type().unwrap(), ComparisonType::TotalOrder);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "compare_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_tensor_type.into(), input_tensor_type.into()],
+                        results: vec![output_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -509,35 +528,41 @@ mod tests {
     fn test_clamp() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
-            let min = block.argument(0).unwrap();
-            let input = block.argument(1).unwrap();
-            let max = block.argument(2).unwrap();
-            let op = clamp(min, input, max, location);
-            assert_eq!(op.min(), min);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.max(), max);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "clamp_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(tensor_type, location), (tensor_type, location), (tensor_type, location)]);
+                let min = block.argument(0).unwrap();
+                let input = block.argument(1).unwrap();
+                let max = block.argument(2).unwrap();
+                let op = clamp(min, input, max, location).unwrap();
+                assert_eq!(op.min().unwrap(), min);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.max().unwrap(), max);
+                let op = clamp(min, input, max, location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "clamp_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -555,33 +580,38 @@ mod tests {
     fn test_maximum() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = maximum(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "maximum_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = maximum(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                let op = maximum(lhs, rhs, location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "maximum_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -599,33 +629,38 @@ mod tests {
     fn test_minimum() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let tensor_type = context.tensor_type(f32_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = minimum(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "minimum_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = minimum(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                let op = minimum(lhs, rhs, location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "minimum_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

@@ -2,7 +2,7 @@ use ryft_xla_sys::bindings::{
     MlirLocation, mlirLocationNameGet, mlirLocationNameGetChildLoc, mlirLocationNameGetName, mlirLocationNameGetTypeID,
 };
 
-use crate::{Context, Identifier, Location, LocationRef, StringRef, TypeId, mlir_subtype_trait_impls};
+use crate::{Context, Error, Identifier, Location, LocationRef, StringRef, TypeId, mlir_subtype_trait_impls};
 
 /// [`Location`] that consists of a name and an optional associated child [`Location`]. A [`NamedLocationRef`] is a kind
 /// of location that attaches a symbolic name string (plus optionally another underlying location). It is useful when
@@ -19,8 +19,8 @@ pub struct NamedLocationRef<'c, 't> {
 
 impl<'c, 't> NamedLocationRef<'c, 't> {
     /// Returns the [`TypeId`] that corresponds to [`NamedLocationRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirLocationNameGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirLocationNameGetTypeID()) }
     }
 
     /// Returns the name of this [`NamedLocationRef`].
@@ -31,7 +31,10 @@ impl<'c, 't> NamedLocationRef<'c, 't> {
     /// Returns the child [`Location`] of this [`NamedLocationRef`]. If this location was created with no children,
     /// then this function will return an [`UnknownLocationRef`](crate::UnknownLocationRef).
     pub fn child(&self) -> LocationRef<'c, 't> {
-        unsafe { LocationRef::from_c_api(mlirLocationNameGetChildLoc(self.handle), self.context).unwrap() }
+        unsafe {
+            LocationRef::from_c_api(mlirLocationNameGetChildLoc(self.handle), self.context)
+                .unwrap_or_else(|_| self.as_ref())
+        }
     }
 }
 
@@ -51,11 +54,8 @@ impl<'t> Context<'t> {
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
             let child = child.map(|location| location.to_c_api()).unwrap_or(MlirLocation { ptr: std::ptr::null_mut() });
-            NamedLocationRef::from_c_api(
-                mlirLocationNameGet(*self.handle.borrow(), StringRef::from(name.as_ref()).to_c_api(), child),
-                self,
-            )
-            .unwrap()
+            let handle = mlirLocationNameGet(*self.handle.borrow(), StringRef::from(name.as_ref()).to_c_api(), child);
+            NamedLocationRef { handle, context: self }
         }
     }
 }
@@ -70,9 +70,9 @@ mod tests {
 
     #[test]
     fn test_named_location_type_id() {
-        let named_location_type_id = NamedLocationRef::type_id();
-        assert_eq!(NamedLocationRef::type_id(), NamedLocationRef::type_id());
-        assert_eq!(named_location_type_id, NamedLocationRef::type_id());
+        let named_location_type_id = NamedLocationRef::type_id().unwrap();
+        assert_eq!(NamedLocationRef::type_id().unwrap(), NamedLocationRef::type_id().unwrap());
+        assert_eq!(named_location_type_id, NamedLocationRef::type_id().unwrap());
     }
 
     #[test]

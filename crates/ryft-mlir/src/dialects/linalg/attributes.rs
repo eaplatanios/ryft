@@ -1,7 +1,7 @@
 use ryft_xla_sys::bindings::MlirAttribute;
 
 use crate::{
-    Attribute, AttributeRef, Context, DialectHandle, FromWithContext, IntegerAttributeRef, IntegerTypeRef, Type,
+    Attribute, AttributeRef, Context, DialectHandle, Error, IntegerAttributeRef, IntegerTypeRef, Type,
     mlir_subtype_trait_impls,
 };
 
@@ -55,28 +55,28 @@ macro_rules! linalg_enum_attribute {
 
         impl $attribute_name<'_, '_> {
             /// Returns the enum value stored in this attribute.
-            pub fn value(&self) -> $enum_name {
+            pub fn value(&self) -> Result<$enum_name, Error> {
                 let source = self.to_string();
                 source
                     .rsplit_once('<')
                     .and_then(|(_, value)| value.strip_suffix('>'))
                     .and_then(|value| $enum_name::try_from(value).ok())
-                    .expect(concat!("invalid Linalg `", $description, "` attribute"))
+                    .ok_or_else(|| Error::invalid_argument(concat!("invalid Linalg `", $description, "` attribute")))
             }
         }
 
         impl<'c, 't> Attribute<'c, 't> for $attribute_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR attribute handle"));
                 }
-                context.load_dialect(DialectHandle::linalg());
+                context.load_dialect(DialectHandle::linalg()?)?;
                 let expected = context.parse_attribute($sentinel)?;
                 let attribute = unsafe { AttributeRef::from_c_api(handle, context) }?;
                 if attribute.type_id() == expected.type_id() {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR attribute handle"))
                 }
             }
 
@@ -91,21 +91,18 @@ macro_rules! linalg_enum_attribute {
 
         mlir_subtype_trait_impls!($attribute_name<'c, 't> as Attribute, mlir_type = Attribute);
 
-        impl<'c, 't> FromWithContext<'c, 't, $enum_name> for $attribute_name<'c, 't> {
-            fn from_with_context(value: $enum_name, context: &'c Context<'t>) -> Self {
-                context.$context_method(value)
-            }
-        }
-
         impl<'t> Context<'t> {
             #[doc = "Creates a new Linalg `"]
             #[doc = $description]
             #[doc = "` enum [`Attribute`] owned by this [`Context`]."]
-            pub fn $context_method<'c>(&'c self, value: $enum_name) -> $attribute_name<'c, 't> {
-                self.load_dialect(DialectHandle::linalg());
+            pub fn $context_method<'c>(&'c self, value: $enum_name) -> Result<$attribute_name<'c, 't>, Error> {
+                self.load_dialect(DialectHandle::linalg()?)?;
                 let source = format!(concat!("#linalg.", $mnemonic, "<{}>"), value.as_str());
-                let attribute = self.parse_attribute(&source).unwrap();
-                unsafe { $attribute_name::from_c_api(attribute.to_c_api(), self).unwrap() }
+                let attribute = self.parse_attribute(&source)?;
+                unsafe {
+                    $attribute_name::from_c_api(attribute.to_c_api(), self)
+                        .map_err(|_| Error::invalid_argument(concat!("invalid Linalg `", $description, "` attribute")))
+                }
             }
         }
     };
@@ -297,24 +294,30 @@ pub struct WinogradConv2DFmrAttributeRef<'c, 't> {
 
 impl WinogradConv2DFmrAttributeRef<'_, '_> {
     /// Returns the Winograd Conv2D FMR value stored in this attribute.
-    pub fn value(&self) -> WinogradConv2DFmr {
-        let attribute = self.as_ref().cast::<IntegerAttributeRef>().unwrap();
+    pub fn value(&self) -> Result<WinogradConv2DFmr, Error> {
+        let attribute = self
+            .as_ref()
+            .cast::<IntegerAttributeRef>()
+            .ok_or_else(|| Error::invalid_argument("invalid Linalg Winograd Conv2D FMR attribute"))?;
         WinogradConv2DFmr::from_discriminant(attribute.signless_value())
-            .expect("invalid Linalg Winograd Conv2D FMR attribute")
+            .ok_or_else(|| Error::invalid_argument("invalid Linalg Winograd Conv2D FMR attribute"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for WinogradConv2DFmrAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         let attribute = unsafe { IntegerAttributeRef::from_c_api(handle, context) }?;
-        let r#type = attribute.r#type().cast::<IntegerTypeRef>()?;
+        let r#type = attribute.r#type()?;
+        let r#type = r#type
+            .cast::<IntegerTypeRef>()
+            .ok_or_else(|| Error::internal("expected integer type in Linalg Winograd Conv2D FMR attribute"))?;
         if r#type.is_signless()
             && r#type.bit_width() == 32
             && WinogradConv2DFmr::from_discriminant(attribute.signless_value()).is_some()
         {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -329,21 +332,18 @@ impl<'c, 't> Attribute<'c, 't> for WinogradConv2DFmrAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(WinogradConv2DFmrAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
-impl<'c, 't> FromWithContext<'c, 't, WinogradConv2DFmr> for WinogradConv2DFmrAttributeRef<'c, 't> {
-    fn from_with_context(value: WinogradConv2DFmr, context: &'c Context<'t>) -> Self {
-        context.linalg_winograd_conv_2d_fmr_attribute(value)
-    }
-}
-
 impl<'t> Context<'t> {
     /// Creates a new Linalg Winograd Conv2D FMR enum [`Attribute`] owned by this [`Context`].
     pub fn linalg_winograd_conv_2d_fmr_attribute<'c>(
         &'c self,
         value: WinogradConv2DFmr,
-    ) -> WinogradConv2DFmrAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::linalg());
+    ) -> Result<WinogradConv2DFmrAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::linalg()?)?;
         let attribute = self.integer_attribute(self.signless_integer_type(32), value.discriminant());
-        unsafe { WinogradConv2DFmrAttributeRef::from_c_api(attribute.to_c_api(), self).unwrap() }
+        unsafe {
+            WinogradConv2DFmrAttributeRef::from_c_api(attribute.to_c_api(), self)
+                .map_err(|_| Error::invalid_argument("invalid Linalg Winograd Conv2D FMR attribute"))
+        }
     }
 }
 
@@ -372,256 +372,256 @@ mod tests {
     #[test]
     fn test_elementwise_kind_attribute() {
         let context = Context::new();
-        let attribute = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add);
+        let attribute = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), ElementwiseKind::Add);
+        assert_eq!(attribute.value().unwrap(), ElementwiseKind::Add);
     }
 
     #[test]
     fn test_elementwise_kind_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add);
-        let attribute_2 = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add);
+        let attribute_1 = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add).unwrap();
+        let attribute_2 = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.linalg_elementwise_kind_attribute(ElementwiseKind::Multiply);
+        let attribute_2 = context.linalg_elementwise_kind_attribute(ElementwiseKind::Multiply).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add);
+        let attribute_2 = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_elementwise_kind_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add);
+        let attribute = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add).unwrap();
         test_attribute_display_and_debug(attribute, "#linalg.elementwise_kind<add>");
     }
 
     #[test]
     fn test_elementwise_kind_attribute_casting() {
         let context = Context::new();
-        let attribute = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add);
+        let attribute = context.linalg_elementwise_kind_attribute(ElementwiseKind::Add).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_unary_fn_attribute() {
         let context = Context::new();
-        let attribute = context.linalg_unary_fn_attribute(UnaryFn::Exp);
+        let attribute = context.linalg_unary_fn_attribute(UnaryFn::Exp).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), UnaryFn::Exp);
+        assert_eq!(attribute.value().unwrap(), UnaryFn::Exp);
     }
 
     #[test]
     fn test_unary_fn_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.linalg_unary_fn_attribute(UnaryFn::Exp);
-        let attribute_2 = context.linalg_unary_fn_attribute(UnaryFn::Exp);
+        let attribute_1 = context.linalg_unary_fn_attribute(UnaryFn::Exp).unwrap();
+        let attribute_2 = context.linalg_unary_fn_attribute(UnaryFn::Exp).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.linalg_unary_fn_attribute(UnaryFn::Log);
+        let attribute_2 = context.linalg_unary_fn_attribute(UnaryFn::Log).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.linalg_unary_fn_attribute(UnaryFn::Exp);
+        let attribute_2 = context.linalg_unary_fn_attribute(UnaryFn::Exp).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_unary_fn_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.linalg_unary_fn_attribute(UnaryFn::Exp);
+        let attribute = context.linalg_unary_fn_attribute(UnaryFn::Exp).unwrap();
         test_attribute_display_and_debug(attribute, "#linalg.unary_fn<exp>");
     }
 
     #[test]
     fn test_unary_fn_attribute_casting() {
         let context = Context::new();
-        let attribute = context.linalg_unary_fn_attribute(UnaryFn::Exp);
+        let attribute = context.linalg_unary_fn_attribute(UnaryFn::Exp).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_binary_fn_attribute() {
         let context = Context::new();
-        let attribute = context.linalg_binary_fn_attribute(BinaryFn::Multiply);
+        let attribute = context.linalg_binary_fn_attribute(BinaryFn::Multiply).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), BinaryFn::Multiply);
+        assert_eq!(attribute.value().unwrap(), BinaryFn::Multiply);
     }
 
     #[test]
     fn test_binary_fn_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.linalg_binary_fn_attribute(BinaryFn::Multiply);
-        let attribute_2 = context.linalg_binary_fn_attribute(BinaryFn::Multiply);
+        let attribute_1 = context.linalg_binary_fn_attribute(BinaryFn::Multiply).unwrap();
+        let attribute_2 = context.linalg_binary_fn_attribute(BinaryFn::Multiply).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.linalg_binary_fn_attribute(BinaryFn::Add);
+        let attribute_2 = context.linalg_binary_fn_attribute(BinaryFn::Add).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.linalg_binary_fn_attribute(BinaryFn::Multiply);
+        let attribute_2 = context.linalg_binary_fn_attribute(BinaryFn::Multiply).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_binary_fn_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.linalg_binary_fn_attribute(BinaryFn::Multiply);
+        let attribute = context.linalg_binary_fn_attribute(BinaryFn::Multiply).unwrap();
         test_attribute_display_and_debug(attribute, "#linalg.binary_fn<mul>");
     }
 
     #[test]
     fn test_binary_fn_attribute_casting() {
         let context = Context::new();
-        let attribute = context.linalg_binary_fn_attribute(BinaryFn::Multiply);
+        let attribute = context.linalg_binary_fn_attribute(BinaryFn::Multiply).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_ternary_fn_attribute() {
         let context = Context::new();
-        let attribute = context.linalg_ternary_fn_attribute(TernaryFn::Select);
+        let attribute = context.linalg_ternary_fn_attribute(TernaryFn::Select).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), TernaryFn::Select);
+        assert_eq!(attribute.value().unwrap(), TernaryFn::Select);
     }
 
     #[test]
     fn test_ternary_fn_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.linalg_ternary_fn_attribute(TernaryFn::Select);
-        let attribute_2 = context.linalg_ternary_fn_attribute(TernaryFn::Select);
+        let attribute_1 = context.linalg_ternary_fn_attribute(TernaryFn::Select).unwrap();
+        let attribute_2 = context.linalg_ternary_fn_attribute(TernaryFn::Select).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.linalg_ternary_fn_attribute(TernaryFn::Select);
+        let attribute_2 = context.linalg_ternary_fn_attribute(TernaryFn::Select).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_ternary_fn_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.linalg_ternary_fn_attribute(TernaryFn::Select);
+        let attribute = context.linalg_ternary_fn_attribute(TernaryFn::Select).unwrap();
         test_attribute_display_and_debug(attribute, "#linalg.ternary_fn<select>");
     }
 
     #[test]
     fn test_ternary_fn_attribute_casting() {
         let context = Context::new();
-        let attribute = context.linalg_ternary_fn_attribute(TernaryFn::Select);
+        let attribute = context.linalg_ternary_fn_attribute(TernaryFn::Select).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_type_fn_attribute() {
         let context = Context::new();
-        let attribute = context.linalg_type_fn_attribute(TypeFn::CastUnsigned);
+        let attribute = context.linalg_type_fn_attribute(TypeFn::CastUnsigned).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), TypeFn::CastUnsigned);
+        assert_eq!(attribute.value().unwrap(), TypeFn::CastUnsigned);
     }
 
     #[test]
     fn test_type_fn_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.linalg_type_fn_attribute(TypeFn::CastUnsigned);
-        let attribute_2 = context.linalg_type_fn_attribute(TypeFn::CastUnsigned);
+        let attribute_1 = context.linalg_type_fn_attribute(TypeFn::CastUnsigned).unwrap();
+        let attribute_2 = context.linalg_type_fn_attribute(TypeFn::CastUnsigned).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.linalg_type_fn_attribute(TypeFn::CastSigned);
+        let attribute_2 = context.linalg_type_fn_attribute(TypeFn::CastSigned).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.linalg_type_fn_attribute(TypeFn::CastUnsigned);
+        let attribute_2 = context.linalg_type_fn_attribute(TypeFn::CastUnsigned).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_type_fn_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.linalg_type_fn_attribute(TypeFn::CastUnsigned);
+        let attribute = context.linalg_type_fn_attribute(TypeFn::CastUnsigned).unwrap();
         test_attribute_display_and_debug(attribute, "#linalg.type_fn<cast_unsigned>");
     }
 
     #[test]
     fn test_type_fn_attribute_casting() {
         let context = Context::new();
-        let attribute = context.linalg_type_fn_attribute(TypeFn::CastUnsigned);
+        let attribute = context.linalg_type_fn_attribute(TypeFn::CastUnsigned).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_iterator_type_attribute() {
         let context = Context::new();
-        let attribute = context.linalg_iterator_type_attribute(IteratorType::Reduction);
+        let attribute = context.linalg_iterator_type_attribute(IteratorType::Reduction).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), IteratorType::Reduction);
+        assert_eq!(attribute.value().unwrap(), IteratorType::Reduction);
     }
 
     #[test]
     fn test_iterator_type_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.linalg_iterator_type_attribute(IteratorType::Reduction);
-        let attribute_2 = context.linalg_iterator_type_attribute(IteratorType::Reduction);
+        let attribute_1 = context.linalg_iterator_type_attribute(IteratorType::Reduction).unwrap();
+        let attribute_2 = context.linalg_iterator_type_attribute(IteratorType::Reduction).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.linalg_iterator_type_attribute(IteratorType::Parallel);
+        let attribute_2 = context.linalg_iterator_type_attribute(IteratorType::Parallel).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.linalg_iterator_type_attribute(IteratorType::Reduction);
+        let attribute_2 = context.linalg_iterator_type_attribute(IteratorType::Reduction).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_iterator_type_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.linalg_iterator_type_attribute(IteratorType::Reduction);
+        let attribute = context.linalg_iterator_type_attribute(IteratorType::Reduction).unwrap();
         test_attribute_display_and_debug(attribute, "#linalg.iterator_type<reduction>");
     }
 
     #[test]
     fn test_iterator_type_attribute_casting() {
         let context = Context::new();
-        let attribute = context.linalg_iterator_type_attribute(IteratorType::Reduction);
+        let attribute = context.linalg_iterator_type_attribute(IteratorType::Reduction).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_winograd_conv_2d_fmr_attribute() {
         let context = Context::new();
-        let attribute = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3);
+        let attribute = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), WinogradConv2DFmr::F2R3);
+        assert_eq!(attribute.value().unwrap(), WinogradConv2DFmr::F2R3);
     }
 
     #[test]
     fn test_winograd_conv_2d_fmr_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3);
-        let attribute_2 = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3);
+        let attribute_1 = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3).unwrap();
+        let attribute_2 = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F4R3);
+        let attribute_2 = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F4R3).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3);
+        let attribute_2 = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_winograd_conv_2d_fmr_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3);
+        let attribute = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3).unwrap();
         test_attribute_display_and_debug(attribute, "0 : i32");
     }
 
     #[test]
     fn test_winograd_conv_2d_fmr_attribute_casting() {
         let context = Context::new();
-        let attribute = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3);
+        let attribute = context.linalg_winograd_conv_2d_fmr_attribute(WinogradConv2DFmr::F2R3).unwrap();
         test_attribute_casting(attribute);
     }
 }

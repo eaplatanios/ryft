@@ -5,10 +5,9 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::{
-    ArrayAttributeRef, Attribute, AttributeRef, BlockRef, Context, DictionaryAttributeRef, FlatSymbolRefAttributeRef,
-    FromWithContext, FunctionTypeRef, IntoWithContext, LogicalResult, OperationBuilder, Region, RegionRef,
-    StringAttributeRef, StringRef, SymbolVisibility, SymbolVisibilityAttributeRef, Type, TypeAndAttributes,
-    TypeAttributeRef, TypeRef, Value, ValueRef,
+    ArrayAttributeRef, Attribute, AttributeRef, BlockRef, Context, DictionaryAttributeRef, Error,
+    FlatSymbolRefAttributeRef, FunctionTypeRef, LogicalResult, OperationBuilder, Region, RegionRef, StringRef,
+    SymbolVisibility, TryFromWithContext, TryIntoWithContext, Type, TypeAndAttributes, TypeRef, Value, ValueRef,
 };
 
 use super::{Operation, OperationRef};
@@ -62,7 +61,7 @@ pub enum Callee<'o, 'c, 't> {
 /// https://mlir.llvm.org/docs/Interfaces/#callinterfaces) for more information.
 pub trait Call<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the callee of this [`Call`] (e.g., a symbol that corresponds to a [`Function`]).
-    fn callee(&self) -> Callee<'o, 'c, 't>;
+    fn callee(&self) -> Result<Callee<'o, 'c, 't>, Error>;
 }
 
 /// Trait that represents [`Operation`]s that are effectively potential sub-routines, and may be targets for [`Call`]
@@ -74,14 +73,14 @@ pub trait Call<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 /// https://mlir.llvm.org/docs/Interfaces/#callinterfaces) for more information.
 pub trait Callable<'o, 'c: 'o, 't: 'c>: HasCallableArgumentAndResultAttributes<'o, 'c, 't> {
     /// Returns `true` if this [`Callable`] is external (i.e., if it has no body).
-    fn is_external_callable(&self) -> bool {
-        self.callable_region().is_none()
+    fn is_external_callable(&self) -> Result<bool, Error> {
+        Ok(self.callable_region()?.is_none())
     }
 
     /// Returns the [`Region`] on this [`Callable`] that is callable or [`None`] if this is an _external_ callable
     /// object (e.g., an external function).
-    fn callable_region(&self) -> Option<RegionRef<'o, 'c, 't>> {
-        self.region(0)
+    fn callable_region(&self) -> Result<Option<RegionRef<'o, 'c, 't>>, Error> {
+        if self.region_count() == 0 { Ok(None) } else { self.region(0).map(Some) }
     }
 }
 
@@ -105,62 +104,59 @@ pub const FUNCTION_TYPE_ATTRIBUTE: &str = "function_type";
 /// for more information.
 pub trait Function<'o, 'c: 'o, 't: 'c>: Symbol<'o, 'c, 't> + Callable<'o, 'c, 't> {
     /// Returns the symbol name of this [`Callable`], which can be used to refer to it from other [`Operation`]s.
-    fn function_name(&self) -> StringRef<'c> {
-        self.symbol_name().unwrap()
+    fn function_name(&self) -> Result<StringRef<'c>, Error> {
+        self.symbol_name()?.ok_or_else(|| {
+            Error::invalid_argument(format!("missing symbol name in `{}`", self.name().as_str().unwrap_or("<unknown>")))
+        })
     }
 
     /// Returns the [`Type`] of this [`Function`].
-    fn function_type(&self) -> FunctionTypeRef<'c, 't> {
-        self.attribute(FUNCTION_TYPE_ATTRIBUTE)
-            .unwrap()
-            .cast::<TypeAttributeRef>()
-            .unwrap()
-            .r#type()
+    fn function_type(&self) -> Result<FunctionTypeRef<'c, 't>, Error> {
+        self.type_attribute(FUNCTION_TYPE_ATTRIBUTE)?
+            .r#type()?
             .cast()
-            .unwrap()
+            .ok_or_else(|| Error::invalid_argument("invalid `function_type` attribute in function operation"))
     }
 
     /// Returns the number of arguments of this [`Function`].
-    fn function_argument_count(&self) -> usize {
-        self.function_type().input_count()
+    fn function_argument_count(&self) -> Result<usize, Error> {
+        Ok(self.function_type()?.input_count())
     }
 
     /// Returns [`Vec`] that contains the [`Type`]s of the arguments of this [`Function`].
-    fn function_argument_types(&self) -> Vec<TypeRef<'c, 't>> {
-        self.function_type().inputs().collect()
+    fn function_argument_types(&self) -> Result<Vec<TypeRef<'c, 't>>, Error> {
+        self.function_type()?.inputs().collect()
     }
 
-    /// Returns the [`Type`] of the argument at the `index`-pth position in the arguments list of this [`Function`].
-    ///
-    /// Note that this function will panic if the provided index is out of bounds.
-    fn function_argument_type(&self, index: usize) -> TypeRef<'c, 't> {
-        self.function_type().input(index)
+    /// Returns the [`Type`] of the argument at the `index`-pth position in the arguments list of this [`Function`],
+    /// or an error if `index` is out of bounds.
+    fn function_argument_type(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        self.function_type()?.input(index)
     }
 
     /// Returns the number of results of this [`Function`].
-    fn function_result_count(&self) -> usize {
-        self.function_type().output_count()
+    fn function_result_count(&self) -> Result<usize, Error> {
+        Ok(self.function_type()?.output_count())
     }
 
     /// Returns [`Vec`] that contains the [`Type`]s of the results of this [`Function`].
-    fn function_result_types(&self) -> Vec<TypeRef<'c, 't>> {
-        self.function_type().outputs().collect()
+    fn function_result_types(&self) -> Result<Vec<TypeRef<'c, 't>>, Error> {
+        self.function_type()?.outputs().collect()
     }
 
-    /// Returns the [`Type`] of the argument at the `index`-pth position in the results list of this [`Function`].
-    ///
-    /// Note that this function will panic if the provided index is out of bounds.
-    fn function_result_type(&self, index: usize) -> TypeRef<'c, 't> {
-        self.function_type().output(index)
+    /// Returns the [`Type`] of the argument at the `index`-pth position in the results list of this [`Function`],
+    /// or an error if `index` is out of bounds.
+    fn function_result_type(&self, index: usize) -> Result<TypeRef<'c, 't>, Error> {
+        self.function_type()?.output(index)
     }
 
     /// Convenient helper that returns the combined results of [`Function::function_argument_types`] and
     /// [`Function::callable_argument_attributes`](HasCallableArgumentAndResultAttributes::callable_argument_attributes)
     /// combined in a single [`Vec`].
-    fn function_argument_types_and_attributes<'r>(&'r self) -> Vec<TypeAndAttributes<'o, 't, 'c>> {
-        let argument_types = self.function_argument_types();
-        let argument_attributes = self.callable_argument_attributes();
-        argument_types
+    fn function_argument_types_and_attributes<'r>(&'r self) -> Result<Vec<TypeAndAttributes<'o, 't, 'c>>, Error> {
+        let argument_types = self.function_argument_types()?;
+        let argument_attributes = self.callable_argument_attributes()?;
+        Ok(argument_types
             .into_iter()
             .zip(argument_attributes)
             .map(|(r#type, attributes)| {
@@ -170,16 +166,16 @@ pub trait Function<'o, 'c: 'o, 't: 'c>: Symbol<'o, 'c, 't> + Callable<'o, 'c, 't
                     TypeAndAttributes { r#type, attributes: Some(attributes) }
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// Convenient helper that returns the combined results of [`Function::function_result_types`] and
     /// [`Function::callable_result_attributes`](HasCallableArgumentAndResultAttributes::callable_result_attributes)
     /// combined in a single [`Vec`].
-    fn function_result_types_and_attributes<'r>(&'r self) -> Vec<TypeAndAttributes<'o, 't, 'c>> {
-        let result_types = self.function_result_types();
-        let result_attributes = self.callable_result_attributes();
-        result_types
+    fn function_result_types_and_attributes<'r>(&'r self) -> Result<Vec<TypeAndAttributes<'o, 't, 'c>>, Error> {
+        let result_types = self.function_result_types()?;
+        let result_attributes = self.callable_result_attributes()?;
+        Ok(result_types
             .into_iter()
             .zip(result_attributes)
             .map(|(r#type, attributes)| {
@@ -189,17 +185,22 @@ pub trait Function<'o, 'c: 'o, 't: 'c>: Symbol<'o, 'c, 't> + Callable<'o, 'c, 't
                     TypeAndAttributes { r#type, attributes: Some(attributes) }
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// Returns `true` if this is an _external_ [`Function`].
-    fn is_external_function(&self) -> bool {
-        self.function_body().is_empty()
+    fn is_external_function(&self) -> Result<bool, Error> {
+        Ok(self.function_body()?.is_empty())
     }
 
     /// Returns the body of this [`Function`].
-    fn function_body(&self) -> RegionRef<'o, 'c, 't> {
-        self.callable_region().unwrap()
+    fn function_body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.callable_region()?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing callable region in `{}`",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 }
 
@@ -218,33 +219,39 @@ pub trait HasCallableArgumentAndResultAttributes<'o, 'c: 'o, 't: 'c>: Operation<
     /// Returns the [`Attribute`]s attached to the arguments of this [`Operation`]. Specifically, when such attributes
     /// exist, this function returns a [`Vec`] with one element per argument. Each element is a [`HashMap`] that maps
     /// attribute names to their values for the corresponding argument of this operation.
-    fn callable_argument_attributes(&self) -> Vec<HashMap<StringRef<'c>, AttributeRef<'c, 't>>> {
-        self.attribute(ARGUMENT_ATTRIBUTES_ATTRIBUTE)
-            .map(|attribute| {
-                attribute
-                    .cast::<ArrayAttributeRef>()
-                    .unwrap()
-                    .elements()
-                    .map(|element| element.cast::<DictionaryAttributeRef>().unwrap().into())
-                    .collect()
+    fn callable_argument_attributes(&self) -> Result<Vec<HashMap<StringRef<'c>, AttributeRef<'c, 't>>>, Error> {
+        if !self.has_attribute(ARGUMENT_ATTRIBUTES_ATTRIBUTE) {
+            return Ok(Vec::new());
+        }
+        self.array_attribute(ARGUMENT_ATTRIBUTES_ATTRIBUTE)?
+            .elements()
+            .map(|element| {
+                element?
+                    .cast::<DictionaryAttributeRef>()
+                    .map(HashMap::try_from)
+                    .ok_or_else(|| Error::invalid_argument("invalid `arg_attrs` element"))
+                    .and_then(|attributes| attributes)
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     /// Returns the [`Attribute`]s attached to the results of this [`Operation`]. Specifically, when such attributes
     /// exist, this function returns a [`Vec`] with one element per result. Each element is a [`HashMap`] that maps
     /// attribute names to their values for the corresponding result of this operation.
-    fn callable_result_attributes(&self) -> Vec<HashMap<StringRef<'c>, AttributeRef<'c, 't>>> {
-        self.attribute(RESULT_ATTRIBUTES_ATTRIBUTE)
-            .map(|attribute| {
-                attribute
-                    .cast::<ArrayAttributeRef>()
-                    .unwrap()
-                    .elements()
-                    .map(|element| element.cast::<DictionaryAttributeRef>().unwrap().into())
-                    .collect()
+    fn callable_result_attributes(&self) -> Result<Vec<HashMap<StringRef<'c>, AttributeRef<'c, 't>>>, Error> {
+        if !self.has_attribute(RESULT_ATTRIBUTES_ATTRIBUTE) {
+            return Ok(Vec::new());
+        }
+        self.array_attribute(RESULT_ATTRIBUTES_ATTRIBUTE)?
+            .elements()
+            .map(|element| {
+                element?
+                    .cast::<DictionaryAttributeRef>()
+                    .map(HashMap::try_from)
+                    .ok_or_else(|| Error::invalid_argument("invalid `res_attrs` element"))
+                    .and_then(|attributes| attributes)
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     /// Adds the provided argument [`Attribute`]s to the provided [`OperationBuilder`], assuming that it is building
@@ -252,21 +259,21 @@ pub trait HasCallableArgumentAndResultAttributes<'o, 'c: 'o, 't: 'c>: Operation<
     fn add_callable_argument_attributes<'a, 's: 'a>(
         builder: OperationBuilder<'c, 't>,
         argument_attributes: impl Iterator<Item = &'a Option<HashMap<StringRef<'s>, AttributeRef<'c, 't>>>>,
-    ) -> OperationBuilder<'c, 't>
+    ) -> Result<OperationBuilder<'c, 't>, Error>
     where
         'c: 'a,
     {
         let attribute: ArrayAttributeRef<'c, 't> = argument_attributes
             .map(|attributes| {
-                DictionaryAttributeRef::from_with_context(
+                DictionaryAttributeRef::try_from_with_context(
                     attributes.as_ref().unwrap_or(&HashMap::new()),
                     builder.context(),
                 )
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()?
             .as_slice()
-            .into_with_context(builder.context());
-        builder.add_attribute(ARGUMENT_ATTRIBUTES_ATTRIBUTE, attribute)
+            .try_into_with_context(builder.context())?;
+        Ok(builder.add_attribute(ARGUMENT_ATTRIBUTES_ATTRIBUTE, attribute))
     }
 
     /// Adds the provided result [`Attribute`]s to the provided [`OperationBuilder`], assuming that it is building
@@ -274,21 +281,21 @@ pub trait HasCallableArgumentAndResultAttributes<'o, 'c: 'o, 't: 'c>: Operation<
     fn add_callable_result_attributes<'a, 's: 'a>(
         builder: OperationBuilder<'c, 't>,
         result_attributes: impl Iterator<Item = &'a Option<HashMap<StringRef<'s>, AttributeRef<'c, 't>>>>,
-    ) -> OperationBuilder<'c, 't>
+    ) -> Result<OperationBuilder<'c, 't>, Error>
     where
         'c: 'a,
     {
         let attribute: ArrayAttributeRef<'c, 't> = result_attributes
             .map(|attributes| {
-                DictionaryAttributeRef::from_with_context(
+                DictionaryAttributeRef::try_from_with_context(
                     attributes.as_ref().unwrap_or(&HashMap::new()),
                     builder.context(),
                 )
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()?
             .as_slice()
-            .into_with_context(builder.context());
-        builder.add_attribute(RESULT_ATTRIBUTES_ATTRIBUTE, attribute)
+            .try_into_with_context(builder.context())?;
+        Ok(builder.add_attribute(RESULT_ATTRIBUTES_ATTRIBUTE, attribute))
     }
 }
 
@@ -344,16 +351,16 @@ pub trait NoTerminator<'o, 'c: 'o, 't: 'c>: SingleBlockRegions<'o, 'c, 't> {}
 /// Trait that represents [`Operation`]s that have a single operand.
 pub trait OneOperand<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the input of this [`Operation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 }
 
 /// Trait that represents [`Operation`]s that contain a single [`Region`].
 pub trait OneRegion<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the _body_ region of this [`Operation`], if it has one.
-    fn body_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -363,16 +370,16 @@ pub trait OneResult<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     ///
     /// Note that this function is called `output` and not `result` in order to avoid
     /// a name collision with [`Operation::result`].
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0).map(|result| result.as_ref())
     }
 
     /// Returns the [`Type`] of the single result/output of this [`Operation`].
     ///
     /// Note that this function is called `output_type` and not `result_type` in order to avoid
     /// a name collision with [`Operation::result_type`].
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap().cast().unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -397,8 +404,10 @@ pub trait SingleBlock<'o, 'c: 'o, 't: 'c>:
 {
     /// Returns a reference to the [`Block`](crate::Block) that represents the body of this [`Operation`]
     /// (i.e., the only [`Block`](crate::Block) it contains).
-    fn body(&self) -> BlockRef<'o, 'c, 't> {
-        self.body_region().blocks().next().unwrap()
+    fn body(&self) -> Result<BlockRef<'o, 'c, 't>, Error> {
+        self.body_region()?.blocks()?.next().ok_or_else(|| {
+            Error::invalid_argument(format!("missing body block in `{}`", self.name().as_str().unwrap_or("<unknown>")))
+        })?
     }
 }
 
@@ -418,36 +427,39 @@ pub const SYMBOL_VISIBILITY_ATTRIBUTE: &str = "sym_visibility";
 pub trait Symbol<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the symbol name of this [`Operation`], which can be used to refer to it from other [`Operation`]s.
     /// Note that if the name is optional and missing, this function will return [`None`].
-    fn symbol_name(&self) -> Option<StringRef<'c>> {
-        self.attribute(SYMBOL_NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef<'c, 't>>().map(|attribute| attribute.string()))
+    fn symbol_name(&self) -> Result<Option<StringRef<'c>>, Error> {
+        if self.has_attribute(SYMBOL_NAME_ATTRIBUTE) {
+            self.string_attribute(SYMBOL_NAME_ATTRIBUTE).map(|attribute| Some(attribute.string()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the [`SymbolVisibility`] of this [`Operation`]. If not specified, then [`SymbolVisibility::default()`]
     /// will be returned (which is [`SymbolVisibility::Public`]).
-    fn symbol_visibility(&self) -> SymbolVisibility {
-        self.attribute(SYMBOL_VISIBILITY_ATTRIBUTE)
-            .and_then(|attribute| {
-                attribute
-                    .cast::<SymbolVisibilityAttributeRef<'c, 't>>()
-                    .and_then(|attribute| attribute.visibility())
-            })
-            .unwrap_or(SymbolVisibility::default())
+    fn symbol_visibility(&self) -> Result<SymbolVisibility, Error> {
+        if self.has_attribute(SYMBOL_VISIBILITY_ATTRIBUTE) {
+            self.symbol_visibility_attribute(SYMBOL_VISIBILITY_ATTRIBUTE)?
+                .visibility()
+                .ok_or_else(|| Error::invalid_argument("invalid symbol visibility attribute"))
+        } else {
+            Ok(SymbolVisibility::default())
+        }
     }
 
     /// Returns `true` if this [`Symbol`]'s visibility is [`SymbolVisibility::Public`].
-    fn is_public(&self) -> bool {
-        self.symbol_visibility() == SymbolVisibility::Public
+    fn is_public(&self) -> Result<bool, Error> {
+        Ok(self.symbol_visibility()? == SymbolVisibility::Public)
     }
 
     /// Returns `true` if this [`Symbol`]'s visibility is [`SymbolVisibility::Private`].
-    fn is_private(&self) -> bool {
-        self.symbol_visibility() == SymbolVisibility::Private
+    fn is_private(&self) -> Result<bool, Error> {
+        Ok(self.symbol_visibility()? == SymbolVisibility::Private)
     }
 
     /// Returns `true` if this [`Symbol`]'s visibility is [`SymbolVisibility::Nested`].
-    fn is_nested(&self) -> bool {
-        self.symbol_visibility() == SymbolVisibility::Nested
+    fn is_nested(&self) -> Result<bool, Error> {
+        Ok(self.symbol_visibility()? == SymbolVisibility::Nested)
     }
 
     /// Replaces all uses of this [`Symbol`] with `new_symbol` in the provided [`Operation`]
@@ -456,13 +468,14 @@ pub trait Symbol<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         &self,
         new_symbol: S,
         operation: O,
-    ) -> LogicalResult
+    ) -> Result<LogicalResult, Error>
     where
         'c: 'r,
     {
-        self.symbol_name()
+        Ok(self
+            .symbol_name()?
             .map(|old_symbol| operation.replace_symbol(old_symbol, new_symbol))
-            .unwrap_or(LogicalResult::failure())
+            .unwrap_or(LogicalResult::failure()))
     }
 }
 
@@ -472,12 +485,12 @@ pub trait Symbol<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 /// for more information.
 pub trait SymbolTable<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Creates a new [`SymbolTable`] for this operation.
-    fn new_symbol_table(&self) -> super::symbol_table::SymbolTable<'o, 'c, 't> {
+    fn new_symbol_table(&self) -> Result<super::symbol_table::SymbolTable<'o, 'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow_mut();
-        unsafe { super::symbol_table::SymbolTable::from_c_api(mlirSymbolTableCreate(self.to_c_api()), self).unwrap() }
+        unsafe { super::symbol_table::SymbolTable::from_c_api(mlirSymbolTableCreate(self.to_c_api()), self) }
     }
 
     /// Replaces all uses of `old_symbol` with `new_symbol` in this [`Operation`] and returns a [`LogicalResult`]
@@ -528,8 +541,9 @@ pub trait SymbolTable<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             unsafe {
                 let data = data as *mut (&mut F, &'c Context<'t>);
                 let (ref mut callback, context) = *data;
-                let operation = OperationRef::from_c_api(operation, context).unwrap();
-                (callback)(operation, all_symbol_uses_visible)
+                if let Ok(operation) = OperationRef::from_c_api(operation, context) {
+                    callback(operation, all_symbol_uses_visible);
+                }
             }
         }
 
@@ -566,10 +580,11 @@ mod tests {
     #[test]
     fn test_callable() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let location = context.unknown_location();
-        let function = func::func("external_function", func::FuncAttributes::default(), context.region(), location);
-        assert!(!function.is_external_callable());
+        let function =
+            func::func("external_function", func::FuncAttributes::default(), context.region(), location).unwrap();
+        assert!(!function.is_external_callable().unwrap());
     }
 
     #[test]
@@ -612,25 +627,28 @@ mod tests {
             },
             context.region(),
             location,
-        );
-        assert_eq!(function.symbol_name().map(|name| name.as_str()), Some(Ok("custom_function")));
-        assert_eq!(function.symbol_visibility(), SymbolVisibility::Private);
-        assert!(!function.is_public());
-        assert!(function.is_private());
-        assert!(!function.is_nested());
-        assert_eq!(function.function_name().as_str(), Ok("custom_function"));
+        )
+        .unwrap();
+        assert_eq!(function.symbol_name().unwrap().map(|name| name.as_str()), Some(Ok("custom_function")));
+        assert_eq!(function.symbol_visibility().unwrap(), SymbolVisibility::Private);
+        assert!(!function.is_public().unwrap());
+        assert!(function.is_private().unwrap());
+        assert!(!function.is_nested().unwrap());
+        assert_eq!(function.function_name().unwrap().as_str(), Ok("custom_function"));
         assert_eq!(
-            function.function_type(),
+            function.function_type().unwrap(),
             context.function_type(&[f64_type, f64_type, f64_type], &[f64_type, f32_type])
         );
-        assert_eq!(function.function_argument_count(), 3);
-        assert_eq!(function.function_argument_types(), vec![f64_type, f64_type, f64_type]);
-        assert_eq!(function.function_argument_type(1), f64_type);
-        assert_eq!(function.function_result_count(), 2);
-        assert_eq!(function.function_result_types(), vec![f64_type, f32_type]);
-        assert_eq!(function.function_result_type(1), f32_type);
+        assert_eq!(function.function_argument_count().unwrap(), 3);
+        assert_eq!(function.function_argument_types().unwrap(), vec![f64_type, f64_type, f64_type]);
+        assert_eq!(function.function_argument_type(1).unwrap(), f64_type);
+        assert!(function.function_argument_type(3).is_err());
+        assert_eq!(function.function_result_count().unwrap(), 2);
+        assert_eq!(function.function_result_types().unwrap(), vec![f64_type, f32_type]);
+        assert_eq!(function.function_result_type(1).unwrap(), f32_type);
+        assert!(function.function_result_type(2).is_err());
         assert_eq!(
-            function.function_argument_types_and_attributes(),
+            function.function_argument_types_and_attributes().unwrap(),
             vec![
                 TypeAndAttributes::from(f64_type),
                 TypeAndAttributes {
@@ -644,7 +662,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            function.function_result_types_and_attributes(),
+            function.function_result_types_and_attributes().unwrap(),
             vec![
                 TypeAndAttributes {
                     r#type: f64_type.as_ref(),
@@ -655,7 +673,7 @@ mod tests {
                 TypeAndAttributes::from(f32_type),
             ],
         );
-        assert!(function.is_external_function());
+        assert!(function.is_external_function().unwrap());
     }
 
     #[test]
@@ -666,9 +684,9 @@ mod tests {
         let tensor_type = context.tensor_type(i32_type, &[Size::Static(3)], None, location).unwrap();
         let block = context.block(&[(tensor_type, location)]);
         let input = block.argument(0).unwrap();
-        let op = stable_hlo::sign(input, location);
+        let op = stable_hlo::sign(input, location).unwrap();
         assert_eq!(op.operand_count(), 1);
-        let _ = op.input();
+        let _ = op.input().unwrap();
     }
 
     #[test]
@@ -676,12 +694,12 @@ mod tests {
         let context = Context::new();
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let module = module.as_operation();
+        let module = context.module(location).unwrap();
+        let module = module.as_operation().unwrap();
         assert_eq!(module.region_count(), 1);
-        assert!(module.region(0).is_some());
-        assert!(module.region(1).is_none());
-        assert_eq!(module.body_region().blocks().count(), 1);
+        assert!(module.region(0).is_ok());
+        assert!(module.region(1).is_err());
+        assert_eq!(module.body_region().unwrap().blocks().unwrap().count(), 1);
     }
 
     #[test]
@@ -691,10 +709,10 @@ mod tests {
         let f64_type = context.float64_type();
         let i64_type = context.signless_integer_type(64);
         let function_type = context.function_type(&[f64_type], &[i64_type]);
-        let op = func::constant("test_constant", function_type, location);
+        let op = func::constant("test_constant", function_type, location).unwrap();
         assert_eq!(op.result_count(), 1);
-        let _ = op.output();
-        assert_eq!(op.output_type(), function_type);
+        let _ = op.output().unwrap();
+        assert_eq!(op.output_type().unwrap(), function_type);
     }
 
     #[test]
@@ -705,20 +723,22 @@ mod tests {
         let i32_type = context.signless_integer_type(32);
         let tensor_type = context.tensor_type(i32_type, &[], None, location).unwrap();
         let mut block = context.block(&[(tensor_type, location)]);
-        block.append_operation(stable_hlo::r#return(&[block.argument(0).unwrap()], location));
+        block
+            .append_operation(stable_hlo::r#return(&[block.argument(0).unwrap()], location).unwrap())
+            .unwrap();
         let mut region = context.region();
-        region.append_block(block);
+        region.append_block(block).unwrap();
         let block = context.block(&[(tensor_type, location)]);
-        let op = stable_hlo::map(&[block.argument(0).unwrap()], &[], region, location);
-        let _ = op.body();
+        let op = stable_hlo::map(&[block.argument(0).unwrap()], &[], region, location).unwrap();
+        let _ = op.body().unwrap();
     }
 
     #[test]
     fn test_symbol_table() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let function_0_op = func::func(
             "function_0",
             func::FuncAttributes {
@@ -728,7 +748,8 @@ mod tests {
             },
             context.region(),
             location,
-        );
+        )
+        .unwrap();
         let function_1_op = func::func(
             "function_1",
             func::FuncAttributes {
@@ -738,25 +759,42 @@ mod tests {
             },
             context.region(),
             location,
-        );
-        module.body().append_operation(function_0_op);
-        module.body().append_operation(function_1_op.clone());
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let call_op = block.append_operation(func::call(
-                "function_0",
-                func::CallProperties { results: vec![context.none_type().into()], ..func::CallProperties::default() },
-                location,
-            ));
-            block.append_operation(func::r#return(&[call_op.result(0).unwrap()], location));
-            func::func(
-                "function_2",
-                func::FuncAttributes { results: vec![context.none_type().into()], ..func::FuncAttributes::default() },
-                block.into(),
-                location,
-            )
-        });
-        let module = module.as_operation();
+        )
+        .unwrap();
+        module.body().unwrap().append_operation(function_0_op).unwrap();
+        module.body().unwrap().append_operation(function_1_op.clone()).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let call_op = block
+                    .append_operation(
+                        func::call(
+                            "function_0",
+                            func::CallProperties {
+                                results: vec![context.none_type().into()],
+                                ..func::CallProperties::default()
+                            },
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                block.append_operation(func::r#return(&[call_op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "function_2",
+                    func::FuncAttributes {
+                        results: vec![context.none_type().into()],
+                        ..func::FuncAttributes::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        let module = module.as_operation().unwrap();
         assert!(module.verify());
         assert_eq!(
             module.to_string(),
@@ -773,11 +811,11 @@ mod tests {
         );
 
         // Verify what symbols exist.
-        let symbol_table = module.new_symbol_table();
-        assert!(symbol_table.lookup("function_0").is_some());
-        assert!(symbol_table.lookup("function_1").is_some());
-        assert!(symbol_table.lookup("function_2").is_some());
-        assert!(symbol_table.lookup("function_3").is_none());
+        let symbol_table = module.new_symbol_table().unwrap();
+        assert!(symbol_table.lookup("function_0").unwrap().is_some());
+        assert!(symbol_table.lookup("function_1").unwrap().is_some());
+        assert!(symbol_table.lookup("function_2").unwrap().is_some());
+        assert!(symbol_table.lookup("function_3").unwrap().is_none());
 
         // Try to do a replacement.
         assert!(module.replace_symbol("function_0", "function_1").is_success());
@@ -797,7 +835,7 @@ mod tests {
         );
 
         // Try to do another replacement.
-        assert!(function_1_op.replace_all_uses("function_0", module).is_success());
+        assert!(function_1_op.replace_all_uses("function_0", module).unwrap().is_success());
         assert!(module.verify());
         assert_eq!(
             module.to_string(),

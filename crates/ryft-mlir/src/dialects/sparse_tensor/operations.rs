@@ -1,7 +1,6 @@
 use crate::{
-    AffineMap, AffineMapAttributeRef, ArrayAttributeRef, Attribute, DenseInteger32ArrayAttributeRef, DetachedOp,
-    DetachedRegion, DialectHandle, IntegerAttributeRef, Location, OneResult, Operation, OperationBuilder, RegionRef,
-    Type, TypeRef, Value, ValueRef, mlir_op, mlir_op_trait,
+    AffineMap, Attribute, DetachedOp, DetachedRegion, DialectHandle, Error, IntegerAttributeRef, Location, OneResult,
+    Operation, OperationBuilder, RegionRef, Type, TypeRef, Value, ValueRef, mlir_op, mlir_op_trait,
 };
 
 use super::{
@@ -12,12 +11,12 @@ use super::{
 /// Operation trait for `sparse_tensor.new`.
 pub trait NewOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the source value used to materialize the sparse tensor.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the materialized sparse tensor.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -35,31 +34,44 @@ pub fn new<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     result_type: T,
     location: L,
-) -> DetachedNewOperation<'c, 't> {
+) -> Result<DetachedNewOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.new", location)
         .add_operand(source)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::new`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::new`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.assemble`.
 pub trait AssembleOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the level storage tensors.
-    fn levels(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.operand_count() - 1).map(|index| self.operand_value(index).unwrap()).collect()
+    fn levels(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let level_count = self.operand_count().checked_sub(1).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing values operand in `{}`",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })?;
+        (0..level_count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the values tensor.
-    fn values(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(self.operand_count() - 1).unwrap()
+    fn values(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let index = self.operand_count().checked_sub(1).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing values operand in `{}`",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })?;
+        self.operand_value(index)
     }
 
     /// Returns the assembled sparse tensor.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -78,60 +90,94 @@ pub fn assemble<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     values: ValueRef<'v, 'c, 't>,
     result_type: T,
     location: L,
-) -> DetachedAssembleOperation<'c, 't> {
+) -> Result<DetachedAssembleOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.assemble", location)
         .add_operands(levels)
         .add_operand(values)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::assemble`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::assemble`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.disassemble`.
 pub trait DisassembleOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the sparse tensor being disassembled.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the output level buffers.
-    fn output_levels(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let level_count = (self.result_count() - 2) / 2;
-        (1..1 + level_count).map(|index| self.operand_value(index).unwrap()).collect()
+    fn output_levels(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let level_count = self.result_count().checked_sub(2).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "invalid result count in `{}`",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })? / 2;
+        (1..1 + level_count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the output values buffer.
-    fn output_values(&self) -> ValueRef<'o, 'c, 't> {
-        let level_count = (self.result_count() - 2) / 2;
-        self.operand_value(1 + level_count).unwrap()
+    fn output_values(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let level_count = self.result_count().checked_sub(2).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "invalid result count in `{}`",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })? / 2;
+        self.operand_value(1 + level_count)
     }
 
     /// Returns the copied level buffers.
-    fn returned_levels(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let level_count = (self.result_count() - 2) / 2;
-        (0..level_count).map(|index| self.result(index).unwrap().as_ref()).collect()
+    fn returned_levels(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let level_count = self.result_count().checked_sub(2).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "invalid result count in `{}`",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })? / 2;
+        (0..level_count).map(|index| Ok(self.result(index)?.as_ref())).collect()
     }
 
     /// Returns the copied values buffer.
-    fn returned_values(&self) -> ValueRef<'o, 'c, 't> {
-        let level_count = (self.result_count() - 2) / 2;
-        self.result(level_count).unwrap().as_ref()
+    fn returned_values(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let level_count = self.result_count().checked_sub(2).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "invalid result count in `{}`",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })? / 2;
+        Ok(self.result(level_count)?.as_ref())
     }
 
     /// Returns the occupied lengths of the returned level buffers.
-    fn level_lengths(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let level_count = (self.result_count() - 2) / 2;
+    fn level_lengths(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let level_count = self.result_count().checked_sub(2).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "invalid result count in `{}`",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })? / 2;
         (level_count + 1..level_count + 1 + level_count)
-            .map(|index| self.result(index).unwrap().as_ref())
+            .map(|index| Ok(self.result(index)?.as_ref()))
             .collect()
     }
 
     /// Returns the occupied length of the returned values buffer.
-    fn values_length(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(self.result_count() - 1).unwrap().as_ref()
+    fn values_length(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        let index = self.result_count().checked_sub(1).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing values length result in `{}`",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })?;
+        Ok(self.result(index)?.as_ref())
     }
 }
 
@@ -152,9 +198,9 @@ pub fn disassemble<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     level_length_types: &[TypeRef<'c, 't>],
     values_length_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedDisassembleOperation<'c, 't> {
+) -> Result<DetachedDisassembleOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.disassemble", location)
         .add_operand(tensor)
         .add_operands(output_levels)
@@ -164,19 +210,22 @@ pub fn disassemble<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_results(level_length_types)
         .add_result(values_length_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::disassemble`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::disassemble`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.convert`.
 pub trait ConvertOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the source tensor.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the converted tensor.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -194,26 +243,29 @@ pub fn convert<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     result_type: T,
     location: L,
-) -> DetachedConvertOperation<'c, 't> {
+) -> Result<DetachedConvertOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.convert", location)
         .add_operand(source)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::convert`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::convert`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.reinterpret_map`.
 pub trait ReinterpretMapOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the source tensor.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the tensor with reinterpreted dimension and level maps.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -229,15 +281,18 @@ pub fn reinterpret_map<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>
     source: ValueRef<'v, 'c, 't>,
     result_type: T,
     location: L,
-) -> DetachedReinterpretMapOperation<'c, 't> {
+) -> Result<DetachedReinterpretMapOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.reinterpret_map", location)
         .add_operand(source)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::reinterpret_map`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::reinterpret_map`"))
+        })
 }
 
 /// Name of the sparse tensor level attribute.
@@ -246,20 +301,17 @@ pub const LEVEL_ATTRIBUTE: &str = "level";
 /// Operation trait for `sparse_tensor.positions`.
 pub trait PositionsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the sparse tensor being queried.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the storage level whose positions buffer is queried.
-    fn level(&self) -> i64 {
-        self.attribute(LEVEL_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
-            .unwrap_or_else(|| panic!("invalid '{LEVEL_ATTRIBUTE}' attribute in `sparse_tensor.positions`"))
+    fn level(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(LEVEL_ATTRIBUTE)?.signless_value())
     }
 
     /// Returns the positions buffer.
-    fn positions(&self) -> ValueRef<'o, 'c, 't> {
+    fn positions(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -278,35 +330,35 @@ pub fn positions<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     level: i64,
     result_type: T,
     location: L,
-) -> DetachedPositionsOperation<'c, 't> {
+) -> Result<DetachedPositionsOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.positions", location)
         .add_operand(tensor)
         .add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level))
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::positions`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::positions`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.coordinates`.
 pub trait CoordinatesOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the sparse tensor being queried.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the storage level whose coordinates buffer is queried.
-    fn level(&self) -> i64 {
-        self.attribute(LEVEL_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
-            .unwrap_or_else(|| panic!("invalid '{LEVEL_ATTRIBUTE}' attribute in `sparse_tensor.coordinates`"))
+    fn level(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(LEVEL_ATTRIBUTE)?.signless_value())
     }
 
     /// Returns the coordinates buffer.
-    fn coordinates(&self) -> ValueRef<'o, 'c, 't> {
+    fn coordinates(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -325,27 +377,30 @@ pub fn coordinates<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     level: i64,
     result_type: T,
     location: L,
-) -> DetachedCoordinatesOperation<'c, 't> {
+) -> Result<DetachedCoordinatesOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.coordinates", location)
         .add_operand(tensor)
         .add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level))
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::coordinates`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::coordinates`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.coordinates_buffer`.
 pub trait CoordinatesBufferOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the sparse tensor being queried.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the linear coordinates buffer.
-    fn coordinates_buffer(&self) -> ValueRef<'o, 'c, 't> {
+    fn coordinates_buffer(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -363,26 +418,29 @@ pub fn coordinates_buffer<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, '
     tensor: ValueRef<'v, 'c, 't>,
     result_type: T,
     location: L,
-) -> DetachedCoordinatesBufferOperation<'c, 't> {
+) -> Result<DetachedCoordinatesBufferOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.coordinates_buffer", location)
         .add_operand(tensor)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::coordinates_buffer`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::coordinates_buffer`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.values`.
 pub trait ValuesOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the sparse tensor being queried.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the values buffer.
-    fn values(&self) -> ValueRef<'o, 'c, 't> {
+    fn values(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -400,26 +458,29 @@ pub fn values<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     tensor: ValueRef<'v, 'c, 't>,
     result_type: T,
     location: L,
-) -> DetachedValuesOperation<'c, 't> {
+) -> Result<DetachedValuesOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.values", location)
         .add_operand(tensor)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::values`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::values`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.number_of_entries`.
 pub trait NumberOfEntriesOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the sparse tensor being queried.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the number of stored entries.
-    fn entry_count(&self) -> ValueRef<'o, 'c, 't> {
+    fn entry_count(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -436,15 +497,18 @@ mlir_op_trait!(NumberOfEntries, ZeroSuccessors);
 pub fn number_of_entries<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     tensor: ValueRef<'v, 'c, 't>,
     location: L,
-) -> DetachedNumberOfEntriesOperation<'c, 't> {
+) -> Result<DetachedNumberOfEntriesOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.number_of_entries", location)
         .add_operand(tensor)
         .add_result(context.index_type())
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::number_of_entries`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::number_of_entries`"))
+        })
 }
 
 /// Name of the sparse tensor dimension attribute.
@@ -453,20 +517,17 @@ pub const DIMENSION_ATTRIBUTE: &str = "dimension";
 /// Operation trait for `sparse_tensor.concatenate`.
 pub trait ConcatenateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the input tensors being concatenated.
-    fn inputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn inputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the dimension along which the inputs are concatenated.
-    fn dimension(&self) -> i64 {
-        self.attribute(DIMENSION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
-            .unwrap_or_else(|| panic!("invalid '{DIMENSION_ATTRIBUTE}' attribute in `sparse_tensor.concatenate`"))
+    fn dimension(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(DIMENSION_ATTRIBUTE)?.signless_value())
     }
 
     /// Returns the concatenated tensor.
-    fn concatenated(&self) -> ValueRef<'o, 'c, 't> {
+    fn concatenated(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -485,16 +546,19 @@ pub fn concatenate<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     dimension: i64,
     result_type: T,
     location: L,
-) -> DetachedConcatenateOperation<'c, 't> {
+) -> Result<DetachedConcatenateOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.concatenate", location)
         .add_operands(inputs)
         .add_attribute(DIMENSION_ATTRIBUTE, context.integer_attribute(context.index_type(), dimension))
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::concatenate`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::concatenate`"))
+        })
 }
 
 /// Name of the sparse tensor slice dimension attribute.
@@ -503,20 +567,17 @@ pub const DIM_ATTRIBUTE: &str = "dim";
 /// Operation trait for `sparse_tensor.slice.offset`.
 pub trait SliceOffsetOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the sparse tensor slice being queried.
-    fn slice(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn slice(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the tensor dimension being queried.
-    fn dimension(&self) -> i64 {
-        self.attribute(DIM_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
-            .unwrap_or_else(|| panic!("invalid '{DIM_ATTRIBUTE}' attribute in `sparse_tensor.slice.offset`"))
+    fn dimension(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(DIM_ATTRIBUTE)?.signless_value())
     }
 
     /// Returns the slice offset.
-    fn offset(&self) -> ValueRef<'o, 'c, 't> {
+    fn offset(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -534,35 +595,35 @@ pub fn slice_offset<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     slice: ValueRef<'v, 'c, 't>,
     dimension: i64,
     location: L,
-) -> DetachedSliceOffsetOperation<'c, 't> {
+) -> Result<DetachedSliceOffsetOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.slice.offset", location)
         .add_operand(slice)
         .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.index_type(), dimension))
         .add_result(context.index_type())
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::slice_offset`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::slice_offset`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.slice.stride`.
 pub trait SliceStrideOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the sparse tensor slice being queried.
-    fn slice(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn slice(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the tensor dimension being queried.
-    fn dimension(&self) -> i64 {
-        self.attribute(DIM_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
-            .unwrap_or_else(|| panic!("invalid '{DIM_ATTRIBUTE}' attribute in `sparse_tensor.slice.stride`"))
+    fn dimension(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(DIM_ATTRIBUTE)?.signless_value())
     }
 
     /// Returns the slice stride.
-    fn stride(&self) -> ValueRef<'o, 'c, 't> {
+    fn stride(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -580,27 +641,30 @@ pub fn slice_stride<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     slice: ValueRef<'v, 'c, 't>,
     dimension: i64,
     location: L,
-) -> DetachedSliceStrideOperation<'c, 't> {
+) -> Result<DetachedSliceStrideOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.slice.stride", location)
         .add_operand(slice)
         .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.index_type(), dimension))
         .add_result(context.index_type())
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::slice_stride`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::slice_stride`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.storage_specifier.init`.
 pub trait StorageSpecifierInitOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the optional source storage specifier.
-    fn source(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.operand_value(0)
+    fn source(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.operand_count() == 0 { Ok(None) } else { self.operand_value(0).map(Some) }
     }
 
     /// Returns the initialized storage specifier.
-    fn specifier(&self) -> ValueRef<'o, 'c, 't> {
+    fn specifier(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -618,17 +682,18 @@ pub fn storage_specifier_init<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'
     source: Option<ValueRef<'v, 'c, 't>>,
     result_type: T,
     location: L,
-) -> DetachedStorageSpecifierInitOperation<'c, 't> {
+) -> Result<DetachedStorageSpecifierInitOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.storage_specifier.init", location).add_result(result_type);
     if let Some(source) = source {
         builder = builder.add_operand(source);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::storage_specifier_init`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::storage_specifier_init`"))
+    })
 }
 
 /// Name of the sparse tensor storage-specifier kind attribute.
@@ -637,26 +702,32 @@ pub const SPECIFIER_KIND_ATTRIBUTE: &str = "specifierKind";
 /// Operation trait for `sparse_tensor.storage_specifier.get`.
 pub trait StorageSpecifierGetOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the storage specifier being queried.
-    fn specifier(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn specifier(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the storage-specifier field kind.
-    fn specifier_kind(&self) -> StorageSpecifierKindAttributeRef<'c, 't> {
-        self.attribute(SPECIFIER_KIND_ATTRIBUTE).and_then(|attribute| attribute.cast()).unwrap_or_else(|| {
-            panic!("invalid '{SPECIFIER_KIND_ATTRIBUTE}' attribute in `sparse_tensor.storage_specifier.get`")
+    fn specifier_kind(&self) -> Result<StorageSpecifierKindAttributeRef<'c, 't>, Error> {
+        self.attribute(SPECIFIER_KIND_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SPECIFIER_KIND_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
         })
     }
 
     /// Returns the optional storage level associated with the queried field.
-    fn level(&self) -> Option<i64> {
-        self.attribute(LEVEL_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
+    fn level(&self) -> Result<Option<i64>, Error> {
+        if self.has_attribute(LEVEL_ATTRIBUTE) {
+            self.integer_attribute(LEVEL_ATTRIBUTE).map(|attribute| Some(attribute.signless_value()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the queried metadata value.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -675,50 +746,60 @@ pub fn storage_specifier_get<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     specifier_kind: StorageSpecifierKind,
     level: Option<i64>,
     location: L,
-) -> DetachedStorageSpecifierGetOperation<'c, 't> {
+) -> Result<DetachedStorageSpecifierGetOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.storage_specifier.get", location)
         .add_operand(specifier)
-        .add_attribute(SPECIFIER_KIND_ATTRIBUTE, context.sparse_tensor_storage_specifier_kind_attribute(specifier_kind))
+        .add_attribute(
+            SPECIFIER_KIND_ATTRIBUTE,
+            context.sparse_tensor_storage_specifier_kind_attribute(specifier_kind)?,
+        )
         .add_result(context.index_type());
     if let Some(level) = level {
         builder = builder.add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level));
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::storage_specifier_get`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::storage_specifier_get`"))
+    })
 }
 
 /// Operation trait for `sparse_tensor.storage_specifier.set`.
 pub trait StorageSpecifierSetOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the storage specifier being updated.
-    fn specifier(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn specifier(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the storage-specifier field kind.
-    fn specifier_kind(&self) -> StorageSpecifierKindAttributeRef<'c, 't> {
-        self.attribute(SPECIFIER_KIND_ATTRIBUTE).and_then(|attribute| attribute.cast()).unwrap_or_else(|| {
-            panic!("invalid '{SPECIFIER_KIND_ATTRIBUTE}' attribute in `sparse_tensor.storage_specifier.set`")
+    fn specifier_kind(&self) -> Result<StorageSpecifierKindAttributeRef<'c, 't>, Error> {
+        self.attribute(SPECIFIER_KIND_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SPECIFIER_KIND_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
         })
     }
 
     /// Returns the optional storage level associated with the updated field.
-    fn level(&self) -> Option<i64> {
-        self.attribute(LEVEL_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
+    fn level(&self) -> Result<Option<i64>, Error> {
+        if self.has_attribute(LEVEL_ATTRIBUTE) {
+            self.integer_attribute(LEVEL_ATTRIBUTE).map(|attribute| Some(attribute.signless_value()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the value written into the storage specifier.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the updated storage specifier.
-    fn result(&self) -> ValueRef<'o, 'c, 't> {
+    fn result(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -738,37 +819,41 @@ pub fn storage_specifier_set<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     level: Option<i64>,
     value: ValueRef<'v, 'c, 't>,
     location: L,
-) -> DetachedStorageSpecifierSetOperation<'c, 't> {
+) -> Result<DetachedStorageSpecifierSetOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.storage_specifier.set", location)
         .add_operand(specifier)
         .add_operand(value)
-        .add_attribute(SPECIFIER_KIND_ATTRIBUTE, context.sparse_tensor_storage_specifier_kind_attribute(specifier_kind))
-        .add_result(specifier.r#type());
+        .add_attribute(
+            SPECIFIER_KIND_ATTRIBUTE,
+            context.sparse_tensor_storage_specifier_kind_attribute(specifier_kind)?,
+        )
+        .add_result(specifier.r#type()?);
     if let Some(level) = level {
         builder = builder.add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level));
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::storage_specifier_set`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::storage_specifier_set`"))
+    })
 }
 
 /// Operation trait for `sparse_tensor.lvl`.
 pub trait LevelOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the sparse tensor being queried.
-    fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the level index operand.
-    fn index(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn index(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the level size.
-    fn size(&self) -> ValueRef<'o, 'c, 't> {
+    fn size(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -784,16 +869,19 @@ pub fn level<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     index: ValueRef<'v, 'c, 't>,
     location: L,
-) -> DetachedLevelOperation<'c, 't> {
+) -> Result<DetachedLevelOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.lvl", location)
         .add_operand(source)
         .add_operand(index)
         .add_result(context.index_type())
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::level`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::level`"))
+        })
 }
 
 /// Name of the sparse tensor coordinate-translation direction attribute.
@@ -805,27 +893,35 @@ pub const ENCODER_ATTRIBUTE: &str = "encoder";
 /// Operation trait for `sparse_tensor.crd_translate`.
 pub trait CoordinateTranslateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input coordinates.
-    fn input_coordinates(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn input_coordinates(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the translation direction.
-    fn direction(&self) -> CoordinateTranslationDirectionAttributeRef<'c, 't> {
-        self.attribute(DIRECTION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{DIRECTION_ATTRIBUTE}' attribute in `sparse_tensor.crd_translate`"))
+    fn direction(&self) -> Result<CoordinateTranslationDirectionAttributeRef<'c, 't>, Error> {
+        self.attribute(DIRECTION_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                DIRECTION_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the sparse tensor encoding that defines the coordinate maps.
-    fn encoder(&self) -> SparseTensorEncodingAttributeRef<'c, 't> {
-        self.attribute(ENCODER_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{ENCODER_ATTRIBUTE}' attribute in `sparse_tensor.crd_translate`"))
+    fn encoder(&self) -> Result<SparseTensorEncodingAttributeRef<'c, 't>, Error> {
+        self.attribute(ENCODER_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                ENCODER_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the translated coordinates.
-    fn output_coordinates(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.result_count()).map(|index| self.result(index).unwrap().as_ref()).collect()
+    fn output_coordinates(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (0..self.result_count()).map(|index| Ok(self.result(index)?.as_ref())).collect()
     }
 }
 
@@ -843,18 +939,24 @@ pub fn coordinate_translate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     encoder: SparseTensorEncodingAttributeRef<'c, 't>,
     output_count: usize,
     location: L,
-) -> DetachedCoordinateTranslateOperation<'c, 't> {
+) -> Result<DetachedCoordinateTranslateOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let output_types = (0..output_count).map(|_| context.index_type()).collect::<Vec<_>>();
     OperationBuilder::new("sparse_tensor.crd_translate", location)
         .add_operands(input_coordinates)
-        .add_attribute(DIRECTION_ATTRIBUTE, context.sparse_tensor_coordinate_translation_direction_attribute(direction))
+        .add_attribute(
+            DIRECTION_ATTRIBUTE,
+            context.sparse_tensor_coordinate_translation_direction_attribute(direction)?,
+        )
         .add_attribute(ENCODER_ATTRIBUTE, encoder)
         .add_results(&output_types)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::coordinate_translate`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::coordinate_translate`"))
+        })
 }
 
 /// Name of the sparse tensor in-bounds insertion attribute.
@@ -863,23 +965,23 @@ pub const INBOUNDS_ATTRIBUTE: &str = "inbounds";
 /// Operation trait for `sparse_tensor.push_back`.
 pub trait PushBackOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the current logical size of the input buffer.
-    fn current_size(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn current_size(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the input buffer.
-    fn input_buffer(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn input_buffer(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the value being appended.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the optional append count.
-    fn count(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        if self.operand_count() > 3 { self.operand_value(3) } else { None }
+    fn count(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.operand_count() > 3 { self.operand_value(3).map(Some) } else { Ok(None) }
     }
 
     /// Returns whether the operation is marked as in-bounds.
@@ -888,13 +990,13 @@ pub trait PushBackOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the output buffer.
-    fn output_buffer(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output_buffer(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the new logical size of the output buffer.
-    fn new_size(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(1).unwrap().as_ref()
+    fn new_size(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(1)?.as_ref())
     }
 }
 
@@ -910,52 +1012,53 @@ pub fn push_back<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     count: Option<ValueRef<'v, 'c, 't>>,
     inbounds: bool,
     location: L,
-) -> DetachedPushBackOperation<'c, 't> {
+) -> Result<DetachedPushBackOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.push_back", location)
         .add_operand(current_size)
         .add_operand(input_buffer)
         .add_operand(value)
-        .add_result(input_buffer.r#type())
-        .add_result(current_size.r#type());
+        .add_result(input_buffer.r#type()?)
+        .add_result(current_size.r#type()?);
     if let Some(count) = count {
         builder = builder.add_operand(count);
     }
     if inbounds {
         builder = builder.add_attribute(INBOUNDS_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::push_back`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::push_back`"))
+    })
 }
 
 /// Operation trait for `sparse_tensor.expand`.
 pub trait ExpandOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the sparse tensor being expanded.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the expanded values buffer.
-    fn values(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn values(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the boolean filled buffer.
-    fn filled(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(1).unwrap().as_ref()
+    fn filled(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(1)?.as_ref())
     }
 
     /// Returns the added-coordinates buffer.
-    fn added(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(2).unwrap().as_ref()
+    fn added(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(2)?.as_ref())
     }
 
     /// Returns the number of added coordinates.
-    fn count(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(3).unwrap().as_ref()
+    fn count(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(3)?.as_ref())
     }
 }
 
@@ -970,9 +1073,9 @@ pub fn expand<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     filled_type: TypeRef<'c, 't>,
     added_type: TypeRef<'c, 't>,
     location: L,
-) -> DetachedExpandOperation<'c, 't> {
+) -> Result<DetachedExpandOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.expand", location)
         .add_operand(tensor)
         .add_result(values_type)
@@ -980,44 +1083,47 @@ pub fn expand<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_result(added_type)
         .add_result(context.index_type())
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::expand`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::expand`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.compress`.
 pub trait CompressOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the expanded values buffer.
-    fn values(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn values(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the boolean filled buffer.
-    fn filled(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn filled(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the added-coordinates buffer.
-    fn added(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn added(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the number of added coordinates.
-    fn count(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(3).unwrap()
+    fn count(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(3)
     }
 
     /// Returns the sparse tensor being compressed into.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(4).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(4)
     }
 
     /// Returns the outer level coordinates.
-    fn level_coordinates(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn level_coordinates(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(5).collect()
     }
 
     /// Returns the updated sparse tensor.
-    fn result(&self) -> ValueRef<'o, 'c, 't> {
+    fn result(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -1036,9 +1142,9 @@ pub fn compress<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     tensor: ValueRef<'v, 'c, 't>,
     level_coordinates: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedCompressOperation<'c, 't> {
+) -> Result<DetachedCompressOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.compress", location)
         .add_operand(values)
         .add_operand(filled)
@@ -1046,10 +1152,13 @@ pub fn compress<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_operand(count)
         .add_operand(tensor)
         .add_operands(level_coordinates)
-        .add_result(tensor.r#type())
+        .add_result(tensor.r#type()?)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::compress`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::compress`"))
+        })
 }
 
 /// Name of the sparse tensor insertion-finalization attribute.
@@ -1058,8 +1167,8 @@ pub const HAS_INSERTS_ATTRIBUTE: &str = "hasInserts";
 /// Operation trait for `sparse_tensor.load`.
 pub trait LoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the sparse tensor being loaded.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns whether underlying insertions must be finalized.
@@ -1068,7 +1177,7 @@ pub trait LoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'
     }
 
     /// Returns the loaded tensor.
-    fn result(&self) -> ValueRef<'o, 'c, 't> {
+    fn result(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -1083,31 +1192,32 @@ pub fn load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     tensor: ValueRef<'v, 'c, 't>,
     has_inserts: bool,
     location: L,
-) -> DetachedLoadOperation<'c, 't> {
+) -> Result<DetachedLoadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.load", location)
         .add_operand(tensor)
-        .add_result(tensor.r#type());
+        .add_result(tensor.r#type()?);
     if has_inserts {
         builder = builder.add_attribute(HAS_INSERTS_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::load`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::load`"))
+    })
 }
 
 /// Operation trait for `sparse_tensor.out`.
 pub trait OutOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the sparse tensor being output.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the output destination.
-    fn destination(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 }
 
@@ -1120,15 +1230,16 @@ pub fn out<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     tensor: ValueRef<'v, 'c, 't>,
     destination: ValueRef<'v, 'c, 't>,
     location: L,
-) -> DetachedOutOperation<'c, 't> {
+) -> Result<DetachedOutOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.out", location)
         .add_operand(tensor)
         .add_operand(destination)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::out`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::out`"))
+        })
 }
 
 /// Name of the sparse tensor sort permutation-map attribute.
@@ -1143,40 +1254,43 @@ pub const ALGORITHM_ATTRIBUTE: &str = "algorithm";
 /// Operation trait for `sparse_tensor.sort`.
 pub trait SortOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the number of entries being sorted.
-    fn count(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn count(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the coordinate and value buffer being sorted.
-    fn coordinates_and_values(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn coordinates_and_values(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the payload buffers being sorted jointly.
-    fn payloads(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn payloads(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(2).collect()
     }
 
     /// Returns the coordinate permutation map.
-    fn permutation_map(&self) -> AffineMap<'c, 't> {
-        self.attribute(PERMUTATION_MAP_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<AffineMapAttributeRef>())
-            .map(|attribute| attribute.affine_map())
-            .unwrap_or_else(|| panic!("invalid '{PERMUTATION_MAP_ATTRIBUTE}' attribute in `sparse_tensor.sort`"))
+    fn permutation_map(&self) -> Result<AffineMap<'c, 't>, Error> {
+        self.affine_map_attribute(PERMUTATION_MAP_ATTRIBUTE)?.affine_map()
     }
 
     /// Returns the optional number of payload values carried by the packed buffer.
-    fn payload_count(&self) -> Option<i64> {
-        self.attribute(NY_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
+    fn payload_count(&self) -> Result<Option<i64>, Error> {
+        if self.has_attribute(NY_ATTRIBUTE) {
+            self.integer_attribute(NY_ATTRIBUTE).map(|attribute| Some(attribute.signless_value()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the sorting algorithm.
-    fn algorithm(&self) -> SortKindAttributeRef<'c, 't> {
-        self.attribute(ALGORITHM_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{ALGORITHM_ATTRIBUTE}' attribute in `sparse_tensor.sort`"))
+    fn algorithm(&self) -> Result<SortKindAttributeRef<'c, 't>, Error> {
+        self.attribute(ALGORITHM_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                ALGORITHM_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 }
 
@@ -1193,40 +1307,45 @@ pub fn sort<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     payload_count: Option<i64>,
     algorithm: SortKind,
     location: L,
-) -> DetachedSortOperation<'c, 't> {
+) -> Result<DetachedSortOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.sort", location)
         .add_operand(count)
         .add_operand(coordinates_and_values)
         .add_operands(payloads)
         .add_attribute(PERMUTATION_MAP_ATTRIBUTE, context.affine_map_attribute(permutation_map))
-        .add_attribute(ALGORITHM_ATTRIBUTE, context.sparse_tensor_sort_kind_attribute(algorithm));
+        .add_attribute(ALGORITHM_ATTRIBUTE, context.sparse_tensor_sort_kind_attribute(algorithm)?);
     if let Some(payload_count) = payload_count {
         builder = builder.add_attribute(NY_ATTRIBUTE, context.integer_attribute(context.index_type(), payload_count));
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::sort`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::sort`"))
+    })
 }
 
 /// Operation trait for `sparse_tensor.reorder_coo`.
 pub trait ReorderCooOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the input COO tensor.
-    fn input_coo(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input_coo(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the sorting algorithm.
-    fn algorithm(&self) -> SortKindAttributeRef<'c, 't> {
-        self.attribute(ALGORITHM_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{ALGORITHM_ATTRIBUTE}' attribute in `sparse_tensor.reorder_coo`"))
+    fn algorithm(&self) -> Result<SortKindAttributeRef<'c, 't>, Error> {
+        self.attribute(ALGORITHM_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                ALGORITHM_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the reordered COO tensor.
-    fn result_coo(&self) -> ValueRef<'o, 'c, 't> {
+    fn result_coo(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -1245,16 +1364,19 @@ pub fn reorder_coo<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     algorithm: SortKind,
     result_type: T,
     location: L,
-) -> DetachedReorderCooOperation<'c, 't> {
+) -> Result<DetachedReorderCooOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.reorder_coo", location)
         .add_operand(input_coo)
-        .add_attribute(ALGORITHM_ATTRIBUTE, context.sparse_tensor_sort_kind_attribute(algorithm))
+        .add_attribute(ALGORITHM_ATTRIBUTE, context.sparse_tensor_sort_kind_attribute(algorithm)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::reorder_coo`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::reorder_coo`"))
+        })
 }
 
 /// Name of the sparse tensor binary left-identity attribute.
@@ -1266,13 +1388,13 @@ pub const RIGHT_IDENTITY_ATTRIBUTE: &str = "right_identity";
 /// Operation trait for `sparse_tensor.binary`.
 pub trait BinaryOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the left-hand input value.
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand input value.
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns whether the left-only case is the identity function.
@@ -1286,22 +1408,22 @@ pub trait BinaryOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult
     }
 
     /// Returns the overlap region.
-    fn overlap_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn overlap_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns the left-only region.
-    fn left_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(1).unwrap()
+    fn left_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(1)
     }
 
     /// Returns the right-only region.
-    fn right_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(2).unwrap()
+    fn right_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(2)
     }
 
     /// Returns the binary operation result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         OneResult::output(self)
     }
 }
@@ -1324,9 +1446,9 @@ pub fn binary<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     left_region: DetachedRegion<'c, 't>,
     right_region: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedBinaryOperation<'c, 't> {
+) -> Result<DetachedBinaryOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.binary", location)
         .add_operand(lhs)
         .add_operand(rhs)
@@ -1340,31 +1462,32 @@ pub fn binary<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     if right_identity {
         builder = builder.add_attribute(RIGHT_IDENTITY_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::binary`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::binary`"))
+    })
 }
 
 /// Operation trait for `sparse_tensor.unary`.
 pub trait UnaryOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the input value.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the present-value region.
-    fn present_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn present_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns the absent-value region.
-    fn absent_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(1).unwrap()
+    fn absent_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(1)
     }
 
     /// Returns the unary operation result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         OneResult::output(self)
     }
 }
@@ -1383,43 +1506,46 @@ pub fn unary<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     present_region: DetachedRegion<'c, 't>,
     absent_region: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedUnaryOperation<'c, 't> {
+) -> Result<DetachedUnaryOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.unary", location)
         .add_operand(input)
         .add_result(result_type)
         .add_region(present_region)
         .add_region(absent_region)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::unary`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::unary`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.reduce`.
 pub trait ReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the running reduction value.
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the next input value.
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the reduction identity value.
-    fn identity(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn identity(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the reduction region.
-    fn region(&self) -> RegionRef<'o, 'c, 't> {
-        Operation::region(self, 0).unwrap()
+    fn region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.as_ref().region(0)
     }
 
     /// Returns the reduction result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         OneResult::output(self)
     }
 }
@@ -1439,34 +1565,37 @@ pub fn reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     identity: ValueRef<'v, 'c, 't>,
     region: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedReduceOperation<'c, 't> {
+) -> Result<DetachedReduceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.reduce", location)
         .add_operand(lhs)
         .add_operand(rhs)
         .add_operand(identity)
-        .add_result(lhs.r#type())
+        .add_result(lhs.r#type()?)
         .add_region(region)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::reduce`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::reduce`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.select`.
 pub trait SelectOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the input value.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the predicate region.
-    fn region(&self) -> RegionRef<'o, 'c, 't> {
-        Operation::region(self, 0).unwrap()
+    fn region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.as_ref().region(0)
     }
 
     /// Returns the selected value.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         OneResult::output(self)
     }
 }
@@ -1484,22 +1613,25 @@ pub fn select<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     input: ValueRef<'v, 'c, 't>,
     region: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedSelectOperation<'c, 't> {
+) -> Result<DetachedSelectOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.select", location)
         .add_operand(input)
-        .add_result(input.r#type())
+        .add_result(input.r#type()?)
         .add_region(region)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::select`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::select`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.yield`.
 pub trait YieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the yielded values.
-    fn values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 }
@@ -1518,14 +1650,17 @@ mlir_op_trait!(Yield, ZeroSuccessors);
 pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     values: &[ValueRef<'v, 'c, 't>],
     location: L,
-) -> DetachedYieldOperation<'c, 't> {
+) -> Result<DetachedYieldOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.yield", location)
         .add_operands(values)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::yield`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::yield`"))
+        })
 }
 
 /// Name of the sparse tensor foreach order attribute.
@@ -1534,30 +1669,32 @@ pub const ORDER_ATTRIBUTE: &str = "order";
 /// Operation trait for `sparse_tensor.foreach`.
 pub trait ForeachOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor being iterated over.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the initial loop-carried values.
-    fn initial_values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn initial_values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(1).collect()
     }
 
     /// Returns the optional dense-tensor traversal order.
-    fn order(&self) -> Option<AffineMap<'c, 't>> {
-        self.attribute(ORDER_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<AffineMapAttributeRef>())
-            .map(|attribute| attribute.affine_map())
+    fn order(&self) -> Result<Option<AffineMap<'c, 't>>, Error> {
+        if self.has_attribute(ORDER_ATTRIBUTE) {
+            self.affine_map_attribute(ORDER_ATTRIBUTE)?.affine_map().map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the final loop-carried values.
-    fn final_values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.result_count()).map(|index| self.result(index).unwrap().as_ref()).collect()
+    fn final_values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (0..self.result_count()).map(|index| Ok(self.result(index)?.as_ref())).collect()
     }
 
     /// Returns the foreach body region.
-    fn body_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -1574,10 +1711,10 @@ pub fn foreach<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     order: Option<AffineMap<'c, 't>>,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedForeachOperation<'c, 't> {
+) -> Result<DetachedForeachOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
-    let result_types = initial_values.iter().map(|value| value.r#type()).collect::<Vec<_>>();
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
+    let result_types = initial_values.iter().map(|value| value.r#type()).collect::<Result<Vec<_>, _>>()?;
     let mut builder = OperationBuilder::new("sparse_tensor.foreach", location)
         .add_operand(tensor)
         .add_operands(initial_values)
@@ -1586,46 +1723,37 @@ pub fn foreach<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     if let Some(order) = order {
         builder = builder.add_attribute(ORDER_ATTRIBUTE, context.affine_map_attribute(order));
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::foreach`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::foreach`"))
+    })
 }
 
 /// Operation trait for `sparse_tensor.extract_iteration_space`.
 pub trait ExtractIterationSpaceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the sparse tensor defining the iteration space.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the optional parent iterator.
-    fn parent_iterator(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        if self.operand_count() > 1 { self.operand_value(1) } else { None }
+    fn parent_iterator(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.operand_count() > 1 { self.operand_value(1).map(Some) } else { Ok(None) }
     }
 
     /// Returns the inclusive lower storage level of the iteration space.
-    fn lower_level(&self) -> i64 {
-        self.attribute(LOWER_LEVEL_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
-            .unwrap_or_else(|| {
-                panic!("invalid '{LOWER_LEVEL_ATTRIBUTE}' attribute in `sparse_tensor.extract_iteration_space`")
-            })
+    fn lower_level(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(LOWER_LEVEL_ATTRIBUTE)?.signless_value())
     }
 
     /// Returns the exclusive upper storage level of the iteration space.
-    fn upper_level(&self) -> i64 {
-        self.attribute(UPPER_LEVEL_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
-            .unwrap_or_else(|| {
-                panic!("invalid '{UPPER_LEVEL_ATTRIBUTE}' attribute in `sparse_tensor.extract_iteration_space`")
-            })
+    fn upper_level(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(UPPER_LEVEL_ATTRIBUTE)?.signless_value())
     }
 
     /// Returns the extracted iteration space.
-    fn iteration_space(&self) -> ValueRef<'o, 'c, 't> {
+    fn iteration_space(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -1652,9 +1780,9 @@ pub fn extract_iteration_space<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<
     upper_level: i64,
     result_type: T,
     location: L,
-) -> DetachedExtractIterationSpaceOperation<'c, 't> {
+) -> Result<DetachedExtractIterationSpaceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.extract_iteration_space", location)
         .add_operand(tensor)
         .add_attribute(LOWER_LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), lower_level))
@@ -1663,26 +1791,27 @@ pub fn extract_iteration_space<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<
     if let Some(parent_iterator) = parent_iterator {
         builder = builder.add_operand(parent_iterator);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::extract_iteration_space`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::extract_iteration_space`"))
+    })
 }
 
 /// Operation trait for `sparse_tensor.extract_value`.
 pub trait ExtractValueOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the sparse tensor being read.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the sparse iterator pointing at the stored value.
-    fn iterator(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn iterator(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the extracted value.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -1701,16 +1830,19 @@ pub fn extract_value<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     iterator: ValueRef<'v, 'c, 't>,
     result_type: T,
     location: L,
-) -> DetachedExtractValueOperation<'c, 't> {
+) -> Result<DetachedExtractValueOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.extract_value", location)
         .add_operand(tensor)
         .add_operand(iterator)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::extract_value`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::extract_value`"))
+        })
 }
 
 /// Name of the sparse tensor coordinate-used-levels bitset attribute.
@@ -1719,33 +1851,28 @@ pub const COORDINATE_USED_LEVELS_ATTRIBUTE: &str = "crdUsedLvls";
 /// Operation trait for `sparse_tensor.iterate`.
 pub trait IterateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the sparse iteration space.
-    fn iteration_space(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn iteration_space(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the initial loop-carried values.
-    fn initial_values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn initial_values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(1).collect()
     }
 
     /// Returns the bitset of coordinate levels used by the region.
-    fn coordinate_used_levels(&self) -> u64 {
-        self.attribute(COORDINATE_USED_LEVELS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.unsigned_value())
-            .unwrap_or_else(|| {
-                panic!("invalid '{COORDINATE_USED_LEVELS_ATTRIBUTE}' attribute in `sparse_tensor.iterate`")
-            })
+    fn coordinate_used_levels(&self) -> Result<u64, Error> {
+        Ok(self.integer_attribute(COORDINATE_USED_LEVELS_ATTRIBUTE)?.unsigned_value())
     }
 
     /// Returns the final loop-carried values.
-    fn final_values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.result_count()).map(|index| self.result(index).unwrap().as_ref()).collect()
+    fn final_values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (0..self.result_count()).map(|index| Ok(self.result(index)?.as_ref())).collect()
     }
 
     /// Returns the loop body region.
-    fn body_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -1762,10 +1889,10 @@ pub fn iterate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     coordinate_used_levels: u64,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedIterateOperation<'c, 't> {
+) -> Result<DetachedIterateOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
-    let result_types = initial_values.iter().map(|value| value.r#type()).collect::<Vec<_>>();
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
+    let result_types = initial_values.iter().map(|value| value.r#type()).collect::<Result<Vec<_>, _>>()?;
     OperationBuilder::new("sparse_tensor.iterate", location)
         .add_operand(iteration_space)
         .add_operands(initial_values)
@@ -1776,8 +1903,11 @@ pub fn iterate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_results(&result_types)
         .add_region(body)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::iterate`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::iterate`"))
+        })
 }
 
 /// Name of the sparse tensor coiterate case bitset array attribute.
@@ -1789,62 +1919,52 @@ pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operandSegmentSizes";
 /// Operation trait for `sparse_tensor.coiterate`.
 pub trait CoIterateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the sparse iteration spaces being co-iterated.
-    fn iteration_spaces(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `sparse_tensor.coiterate`")
-            });
-        (0..segment_sizes[0] as usize).map(|index| self.operand_value(index).unwrap()).collect()
+    fn iteration_spaces(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let iteration_space_count =
+            self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        (0..iteration_space_count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the initial loop-carried values.
-    fn initial_values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        let segment_sizes = self
-            .attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                panic!("invalid '{OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `sparse_tensor.coiterate`")
-            });
-        let start = segment_sizes[0] as usize;
-        let end = start + segment_sizes[1] as usize;
-        (start..end).map(|index| self.operand_value(index).unwrap()).collect()
+    fn initial_values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        let start = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        let initial_value_count =
+            self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        let end = start + initial_value_count;
+        (start..end).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the bitset of coordinate levels used by the regions.
-    fn coordinate_used_levels(&self) -> u64 {
-        self.attribute(COORDINATE_USED_LEVELS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.unsigned_value())
-            .unwrap_or_else(|| {
-                panic!("invalid '{COORDINATE_USED_LEVELS_ATTRIBUTE}' attribute in `sparse_tensor.coiterate`")
-            })
+    fn coordinate_used_levels(&self) -> Result<u64, Error> {
+        Ok(self.integer_attribute(COORDINATE_USED_LEVELS_ATTRIBUTE)?.unsigned_value())
     }
 
     /// Returns the case bitsets in region order.
-    fn cases(&self) -> Vec<u64> {
-        self.attribute(CASES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<ArrayAttributeRef>())
-            .map(|attribute| {
-                attribute
-                    .elements()
-                    .map(|element| element.cast::<IntegerAttributeRef>().unwrap().unsigned_value())
-                    .collect()
+    fn cases(&self) -> Result<Vec<u64>, Error> {
+        self.array_attribute(CASES_ATTRIBUTE)?
+            .elements()
+            .map(|element| {
+                element?
+                    .cast::<IntegerAttributeRef<'c, 't>>()
+                    .map(|attribute| attribute.unsigned_value())
+                    .ok_or_else(|| {
+                        Error::invalid_argument(format!(
+                            "invalid `{CASES_ATTRIBUTE}` attribute in `{}`",
+                            self.name().as_str().unwrap_or("<unknown>"),
+                        ))
+                    })
             })
-            .unwrap_or_else(|| panic!("invalid '{CASES_ATTRIBUTE}' attribute in `sparse_tensor.coiterate`"))
+            .collect()
     }
 
     /// Returns the final loop-carried values.
-    fn final_values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (0..self.result_count()).map(|index| self.result(index).unwrap().as_ref()).collect()
+    fn final_values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        (0..self.result_count()).map(|index| Ok(self.result(index)?.as_ref())).collect()
     }
 
     /// Returns the case regions.
-    fn case_regions(&self) -> Vec<RegionRef<'o, 'c, 't>> {
-        (0..self.region_count()).map(|index| self.region(index).unwrap()).collect()
+    fn case_regions(&self) -> Result<Vec<RegionRef<'o, 'c, 't>>, Error> {
+        (0..self.region_count()).map(|index| self.region(index)).collect()
     }
 }
 
@@ -1860,10 +1980,10 @@ pub fn coiterate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     cases: &[u64],
     case_regions: Vec<DetachedRegion<'c, 't>>,
     location: L,
-) -> DetachedCoIterateOperation<'c, 't> {
+) -> Result<DetachedCoIterateOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
-    let result_types = initial_values.iter().map(|value| value.r#type()).collect::<Vec<_>>();
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
+    let result_types = initial_values.iter().map(|value| value.r#type()).collect::<Result<Vec<_>, _>>()?;
     let cases = cases
         .iter()
         .map(|case| context.integer_attribute(context.signless_integer_type(64), *case as i64))
@@ -1873,9 +1993,7 @@ pub fn coiterate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_operands(initial_values)
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-            context
-                .dense_i32_array_attribute(&[iteration_spaces.len() as i32, initial_values.len() as i32])
-                .unwrap(),
+            context.dense_i32_array_attribute(&[iteration_spaces.len() as i32, initial_values.len() as i32])?,
         )
         .add_attribute(
             COORDINATE_USED_LEVELS_ATTRIBUTE,
@@ -1885,15 +2003,18 @@ pub fn coiterate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .add_results(&result_types)
         .add_regions(case_regions)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::coiterate`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::coiterate`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.print`.
 pub trait PrintOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the sparse tensor being printed.
-    fn tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn tensor(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 }
 
@@ -1905,20 +2026,23 @@ mlir_op_trait!(Print, ZeroSuccessors);
 pub fn print<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     tensor: ValueRef<'v, 'c, 't>,
     location: L,
-) -> DetachedPrintOperation<'c, 't> {
+) -> Result<DetachedPrintOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.print", location)
         .add_operand(tensor)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::print`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::print`"))
+        })
 }
 
 /// Operation trait for `sparse_tensor.has_runtime_library`.
 pub trait HasRuntimeLibraryOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns whether the sparse tensor runtime library is enabled.
-    fn enabled(&self) -> ValueRef<'o, 'c, 't> {
+    fn enabled(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.output()
     }
 }
@@ -1930,14 +2054,19 @@ mlir_op_trait!(HasRuntimeLibrary, ZeroRegions);
 mlir_op_trait!(HasRuntimeLibrary, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`HasRuntimeLibraryOperation`] at the specified [`Location`].
-pub fn has_runtime_library<'c, 't: 'c, L: Location<'c, 't>>(location: L) -> DetachedHasRuntimeLibraryOperation<'c, 't> {
+pub fn has_runtime_library<'c, 't: 'c, L: Location<'c, 't>>(
+    location: L,
+) -> Result<DetachedHasRuntimeLibraryOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::sparse_tensor());
+    context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.has_runtime_library", location)
         .add_result(context.signless_integer_type(1))
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `sparse_tensor::has_runtime_library`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::has_runtime_library`"))
+        })
 }
 
 #[cfg(test)]
@@ -1955,42 +2084,51 @@ mod tests {
     fn test_new() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let source_type = context.signless_integer_type(64);
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(source_type, location)]);
-            let source = block.argument(0).unwrap().as_ref();
-            let op = new(source, tensor_type, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.tensor().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "new_test",
-                func::FuncAttributes {
-                    arguments: vec![source_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(source_type, location)]);
+                let source = block.argument(0).unwrap().as_ref();
+                let op = new(source, tensor_type, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "new_test",
+                    func::FuncAttributes {
+                        arguments: vec![source_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2009,51 +2147,60 @@ mod tests {
     fn test_assemble() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let f64_type = context.float64_type();
         let level_tensor_type = context.tensor_type(index_type, &[Size::Dynamic], None, location).unwrap();
         let values_tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], None, location).unwrap();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Static(4)], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (level_tensor_type.as_ref(), location),
-                (level_tensor_type.as_ref(), location),
-                (values_tensor_type.as_ref(), location),
-            ]);
-            let positions = block.argument(0).unwrap().as_ref();
-            let coordinates = block.argument(1).unwrap().as_ref();
-            let values = block.argument(2).unwrap().as_ref();
-            let op = assemble(&[positions, coordinates], values, tensor_type, location);
-            assert_eq!(op.levels(), vec![positions, coordinates]);
-            assert_eq!(op.values(), values);
-            assert_eq!(op.tensor().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "assemble_test",
-                func::FuncAttributes {
-                    arguments: vec![level_tensor_type.into(), level_tensor_type.into(), values_tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Static(4)], Some(encoding.as_ref()), location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (level_tensor_type.as_ref(), location),
+                    (level_tensor_type.as_ref(), location),
+                    (values_tensor_type.as_ref(), location),
+                ]);
+                let positions = block.argument(0).unwrap().as_ref();
+                let coordinates = block.argument(1).unwrap().as_ref();
+                let values = block.argument(2).unwrap().as_ref();
+                let op = assemble(&[positions, coordinates], values, tensor_type, location).unwrap();
+                assert_eq!(op.levels().unwrap(), vec![positions, coordinates]);
+                assert_eq!(op.values().unwrap(), values);
+                assert_eq!(op.levels().unwrap(), vec![positions, coordinates]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "assemble_test",
+                    func::FuncAttributes {
+                        arguments: vec![level_tensor_type.into(), level_tensor_type.into(), values_tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2074,79 +2221,93 @@ mod tests {
     fn test_disassemble() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let f64_type = context.float64_type();
         let level_tensor_type = context.tensor_type(index_type, &[Size::Dynamic], None, location).unwrap();
         let values_tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], None, location).unwrap();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (tensor_type.as_ref(), location),
-                (level_tensor_type.as_ref(), location),
-                (level_tensor_type.as_ref(), location),
-                (values_tensor_type.as_ref(), location),
-            ]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let output_positions = block.argument(1).unwrap().as_ref();
-            let output_coordinates = block.argument(2).unwrap().as_ref();
-            let output_values = block.argument(3).unwrap().as_ref();
-            let returned_level_types = [level_tensor_type.as_ref(), level_tensor_type.as_ref()];
-            let level_length_types = [index_type.as_ref(), index_type.as_ref()];
-            let op = disassemble(
-                tensor,
-                &[output_positions, output_coordinates],
-                output_values,
-                &returned_level_types,
-                values_tensor_type.as_ref(),
-                &level_length_types,
-                index_type.as_ref(),
-                location,
-            );
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.output_levels(), vec![output_positions, output_coordinates]);
-            assert_eq!(op.output_values(), output_values);
-            assert_eq!(op.returned_levels().len(), 2);
-            assert_eq!(op.level_lengths().len(), 2);
-            assert_eq!(op.operands().count(), 4);
-            assert_eq!(op.results().count(), 6);
-            let results = op.results().map(|result| result.as_ref()).collect::<Vec<_>>();
-            block.append_operation(op);
-            block.append_operation(func::r#return(&results, location));
-            func::func(
-                "disassemble_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        tensor_type.into(),
-                        level_tensor_type.into(),
-                        level_tensor_type.into(),
-                        values_tensor_type.into(),
-                    ],
-                    results: vec![
-                        level_tensor_type.into(),
-                        level_tensor_type.into(),
-                        values_tensor_type.into(),
-                        index_type.into(),
-                        index_type.into(),
-                        index_type.into(),
-                    ],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (tensor_type.as_ref(), location),
+                    (level_tensor_type.as_ref(), location),
+                    (level_tensor_type.as_ref(), location),
+                    (values_tensor_type.as_ref(), location),
+                ]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let output_positions = block.argument(1).unwrap().as_ref();
+                let output_coordinates = block.argument(2).unwrap().as_ref();
+                let output_values = block.argument(3).unwrap().as_ref();
+                let returned_level_types = [level_tensor_type.as_ref(), level_tensor_type.as_ref()];
+                let level_length_types = [index_type.as_ref(), index_type.as_ref()];
+                let op = disassemble(
+                    tensor,
+                    &[output_positions, output_coordinates],
+                    output_values,
+                    &returned_level_types,
+                    values_tensor_type.as_ref(),
+                    &level_length_types,
+                    index_type.as_ref(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.output_levels().unwrap(), vec![output_positions, output_coordinates]);
+                assert_eq!(op.output_values().unwrap(), output_values);
+                assert_eq!(op.returned_levels().unwrap().len(), 2);
+                assert_eq!(op.level_lengths().unwrap().len(), 2);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 4);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 6);
+                let results = op
+                    .results()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+                    .into_iter()
+                    .map(|result| result.as_ref())
+                    .collect::<Vec<_>>();
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&results, location).unwrap()).unwrap();
+                func::func(
+                    "disassemble_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            tensor_type.into(),
+                            level_tensor_type.into(),
+                            level_tensor_type.into(),
+                            values_tensor_type.into(),
+                        ],
+                        results: vec![
+                            level_tensor_type.into(),
+                            level_tensor_type.into(),
+                            values_tensor_type.into(),
+                            index_type.into(),
+                            index_type.into(),
+                            index_type.into(),
+                        ],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2171,43 +2332,52 @@ mod tests {
     fn test_convert() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let dense_tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], None, location).unwrap();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         let sparse_tensor_type =
             context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(dense_tensor_type, location)]);
-            let source = block.argument(0).unwrap().as_ref();
-            let op = convert(source, sparse_tensor_type, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.destination().r#type(), sparse_tensor_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "convert_test",
-                func::FuncAttributes {
-                    arguments: vec![dense_tensor_type.into()],
-                    results: vec![sparse_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(dense_tensor_type, location)]);
+                let source = block.argument(0).unwrap().as_ref();
+                let op = convert(source, sparse_tensor_type, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "convert_test",
+                    func::FuncAttributes {
+                        arguments: vec![dense_tensor_type.into()],
+                        results: vec![sparse_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2226,41 +2396,50 @@ mod tests {
     fn test_reinterpret_map() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let source = block.argument(0).unwrap().as_ref();
-            let op = reinterpret_map(source, tensor_type, location);
-            assert_eq!(op.source(), source);
-            assert_eq!(op.destination().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "reinterpret_map_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let source = block.argument(0).unwrap().as_ref();
+                let op = reinterpret_map(source, tensor_type, location).unwrap();
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.source().unwrap(), source);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "reinterpret_map_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2279,43 +2458,52 @@ mod tests {
     fn test_positions() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
         let memref_type = context.mem_ref_type(context.index_type(), &[Size::Dynamic], None, None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let op = positions(tensor, 0, memref_type, location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.level(), 0);
-            assert_eq!(op.positions().r#type(), memref_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "positions_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![memref_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let op = positions(tensor, 0, memref_type, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.level().unwrap(), 0);
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "positions_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![memref_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2334,43 +2522,52 @@ mod tests {
     fn test_coordinates() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
         let memref_type = context.mem_ref_type(context.index_type(), &[Size::Dynamic], None, None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let op = coordinates(tensor, 0, memref_type, location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.level(), 0);
-            assert_eq!(op.coordinates().r#type(), memref_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "coordinates_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![memref_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let op = coordinates(tensor, 0, memref_type, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.level().unwrap(), 0);
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "coordinates_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![memref_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2389,47 +2586,56 @@ mod tests {
     fn test_coordinates_buffer() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[
-                LevelType::new(LevelFormat::Compressed, &[LevelProperty::NonUnique]),
-                LevelType::from(LevelFormat::Singleton),
-            ],
-            Some(context.identity_affine_map(2)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[
+                    LevelType::new(LevelFormat::Compressed, &[LevelProperty::NonUnique]),
+                    LevelType::from(LevelFormat::Singleton),
+                ],
+                Some(context.identity_affine_map(2)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         let tensor_type = context
             .tensor_type(f64_type, &[Size::Dynamic, Size::Dynamic], Some(encoding.as_ref()), location)
             .unwrap();
         let memref_type = context.mem_ref_type(context.index_type(), &[Size::Dynamic], None, None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let op = coordinates_buffer(tensor, memref_type, location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.coordinates_buffer().r#type(), memref_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "coordinates_buffer_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![memref_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let op = coordinates_buffer(tensor, memref_type, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "coordinates_buffer_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![memref_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2448,42 +2654,51 @@ mod tests {
     fn test_values() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
         let memref_type = context.mem_ref_type(f64_type, &[Size::Dynamic], None, None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let op = values(tensor, memref_type, location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.values().r#type(), memref_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "values_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![memref_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let op = values(tensor, memref_type, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "values_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![memref_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2502,42 +2717,51 @@ mod tests {
     fn test_number_of_entries() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let index_type = context.index_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let op = number_of_entries(tensor, location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.entry_count().r#type(), index_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "number_of_entries_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let op = number_of_entries(tensor, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "number_of_entries_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2556,44 +2780,53 @@ mod tests {
     fn test_concatenate() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         let input_type = context.tensor_type(f64_type, &[Size::Static(4)], Some(encoding.as_ref()), location).unwrap();
         let result_type = context.tensor_type(f64_type, &[Size::Static(8)], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (input_type, location)]);
-            let lhs = block.argument(0).unwrap().as_ref();
-            let rhs = block.argument(1).unwrap().as_ref();
-            let op = concatenate(&[lhs, rhs], 0, result_type, location);
-            assert_eq!(op.inputs(), vec![lhs, rhs]);
-            assert_eq!(op.dimension(), 0);
-            assert_eq!(op.concatenated().r#type(), result_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "concatenate_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), input_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (input_type, location)]);
+                let lhs = block.argument(0).unwrap().as_ref();
+                let rhs = block.argument(1).unwrap().as_ref();
+                let op = concatenate(&[lhs, rhs], 0, result_type, location).unwrap();
+                assert_eq!(op.inputs().unwrap(), vec![lhs, rhs]);
+                assert_eq!(op.dimension().unwrap(), 0);
+                assert_eq!(op.dimension().unwrap(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "concatenate_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), input_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2614,44 +2847,53 @@ mod tests {
     fn test_slice_offset() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let index_type = context.index_type();
-        let slice = context.sparse_tensor_dim_slice_attribute(0, 4, 1);
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[slice],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Static(4)], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let op = slice_offset(tensor, 0, location);
-            assert_eq!(op.slice(), tensor);
-            assert_eq!(op.dimension(), 0);
-            assert_eq!(op.offset().r#type(), index_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "slice_offset_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let slice = context.sparse_tensor_dim_slice_attribute(0, 4, 1).unwrap();
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[slice],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Static(4)], Some(encoding.as_ref()), location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let op = slice_offset(tensor, 0, location).unwrap();
+                assert_eq!(op.slice().unwrap(), tensor);
+                assert_eq!(op.dimension().unwrap(), 0);
+                assert_eq!(op.slice().unwrap(), tensor);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "slice_offset_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2671,44 +2913,53 @@ mod tests {
     fn test_slice_stride() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let index_type = context.index_type();
-        let slice = context.sparse_tensor_dim_slice_attribute(0, 4, 1);
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[slice],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Static(4)], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let op = slice_stride(tensor, 0, location);
-            assert_eq!(op.slice(), tensor);
-            assert_eq!(op.dimension(), 0);
-            assert_eq!(op.stride().r#type(), index_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "slice_stride_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let slice = context.sparse_tensor_dim_slice_attribute(0, 4, 1).unwrap();
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[slice],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Static(4)], Some(encoding.as_ref()), location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let op = slice_stride(tensor, 0, location).unwrap();
+                assert_eq!(op.slice().unwrap(), tensor);
+                assert_eq!(op.dimension().unwrap(), 0);
+                assert_eq!(op.slice().unwrap(), tensor);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "slice_stride_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2728,35 +2979,44 @@ mod tests {
     fn test_storage_specifier_init() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let specifier_type = context.sparse_tensor_storage_specifier_type(encoding);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = storage_specifier_init(None, specifier_type, location);
-            assert_eq!(op.source(), None);
-            assert_eq!(op.specifier().r#type(), specifier_type);
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "storage_specifier_init_test",
-                func::FuncAttributes { results: vec![specifier_type.into()], ..Default::default() },
-                block.into(),
-                location,
+        let module = context.module(location).unwrap();
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let specifier_type = context.sparse_tensor_storage_specifier_type(encoding).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = storage_specifier_init(None, specifier_type, location).unwrap();
+                assert_eq!(op.source().unwrap(), None);
+                assert_eq!(op.specifier().unwrap().r#type().unwrap(), specifier_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "storage_specifier_init_test",
+                    func::FuncAttributes { results: vec![specifier_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2775,43 +3035,54 @@ mod tests {
     fn test_storage_specifier_get() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let specifier_type = context.sparse_tensor_storage_specifier_type(encoding);
-        module.body().append_operation({
-            let mut block = context.block(&[(specifier_type, location)]);
-            let specifier = block.argument(0).unwrap().as_ref();
-            let op = storage_specifier_get(specifier, StorageSpecifierKind::CoordinateMemorySize, Some(0), location);
-            assert_eq!(op.specifier(), specifier);
-            assert_eq!(op.specifier_kind().value(), StorageSpecifierKind::CoordinateMemorySize);
-            assert_eq!(op.level(), Some(0));
-            assert_eq!(op.value().r#type(), index_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "storage_specifier_get_test",
-                func::FuncAttributes {
-                    arguments: vec![specifier_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let specifier_type = context.sparse_tensor_storage_specifier_type(encoding).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(specifier_type, location)]);
+                let specifier = block.argument(0).unwrap().as_ref();
+                let op =
+                    storage_specifier_get(specifier, StorageSpecifierKind::CoordinateMemorySize, Some(0), location)
+                        .unwrap();
+                assert_eq!(op.specifier().unwrap(), specifier);
+                assert_eq!(op.specifier_kind().unwrap().value().unwrap(), StorageSpecifierKind::CoordinateMemorySize);
+                assert_eq!(op.level().unwrap(), Some(0));
+                assert_eq!(op.specifier().unwrap(), specifier);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "storage_specifier_get_test",
+                    func::FuncAttributes {
+                        arguments: vec![specifier_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2831,46 +3102,61 @@ mod tests {
     fn test_storage_specifier_set() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let specifier_type = context.sparse_tensor_storage_specifier_type(encoding);
-        module.body().append_operation({
-            let mut block = context.block(&[(specifier_type.as_ref(), location), (index_type.as_ref(), location)]);
-            let specifier = block.argument(0).unwrap().as_ref();
-            let value = block.argument(1).unwrap().as_ref();
-            let op =
-                storage_specifier_set(specifier, StorageSpecifierKind::CoordinateMemorySize, Some(0), value, location);
-            assert_eq!(op.specifier(), specifier);
-            assert_eq!(op.specifier_kind().value(), StorageSpecifierKind::CoordinateMemorySize);
-            assert_eq!(op.level(), Some(0));
-            assert_eq!(op.value(), value);
-            assert_eq!(StorageSpecifierSetOperation::result(&op).r#type(), specifier_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "storage_specifier_set_test",
-                func::FuncAttributes {
-                    arguments: vec![specifier_type.into(), index_type.into()],
-                    results: vec![specifier_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let specifier_type = context.sparse_tensor_storage_specifier_type(encoding).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(specifier_type.as_ref(), location), (index_type.as_ref(), location)]);
+                let specifier = block.argument(0).unwrap().as_ref();
+                let value = block.argument(1).unwrap().as_ref();
+                let op = storage_specifier_set(
+                    specifier,
+                    StorageSpecifierKind::CoordinateMemorySize,
+                    Some(0),
+                    value,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.specifier().unwrap(), specifier);
+                assert_eq!(op.specifier_kind().unwrap().value().unwrap(), StorageSpecifierKind::CoordinateMemorySize);
+                assert_eq!(op.level().unwrap(), Some(0));
+                assert_eq!(op.value().unwrap(), value);
+                assert_eq!(op.specifier().unwrap(), specifier);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "storage_specifier_set_test",
+                    func::FuncAttributes {
+                        arguments: vec![specifier_type.into(), index_type.into()],
+                        results: vec![specifier_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2891,44 +3177,53 @@ mod tests {
     fn test_level() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type.as_ref(), location), (index_type.as_ref(), location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let index = block.argument(1).unwrap().as_ref();
-            let op = level(tensor, index, location);
-            assert_eq!(op.source(), tensor);
-            assert_eq!(op.index(), index);
-            assert_eq!(op.size().r#type(), index_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "level_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), index_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type.as_ref(), location), (index_type.as_ref(), location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let index = block.argument(1).unwrap().as_ref();
+                let op = level(tensor, index, location).unwrap();
+                assert_eq!(op.source().unwrap(), tensor);
+                assert_eq!(op.index().unwrap(), index);
+                assert_eq!(op.source().unwrap(), tensor);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "level_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), index_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2947,48 +3242,58 @@ mod tests {
     fn test_coordinate_translate() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type, location)]);
-            let coordinate = block.argument(0).unwrap().as_ref();
-            let op = coordinate_translate(
-                &[coordinate],
-                CoordinateTranslationDirection::DimensionToLevel,
-                encoding,
-                1,
-                location,
-            );
-            assert_eq!(op.input_coordinates(), vec![coordinate]);
-            assert_eq!(op.direction().value(), CoordinateTranslationDirection::DimensionToLevel);
-            assert_eq!(op.encoder(), encoding);
-            assert_eq!(op.output_coordinates().len(), 1);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "coordinate_translate_test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type, location)]);
+                let coordinate = block.argument(0).unwrap().as_ref();
+                let op = coordinate_translate(
+                    &[coordinate],
+                    CoordinateTranslationDirection::DimensionToLevel,
+                    encoding,
+                    1,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.input_coordinates().unwrap(), vec![coordinate]);
+                assert_eq!(op.direction().unwrap().value().unwrap(), CoordinateTranslationDirection::DimensionToLevel);
+                assert_eq!(op.encoder().unwrap(), encoding);
+                assert_eq!(op.output_coordinates().unwrap().len(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "coordinate_translate_test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3007,46 +3312,57 @@ mod tests {
     fn test_push_back() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let f64_type = context.float64_type();
         let memref_type = context.mem_ref_type(f64_type, &[Size::Dynamic], None, None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (index_type.as_ref(), location),
-                (memref_type.as_ref(), location),
-                (f64_type.as_ref(), location),
-                (index_type.as_ref(), location),
-            ]);
-            let current_size = block.argument(0).unwrap().as_ref();
-            let input_buffer = block.argument(1).unwrap().as_ref();
-            let value = block.argument(2).unwrap().as_ref();
-            let count = block.argument(3).unwrap().as_ref();
-            let op = push_back(current_size, input_buffer, value, Some(count), true, location);
-            assert_eq!(op.current_size(), current_size);
-            assert_eq!(op.input_buffer(), input_buffer);
-            assert_eq!(op.value(), value);
-            assert_eq!(op.count(), Some(count));
-            assert!(op.inbounds());
-            assert_eq!(op.output_buffer().r#type(), memref_type);
-            assert_eq!(op.new_size().r#type(), index_type);
-            assert_eq!(op.operands().count(), 4);
-            assert_eq!(op.results().count(), 2);
-            let results = op.results().map(|result| result.as_ref()).collect::<Vec<_>>();
-            block.append_operation(op);
-            block.append_operation(func::r#return(&results, location));
-            func::func(
-                "push_back_test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into(), memref_type.into(), f64_type.into(), index_type.into()],
-                    results: vec![memref_type.into(), index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (index_type.as_ref(), location),
+                    (memref_type.as_ref(), location),
+                    (f64_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                ]);
+                let current_size = block.argument(0).unwrap().as_ref();
+                let input_buffer = block.argument(1).unwrap().as_ref();
+                let value = block.argument(2).unwrap().as_ref();
+                let count = block.argument(3).unwrap().as_ref();
+                let op = push_back(current_size, input_buffer, value, Some(count), true, location).unwrap();
+                assert_eq!(op.current_size().unwrap(), current_size);
+                assert_eq!(op.input_buffer().unwrap(), input_buffer);
+                assert_eq!(op.value().unwrap(), value);
+                assert_eq!(op.count().unwrap(), Some(count));
+                assert!(op.inbounds());
+                assert_eq!(op.output_buffer().unwrap().r#type().unwrap(), memref_type);
+                assert_eq!(op.new_size().unwrap().r#type().unwrap(), index_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 4);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                let results = op
+                    .results()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+                    .into_iter()
+                    .map(|result| result.as_ref())
+                    .collect::<Vec<_>>();
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&results, location).unwrap()).unwrap();
+                func::func(
+                    "push_back_test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into(), memref_type.into(), f64_type.into(), index_type.into()],
+                        results: vec![memref_type.into(), index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3066,50 +3382,64 @@ mod tests {
     fn test_expand() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let f64_type = context.float64_type();
         let i1_type = context.signless_integer_type(1);
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
         let values_type = context.mem_ref_type(f64_type, &[Size::Dynamic], None, None, location).unwrap();
         let filled_type = context.mem_ref_type(i1_type, &[Size::Dynamic], None, None, location).unwrap();
         let added_type = context.mem_ref_type(index_type, &[Size::Dynamic], None, None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let op = expand(tensor, values_type.as_ref(), filled_type.as_ref(), added_type.as_ref(), location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.values().r#type(), values_type);
-            assert_eq!(op.filled().r#type(), filled_type);
-            assert_eq!(op.added().r#type(), added_type);
-            assert_eq!(op.count().r#type(), index_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 4);
-            let results = op.results().map(|result| result.as_ref()).collect::<Vec<_>>();
-            block.append_operation(op);
-            block.append_operation(func::r#return(&results, location));
-            func::func(
-                "expand_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![values_type.into(), filled_type.into(), added_type.into(), index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let op =
+                    expand(tensor, values_type.as_ref(), filled_type.as_ref(), added_type.as_ref(), location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.values().unwrap().r#type().unwrap(), values_type);
+                assert_eq!(op.filled().unwrap().r#type().unwrap(), filled_type);
+                assert_eq!(op.added().unwrap().r#type().unwrap(), added_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 4);
+                let results = op
+                    .results()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+                    .into_iter()
+                    .map(|result| result.as_ref())
+                    .collect::<Vec<_>>();
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&results, location).unwrap()).unwrap();
+                func::func(
+                    "expand_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![values_type.into(), filled_type.into(), added_type.into(), index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3130,67 +3460,76 @@ mod tests {
     fn test_compress() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let f64_type = context.float64_type();
         let i1_type = context.signless_integer_type(1);
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
         let values_type = context.mem_ref_type(f64_type, &[Size::Dynamic], None, None, location).unwrap();
         let filled_type = context.mem_ref_type(i1_type, &[Size::Dynamic], None, None, location).unwrap();
         let added_type = context.mem_ref_type(index_type, &[Size::Dynamic], None, None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (values_type.as_ref(), location),
-                (filled_type.as_ref(), location),
-                (added_type.as_ref(), location),
-                (index_type.as_ref(), location),
-                (tensor_type.as_ref(), location),
-            ]);
-            let values = block.argument(0).unwrap().as_ref();
-            let filled = block.argument(1).unwrap().as_ref();
-            let added = block.argument(2).unwrap().as_ref();
-            let count = block.argument(3).unwrap().as_ref();
-            let tensor = block.argument(4).unwrap().as_ref();
-            let op = compress(values, filled, added, count, tensor, &[], location);
-            assert_eq!(op.values(), values);
-            assert_eq!(op.filled(), filled);
-            assert_eq!(op.added(), added);
-            assert_eq!(op.count(), count);
-            assert_eq!(op.tensor(), tensor);
-            assert!(op.level_coordinates().is_empty());
-            assert_eq!(CompressOperation::result(&op).r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 5);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "compress_test",
-                func::FuncAttributes {
-                    arguments: vec![
-                        values_type.into(),
-                        filled_type.into(),
-                        added_type.into(),
-                        index_type.into(),
-                        tensor_type.into(),
-                    ],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (values_type.as_ref(), location),
+                    (filled_type.as_ref(), location),
+                    (added_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                    (tensor_type.as_ref(), location),
+                ]);
+                let values = block.argument(0).unwrap().as_ref();
+                let filled = block.argument(1).unwrap().as_ref();
+                let added = block.argument(2).unwrap().as_ref();
+                let count = block.argument(3).unwrap().as_ref();
+                let tensor = block.argument(4).unwrap().as_ref();
+                let op = compress(values, filled, added, count, tensor, &[], location).unwrap();
+                assert_eq!(op.values().unwrap(), values);
+                assert_eq!(op.filled().unwrap(), filled);
+                assert_eq!(op.added().unwrap(), added);
+                assert_eq!(op.count().unwrap(), count);
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert!(op.level_coordinates().unwrap().is_empty());
+                assert_eq!(op.as_ref().result(0).unwrap().r#type().unwrap(), tensor_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 5);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "compress_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            values_type.into(),
+                            filled_type.into(),
+                            added_type.into(),
+                            index_type.into(),
+                            tensor_type.into(),
+                        ],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3211,42 +3550,51 @@ mod tests {
     fn test_load() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let op = load(tensor, true, location);
-            assert_eq!(op.tensor(), tensor);
-            assert!(op.has_inserts());
-            assert_eq!(LoadOperation::result(&op).r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "load_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let op = load(tensor, true, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert!(op.has_inserts());
+                assert_eq!(op.as_ref().result(0).unwrap().r#type().unwrap(), tensor_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "load_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3265,42 +3613,50 @@ mod tests {
     fn test_out() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let destination_type = context.signless_integer_type(64);
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type.as_ref(), location), (destination_type.as_ref(), location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let destination = block.argument(1).unwrap().as_ref();
-            let op = out(tensor, destination, location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.destination(), destination);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 0);
-            block.append_operation(op);
-            block.append_operation(func::r#return(&[] as &[ValueRef], location));
-            func::func(
-                "out_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), destination_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(tensor_type.as_ref(), location), (destination_type.as_ref(), location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let destination = block.argument(1).unwrap().as_ref();
+                let op = out(tensor, destination, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.destination().unwrap(), destination);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[] as &[ValueRef], location).unwrap()).unwrap();
+                func::func(
+                    "out_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), destination_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3319,43 +3675,49 @@ mod tests {
     fn test_sort() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let f64_type = context.float64_type();
         let coordinates_type = context.mem_ref_type(index_type, &[Size::Dynamic], None, None, location).unwrap();
         let payload_type = context.mem_ref_type(f64_type, &[Size::Dynamic], None, None, location).unwrap();
         let permutation_map = context.identity_affine_map(1);
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (index_type.as_ref(), location),
-                (coordinates_type.as_ref(), location),
-                (payload_type.as_ref(), location),
-            ]);
-            let count = block.argument(0).unwrap().as_ref();
-            let coordinates = block.argument(1).unwrap().as_ref();
-            let payload = block.argument(2).unwrap().as_ref();
-            let op = sort(count, coordinates, &[payload], permutation_map, Some(1), SortKind::QuickSort, location);
-            assert_eq!(op.count(), count);
-            assert_eq!(op.coordinates_and_values(), coordinates);
-            assert_eq!(op.payloads(), vec![payload]);
-            assert_eq!(op.permutation_map(), permutation_map);
-            assert_eq!(op.payload_count(), Some(1));
-            assert_eq!(op.algorithm().value(), SortKind::QuickSort);
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 0);
-            block.append_operation(op);
-            block.append_operation(func::r#return(&[] as &[ValueRef], location));
-            func::func(
-                "sort_test",
-                func::FuncAttributes {
-                    arguments: vec![index_type.into(), coordinates_type.into(), payload_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (index_type.as_ref(), location),
+                    (coordinates_type.as_ref(), location),
+                    (payload_type.as_ref(), location),
+                ]);
+                let count = block.argument(0).unwrap().as_ref();
+                let coordinates = block.argument(1).unwrap().as_ref();
+                let payload = block.argument(2).unwrap().as_ref();
+                let op = sort(count, coordinates, &[payload], permutation_map, Some(1), SortKind::QuickSort, location)
+                    .unwrap();
+                assert_eq!(op.count().unwrap(), count);
+                assert_eq!(op.coordinates_and_values().unwrap(), coordinates);
+                assert_eq!(op.payloads().unwrap(), vec![payload]);
+                assert_eq!(op.permutation_map().unwrap(), permutation_map);
+                assert_eq!(op.payload_count().unwrap(), Some(1));
+                assert_eq!(op.algorithm().unwrap().value().unwrap(), SortKind::QuickSort);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[] as &[ValueRef], location).unwrap()).unwrap();
+                func::func(
+                    "sort_test",
+                    func::FuncAttributes {
+                        arguments: vec![index_type.into(), coordinates_type.into(), payload_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3375,47 +3737,56 @@ mod tests {
     fn test_reorder_coo() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[
-                LevelType::new(LevelFormat::Compressed, &[LevelProperty::NonUnique]),
-                LevelType::from(LevelFormat::Singleton),
-            ],
-            Some(context.identity_affine_map(2)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[
+                    LevelType::new(LevelFormat::Compressed, &[LevelProperty::NonUnique]),
+                    LevelType::from(LevelFormat::Singleton),
+                ],
+                Some(context.identity_affine_map(2)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         let tensor_type = context
             .tensor_type(f64_type, &[Size::Dynamic, Size::Dynamic], Some(encoding.as_ref()), location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let op = reorder_coo(input, SortKind::QuickSort, tensor_type, location);
-            assert_eq!(op.input_coo(), input);
-            assert_eq!(op.algorithm().value(), SortKind::QuickSort);
-            assert_eq!(op.result_coo().r#type(), tensor_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "reorder_coo_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let op = reorder_coo(input, SortKind::QuickSort, tensor_type, location).unwrap();
+                assert_eq!(op.input_coo().unwrap(), input);
+                assert_eq!(op.algorithm().unwrap().value().unwrap(), SortKind::QuickSort);
+                assert_eq!(op.input_coo().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "reorder_coo_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3434,53 +3805,61 @@ mod tests {
     fn test_binary() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location), (f64_type, location)]);
-            let lhs = block.argument(0).unwrap().as_ref();
-            let rhs = block.argument(1).unwrap().as_ref();
-            let mut overlap_region = context.region();
-            let mut overlap_block = context.block(&[(f64_type, location), (f64_type, location)]);
-            let overlap_lhs = overlap_block.argument(0).unwrap().as_ref();
-            overlap_block.append_operation(r#yield(&[overlap_lhs], location));
-            overlap_region.append_block(overlap_block);
-            let op = binary(
-                lhs,
-                rhs,
-                f64_type,
-                true,
-                true,
-                overlap_region.into(),
-                context.region().into(),
-                context.region().into(),
-                location,
-            );
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert!(op.left_identity());
-            assert!(op.right_identity());
-            assert_eq!(op.overlap_region().blocks().count(), 1);
-            assert_eq!(op.left_region().blocks().count(), 0);
-            assert_eq!(op.right_region().blocks().count(), 0);
-            assert_eq!(BinaryOperation::output(&op).r#type(), f64_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 3);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "binary_test",
-                func::FuncAttributes {
-                    arguments: vec![f64_type.into(), f64_type.into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location), (f64_type, location)]);
+                let lhs = block.argument(0).unwrap().as_ref();
+                let rhs = block.argument(1).unwrap().as_ref();
+                let mut overlap_region = context.region();
+                let mut overlap_block = context.block(&[(f64_type, location), (f64_type, location)]);
+                let overlap_lhs = overlap_block.argument(0).unwrap().as_ref();
+                overlap_block.append_operation(r#yield(&[overlap_lhs], location).unwrap()).unwrap();
+                overlap_region.append_block(overlap_block).unwrap();
+                let op = binary(
+                    lhs,
+                    rhs,
+                    f64_type,
+                    true,
+                    true,
+                    overlap_region.into(),
+                    context.region().into(),
+                    context.region().into(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert!(op.left_identity());
+                assert!(op.right_identity());
+                assert_eq!(op.overlap_region().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.left_region().unwrap().blocks().unwrap().count(), 0);
+                assert_eq!(op.right_region().unwrap().blocks().unwrap().count(), 0);
+                assert_eq!(op.overlap_region().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "binary_test",
+                    func::FuncAttributes {
+                        arguments: vec![f64_type.into(), f64_type.into()],
+                        results: vec![f64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3504,39 +3883,46 @@ mod tests {
     fn test_unary() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let mut present_region = context.region();
-            let mut present_block = context.block(&[(f64_type, location)]);
-            let present_value = present_block.argument(0).unwrap().as_ref();
-            present_block.append_operation(r#yield(&[present_value], location));
-            present_region.append_block(present_block);
-            let absent_region = context.region();
-            let op = unary(input, f64_type, present_region.into(), absent_region.into(), location);
-            assert_eq!(op.input(), input);
-            assert_eq!(op.present_region().blocks().count(), 1);
-            assert_eq!(op.absent_region().blocks().count(), 0);
-            assert_eq!(UnaryOperation::output(&op).r#type(), f64_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 2);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "unary_test",
-                func::FuncAttributes {
-                    arguments: vec![f64_type.into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let mut present_region = context.region();
+                let mut present_block = context.block(&[(f64_type, location)]);
+                let present_value = present_block.argument(0).unwrap().as_ref();
+                present_block.append_operation(r#yield(&[present_value], location).unwrap()).unwrap();
+                present_region.append_block(present_block).unwrap();
+                let absent_region = context.region();
+                let op = unary(input, f64_type, present_region.into(), absent_region.into(), location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.present_region().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.absent_region().unwrap().blocks().unwrap().count(), 0);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "unary_test",
+                    func::FuncAttributes {
+                        arguments: vec![f64_type.into()],
+                        results: vec![f64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3560,41 +3946,48 @@ mod tests {
     fn test_reduce() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
-            let lhs = block.argument(0).unwrap().as_ref();
-            let rhs = block.argument(1).unwrap().as_ref();
-            let identity = block.argument(2).unwrap().as_ref();
-            let mut region = context.region();
-            let mut region_block = context.block(&[(f64_type, location), (f64_type, location)]);
-            let region_lhs = region_block.argument(0).unwrap().as_ref();
-            region_block.append_operation(r#yield(&[region_lhs], location));
-            region.append_block(region_block);
-            let op = reduce(lhs, rhs, identity, region.into(), location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.identity(), identity);
-            assert_eq!(ReduceOperation::region(&op).blocks().count(), 1);
-            assert_eq!(ReduceOperation::output(&op).r#type(), f64_type);
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "reduce_test",
-                func::FuncAttributes {
-                    arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
+                let lhs = block.argument(0).unwrap().as_ref();
+                let rhs = block.argument(1).unwrap().as_ref();
+                let identity = block.argument(2).unwrap().as_ref();
+                let mut region = context.region();
+                let mut region_block = context.block(&[(f64_type, location), (f64_type, location)]);
+                let region_lhs = region_block.argument(0).unwrap().as_ref();
+                region_block.append_operation(r#yield(&[region_lhs], location).unwrap()).unwrap();
+                region.append_block(region_block).unwrap();
+                let op = reduce(lhs, rhs, identity, region.into(), location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.identity().unwrap(), identity);
+                assert_eq!(op.as_ref().region(0).unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "reduce_test",
+                    func::FuncAttributes {
+                        arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
+                        results: vec![f64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3615,38 +4008,45 @@ mod tests {
     fn test_select() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let i1_type = context.signless_integer_type(1);
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type.as_ref(), location), (i1_type.as_ref(), location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let predicate = block.argument(1).unwrap().as_ref();
-            let mut region = context.region();
-            let mut region_block = context.block(&[(f64_type, location)]);
-            region_block.append_operation(r#yield(&[predicate], location));
-            region.append_block(region_block);
-            let op = select(input, region.into(), location);
-            assert_eq!(op.input(), input);
-            assert_eq!(SelectOperation::region(&op).blocks().count(), 1);
-            assert_eq!(SelectOperation::output(&op).r#type(), f64_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "select_test",
-                func::FuncAttributes {
-                    arguments: vec![f64_type.into(), i1_type.into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type.as_ref(), location), (i1_type.as_ref(), location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let predicate = block.argument(1).unwrap().as_ref();
+                let mut region = context.region();
+                let mut region_block = context.block(&[(f64_type, location)]);
+                region_block.append_operation(r#yield(&[predicate], location).unwrap()).unwrap();
+                region.append_block(region_block).unwrap();
+                let op = select(input, region.into(), location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.as_ref().region(0).unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "select_test",
+                    func::FuncAttributes {
+                        arguments: vec![f64_type.into(), i1_type.into()],
+                        results: vec![f64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3667,37 +4067,44 @@ mod tests {
     fn test_yield() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
-            let lhs = block.argument(0).unwrap().as_ref();
-            let rhs = block.argument(1).unwrap().as_ref();
-            let identity = block.argument(2).unwrap().as_ref();
-            let mut region = context.region();
-            let mut region_block = context.block(&[(f64_type, location), (f64_type, location)]);
-            let yielded = region_block.argument(0).unwrap().as_ref();
-            let yield_op = r#yield(&[yielded], location);
-            assert_eq!(yield_op.values(), vec![yielded]);
-            assert_eq!(yield_op.operands().count(), 1);
-            assert_eq!(yield_op.results().count(), 0);
-            region_block.append_operation(yield_op);
-            region.append_block(region_block);
-            let op = reduce(lhs, rhs, identity, region.into(), location);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "yield_test",
-                func::FuncAttributes {
-                    arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
+                let lhs = block.argument(0).unwrap().as_ref();
+                let rhs = block.argument(1).unwrap().as_ref();
+                let identity = block.argument(2).unwrap().as_ref();
+                let mut region = context.region();
+                let mut region_block = context.block(&[(f64_type, location), (f64_type, location)]);
+                let yielded = region_block.argument(0).unwrap().as_ref();
+                let yield_op = r#yield(&[yielded], location).unwrap();
+                assert_eq!(yield_op.values().unwrap(), vec![yielded]);
+                assert_eq!(yield_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(yield_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                region_block.append_operation(yield_op).unwrap();
+                region.append_block(region_block).unwrap();
+                let op = reduce(lhs, rhs, identity, region.into(), location).unwrap();
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "yield_test",
+                    func::FuncAttributes {
+                        arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
+                        results: vec![f64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3718,47 +4125,54 @@ mod tests {
     fn test_foreach() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
         let f64_type = context.float64_type();
         let i64_type = context.signless_integer_type(64);
         let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type.as_ref(), location), (i64_type.as_ref(), location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let initial = block.argument(1).unwrap().as_ref();
-            let mut body = context.region();
-            let mut body_block = context.block(&[
-                (index_type.as_ref(), location),
-                (f64_type.as_ref(), location),
-                (i64_type.as_ref(), location),
-            ]);
-            let carried = body_block.argument(2).unwrap().as_ref();
-            body_block.append_operation(r#yield(&[carried], location));
-            body.append_block(body_block);
-            let op = foreach(tensor, &[initial], None, body.into(), location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.initial_values(), vec![initial]);
-            assert_eq!(op.order(), None);
-            assert_eq!(op.final_values().len(), 1);
-            assert_eq!(op.body_region().blocks().count(), 1);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "foreach_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), i64_type.into()],
-                    results: vec![i64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type.as_ref(), location), (i64_type.as_ref(), location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let initial = block.argument(1).unwrap().as_ref();
+                let mut body = context.region();
+                let mut body_block = context.block(&[
+                    (index_type.as_ref(), location),
+                    (f64_type.as_ref(), location),
+                    (i64_type.as_ref(), location),
+                ]);
+                let carried = body_block.argument(2).unwrap().as_ref();
+                body_block.append_operation(r#yield(&[carried], location).unwrap()).unwrap();
+                body.append_block(body_block).unwrap();
+                let op = foreach(tensor, &[initial], None, body.into(), location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.initial_values().unwrap(), vec![initial]);
+                assert_eq!(op.order().unwrap(), None);
+                assert_eq!(op.final_values().unwrap().len(), 1);
+                assert_eq!(op.body_region().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "foreach_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), i64_type.into()],
+                        results: vec![i64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3779,45 +4193,54 @@ mod tests {
     fn test_extract_iteration_space() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
-        let iteration_space_type = context.sparse_tensor_iteration_space_type(encoding, 0, 1);
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let op = extract_iteration_space(tensor, None, 0, 1, iteration_space_type, location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.parent_iterator(), None);
-            assert_eq!(op.lower_level(), 0);
-            assert_eq!(op.upper_level(), 1);
-            assert_eq!(op.iteration_space().r#type(), iteration_space_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "extract_iteration_space_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![iteration_space_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
+        let iteration_space_type = context.sparse_tensor_iteration_space_type(encoding, 0, 1).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let op = extract_iteration_space(tensor, None, 0, 1, iteration_space_type, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.parent_iterator().unwrap(), None);
+                assert_eq!(op.lower_level().unwrap(), 0);
+                assert_eq!(op.upper_level().unwrap(), 1);
+                assert_eq!(op.lower_level().unwrap(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "extract_iteration_space_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![iteration_space_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3838,44 +4261,53 @@ mod tests {
     fn test_extract_value() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
-        let iterator_type = context.sparse_tensor_iterator_type(encoding, 0, 1);
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type.as_ref(), location), (iterator_type.as_ref(), location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let iterator = block.argument(1).unwrap().as_ref();
-            let op = extract_value(tensor, iterator, f64_type, location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.iterator(), iterator);
-            assert_eq!(op.value().r#type(), f64_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "extract_value_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into(), iterator_type.into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
+        let iterator_type = context.sparse_tensor_iterator_type(encoding, 0, 1).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type.as_ref(), location), (iterator_type.as_ref(), location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let iterator = block.argument(1).unwrap().as_ref();
+                let op = extract_value(tensor, iterator, f64_type, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.iterator().unwrap(), iterator);
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "extract_value_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into(), iterator_type.into()],
+                        results: vec![f64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3896,57 +4328,66 @@ mod tests {
     fn test_iterate() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let iteration_space_type = context.sparse_tensor_iteration_space_type(encoding, 0, 1);
-        let iterator_type = context.sparse_tensor_iterator_type(encoding, 0, 1);
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(iteration_space_type.as_ref(), location), (index_type.as_ref(), location)]);
-            let iteration_space = block.argument(0).unwrap().as_ref();
-            let initial = block.argument(1).unwrap().as_ref();
-            let mut body = context.region();
-            let mut body_block = context.block(&[
-                (index_type.as_ref(), location),
-                (index_type.as_ref(), location),
-                (iterator_type.as_ref(), location),
-            ]);
-            let carried = body_block.argument(0).unwrap().as_ref();
-            body_block.append_operation(r#yield(&[carried], location));
-            body.append_block(body_block);
-            let op = iterate(iteration_space, &[initial], 1, body.into(), location);
-            assert_eq!(op.iteration_space(), iteration_space);
-            assert_eq!(op.initial_values(), vec![initial]);
-            assert_eq!(op.coordinate_used_levels(), 1);
-            assert_eq!(op.final_values().len(), 1);
-            assert_eq!(op.body_region().blocks().count(), 1);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "iterate_test",
-                func::FuncAttributes {
-                    arguments: vec![iteration_space_type.into(), index_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let iteration_space_type = context.sparse_tensor_iteration_space_type(encoding, 0, 1).unwrap();
+        let iterator_type = context.sparse_tensor_iterator_type(encoding, 0, 1).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(iteration_space_type.as_ref(), location), (index_type.as_ref(), location)]);
+                let iteration_space = block.argument(0).unwrap().as_ref();
+                let initial = block.argument(1).unwrap().as_ref();
+                let mut body = context.region();
+                let mut body_block = context.block(&[
+                    (index_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                    (iterator_type.as_ref(), location),
+                ]);
+                let carried = body_block.argument(0).unwrap().as_ref();
+                body_block.append_operation(r#yield(&[carried], location).unwrap()).unwrap();
+                body.append_block(body_block).unwrap();
+                let op = iterate(iteration_space, &[initial], 1, body.into(), location).unwrap();
+                assert_eq!(op.iteration_space().unwrap(), iteration_space);
+                assert_eq!(op.initial_values().unwrap(), vec![initial]);
+                assert_eq!(op.coordinate_used_levels().unwrap(), 1);
+                assert_eq!(op.final_values().unwrap().len(), 1);
+                assert_eq!(op.body_region().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "iterate_test",
+                    func::FuncAttributes {
+                        arguments: vec![iteration_space_type.into(), index_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -3969,62 +4410,72 @@ mod tests {
     fn test_coiterate() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let iteration_space_type = context.sparse_tensor_iteration_space_type(encoding, 0, 1);
-        let iterator_type = context.sparse_tensor_iterator_type(encoding, 0, 1);
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (iteration_space_type.as_ref(), location),
-                (iteration_space_type.as_ref(), location),
-                (index_type.as_ref(), location),
-            ]);
-            let lhs_space = block.argument(0).unwrap().as_ref();
-            let rhs_space = block.argument(1).unwrap().as_ref();
-            let initial = block.argument(2).unwrap().as_ref();
-            let mut case_region = context.region();
-            let mut case_block = context.block(&[
-                (index_type.as_ref(), location),
-                (index_type.as_ref(), location),
-                (iterator_type.as_ref(), location),
-            ]);
-            let carried = case_block.argument(0).unwrap().as_ref();
-            case_block.append_operation(r#yield(&[carried], location));
-            case_region.append_block(case_block);
-            let op = coiterate(&[lhs_space, rhs_space], &[initial], 1, &[1], vec![case_region.into()], location);
-            assert_eq!(op.iteration_spaces(), vec![lhs_space, rhs_space]);
-            assert_eq!(op.initial_values(), vec![initial]);
-            assert_eq!(op.coordinate_used_levels(), 1);
-            assert_eq!(op.cases(), vec![1]);
-            assert_eq!(op.final_values().len(), 1);
-            assert_eq!(op.case_regions().len(), 1);
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "coiterate_test",
-                func::FuncAttributes {
-                    arguments: vec![iteration_space_type.into(), iteration_space_type.into(), index_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let iteration_space_type = context.sparse_tensor_iteration_space_type(encoding, 0, 1).unwrap();
+        let iterator_type = context.sparse_tensor_iterator_type(encoding, 0, 1).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (iteration_space_type.as_ref(), location),
+                    (iteration_space_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                ]);
+                let lhs_space = block.argument(0).unwrap().as_ref();
+                let rhs_space = block.argument(1).unwrap().as_ref();
+                let initial = block.argument(2).unwrap().as_ref();
+                let mut case_region = context.region();
+                let mut case_block = context.block(&[
+                    (index_type.as_ref(), location),
+                    (index_type.as_ref(), location),
+                    (iterator_type.as_ref(), location),
+                ]);
+                let carried = case_block.argument(0).unwrap().as_ref();
+                case_block.append_operation(r#yield(&[carried], location).unwrap()).unwrap();
+                case_region.append_block(case_block).unwrap();
+                let op = coiterate(&[lhs_space, rhs_space], &[initial], 1, &[1], vec![case_region.into()], location)
+                    .unwrap();
+                assert_eq!(op.iteration_spaces().unwrap(), vec![lhs_space, rhs_space]);
+                assert_eq!(op.initial_values().unwrap(), vec![initial]);
+                assert_eq!(op.coordinate_used_levels().unwrap(), 1);
+                assert_eq!(op.cases().unwrap(), vec![1]);
+                assert_eq!(op.final_values().unwrap().len(), 1);
+                assert_eq!(op.case_regions().unwrap().len(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "coiterate_test",
+                    func::FuncAttributes {
+                        arguments: vec![iteration_space_type.into(), iteration_space_type.into(), index_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4049,36 +4500,43 @@ mod tests {
     fn test_print() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        let encoding = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            0,
-            0,
-            None,
-            None,
-            &[],
-        );
-        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let tensor = block.argument(0).unwrap().as_ref();
-            let op = print(tensor, location);
-            assert_eq!(op.tensor(), tensor);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 0);
-            block.append_operation(op);
-            block.append_operation(func::r#return(&[] as &[ValueRef], location));
-            func::func(
-                "print_test",
-                func::FuncAttributes { arguments: vec![tensor_type.into()], ..Default::default() },
-                block.into(),
-                location,
+        let encoding = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                0,
+                0,
+                None,
+                None,
+                &[],
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        let tensor_type = context.tensor_type(f64_type, &[Size::Dynamic], Some(encoding.as_ref()), location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let tensor = block.argument(0).unwrap().as_ref();
+                let op = print(tensor, location).unwrap();
+                assert_eq!(op.tensor().unwrap(), tensor);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[] as &[ValueRef], location).unwrap()).unwrap();
+                func::func(
+                    "print_test",
+                    func::FuncAttributes { arguments: vec![tensor_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -4097,24 +4555,31 @@ mod tests {
     fn test_has_runtime_library() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let result_type = context.signless_integer_type(1);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = has_runtime_library(location);
-            assert_eq!(op.enabled().r#type(), result_type);
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "has_runtime_library_test",
-                func::FuncAttributes { results: vec![result_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = has_runtime_library(location).unwrap();
+                assert_eq!(op.enabled().unwrap().r#type().unwrap(), result_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(func::r#return(&[op.as_ref().result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "has_runtime_library_test",
+                    func::FuncAttributes { results: vec![result_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

@@ -1,6 +1,6 @@
 use crate::{
-    AttributeRef, DetachedOp, DialectHandle, Location, Operation, OperationBuilder, Type, TypeRef, Value, ValueRef,
-    mlir_op,
+    AttributeRef, DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Type, TypeRef, Value,
+    ValueRef, mlir_op,
 };
 
 /// Canonical MLIR operation name for [`VectorDeinterleave2Operation`].
@@ -14,13 +14,13 @@ pub trait VectorDeinterleave2Operation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't
     }
 
     /// Returns the `vector` operand.
-    fn vector(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn vector(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -31,16 +31,17 @@ pub fn intr_vector_deinterleave2<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: 
     vector: V0,
     result_type: T0,
     location: L,
-) -> DetachedVectorDeinterleave2Operation<'c, 't> {
+) -> Result<DetachedVectorDeinterleave2Operation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_DEINTERLEAVE2_OPERATION_NAME, location);
     builder = builder.add_operand(vector);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_deinterleave2`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_deinterleave2`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorExtractOperation`].
@@ -54,18 +55,24 @@ pub trait VectorExtractOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `source_vector` operand.
-    fn source_vector(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn source_vector(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `pos` attribute.
-    fn pos(&self) -> AttributeRef<'c, 't> {
-        self.attribute("pos").unwrap()
+    fn pos(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("pos")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "pos",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -77,17 +84,18 @@ pub fn intr_vector_extract<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'
     result_type: T0,
     pos: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedVectorExtractOperation<'c, 't> {
+) -> Result<DetachedVectorExtractOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_EXTRACT_OPERATION_NAME, location);
     builder = builder.add_operand(source_vector);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("pos", pos);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_extract`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_extract`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorInsertOperation`].
@@ -101,23 +109,29 @@ pub trait VectorInsertOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `destination_vector` operand.
-    fn destination_vector(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn destination_vector(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `source_vector` operand.
-    fn source_vector(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn source_vector(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `pos` attribute.
-    fn pos(&self) -> AttributeRef<'c, 't> {
-        self.attribute("pos").unwrap()
+    fn pos(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("pos")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "pos",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -138,18 +152,19 @@ pub fn intr_vector_insert<
     result_type: T0,
     pos: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedVectorInsertOperation<'c, 't> {
+) -> Result<DetachedVectorInsertOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_INSERT_OPERATION_NAME, location);
     builder = builder.add_operand(destination_vector);
     builder = builder.add_operand(source_vector);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("pos", pos);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_insert`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_insert`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorInterleave2Operation`].
@@ -163,18 +178,18 @@ pub trait VectorInterleave2Operation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> 
     }
 
     /// Returns the `first_vector` operand.
-    fn first_vector(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn first_vector(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `second_vector` operand.
-    fn second_vector(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn second_vector(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -194,17 +209,18 @@ pub fn intr_vector_interleave2<
     second_vector: V1,
     result_type: T0,
     location: L,
-) -> DetachedVectorInterleave2Operation<'c, 't> {
+) -> Result<DetachedVectorInterleave2Operation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_INTERLEAVE2_OPERATION_NAME, location);
     builder = builder.add_operand(first_vector);
     builder = builder.add_operand(second_vector);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_interleave2`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_interleave2`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceAddOperation`].
@@ -218,13 +234,13 @@ pub trait VectorReduceAddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -235,16 +251,17 @@ pub fn intr_vector_reduce_add<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Typ
     input: V0,
     result_type: T0,
     location: L,
-) -> DetachedVectorReduceAddOperation<'c, 't> {
+) -> Result<DetachedVectorReduceAddOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_ADD_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_add`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_add`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceAndOperation`].
@@ -258,13 +275,13 @@ pub trait VectorReduceAndOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -275,16 +292,17 @@ pub fn intr_vector_reduce_and<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Typ
     input: V0,
     result_type: T0,
     location: L,
-) -> DetachedVectorReduceAndOperation<'c, 't> {
+) -> Result<DetachedVectorReduceAndOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_AND_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_and`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_and`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceFaddOperation`].
@@ -298,23 +316,23 @@ pub trait VectorReduceFaddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `start_value` operand.
-    fn start_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn start_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the optional `fastmathFlags` attribute.
-    fn fastmath_flags(&self) -> Option<AttributeRef<'c, 't>> {
+    fn fastmath_flags(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("fastmathFlags")
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -335,9 +353,9 @@ pub fn intr_vector_reduce_fadd<
     result_type: T0,
     fastmath_flags: Option<AttributeRef<'c, 't>>,
     location: L,
-) -> DetachedVectorReduceFaddOperation<'c, 't> {
+) -> Result<DetachedVectorReduceFaddOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FADD_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(input);
@@ -345,10 +363,11 @@ pub fn intr_vector_reduce_fadd<
     if let Some(fastmath_flags) = fastmath_flags {
         builder = builder.add_attribute("fastmathFlags", fastmath_flags);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_fadd`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_fadd`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceFmaxOperation`].
@@ -362,18 +381,18 @@ pub trait VectorReduceFmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the optional `fastmathFlags` attribute.
-    fn fastmath_flags(&self) -> Option<AttributeRef<'c, 't>> {
+    fn fastmath_flags(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("fastmathFlags")
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -385,19 +404,20 @@ pub fn intr_vector_reduce_fmax<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     result_type: T0,
     fastmath_flags: Option<AttributeRef<'c, 't>>,
     location: L,
-) -> DetachedVectorReduceFmaxOperation<'c, 't> {
+) -> Result<DetachedVectorReduceFmaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FMAX_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
     if let Some(fastmath_flags) = fastmath_flags {
         builder = builder.add_attribute("fastmathFlags", fastmath_flags);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_fmax`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_fmax`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceFmaximumOperation`].
@@ -411,18 +431,18 @@ pub trait VectorReduceFmaximumOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, '
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the optional `fastmathFlags` attribute.
-    fn fastmath_flags(&self) -> Option<AttributeRef<'c, 't>> {
+    fn fastmath_flags(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("fastmathFlags")
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -434,19 +454,20 @@ pub fn intr_vector_reduce_fmaximum<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0
     result_type: T0,
     fastmath_flags: Option<AttributeRef<'c, 't>>,
     location: L,
-) -> DetachedVectorReduceFmaximumOperation<'c, 't> {
+) -> Result<DetachedVectorReduceFmaximumOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FMAXIMUM_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
     if let Some(fastmath_flags) = fastmath_flags {
         builder = builder.add_attribute("fastmathFlags", fastmath_flags);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_fmaximum`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_fmaximum`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceFminOperation`].
@@ -460,18 +481,18 @@ pub trait VectorReduceFminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the optional `fastmathFlags` attribute.
-    fn fastmath_flags(&self) -> Option<AttributeRef<'c, 't>> {
+    fn fastmath_flags(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("fastmathFlags")
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -483,19 +504,20 @@ pub fn intr_vector_reduce_fmin<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     result_type: T0,
     fastmath_flags: Option<AttributeRef<'c, 't>>,
     location: L,
-) -> DetachedVectorReduceFminOperation<'c, 't> {
+) -> Result<DetachedVectorReduceFminOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FMIN_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
     if let Some(fastmath_flags) = fastmath_flags {
         builder = builder.add_attribute("fastmathFlags", fastmath_flags);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_fmin`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_fmin`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceFminimumOperation`].
@@ -509,18 +531,18 @@ pub trait VectorReduceFminimumOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, '
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the optional `fastmathFlags` attribute.
-    fn fastmath_flags(&self) -> Option<AttributeRef<'c, 't>> {
+    fn fastmath_flags(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("fastmathFlags")
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -532,19 +554,20 @@ pub fn intr_vector_reduce_fminimum<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0
     result_type: T0,
     fastmath_flags: Option<AttributeRef<'c, 't>>,
     location: L,
-) -> DetachedVectorReduceFminimumOperation<'c, 't> {
+) -> Result<DetachedVectorReduceFminimumOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FMINIMUM_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
     if let Some(fastmath_flags) = fastmath_flags {
         builder = builder.add_attribute("fastmathFlags", fastmath_flags);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_fminimum`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_fminimum`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceFmulOperation`].
@@ -558,23 +581,23 @@ pub trait VectorReduceFmulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `start_value` operand.
-    fn start_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn start_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the optional `fastmathFlags` attribute.
-    fn fastmath_flags(&self) -> Option<AttributeRef<'c, 't>> {
+    fn fastmath_flags(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute("fastmathFlags")
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -595,9 +618,9 @@ pub fn intr_vector_reduce_fmul<
     result_type: T0,
     fastmath_flags: Option<AttributeRef<'c, 't>>,
     location: L,
-) -> DetachedVectorReduceFmulOperation<'c, 't> {
+) -> Result<DetachedVectorReduceFmulOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FMUL_OPERATION_NAME, location);
     builder = builder.add_operand(start_value);
     builder = builder.add_operand(input);
@@ -605,10 +628,11 @@ pub fn intr_vector_reduce_fmul<
     if let Some(fastmath_flags) = fastmath_flags {
         builder = builder.add_attribute("fastmathFlags", fastmath_flags);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_fmul`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_fmul`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceMulOperation`].
@@ -622,13 +646,13 @@ pub trait VectorReduceMulOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -639,16 +663,17 @@ pub fn intr_vector_reduce_mul<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Typ
     input: V0,
     result_type: T0,
     location: L,
-) -> DetachedVectorReduceMulOperation<'c, 't> {
+) -> Result<DetachedVectorReduceMulOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_MUL_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_mul`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_mul`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceOrOperation`].
@@ -662,13 +687,13 @@ pub trait VectorReduceOrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -679,16 +704,17 @@ pub fn intr_vector_reduce_or<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type
     input: V0,
     result_type: T0,
     location: L,
-) -> DetachedVectorReduceOrOperation<'c, 't> {
+) -> Result<DetachedVectorReduceOrOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_OR_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_or`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_or`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceSmaxOperation`].
@@ -702,13 +728,13 @@ pub trait VectorReduceSmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -719,16 +745,17 @@ pub fn intr_vector_reduce_smax<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     input: V0,
     result_type: T0,
     location: L,
-) -> DetachedVectorReduceSmaxOperation<'c, 't> {
+) -> Result<DetachedVectorReduceSmaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_SMAX_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_smax`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_smax`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceSminOperation`].
@@ -742,13 +769,13 @@ pub trait VectorReduceSminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -759,16 +786,17 @@ pub fn intr_vector_reduce_smin<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     input: V0,
     result_type: T0,
     location: L,
-) -> DetachedVectorReduceSminOperation<'c, 't> {
+) -> Result<DetachedVectorReduceSminOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_SMIN_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_smin`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_smin`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceUmaxOperation`].
@@ -782,13 +810,13 @@ pub trait VectorReduceUmaxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -799,16 +827,17 @@ pub fn intr_vector_reduce_umax<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     input: V0,
     result_type: T0,
     location: L,
-) -> DetachedVectorReduceUmaxOperation<'c, 't> {
+) -> Result<DetachedVectorReduceUmaxOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_UMAX_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_umax`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_umax`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceUminOperation`].
@@ -822,13 +851,13 @@ pub trait VectorReduceUminOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -839,16 +868,17 @@ pub fn intr_vector_reduce_umin<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     input: V0,
     result_type: T0,
     location: L,
-) -> DetachedVectorReduceUminOperation<'c, 't> {
+) -> Result<DetachedVectorReduceUminOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_UMIN_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_umin`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_umin`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VectorReduceXorOperation`].
@@ -862,13 +892,13 @@ pub trait VectorReduceXorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `input` operand.
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -879,16 +909,17 @@ pub fn intr_vector_reduce_xor<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Typ
     input: V0,
     result_type: T0,
     location: L,
-) -> DetachedVectorReduceXorOperation<'c, 't> {
+) -> Result<DetachedVectorReduceXorOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_XOR_OPERATION_NAME, location);
     builder = builder.add_operand(input);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vector_reduce_xor`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vector_reduce_xor`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`VscaleOperation`].
@@ -902,8 +933,8 @@ pub trait VscaleOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns this operation's result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -913,15 +944,14 @@ mlir_op!(Vscale);
 pub fn intr_vscale<'v, 'c: 'v, 't: 'c, T0: Type<'c, 't>, L: Location<'c, 't>>(
     result_type: T0,
     location: L,
-) -> DetachedVscaleOperation<'c, 't> {
+) -> Result<DetachedVscaleOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VSCALE_OPERATION_NAME, location);
     builder = builder.add_result(result_type);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::intr_vscale`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vscale`"))
+    })
 }
 
 #[cfg(test)]
@@ -937,34 +967,39 @@ mod tests {
     #[test]
     fn test_intr_vector_deinterleave2() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
         let vector8_i32_type = context.parse_type("vector<8xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector8_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_deinterleave2(arg_0, vector_i32_type, location);
-            assert_eq!(op.vector(), arg_0);
-            assert_eq!(op.output_type(), vector_i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.deinterleave2");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_deinterleave2_test",
-                func::FuncAttributes {
-                    arguments: vec![vector8_i32_type.into()],
-                    results: vec![vector_i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector8_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_deinterleave2(arg_0, vector_i32_type, location).unwrap();
+                assert_eq!(op.vector().unwrap(), arg_0);
+                assert_eq!(op.output_type().unwrap(), vector_i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.deinterleave2");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_deinterleave2_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector8_i32_type.into()],
+                        results: vec![vector_i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -981,36 +1016,41 @@ mod tests {
     #[test]
     fn test_intr_vector_extract() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
         let pos = context.integer_attribute(i64_type, 1).as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_extract(arg_0, vector_i32_type, pos, location);
-            assert_eq!(op.source_vector(), arg_0);
-            assert_eq!(op.pos(), pos);
-            assert_eq!(op.output_type(), vector_i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.extract");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_extract_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into()],
-                    results: vec![vector_i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_extract(arg_0, vector_i32_type, pos, location).unwrap();
+                assert_eq!(op.source_vector().unwrap(), arg_0);
+                assert_eq!(op.pos().unwrap(), pos);
+                assert_eq!(op.output_type().unwrap(), vector_i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.extract");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_extract_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into()],
+                        results: vec![vector_i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1027,39 +1067,44 @@ mod tests {
     #[test]
     fn test_intr_vector_insert() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
         let pos = context.integer_attribute(i64_type, 1).as_ref();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(vector_i32_type.as_ref(), location), (vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let arg_1 = block.argument(1).unwrap();
-            let op = intr_vector_insert(arg_0, arg_1, vector_i32_type, pos, location);
-            assert_eq!(op.destination_vector(), arg_0);
-            assert_eq!(op.source_vector(), arg_1);
-            assert_eq!(op.pos(), pos);
-            assert_eq!(op.output_type(), vector_i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.insert");
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_insert_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into(), vector_i32_type.into()],
-                    results: vec![vector_i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(vector_i32_type.as_ref(), location), (vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let arg_1 = block.argument(1).unwrap();
+                let op = intr_vector_insert(arg_0, arg_1, vector_i32_type, pos, location).unwrap();
+                assert_eq!(op.destination_vector().unwrap(), arg_0);
+                assert_eq!(op.source_vector().unwrap(), arg_1);
+                assert_eq!(op.pos().unwrap(), pos);
+                assert_eq!(op.output_type().unwrap(), vector_i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.insert");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_insert_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into(), vector_i32_type.into()],
+                        results: vec![vector_i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1076,37 +1121,42 @@ mod tests {
     #[test]
     fn test_intr_vector_interleave2() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
         let vector8_i32_type = context.parse_type("vector<8xi32>").unwrap();
-        module.body().append_operation({
-            let mut block =
-                context.block(&[(vector_i32_type.as_ref(), location), (vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let arg_1 = block.argument(1).unwrap();
-            let op = intr_vector_interleave2(arg_0, arg_1, vector8_i32_type, location);
-            assert_eq!(op.first_vector(), arg_0);
-            assert_eq!(op.second_vector(), arg_1);
-            assert_eq!(op.output_type(), vector8_i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.interleave2");
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_interleave2_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into(), vector_i32_type.into()],
-                    results: vec![vector8_i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(vector_i32_type.as_ref(), location), (vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let arg_1 = block.argument(1).unwrap();
+                let op = intr_vector_interleave2(arg_0, arg_1, vector8_i32_type, location).unwrap();
+                assert_eq!(op.first_vector().unwrap(), arg_0);
+                assert_eq!(op.second_vector().unwrap(), arg_1);
+                assert_eq!(op.output_type().unwrap(), vector8_i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.interleave2");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_interleave2_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into(), vector_i32_type.into()],
+                        results: vec![vector8_i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1123,34 +1173,39 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_add() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_add(arg_0, i32_type, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.add");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_add_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_add(arg_0, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.add");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_add_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1167,34 +1222,39 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_and() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_and(arg_0, i32_type, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.and");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_and_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_and(arg_0, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.and");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_and_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1211,37 +1271,42 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_fadd() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type.as_ref(), location), (vector_f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let arg_1 = block.argument(1).unwrap();
-            let op = intr_vector_reduce_fadd(arg_0, arg_1, f32_type, None, location);
-            assert_eq!(op.start_value(), arg_0);
-            assert_eq!(op.input(), arg_1);
-            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fadd");
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_fadd_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), vector_f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type.as_ref(), location), (vector_f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let arg_1 = block.argument(1).unwrap();
+                let op = intr_vector_reduce_fadd(arg_0, arg_1, f32_type, None, location).unwrap();
+                assert_eq!(op.start_value().unwrap(), arg_0);
+                assert_eq!(op.input().unwrap(), arg_1);
+                assert_eq!(op.fastmath_flags().unwrap().unwrap().to_string(), "#llvm.fastmath<none>");
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fadd");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_fadd_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), vector_f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1258,35 +1323,40 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_fmax() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_fmax(arg_0, f32_type, None, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fmax");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_fmax_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_fmax(arg_0, f32_type, None, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.fastmath_flags().unwrap().unwrap().to_string(), "#llvm.fastmath<none>");
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fmax");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_fmax_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1303,35 +1373,40 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_fmaximum() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_fmaximum(arg_0, f32_type, None, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fmaximum");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_fmaximum_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_fmaximum(arg_0, f32_type, None, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.fastmath_flags().unwrap().unwrap().to_string(), "#llvm.fastmath<none>");
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fmaximum");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_fmaximum_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1348,35 +1423,40 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_fmin() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_fmin(arg_0, f32_type, None, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fmin");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_fmin_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_fmin(arg_0, f32_type, None, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.fastmath_flags().unwrap().unwrap().to_string(), "#llvm.fastmath<none>");
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fmin");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_fmin_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1393,35 +1473,40 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_fminimum() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_fminimum(arg_0, f32_type, None, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fminimum");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_fminimum_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_fminimum(arg_0, f32_type, None, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.fastmath_flags().unwrap().unwrap().to_string(), "#llvm.fastmath<none>");
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fminimum");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_fminimum_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1438,37 +1523,42 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_fmul() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let vector_f32_type = context.parse_type("vector<4xf32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type.as_ref(), location), (vector_f32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let arg_1 = block.argument(1).unwrap();
-            let op = intr_vector_reduce_fmul(arg_0, arg_1, f32_type, None, location);
-            assert_eq!(op.start_value(), arg_0);
-            assert_eq!(op.input(), arg_1);
-            assert_eq!(op.fastmath_flags().unwrap().to_string(), "#llvm.fastmath<none>");
-            assert_eq!(op.output_type(), f32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fmul");
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_fmul_test",
-                func::FuncAttributes {
-                    arguments: vec![f32_type.into(), vector_f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type.as_ref(), location), (vector_f32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let arg_1 = block.argument(1).unwrap();
+                let op = intr_vector_reduce_fmul(arg_0, arg_1, f32_type, None, location).unwrap();
+                assert_eq!(op.start_value().unwrap(), arg_0);
+                assert_eq!(op.input().unwrap(), arg_1);
+                assert_eq!(op.fastmath_flags().unwrap().unwrap().to_string(), "#llvm.fastmath<none>");
+                assert_eq!(op.output_type().unwrap(), f32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.fmul");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_fmul_test",
+                    func::FuncAttributes {
+                        arguments: vec![f32_type.into(), vector_f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1485,34 +1575,39 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_mul() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_mul(arg_0, i32_type, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.mul");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_mul_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_mul(arg_0, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.mul");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_mul_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1529,34 +1624,39 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_or() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_or(arg_0, i32_type, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.or");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_or_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_or(arg_0, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.or");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_or_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1573,34 +1673,39 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_smax() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_smax(arg_0, i32_type, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.smax");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_smax_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_smax(arg_0, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.smax");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_smax_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1617,34 +1722,39 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_smin() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_smin(arg_0, i32_type, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.smin");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_smin_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_smin(arg_0, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.smin");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_smin_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1661,34 +1771,39 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_umax() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_umax(arg_0, i32_type, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.umax");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_umax_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_umax(arg_0, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.umax");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_umax_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1705,34 +1820,39 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_umin() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_umin(arg_0, i32_type, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.umin");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_umin_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_umin(arg_0, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.umin");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_umin_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1749,34 +1869,39 @@ mod tests {
     #[test]
     fn test_intr_vector_reduce_xor() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let vector_i32_type = context.parse_type("vector<4xi32>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
-            let arg_0 = block.argument(0).unwrap();
-            let op = intr_vector_reduce_xor(arg_0, i32_type, location);
-            assert_eq!(op.input(), arg_0);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.xor");
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vector_reduce_xor_test",
-                func::FuncAttributes {
-                    arguments: vec![vector_i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(vector_i32_type.as_ref(), location)]);
+                let arg_0 = block.argument(0).unwrap();
+                let op = intr_vector_reduce_xor(arg_0, i32_type, location).unwrap();
+                assert_eq!(op.input().unwrap(), arg_0);
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vector.reduce.xor");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vector_reduce_xor_test",
+                    func::FuncAttributes {
+                        arguments: vec![vector_i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1793,27 +1918,32 @@ mod tests {
     #[test]
     fn test_intr_vscale() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = intr_vscale(i32_type.as_ref(), location);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operation_name(), "llvm.intr.vscale");
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_intr_vscale_test",
-                func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = intr_vscale(i32_type.as_ref(), location).unwrap();
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operation_name(), "llvm.intr.vscale");
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_intr_vscale_test",
+                    func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

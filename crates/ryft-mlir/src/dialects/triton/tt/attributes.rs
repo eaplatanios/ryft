@@ -3,7 +3,7 @@ use ryft_xla_sys::mlir::dialects::triton::tt::{
     MlirTritonTtEnumAttribute, mlirAttributeIsATritonTtEnumAttr, mlirTritonTtEnumAttrGet, mlirTritonTtEnumAttrGetValue,
 };
 
-use crate::{Attribute, Context, DialectHandle, FromWithContext, StringRef, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, DialectHandle, Error, StringRef, mlir_subtype_trait_impls};
 
 macro_rules! tt_enum_attribute {
     (
@@ -54,25 +54,25 @@ macro_rules! tt_enum_attribute {
 
         impl<'c, 't> $attribute_name<'c, 't> {
             /// Returns the enum value stored in this attribute.
-            pub fn value(&self) -> $enum_name {
+            pub fn value(&self) -> Result<$enum_name, Error> {
                 let value = unsafe { StringRef::from_c_api(mlirTritonTtEnumAttrGetValue(self.handle, $ffi_kind)) };
                 value
                     .as_str()
                     .ok()
                     .and_then($enum_name::from_str)
-                    .expect(concat!("invalid Triton `tt` `", $mnemonic, "` attribute"))
+                    .ok_or_else(|| Error::invalid_argument(concat!("invalid Triton `tt` `", $mnemonic, "` attribute")))
             }
         }
 
         impl<'c, 't> Attribute<'c, 't> for $attribute_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR attribute handle"));
                 }
                 if unsafe { mlirAttributeIsATritonTtEnumAttr(handle, $ffi_kind) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR attribute handle"))
                 }
             }
 
@@ -87,25 +87,19 @@ macro_rules! tt_enum_attribute {
 
         mlir_subtype_trait_impls!($attribute_name<'c, 't> as Attribute, mlir_type = Attribute);
 
-        impl<'c, 't> FromWithContext<'c, 't, $enum_name> for $attribute_name<'c, 't> {
-            fn from_with_context(value: $enum_name, context: &'c Context<'t>) -> Self {
-                context.$context_method(value)
-            }
-        }
-
         impl<'t> Context<'t> {
             #[doc = "Creates a Triton `tt` "]
             #[doc = $description]
             #[doc = " attribute owned by this [`Context`]."]
-            pub fn $context_method<'c>(&'c self, value: $enum_name) -> $attribute_name<'c, 't> {
-                self.load_dialect(DialectHandle::triton_tt());
+            pub fn $context_method<'c>(&'c self, value: $enum_name) -> Result<$attribute_name<'c, 't>, Error> {
+                self.load_dialect(DialectHandle::triton_tt()?)?;
                 let value = StringRef::from(value.as_str());
                 unsafe {
                     $attribute_name::from_c_api(
                         mlirTritonTtEnumAttrGet(*self.handle.borrow_mut(), $ffi_kind, value.to_c_api()),
                         self,
                     )
-                    .expect(concat!("invalid arguments to `Context::", stringify!($context_method), "`"))
+                    .map_err(|_| Error::invalid_argument(concat!("invalid Triton `tt` `", $mnemonic, "` attribute")))
                 }
             }
         }
@@ -324,10 +318,10 @@ mod tests {
             #[test]
             fn $test_name() {
                 let context = Context::new();
-                let attribute = context.$context_method($enum_name::$value_1);
+                let attribute = context.$context_method($enum_name::$value_1).unwrap();
                 assert_eq!(&context, attribute.context());
-                assert_eq!(attribute.value(), $enum_name::$value_1);
-                assert_eq!(attribute.value().as_str(), $enum_name::$value_1.as_str());
+                assert_eq!(attribute.value().unwrap(), $enum_name::$value_1);
+                assert_eq!(attribute.value().unwrap().as_str(), $enum_name::$value_1.as_str());
                 assert_eq!($enum_name::from_str($enum_name::$value_1.as_str()), Some($enum_name::$value_1));
                 assert_eq!($enum_name::from_str("invalid"), None);
             }
@@ -337,31 +331,31 @@ mod tests {
                 let context = Context::new();
 
                 // Same attributes from the same context must be equal because they are "uniqued".
-                let attribute_1 = context.$context_method($enum_name::$value_1);
-                let attribute_2 = context.$context_method($enum_name::$value_1);
+                let attribute_1 = context.$context_method($enum_name::$value_1).unwrap();
+                let attribute_2 = context.$context_method($enum_name::$value_1).unwrap();
                 assert_eq!(attribute_1, attribute_2);
 
                 // Different attributes from the same context must not be equal.
-                let attribute_2 = context.$context_method($enum_name::$value_2);
+                let attribute_2 = context.$context_method($enum_name::$value_2).unwrap();
                 assert_ne!(attribute_1, attribute_2);
 
                 // Same attributes from different contexts must not be equal.
                 let context = Context::new();
-                let attribute_2 = context.$context_method($enum_name::$value_1);
+                let attribute_2 = context.$context_method($enum_name::$value_1).unwrap();
                 assert_ne!(attribute_1, attribute_2);
             }
 
             #[test]
             fn $test_display_name() {
                 let context = Context::new();
-                let attribute = context.$context_method($enum_name::$value_1);
+                let attribute = context.$context_method($enum_name::$value_1).unwrap();
                 test_attribute_display_and_debug(attribute, $expected);
             }
 
             #[test]
             fn $test_casting_name() {
                 let context = Context::new();
-                let attribute = context.$context_method($enum_name::$value_1);
+                let attribute = context.$context_method($enum_name::$value_1).unwrap();
                 test_attribute_casting(attribute);
             }
         };

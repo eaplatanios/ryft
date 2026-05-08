@@ -6,7 +6,7 @@ use ryft_xla_sys::bindings::{
     mlirRegionInsertOwnedBlockBefore, mlirRegionTakeBody,
 };
 
-use crate::{Block, BlockRef, Context, DetachedBlock, FromWithContext};
+use crate::{Block, BlockRef, Context, DetachedBlock, Error, TryFromWithContext};
 
 /// [`Region`]s are one of the main building blocks of MLIR programs. MLIR is fundamentally based on a graph-like
 /// data structure of nodes, called [`Operation`](crate::Operation)s, and edges, called [`Value`](crate::Value)s.
@@ -45,24 +45,25 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
 
     /// Returns a reference to this [`Region`].
     fn as_ref(&self) -> RegionRef<'r, 'c, 't> {
-        unsafe { RegionRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
+        RegionRef { handle: unsafe { self.to_c_api() }, context: self.context(), owner: PhantomData }
     }
 
     /// Returns `true` if this [`Region`] is empty (i.e., if it contains no [`Block`]s).
     fn is_empty(&self) -> bool {
-        self.blocks().current_block.is_none()
+        unsafe { mlirRegionGetFirstBlock(self.to_c_api()).ptr.is_null() }
     }
 
     /// Returns a [`RegionBlockRefIterator`], that enables iteration over references of all [`Block`]s contained
     /// in this [`Region`].
-    fn blocks(&self) -> RegionBlockRefIterator<'r, 'c, 't> {
-        RegionBlockRefIterator {
-            current_block: unsafe { BlockRef::from_c_api(mlirRegionGetFirstBlock(self.to_c_api()), self.context()) },
-        }
+    fn blocks(&self) -> Result<RegionBlockRefIterator<'r, 'c, 't>, Error> {
+        let handle = unsafe { mlirRegionGetFirstBlock(self.to_c_api()) };
+        let current_block =
+            if handle.ptr.is_null() { None } else { Some(unsafe { BlockRef::from_c_api(handle, self.context())? }) };
+        Ok(RegionBlockRefIterator { current_block, error: None })
     }
 
     /// Appends the provided [`Block`] to the end of this [`Region`] and returns a reference to the appended [`Block`].
-    fn append_block(&mut self, block: DetachedBlock<'c, 't>) -> BlockRef<'r, 'c, 't> {
+    fn append_block(&mut self, block: DetachedBlock<'c, 't>) -> Result<BlockRef<'r, 'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
@@ -71,7 +72,7 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
             let handle = block.to_c_api();
             std::mem::forget(block);
             mlirRegionAppendOwnedBlock(self.to_c_api(), handle);
-            BlockRef::from_c_api(handle, self.context()).unwrap()
+            BlockRef::from_c_api(handle, self.context())
         }
     }
 
@@ -79,7 +80,7 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
     /// the inserted [`Block`]. Note that this is an expensive operation that scans the [`Region`] linearly to find the
     /// insertion point. You should instead use [`Region::insert_block_after`] and/or [`Region::insert_block_before`]
     /// when possible.
-    fn insert_block(&mut self, block: DetachedBlock<'c, 't>, index: usize) -> BlockRef<'r, 'c, 't> {
+    fn insert_block(&mut self, block: DetachedBlock<'c, 't>, index: usize) -> Result<BlockRef<'r, 'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
@@ -88,7 +89,7 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
             let handle = block.to_c_api();
             std::mem::forget(block);
             mlirRegionInsertOwnedBlock(self.to_c_api(), index.cast_signed(), handle);
-            BlockRef::from_c_api(handle, self.context()).unwrap()
+            BlockRef::from_c_api(handle, self.context())
         }
     }
 
@@ -99,7 +100,7 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
         &mut self,
         block: DetachedBlock<'c, 't>,
         reference: Option<&BlockRef<'r, 'c, 't>>,
-    ) -> BlockRef<'r, 'c, 't> {
+    ) -> Result<BlockRef<'r, 'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
@@ -109,7 +110,7 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
             let handle = block.to_c_api();
             std::mem::forget(block);
             mlirRegionInsertOwnedBlockAfter(self.to_c_api(), reference, handle);
-            BlockRef::from_c_api(handle, self.context()).unwrap()
+            BlockRef::from_c_api(handle, self.context())
         }
     }
 
@@ -120,7 +121,7 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
         &mut self,
         block: DetachedBlock<'c, 't>,
         reference: Option<&BlockRef<'r, 'c, 't>>,
-    ) -> BlockRef<'r, 'c, 't> {
+    ) -> Result<BlockRef<'r, 'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
@@ -130,7 +131,7 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
             let handle = block.to_c_api();
             std::mem::forget(block);
             mlirRegionInsertOwnedBlockBefore(self.to_c_api(), reference, handle);
-            BlockRef::from_c_api(handle, self.context()).unwrap()
+            BlockRef::from_c_api(handle, self.context())
         }
     }
 
@@ -200,21 +201,23 @@ impl Drop for DetachedRegion<'_, '_> {
     }
 }
 
-impl<'c, 't> From<DetachedBlock<'c, 't>> for DetachedRegion<'c, 't> {
-    fn from(value: DetachedBlock<'c, 't>) -> Self {
+impl<'c, 't> TryFrom<DetachedBlock<'c, 't>> for DetachedRegion<'c, 't> {
+    type Error = Error;
+
+    fn try_from(value: DetachedBlock<'c, 't>) -> Result<Self, Self::Error> {
         let mut region = value.context().region();
-        region.append_block(value);
-        region
+        region.append_block(value)?;
+        Ok(region)
     }
 }
 
-impl<'c, 't> FromWithContext<'c, 't, Vec<DetachedBlock<'c, 't>>> for DetachedRegion<'c, 't> {
-    fn from_with_context(value: Vec<DetachedBlock<'c, 't>>, context: &'c Context<'t>) -> Self {
+impl<'c, 't> TryFromWithContext<'c, 't, Vec<DetachedBlock<'c, 't>>> for DetachedRegion<'c, 't> {
+    fn try_from_with_context(value: Vec<DetachedBlock<'c, 't>>, context: &'c Context<'t>) -> Result<Self, Error> {
         let mut region = context.region();
         for block in value {
-            region.append_block(block);
+            region.append_block(block)?;
         }
-        region
+        Ok(region)
     }
 }
 
@@ -251,8 +254,12 @@ impl<'o, 'c, 't> RegionRef<'o, 'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirRegion, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context, owner: PhantomData }) }
+    pub unsafe fn from_c_api(handle: MlirRegion, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR region handle"))
+        } else {
+            Ok(Self { handle, context, owner: PhantomData })
+        }
     }
 }
 
@@ -280,9 +287,11 @@ impl<'o, 'r: 'o, 'c: 'r, 't: 'c, R: Region<'r, 'c, 't>> PartialEq<R> for RegionR
 
 impl<'o, 'c, 't> Eq for RegionRef<'o, 'c, 't> {}
 
-impl<'r, 'c, 't> From<&'r DetachedRegion<'c, 't>> for RegionRef<'r, 'c, 't> {
-    fn from(value: &'r DetachedRegion<'c, 't>) -> Self {
-        value.as_ref()
+impl<'r, 'c, 't> TryFrom<&'r DetachedRegion<'c, 't>> for RegionRef<'r, 'c, 't> {
+    type Error = Error;
+
+    fn try_from(value: &'r DetachedRegion<'c, 't>) -> Result<Self, Self::Error> {
+        Ok(value.as_ref())
     }
 }
 
@@ -294,19 +303,30 @@ impl<'r, 'c, 't> From<&'r DetachedRegion<'c, 't>> for RegionRef<'r, 'c, 't> {
 pub struct RegionBlockRefIterator<'r, 'c: 'r, 't: 'c> {
     /// Current [`BlockRef`] in this iterator (i.e., the [`BlockRef`] that will be returned in the next call to
     /// [`RegionBlockRefIterator::next`]). [`BlockRef`]s are stored in such a way in MLIR that we can always obtain
-    /// the next [`Block`] in a [`Region`] given a [`BlockRef`] in that same [`Region`]s.
+    /// the next [`Block`] in a [`Region`] given a [`BlockRef`] in that same [`Region`].
     current_block: Option<BlockRef<'r, 'c, 't>>,
+
+    /// Error encountered while preparing the next iterator item.
+    error: Option<Error>,
 }
 
 impl<'r, 'c, 't> Iterator for RegionBlockRefIterator<'r, 'c, 't> {
-    type Item = BlockRef<'r, 'c, 't>;
+    type Item = Result<BlockRef<'r, 'c, 't>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let item = self.current_block.take();
-        self.current_block = item.as_ref().and_then(|block| unsafe {
-            BlockRef::from_c_api(mlirBlockGetNextInRegion(block.to_c_api()), block.context())
-        });
-        item
+        if let Some(error) = self.error.take() {
+            return Some(Err(error));
+        }
+
+        let current_block = self.current_block.take()?;
+        let handle = unsafe { mlirBlockGetNextInRegion(current_block.to_c_api()) };
+        if !handle.ptr.is_null() {
+            match unsafe { BlockRef::from_c_api(handle, current_block.context()) } {
+                Ok(next_block) => self.current_block = Some(next_block),
+                Err(error) => self.error = Some(error),
+            }
+        }
+        Some(Ok(current_block))
     }
 }
 
@@ -320,26 +340,26 @@ mod tests {
         let mut region_0 = context.region();
         assert!(region_0.is_empty());
         assert_eq!(region_0.context(), &context);
-        assert!(region_0.blocks().next().is_none());
-        let block_0 = region_0.append_block(context.block_with_no_arguments());
-        let block_1 = region_0.append_block(context.block_with_no_arguments());
-        let block_2 = region_0.append_block(context.block_with_no_arguments());
-        let block_3 = region_0.insert_block(context.block_with_no_arguments(), 1);
-        let block_4 = region_0.insert_block(context.block_with_no_arguments(), 0);
-        let block_5 = region_0.insert_block_after(context.block_with_no_arguments(), Some(&block_1));
-        let block_6 = region_0.insert_block_after(context.block_with_no_arguments(), None);
-        let block_7 = region_0.insert_block_before(context.block_with_no_arguments(), Some(&block_4));
-        let block_8 = region_0.insert_block_before(context.block_with_no_arguments(), None);
+        assert!(region_0.blocks().unwrap().next().is_none());
+        let block_0 = region_0.append_block(context.block_with_no_arguments()).unwrap();
+        let block_1 = region_0.append_block(context.block_with_no_arguments()).unwrap();
+        let block_2 = region_0.append_block(context.block_with_no_arguments()).unwrap();
+        let block_3 = region_0.insert_block(context.block_with_no_arguments(), 1).unwrap();
+        let block_4 = region_0.insert_block(context.block_with_no_arguments(), 0).unwrap();
+        let block_5 = region_0.insert_block_after(context.block_with_no_arguments(), Some(&block_1)).unwrap();
+        let block_6 = region_0.insert_block_after(context.block_with_no_arguments(), None).unwrap();
+        let block_7 = region_0.insert_block_before(context.block_with_no_arguments(), Some(&block_4)).unwrap();
+        let block_8 = region_0.insert_block_before(context.block_with_no_arguments(), None).unwrap();
         assert!(!region_0.is_empty());
         assert_eq!(
-            region_0.blocks().collect::<Vec<_>>(),
+            region_0.blocks().unwrap().collect::<Result<Vec<_>, _>>().unwrap(),
             vec![block_6, block_7, block_4, block_0, block_3, block_1, block_5, block_2, block_8],
         );
 
         // Test null pointer edge case.
         let bad_handle = MlirRegion { ptr: std::ptr::null_mut() };
         let region = unsafe { RegionRef::from_c_api(bad_handle, &context) };
-        assert!(region.is_none());
+        assert!(region.is_err());
     }
 
     #[test]
@@ -347,14 +367,14 @@ mod tests {
         let context = Context::new();
         let mut region_0 = context.region();
         let mut region_1 = context.region();
-        region_0.append_block(context.block_with_no_arguments());
-        region_0.append_block(context.block_with_no_arguments());
-        region_1.append_block(context.block_with_no_arguments());
-        assert_eq!(region_0.blocks().count(), 2);
-        assert_eq!(region_1.blocks().count(), 1);
+        region_0.append_block(context.block_with_no_arguments()).unwrap();
+        region_0.append_block(context.block_with_no_arguments()).unwrap();
+        region_1.append_block(context.block_with_no_arguments()).unwrap();
+        assert_eq!(region_0.blocks().unwrap().count(), 2);
+        assert_eq!(region_1.blocks().unwrap().count(), 1);
         region_1.take_body(region_0.as_ref());
-        assert_eq!(region_0.blocks().count(), 0);
-        assert_eq!(region_1.blocks().count(), 2);
+        assert_eq!(region_0.blocks().unwrap().count(), 0);
+        assert_eq!(region_1.blocks().unwrap().count(), 2);
     }
 
     #[test]
@@ -367,7 +387,7 @@ mod tests {
         assert_eq!(region_0.as_ref().clone(), region_0.as_ref());
         assert_ne!(region_0, region_1);
         assert_ne!(region_1.as_ref(), region_0);
-        assert_eq!(RegionRef::from(&region_1), region_1);
+        assert_eq!(region_1.as_ref(), region_1);
     }
 
     #[test]
@@ -382,22 +402,22 @@ mod tests {
     fn test_region_from_block() {
         let context = Context::new();
         let block = context.block_with_no_arguments();
-        let region = DetachedRegion::from(block);
-        assert_eq!(region.blocks().count(), 1);
+        let region = DetachedRegion::try_from(block).unwrap();
+        assert_eq!(region.blocks().unwrap().count(), 1);
     }
 
     #[test]
     fn test_region_from_blocks() {
         let context = Context::new();
         let blocks = vec![];
-        let region = DetachedRegion::from_with_context(blocks, &context);
-        assert_eq!(region.blocks().count(), 0);
+        let region = DetachedRegion::try_from_with_context(blocks, &context).unwrap();
+        assert_eq!(region.blocks().unwrap().count(), 0);
         let blocks = vec![
             context.block_with_no_arguments(),
             context.block_with_no_arguments(),
             context.block_with_no_arguments(),
         ];
-        let region = DetachedRegion::from_with_context(blocks, &context);
-        assert_eq!(region.blocks().count(), 3);
+        let region = DetachedRegion::try_from_with_context(blocks, &context).unwrap();
+        assert_eq!(region.blocks().unwrap().count(), 3);
     }
 }

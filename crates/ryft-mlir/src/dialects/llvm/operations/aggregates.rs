@@ -1,5 +1,6 @@
 use crate::{
-    AttributeRef, DetachedOp, DialectHandle, Location, Operation, OperationBuilder, TypeRef, Value, ValueRef, mlir_op,
+    AttributeRef, DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, TypeRef, Value, ValueRef,
+    mlir_op,
 };
 
 /// Canonical MLIR operation name for [`ExtractValueOperation`].
@@ -13,18 +14,24 @@ pub trait ExtractValueOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `container` operand.
-    fn container(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn container(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `position` attribute.
-    fn position(&self) -> AttributeRef<'c, 't> {
-        self.attribute("position").unwrap()
+    fn position(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("position")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "position",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's first result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -36,17 +43,18 @@ pub fn extract_value<'c, 't: 'c, V1: Value<'c, 'c, 't>, L: Location<'c, 't>>(
     result_type: TypeRef<'c, 't>,
     position: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedExtractValueOperation<'c, 't> {
+) -> Result<DetachedExtractValueOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(EXTRACT_VALUE_OPERATION_NAME, location);
     builder = builder.add_operand(container);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("position", position);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::extract_value`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::extract_value`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`InsertValueOperation`].
@@ -60,23 +68,29 @@ pub trait InsertValueOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `container` operand.
-    fn container(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn container(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the `value` operand.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the `position` attribute.
-    fn position(&self) -> AttributeRef<'c, 't> {
-        self.attribute("position").unwrap()
+    fn position(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute("position")?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                "position",
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's first result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -89,18 +103,17 @@ pub fn insert_value<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>, L:
     result_type: TypeRef<'c, 't>,
     position: AttributeRef<'c, 't>,
     location: L,
-) -> DetachedInsertValueOperation<'c, 't> {
+) -> Result<DetachedInsertValueOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(INSERT_VALUE_OPERATION_NAME, location);
     builder = builder.add_operand(container);
     builder = builder.add_operand(value);
     builder = builder.add_result(result_type);
     builder = builder.add_attribute("position", position);
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::insert_value`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::insert_value`"))
+    })
 }
 
 /// Canonical MLIR operation name for [`LandingpadOperation`].
@@ -114,7 +127,7 @@ pub trait LandingPadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the `clauses` operands.
-    fn clauses(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn clauses(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(0).collect()
     }
 
@@ -124,8 +137,8 @@ pub trait LandingPadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns this operation's first result type.
-    fn output_type(&self) -> TypeRef<'c, 't> {
-        self.result_type(0).unwrap()
+    fn output_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.result_type(0)
     }
 }
 
@@ -137,19 +150,18 @@ pub fn landing_pad<'c, 't: 'c, L: Location<'c, 't>>(
     result_type: TypeRef<'c, 't>,
     cleanup: bool,
     location: L,
-) -> DetachedLandingPadOperation<'c, 't> {
+) -> Result<DetachedLandingPadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LANDING_PAD_OPERATION_NAME, location);
     builder = builder.add_operands(clauses);
     builder = builder.add_result(result_type);
     if cleanup {
         builder = builder.add_attribute("cleanup", context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::landing_pad`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::landing_pad`"))
+    })
 }
 
 #[cfg(test)]
@@ -166,31 +178,37 @@ mod tests {
     fn test_extract_value() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let struct_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i32_type.as_ref()], false);
-        module.body().append_operation({
-            let mut block = context.block(&[(struct_type.as_ref(), location)]);
-            let position = context.dense_i64_array_attribute(&[1]).unwrap();
-            let op = extract_value(block.argument(0).unwrap(), i32_type.as_ref(), position.as_ref(), location);
-            assert_eq!(op.operation_name(), "llvm.extractvalue");
-            assert_eq!(op.container(), block.argument(0).unwrap());
-            assert_eq!(op.position(), position);
-            assert_eq!(op.output_type(), i32_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_extractvalue_test",
-                func::FuncAttributes {
-                    arguments: vec![struct_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let struct_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i32_type.as_ref()], false).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(struct_type.as_ref(), location)]);
+                let position = context.dense_i64_array_attribute(&[1]).unwrap();
+                let op =
+                    extract_value(block.argument(0).unwrap(), i32_type.as_ref(), position.as_ref(), location).unwrap();
+                assert_eq!(op.operation_name(), "llvm.extractvalue");
+                assert_eq!(op.container().unwrap(), block.argument(0).unwrap());
+                assert_eq!(op.position().unwrap(), position);
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_extractvalue_test",
+                    func::FuncAttributes {
+                        arguments: vec![struct_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             concat!(
@@ -208,38 +226,44 @@ mod tests {
     fn test_insert_value() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let struct_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i32_type.as_ref()], false);
-        module.body().append_operation({
-            let mut block = context.block(&[(struct_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let position = context.dense_i64_array_attribute(&[1]).unwrap();
-            let op = insert_value(
-                block.argument(0).unwrap(),
-                block.argument(1).unwrap(),
-                struct_type.as_ref(),
-                position.as_ref(),
-                location,
-            );
-            assert_eq!(op.operation_name(), "llvm.insertvalue");
-            assert_eq!(op.container(), block.argument(0).unwrap());
-            assert_eq!(op.value(), block.argument(1).unwrap());
-            assert_eq!(op.position(), position);
-            assert_eq!(op.output_type(), struct_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_insert_value_test",
-                func::FuncAttributes {
-                    arguments: vec![struct_type.into(), i32_type.into()],
-                    results: vec![struct_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let struct_type = context.llvm_literal_struct_type(&[i32_type.as_ref(), i32_type.as_ref()], false).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(struct_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let position = context.dense_i64_array_attribute(&[1]).unwrap();
+                let op = insert_value(
+                    block.argument(0).unwrap(),
+                    block.argument(1).unwrap(),
+                    struct_type.as_ref(),
+                    position.as_ref(),
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.operation_name(), "llvm.insertvalue");
+                assert_eq!(op.container().unwrap(), block.argument(0).unwrap());
+                assert_eq!(op.value().unwrap(), block.argument(1).unwrap());
+                assert_eq!(op.position().unwrap(), position);
+                assert_eq!(op.output_type().unwrap(), struct_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_insert_value_test",
+                    func::FuncAttributes {
+                        arguments: vec![struct_type.into(), i32_type.into()],
+                        results: vec![struct_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             concat!(
@@ -257,26 +281,31 @@ mod tests {
     fn test_landing_pad() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i8_type = context.signless_integer_type(8);
-        let pointer_type = context.llvm_pointer_type(0);
-        let result_type = context.llvm_literal_struct_type(&[pointer_type.as_ref(), i8_type.as_ref()], false);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = landing_pad(&[], result_type.as_ref(), true, location);
-            assert_eq!(op.operation_name(), "llvm.landingpad");
-            assert!(op.cleanup());
-            assert_eq!(op.output_type(), result_type);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_landingpad_test",
-                func::FuncAttributes { arguments: vec![], results: vec![result_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
+        let result_type = context.llvm_literal_struct_type(&[pointer_type.as_ref(), i8_type.as_ref()], false).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = landing_pad(&[], result_type.as_ref(), true, location).unwrap();
+                assert_eq!(op.operation_name(), "llvm.landingpad");
+                assert!(op.cleanup());
+                assert_eq!(op.output_type().unwrap(), result_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_landingpad_test",
+                    func::FuncAttributes { arguments: vec![], results: vec![result_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

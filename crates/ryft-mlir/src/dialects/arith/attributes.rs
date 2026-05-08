@@ -9,9 +9,9 @@ use ryft_xla_sys::mlir::dialects::arith::{
     mlirAttributeIsAArithIntegerOverflowFlagsAttr, mlirAttributeIsAArithRoundingModeAttr,
 };
 
-use crate::{Attribute, Context, DialectHandle, FromWithContext, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, DialectHandle, Error, TryFromWithContext, mlir_subtype_trait_impls};
 
-/// Atomic read-modify-write reduction kind used by MLIR arithmetic operations and affine parallel reductions.
+/// Atomic read-modify-write reduction kind used by MLIR `arith`metic operations and affine parallel reductions.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AtomicRmwKind {
     /// Floating-point addition reduction.
@@ -122,18 +122,20 @@ pub struct AtomicRmwKindAttributeRef<'c, 't> {
 
 impl AtomicRmwKindAttributeRef<'_, '_> {
     /// Returns the atomic read-modify-write kind stored in this attribute.
-    pub fn value(&self) -> AtomicRmwKind {
+    pub fn value(&self) -> Result<AtomicRmwKind, Error> {
         AtomicRmwKind::from_value(unsafe { mlirArithAtomicRmwKindAttrGetValue(self.handle) as i64 })
-            .expect("invalid `arith::AtomicRmwKind` attribute")
+            .ok_or_else(|| Error::invalid_argument("invalid `arith::AtomicRmwKind` attribute"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for AtomicRmwKindAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirAttributeIsAArithAtomicRmwKindAttr(handle) } {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR attribute handle"))
+        } else if unsafe { mlirAttributeIsAArithAtomicRmwKindAttr(handle) } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR `arith` atomic RMW kind attribute handle"))
         }
     }
 
@@ -148,13 +150,13 @@ impl<'c, 't> Attribute<'c, 't> for AtomicRmwKindAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(AtomicRmwKindAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
-impl<'c, 't> FromWithContext<'c, 't, AtomicRmwKind> for AtomicRmwKindAttributeRef<'c, 't> {
-    fn from_with_context(value: AtomicRmwKind, context: &'c Context<'t>) -> Self {
+impl<'c, 't> TryFromWithContext<'c, 't, AtomicRmwKind> for AtomicRmwKindAttributeRef<'c, 't> {
+    fn try_from_with_context(value: AtomicRmwKind, context: &'c Context<'t>) -> Result<Self, Error> {
         context.arith_atomic_rmw_kind_attribute(value)
     }
 }
 
-/// Floating-point fast-math flags used by MLIR arithmetic operations.
+/// Floating-point fast-math flags used by MLIR `arith`metic operations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FastMathFlags {
     /// Bit mask storing the MLIR fast-math flags.
@@ -267,18 +269,20 @@ pub struct FastMathFlagsAttributeRef<'c, 't> {
 
 impl FastMathFlagsAttributeRef<'_, '_> {
     /// Returns the fast-math flags stored in this attribute.
-    pub fn value(&self) -> FastMathFlags {
+    pub fn value(&self) -> Result<FastMathFlags, Error> {
         FastMathFlags::from_bits(unsafe { mlirArithFastMathFlagsAttrGetValue(self.handle) })
-            .expect("invalid `arith::FastMathFlags` attribute")
+            .ok_or_else(|| Error::invalid_argument("invalid `arith::FastMathFlags` attribute"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for FastMathFlagsAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirAttributeIsAArithFastMathFlagsAttr(handle) } {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR attribute handle"))
+        } else if unsafe { mlirAttributeIsAArithFastMathFlagsAttr(handle) } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR `arith` fast-math flags attribute handle"))
         }
     }
 
@@ -293,13 +297,13 @@ impl<'c, 't> Attribute<'c, 't> for FastMathFlagsAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(FastMathFlagsAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
-impl<'c, 't> FromWithContext<'c, 't, FastMathFlags> for FastMathFlagsAttributeRef<'c, 't> {
-    fn from_with_context(value: FastMathFlags, context: &'c Context<'t>) -> Self {
+impl<'c, 't> TryFromWithContext<'c, 't, FastMathFlags> for FastMathFlagsAttributeRef<'c, 't> {
+    fn try_from_with_context(value: FastMathFlags, context: &'c Context<'t>) -> Result<Self, Error> {
         context.arith_fast_math_flags_attribute(value)
     }
 }
 
-/// Integer overflow flags used by MLIR arithmetic operations.
+/// Integer overflow flags used by MLIR `arith`metic operations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IntegerOverflowFlags {
     /// Bit mask storing the MLIR integer overflow flags.
@@ -394,18 +398,20 @@ pub struct IntegerOverflowFlagsAttributeRef<'c, 't> {
 
 impl IntegerOverflowFlagsAttributeRef<'_, '_> {
     /// Returns the integer overflow flags stored in this attribute.
-    pub fn value(&self) -> IntegerOverflowFlags {
+    pub fn value(&self) -> Result<IntegerOverflowFlags, Error> {
         IntegerOverflowFlags::from_bits(unsafe { mlirArithIntegerOverflowFlagsAttrGetValue(self.handle) })
-            .expect("invalid `arith::IntegerOverflowFlags` attribute")
+            .ok_or_else(|| Error::invalid_argument("invalid `arith::IntegerOverflowFlags` attribute"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for IntegerOverflowFlagsAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirAttributeIsAArithIntegerOverflowFlagsAttr(handle) } {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR attribute handle"))
+        } else if unsafe { mlirAttributeIsAArithIntegerOverflowFlagsAttr(handle) } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR `arith` integer overflow flags attribute handle"))
         }
     }
 
@@ -420,13 +426,13 @@ impl<'c, 't> Attribute<'c, 't> for IntegerOverflowFlagsAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(IntegerOverflowFlagsAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
-impl<'c, 't> FromWithContext<'c, 't, IntegerOverflowFlags> for IntegerOverflowFlagsAttributeRef<'c, 't> {
-    fn from_with_context(value: IntegerOverflowFlags, context: &'c Context<'t>) -> Self {
+impl<'c, 't> TryFromWithContext<'c, 't, IntegerOverflowFlags> for IntegerOverflowFlagsAttributeRef<'c, 't> {
+    fn try_from_with_context(value: IntegerOverflowFlags, context: &'c Context<'t>) -> Result<Self, Error> {
         context.arith_integer_overflow_flags_attribute(value)
     }
 }
 
-/// Floating-point rounding mode used by MLIR arithmetic cast operations.
+/// Floating-point rounding mode used by MLIR `arith`metic cast operations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RoundingMode {
     /// Rounds to the nearest value, with ties rounded to the even significand.
@@ -482,18 +488,20 @@ pub struct RoundingModeAttributeRef<'c, 't> {
 
 impl RoundingModeAttributeRef<'_, '_> {
     /// Returns the rounding mode stored in this attribute.
-    pub fn value(&self) -> RoundingMode {
+    pub fn value(&self) -> Result<RoundingMode, Error> {
         RoundingMode::from_value(unsafe { mlirArithRoundingModeAttrGetValue(self.handle) })
-            .expect("invalid `arith::RoundingMode` attribute")
+            .ok_or_else(|| Error::invalid_argument("invalid `arith::RoundingMode` attribute"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for RoundingModeAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirAttributeIsAArithRoundingModeAttr(handle) } {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR attribute handle"))
+        } else if unsafe { mlirAttributeIsAArithRoundingModeAttr(handle) } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR `arith` rounding mode attribute handle"))
         }
     }
 
@@ -508,62 +516,67 @@ impl<'c, 't> Attribute<'c, 't> for RoundingModeAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(RoundingModeAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
-impl<'c, 't> FromWithContext<'c, 't, RoundingMode> for RoundingModeAttributeRef<'c, 't> {
-    fn from_with_context(value: RoundingMode, context: &'c Context<'t>) -> Self {
+impl<'c, 't> TryFromWithContext<'c, 't, RoundingMode> for RoundingModeAttributeRef<'c, 't> {
+    fn try_from_with_context(value: RoundingMode, context: &'c Context<'t>) -> Result<Self, Error> {
         context.arith_rounding_mode_attribute(value)
     }
 }
 
 impl<'t> Context<'t> {
     /// Creates an `arith` atomic read-modify-write kind attribute owned by this [`Context`].
-    pub fn arith_atomic_rmw_kind_attribute<'c>(&'c self, value: AtomicRmwKind) -> AtomicRmwKindAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::arith());
-        unsafe {
-            AtomicRmwKindAttributeRef::from_c_api(
-                mlirArithAtomicRmwKindAttrGet(*self.handle.borrow_mut(), value.value() as u64),
-                self,
-            )
-            .expect("invalid arguments to `Context::arith_atomic_rmw_kind_attribute`")
-        }
+    pub fn arith_atomic_rmw_kind_attribute<'c>(
+        &'c self,
+        value: AtomicRmwKind,
+    ) -> Result<AtomicRmwKindAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::arith()?)?;
+        Ok(unsafe {
+            AtomicRmwKindAttributeRef {
+                handle: mlirArithAtomicRmwKindAttrGet(*self.handle.borrow_mut(), value.value() as u64),
+                context: self,
+            }
+        })
     }
 
     /// Creates an `arith` fast-math flags attribute owned by this [`Context`].
-    pub fn arith_fast_math_flags_attribute<'c>(&'c self, value: FastMathFlags) -> FastMathFlagsAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::arith());
-        unsafe {
-            FastMathFlagsAttributeRef::from_c_api(
-                mlirArithFastMathFlagsAttrGet(*self.handle.borrow_mut(), value.bits()),
-                self,
-            )
-            .expect("invalid arguments to `Context::arith_fast_math_flags_attribute`")
-        }
+    pub fn arith_fast_math_flags_attribute<'c>(
+        &'c self,
+        value: FastMathFlags,
+    ) -> Result<FastMathFlagsAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::arith()?)?;
+        Ok(unsafe {
+            FastMathFlagsAttributeRef {
+                handle: mlirArithFastMathFlagsAttrGet(*self.handle.borrow_mut(), value.bits()),
+                context: self,
+            }
+        })
     }
 
     /// Creates an `arith` integer overflow flags attribute owned by this [`Context`].
     pub fn arith_integer_overflow_flags_attribute<'c>(
         &'c self,
         value: IntegerOverflowFlags,
-    ) -> IntegerOverflowFlagsAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::arith());
-        unsafe {
-            IntegerOverflowFlagsAttributeRef::from_c_api(
-                mlirArithIntegerOverflowFlagsAttrGet(*self.handle.borrow_mut(), value.bits()),
-                self,
-            )
-            .expect("invalid arguments to `Context::arith_integer_overflow_flags_attribute`")
-        }
+    ) -> Result<IntegerOverflowFlagsAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::arith()?)?;
+        Ok(unsafe {
+            IntegerOverflowFlagsAttributeRef {
+                handle: mlirArithIntegerOverflowFlagsAttrGet(*self.handle.borrow_mut(), value.bits()),
+                context: self,
+            }
+        })
     }
 
     /// Creates an `arith` rounding mode attribute owned by this [`Context`].
-    pub fn arith_rounding_mode_attribute<'c>(&'c self, value: RoundingMode) -> RoundingModeAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::arith());
-        unsafe {
-            RoundingModeAttributeRef::from_c_api(
-                mlirArithRoundingModeAttrGet(*self.handle.borrow_mut(), value.value()),
-                self,
-            )
-            .expect("invalid arguments to `Context::arith_rounding_mode_attribute`")
-        }
+    pub fn arith_rounding_mode_attribute<'c>(
+        &'c self,
+        value: RoundingMode,
+    ) -> Result<RoundingModeAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::arith()?)?;
+        Ok(unsafe {
+            RoundingModeAttributeRef {
+                handle: mlirArithRoundingModeAttrGet(*self.handle.borrow_mut(), value.value()),
+                context: self,
+            }
+        })
     }
 }
 
@@ -576,38 +589,38 @@ mod tests {
     #[test]
     fn test_atomic_rmw_kind_attribute() {
         let context = Context::new();
-        let attribute = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger);
+        let attribute = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), AtomicRmwKind::AddInteger);
-        assert_eq!(AtomicRmwKind::from_value(attribute.value().value()), Some(AtomicRmwKind::AddInteger));
+        assert_eq!(attribute.value().unwrap(), AtomicRmwKind::AddInteger);
+        assert_eq!(AtomicRmwKind::from_value(attribute.value().unwrap().value()), Some(AtomicRmwKind::AddInteger));
     }
 
     #[test]
     fn test_atomic_rmw_kind_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger);
-        let attribute_2 = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger);
+        let attribute_1 = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger).unwrap();
+        let attribute_2 = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::MaxSigned);
+        let attribute_2 = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::MaxSigned).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger);
+        let attribute_2 = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_atomic_rmw_kind_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger);
+        let attribute = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger).unwrap();
         test_attribute_display_and_debug(attribute, "1 : i64");
     }
 
     #[test]
     fn test_atomic_rmw_kind_attribute_casting() {
         let context = Context::new();
-        let attribute = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger);
+        let attribute = context.arith_atomic_rmw_kind_attribute(AtomicRmwKind::AddInteger).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -615,12 +628,12 @@ mod tests {
     fn test_fast_math_flags_attribute() {
         let context = Context::new();
         let flags = FastMathFlags::NO_NANS | FastMathFlags::NO_INFINITIES;
-        let attribute = context.arith_fast_math_flags_attribute(flags);
+        let attribute = context.arith_fast_math_flags_attribute(flags).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), flags);
-        assert!(attribute.value().contains(FastMathFlags::NO_NANS));
-        assert!(attribute.value().contains(FastMathFlags::NO_INFINITIES));
-        assert!(!attribute.value().contains(FastMathFlags::ALLOW_CONTRACT));
+        assert_eq!(attribute.value().unwrap(), flags);
+        assert!(attribute.value().unwrap().contains(FastMathFlags::NO_NANS));
+        assert!(attribute.value().unwrap().contains(FastMathFlags::NO_INFINITIES));
+        assert!(!attribute.value().unwrap().contains(FastMathFlags::ALLOW_CONTRACT));
         assert_eq!(FastMathFlags::from_bits(flags.bits()), Some(flags));
         assert_eq!(FastMathFlags::from_bits(FastMathFlags::FAST.bits() + 1), None);
     }
@@ -628,29 +641,29 @@ mod tests {
     #[test]
     fn test_fast_math_flags_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.arith_fast_math_flags_attribute(FastMathFlags::NO_NANS);
-        let attribute_2 = context.arith_fast_math_flags_attribute(FastMathFlags::NO_NANS);
+        let attribute_1 = context.arith_fast_math_flags_attribute(FastMathFlags::NO_NANS).unwrap();
+        let attribute_2 = context.arith_fast_math_flags_attribute(FastMathFlags::NO_NANS).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.arith_fast_math_flags_attribute(FastMathFlags::NO_INFINITIES);
+        let attribute_2 = context.arith_fast_math_flags_attribute(FastMathFlags::NO_INFINITIES).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.arith_fast_math_flags_attribute(FastMathFlags::NO_NANS);
+        let attribute_2 = context.arith_fast_math_flags_attribute(FastMathFlags::NO_NANS).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_fast_math_flags_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.arith_fast_math_flags_attribute(FastMathFlags::NO_NANS);
+        let attribute = context.arith_fast_math_flags_attribute(FastMathFlags::NO_NANS).unwrap();
         test_attribute_display_and_debug(attribute, "#arith.fastmath<nnan>");
     }
 
     #[test]
     fn test_fast_math_flags_attribute_casting() {
         let context = Context::new();
-        let attribute = context.arith_fast_math_flags_attribute(FastMathFlags::NO_NANS);
+        let attribute = context.arith_fast_math_flags_attribute(FastMathFlags::NO_NANS).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -658,11 +671,11 @@ mod tests {
     fn test_integer_overflow_flags_attribute() {
         let context = Context::new();
         let flags = IntegerOverflowFlags::NO_SIGNED_WRAP | IntegerOverflowFlags::NO_UNSIGNED_WRAP;
-        let attribute = context.arith_integer_overflow_flags_attribute(flags);
+        let attribute = context.arith_integer_overflow_flags_attribute(flags).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), flags);
-        assert!(attribute.value().contains(IntegerOverflowFlags::NO_SIGNED_WRAP));
-        assert!(attribute.value().contains(IntegerOverflowFlags::NO_UNSIGNED_WRAP));
+        assert_eq!(attribute.value().unwrap(), flags);
+        assert!(attribute.value().unwrap().contains(IntegerOverflowFlags::NO_SIGNED_WRAP));
+        assert!(attribute.value().unwrap().contains(IntegerOverflowFlags::NO_UNSIGNED_WRAP));
         assert_eq!(IntegerOverflowFlags::from_bits(flags.bits()), Some(flags));
         assert_eq!(IntegerOverflowFlags::from_bits(flags.bits() + 1), None);
     }
@@ -670,67 +683,68 @@ mod tests {
     #[test]
     fn test_integer_overflow_flags_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_SIGNED_WRAP);
-        let attribute_2 = context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_SIGNED_WRAP);
+        let attribute_1 = context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_SIGNED_WRAP).unwrap();
+        let attribute_2 = context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_SIGNED_WRAP).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_UNSIGNED_WRAP);
+        let attribute_2 =
+            context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_UNSIGNED_WRAP).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_SIGNED_WRAP);
+        let attribute_2 = context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_SIGNED_WRAP).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_integer_overflow_flags_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_SIGNED_WRAP);
+        let attribute = context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_SIGNED_WRAP).unwrap();
         test_attribute_display_and_debug(attribute, "#arith.overflow<nsw>");
     }
 
     #[test]
     fn test_integer_overflow_flags_attribute_casting() {
         let context = Context::new();
-        let attribute = context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_SIGNED_WRAP);
+        let attribute = context.arith_integer_overflow_flags_attribute(IntegerOverflowFlags::NO_SIGNED_WRAP).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_rounding_mode_attribute() {
         let context = Context::new();
-        let attribute = context.arith_rounding_mode_attribute(RoundingMode::TowardZero);
+        let attribute = context.arith_rounding_mode_attribute(RoundingMode::TowardZero).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), RoundingMode::TowardZero);
-        assert_eq!(RoundingMode::from_value(attribute.value().value()), Some(RoundingMode::TowardZero));
+        assert_eq!(attribute.value().unwrap(), RoundingMode::TowardZero);
+        assert_eq!(RoundingMode::from_value(attribute.value().unwrap().value()), Some(RoundingMode::TowardZero));
     }
 
     #[test]
     fn test_rounding_mode_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.arith_rounding_mode_attribute(RoundingMode::TowardZero);
-        let attribute_2 = context.arith_rounding_mode_attribute(RoundingMode::TowardZero);
+        let attribute_1 = context.arith_rounding_mode_attribute(RoundingMode::TowardZero).unwrap();
+        let attribute_2 = context.arith_rounding_mode_attribute(RoundingMode::TowardZero).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.arith_rounding_mode_attribute(RoundingMode::Downward);
+        let attribute_2 = context.arith_rounding_mode_attribute(RoundingMode::Downward).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.arith_rounding_mode_attribute(RoundingMode::TowardZero);
+        let attribute_2 = context.arith_rounding_mode_attribute(RoundingMode::TowardZero).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_rounding_mode_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.arith_rounding_mode_attribute(RoundingMode::TowardZero);
+        let attribute = context.arith_rounding_mode_attribute(RoundingMode::TowardZero).unwrap();
         test_attribute_display_and_debug(attribute, "3 : i32");
     }
 
     #[test]
     fn test_rounding_mode_attribute_casting() {
         let context = Context::new();
-        let attribute = context.arith_rounding_mode_attribute(RoundingMode::TowardZero);
+        let attribute = context.arith_rounding_mode_attribute(RoundingMode::TowardZero).unwrap();
         test_attribute_casting(attribute);
     }
 }

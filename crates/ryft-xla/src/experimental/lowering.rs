@@ -41,6 +41,10 @@ pub(crate) enum LoweringError {
     #[error("{0}")]
     ShardingError(#[from] ShardingError),
 
+    /// Underlying MLIR error returned while building or mutating MLIR objects.
+    #[error("{0}")]
+    MlirError(#[from] ryft_mlir::Error),
+
     /// Error returned when a lowered function name is empty or contains whitespace.
     #[error("invalid function name '{function_name}' used during XLA lowering")]
     InvalidFunctionName { function_name: String },
@@ -215,7 +219,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AddOperation {
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let result =
-            lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
+            lowerer
+                .block
+                .append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()])
     }
 }
@@ -228,10 +234,11 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SubOperation {
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result =
-            lowerer
-                .block
-                .append_operation(stable_hlo::subtract(input_values[0], input_values[1], lowerer.location));
+        let result = lowerer.block.append_operation(stable_hlo::subtract(
+            input_values[0],
+            input_values[1],
+            lowerer.location,
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.subtract should return one result").as_ref()])
     }
 }
@@ -244,10 +251,11 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MulOperation {
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result =
-            lowerer
-                .block
-                .append_operation(stable_hlo::multiply(input_values[0], input_values[1], lowerer.location));
+        let result = lowerer.block.append_operation(stable_hlo::multiply(
+            input_values[0],
+            input_values[1],
+            lowerer.location,
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
     }
 }
@@ -263,7 +271,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DivOperation {
         let result =
             lowerer
                 .block
-                .append_operation(stable_hlo::divide(input_values[0], input_values[1], lowerer.location));
+                .append_operation(stable_hlo::divide(input_values[0], input_values[1], lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.divide should return one result").as_ref()])
     }
 }
@@ -276,7 +284,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for NegOperation {
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
+        let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
     }
 }
@@ -292,7 +300,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SinOperation {
         let result =
             lowerer
                 .block
-                .append_operation(stable_hlo::sine(input_values[0], Accuracy::Default, lowerer.location));
+                .append_operation(stable_hlo::sine(input_values[0], Accuracy::Default, lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
     }
 }
@@ -305,10 +313,11 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CosOperation {
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result =
-            lowerer
-                .block
-                .append_operation(stable_hlo::cosine(input_values[0], Accuracy::Default, lowerer.location));
+        let result = lowerer.block.append_operation(stable_hlo::cosine(
+            input_values[0],
+            Accuracy::Default,
+            lowerer.location,
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
     }
 }
@@ -321,7 +330,8 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MatrixTransposeOperatio
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result = lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
+        let result =
+            lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
     }
 }
@@ -335,7 +345,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MatMulOperation {
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0])?;
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
             input_values[0],
             input_values[1],
@@ -344,7 +354,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MatMulOperation {
             None,
             output_tensor_type,
             lowerer.location,
-        ));
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
     }
 }
@@ -367,15 +377,16 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ScaleOperation<ArrayTyp
                 output_tensor_type,
                 &[],
                 lowerer.location,
-            ));
+            )?)?;
             broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()
         } else {
             factor_value
         };
-        let result =
-            lowerer
-                .block
-                .append_operation(stable_hlo::multiply(input_values[0], factor_broadcast, lowerer.location));
+        let result = lowerer.block.append_operation(stable_hlo::multiply(
+            input_values[0],
+            factor_broadcast,
+            lowerer.location,
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
     }
 }
@@ -391,7 +402,7 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> LowerableXlaOpera
         let factor = &self.factor;
         let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0])?;
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
             factor_value,
             input_values[0],
@@ -400,7 +411,7 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> LowerableXlaOpera
             None,
             output_tensor_type,
             lowerer.location,
-        ));
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
     }
 }
@@ -416,7 +427,7 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> LowerableXlaOpera
         let factor = &self.factor;
         let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0])?;
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
             input_values[0],
             factor_value,
@@ -425,7 +436,7 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> LowerableXlaOpera
             None,
             output_tensor_type,
             lowerer.location,
-        ));
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
     }
 }
@@ -445,7 +456,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
             input_values[0],
             output_shape.as_slice(),
             lowerer.location,
-        ));
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
     }
 }
@@ -461,22 +472,21 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Loc
     let output_type = &output_types[0];
     let tensor_type = lower_tensor_type(output_type, context, location)?;
     if !output_type.shape.dimensions.is_empty() {
-        let scalar_tensor_type = context
-            .tensor_type(lower_element_type(output_type.data_type, context)?, &[], None, location)
-            .ok_or_else(|| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(output_type.data_type) })?;
+        let scalar_tensor_type =
+            context.tensor_type(lower_element_type(output_type.data_type, context)?, &[], None, location)?;
         let scalar_elements =
             lower_constant_elements_attribute(output_type.data_type, scalar_tensor_type, constant_kind, context)?;
-        let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location));
+        let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location)?)?;
         let broadcast = block.append_operation(stable_hlo::broadcast(
             scalar_constant.result(0).unwrap().as_ref(),
             tensor_type,
             &[],
             location,
-        ));
+        )?)?;
         return Ok(vec![broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()]);
     }
     let elements = lower_constant_elements_attribute(output_type.data_type, tensor_type, constant_kind, context)?;
-    let constant = block.append_operation(stable_hlo::constant(elements, location));
+    let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
     Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
 }
 
@@ -647,11 +657,12 @@ impl LowerableXlaOperation<ShardMapTensor> for XlaOperation {
                 lowerer.location,
             ),
             Self::WithShardingConstraint(op) => {
+                let sharding = op.sharding.to_mlir(lowerer.location)?;
                 let operation = lowerer.block.append_operation(shardy::sharding_constraint(
                     input_values[0],
-                    op.sharding.to_mlir(lowerer.location),
+                    sharding,
                     lowerer.location,
-                ));
+                )?)?;
                 Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
             }
             Self::Custom(custom_op) => {
@@ -1082,7 +1093,7 @@ pub(crate) fn to_mlir_module<
 
     let context = MlirContext::new();
     let location = context.unknown_location();
-    let module = context.module(location);
+    let module = context.module(location)?;
 
     let global_input_tensor_types = global_input_types
         .iter()
@@ -1092,14 +1103,14 @@ pub(crate) fn to_mlir_module<
         .iter()
         .map(|array_type| lower_tensor_type(array_type, &context, location))
         .collect::<Result<Vec<_>, _>>()?;
-    let mesh_operation = shard_map.mesh().to_mlir(location);
-    module.body().append_operation(mesh_operation);
+    let mesh_operation = shard_map.mesh().to_mlir(location)?;
+    module.body()?.append_operation(mesh_operation)?;
 
     let function_arguments = global_input_tensor_types
         .iter()
         .zip(shard_map.in_shardings().iter())
         .map(|(tensor_type, sharding)| {
-            let sharding = sharding.to_mlir(location);
+            let sharding = sharding.to_mlir(location)?;
             Ok(TypeAndAttributes {
                 r#type: tensor_type.as_ref(),
                 attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
@@ -1110,7 +1121,7 @@ pub(crate) fn to_mlir_module<
         .iter()
         .zip(shard_map.out_shardings().iter())
         .map(|(tensor_type, sharding)| {
-            let sharding = sharding.to_mlir(location);
+            let sharding = sharding.to_mlir(location)?;
             Ok(TypeAndAttributes {
                 r#type: tensor_type.as_ref(),
                 attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
@@ -1118,7 +1129,7 @@ pub(crate) fn to_mlir_module<
         })
         .collect::<Result<Vec<_>, LoweringError>>()?;
 
-    module.body().append_operation({
+    module.body()?.append_operation({
         let function_block = context.block(
             global_input_tensor_types
                 .iter()
@@ -1140,17 +1151,19 @@ pub(crate) fn to_mlir_module<
             &context,
             location.as_ref(),
         )?;
-        function_block_ref.append_operation(func::r#return(manual_results.as_slice(), location));
+        function_block_ref.append_operation(func::r#return(manual_results.as_slice(), location)?)?;
 
+        let mut function_region = context.region();
+        function_region.append_block(function_block)?;
         func::func(
             function_name.as_str(),
             func::FuncAttributes { arguments: function_arguments, results: function_results, ..Default::default() },
-            function_block.into(),
+            function_region,
             location,
-        )
-    });
+        )?
+    })?;
 
-    if !module.verify() {
+    if !module.verify()? {
         return Err(LoweringError::MlirVerificationFailure);
     }
 
@@ -1177,11 +1190,11 @@ where
 
     let context = MlirContext::new();
     let location = context.unknown_location();
-    let module = context.module(location);
+    let module = context.module(location)?;
 
     if let Some(mesh) = collect_nested_sharding_mesh(program, None)? {
-        let mesh_operation = mesh.to_mlir(location);
-        module.body().append_operation(mesh_operation);
+        let mesh_operation = mesh.to_mlir(location)?;
+        module.body()?.append_operation(mesh_operation)?;
     }
 
     let global_input_tensor_types = global_input_types
@@ -1201,7 +1214,7 @@ where
         .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
         .collect::<Vec<_>>();
 
-    module.body().append_operation({
+    module.body()?.append_operation({
         let function_block = context.block(
             global_input_tensor_types
                 .iter()
@@ -1212,17 +1225,19 @@ where
         {
             let mut function_block_ref = function_block.as_ref();
             let outputs = lower_program_outputs(program, &mut function_block_ref, &context, location.as_ref())?;
-            function_block_ref.append_operation(func::r#return(outputs.as_slice(), location));
+            function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
         }
+        let mut function_region = context.region();
+        function_region.append_block(function_block)?;
         func::func(
             function_name.as_str(),
             func::FuncAttributes { arguments: function_arguments, results: function_results, ..Default::default() },
-            function_block.into(),
+            function_region,
             location,
-        )
-    });
+        )?
+    })?;
 
-    if !module.verify() {
+    if !module.verify()? {
         return Err(LoweringError::MlirVerificationFailure);
     }
     Ok(module.to_string())
@@ -1257,9 +1272,11 @@ impl MlirLowerableValue for NdArrayValue<f64> {
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
         let standard_layout = self.as_ndarray().as_standard_layout();
         let elements = standard_layout.iter().copied().collect::<Vec<_>>();
-        context
+        let attribute = context
             .dense_f64_elements_attribute(tensor_type, elements.as_slice())
-            .and_then(|attribute| attribute.cast::<DenseElementsAttributeRef>())
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?;
+        attribute
+            .cast::<DenseElementsAttributeRef>()
             .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })
     }
 
@@ -1271,10 +1288,12 @@ impl MlirLowerableValue for NdArrayValue<f64> {
         let Some(element) = self.as_ndarray().iter().next().filter(|_| self.as_ndarray().len() == 1) else {
             return Ok(None);
         };
+        let attribute = context
+            .dense_f64_elements_attribute(tensor_type, std::slice::from_ref(element))
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?;
         Ok(Some(
-            context
-                .dense_f64_elements_attribute(tensor_type, std::slice::from_ref(element))
-                .and_then(|attribute| attribute.cast::<DenseElementsAttributeRef>())
+            attribute
+                .cast::<DenseElementsAttributeRef>()
                 .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?,
         ))
     }
@@ -1319,7 +1338,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
     let function_name = normalize_function_name(function_name.as_ref())?;
     let context = MlirContext::new();
     let location = context.unknown_location();
-    let module = context.module(location);
+    let module = context.module(location)?;
 
     let input_tensor_types = program
         .input_ids
@@ -1338,15 +1357,17 @@ pub(crate) fn to_mlir_module_for_plain_program<
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    module.body().append_operation({
+    module.body()?.append_operation({
         let function_block = context.block(
             input_tensor_types.iter().map(|tensor_type| (*tensor_type, location)).collect::<Vec<_>>().as_slice(),
         );
         {
             let mut function_block_ref = function_block.as_ref();
             let outputs = lower_plain_program_outputs(program, &mut function_block_ref, &context, location.as_ref())?;
-            function_block_ref.append_operation(func::r#return(outputs.as_slice(), location));
+            function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
         }
+        let mut function_region = context.region();
+        function_region.append_block(function_block)?;
         func::func(
             function_name.as_str(),
             func::FuncAttributes {
@@ -1360,12 +1381,12 @@ pub(crate) fn to_mlir_module_for_plain_program<
                     .collect(),
                 ..Default::default()
             },
-            function_block.into(),
+            function_region,
             location,
-        )
-    });
+        )?
+    })?;
 
-    if !module.verify() {
+    if !module.verify()? {
         return Err(LoweringError::MlirVerificationFailure);
     }
 
@@ -1505,9 +1526,9 @@ where
     {
         let mut block_ref = block.as_ref();
         let outputs = lower_nested_program_inline(program, input_values, &mut block_ref, context, location, false)?;
-        block_ref.append_operation(stable_hlo::r#return(outputs.as_slice(), location));
+        block_ref.append_operation(stable_hlo::r#return(outputs.as_slice(), location)?)?;
     }
-    region.append_block(block);
+    region.append_block(block)?;
     Ok(region)
 }
 
@@ -1553,7 +1574,7 @@ where
                 true_branch_region.into(),
                 false_branch_region.into(),
                 location,
-            ));
+            )?)?;
             Ok((0..condition_op.output_types().len())
                 .map(|index| {
                     operation.result(index).expect("stablehlo.if should return one result per output").as_ref()
@@ -1608,9 +1629,9 @@ where
                 op: format!("while condition lowered to {} outputs", condition_outputs.len()),
             });
         }
-        condition_block_ref.append_operation(stable_hlo::r#return(condition_outputs.as_slice(), location));
+        condition_block_ref.append_operation(stable_hlo::r#return(condition_outputs.as_slice(), location)?)?;
     }
-    condition_region.append_block(condition_block);
+    condition_region.append_block(condition_block)?;
 
     let mut body_region = context.region();
     let body_block = context.block(block_arguments.as_slice());
@@ -1632,16 +1653,16 @@ where
                 op: format!("while body lowered to {} outputs", body_outputs.len()),
             });
         }
-        body_block_ref.append_operation(stable_hlo::r#return(body_outputs.as_slice(), location));
+        body_block_ref.append_operation(stable_hlo::r#return(body_outputs.as_slice(), location)?)?;
     }
-    body_region.append_block(body_block);
+    body_region.append_block(body_block)?;
 
     let operation = block.append_operation(stable_hlo::r#while(
         input_values,
         condition_region.into(),
         body_region.into(),
         location,
-    ));
+    )?)?;
     Ok((0..state_types.len())
         .map(|index| operation.result(index).expect("stablehlo.while should return one result per state leaf").as_ref())
         .collect())
@@ -1687,7 +1708,7 @@ where
     if outputs.is_empty() || !add_optimization_barrier {
         return Ok(outputs);
     }
-    let barrier = block.append_operation(stable_hlo::optimization_barrier(outputs.as_slice(), location));
+    let barrier = block.append_operation(stable_hlo::optimization_barrier(outputs.as_slice(), location)?)?;
     Ok((0..outputs.len())
         .map(|index| {
             barrier
@@ -1870,20 +1891,23 @@ where
     {
         let mut body_block_ref = body_block.as_ref();
         let body_outputs = lower_program_outputs(program, &mut body_block_ref, context, location.as_ref())?;
-        body_block_ref.append_operation(shardy::r#return(body_outputs.as_slice(), location));
+        body_block_ref.append_operation(shardy::r#return(body_outputs.as_slice(), location)?)?;
     }
-    body_region.append_block(body_block);
+    body_region.append_block(body_block)?;
 
     let manual_computation = block.append_operation(shardy::manual_computation(
         outer_inputs,
         global_output_tensor_types.as_slice(),
-        shard_map.to_shardy_in_shardings(context),
-        shard_map.to_shardy_out_shardings(context),
-        shard_map.to_shardy_manual_axes(context),
+        shard_map.to_shardy_in_shardings(context)?,
+        shard_map.to_shardy_out_shardings(context)?,
+        shard_map.to_shardy_manual_axes(context)?,
         body_region,
         location,
-    ));
-    Ok(manual_computation.results().map(|result| result.as_ref()).collect::<Vec<_>>())
+    )?)?;
+    manual_computation
+        .results()
+        .map(|result| result.map(|result| result.as_ref()).map_err(LoweringError::from))
+        .collect()
 }
 
 /// Lowers one linear shard-map evaluation mode and returns its resulting values.
@@ -1968,23 +1992,23 @@ where
     if !value_type.shape.dimensions.is_empty() {
         let scalar_tensor_type = context
             .tensor_type(lower_element_type(value_type.data_type, context)?, &[], None, location)
-            .ok_or_else(|| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(value_type.data_type) })?;
+            .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(value_type.data_type) })?;
         if let Some(scalar_elements) = value.to_scalar_dense_elements_attribute(scalar_tensor_type, context)? {
-            let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location));
+            let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location)?)?;
             let tensor_type = lower_tensor_type(&value_type, context, location)?;
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 scalar_constant.result(0).unwrap().as_ref(),
                 tensor_type,
                 &[],
                 location,
-            ));
+            )?)?;
             return Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref());
         }
     }
 
     let tensor_type = lower_tensor_type(&value_type, context, location)?;
     let elements = value.to_dense_elements_attribute(tensor_type, context)?;
-    let constant = block.append_operation(stable_hlo::constant(elements, location));
+    let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
     Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
 }
 
@@ -2006,20 +2030,20 @@ where
     if !array_type.shape.dimensions.is_empty() {
         let scalar_tensor_type = context
             .tensor_type(lower_element_type(array_type.data_type, context)?, &[], None, location)
-            .ok_or_else(|| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(array_type.data_type) })?;
+            .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(array_type.data_type) })?;
         let scalar_elements =
             lower_constant_elements_attribute(array_type.data_type, scalar_tensor_type, constant_kind, context)?;
-        let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location));
+        let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location)?)?;
         let broadcast = block.append_operation(stable_hlo::broadcast(
             scalar_constant.result(0).unwrap().as_ref(),
             tensor_type,
             &[],
             location,
-        ));
+        )?)?;
         return Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref());
     }
     let elements = lower_constant_elements_attribute(array_type.data_type, tensor_type, constant_kind, context)?;
-    let constant = block.append_operation(stable_hlo::constant(elements, location));
+    let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
     Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
 }
 
@@ -2058,7 +2082,9 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         }
         XlaOperation::Add => {
             let result =
-                lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
+                lowerer
+                    .block
+                    .append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()])
         }
         XlaOperation::Sub => {
@@ -2066,7 +2092,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 input_values[0],
                 input_values[1],
                 lowerer.location,
-            ));
+            )?)?;
             Ok(vec![result.result(0).expect("stablehlo.subtract should return one result").as_ref()])
         }
         XlaOperation::Mul => {
@@ -2074,25 +2100,27 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 input_values[0],
                 input_values[1],
                 lowerer.location,
-            ));
+            )?)?;
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
         XlaOperation::Div => {
-            let result =
-                lowerer
-                    .block
-                    .append_operation(stable_hlo::divide(input_values[0], input_values[1], lowerer.location));
+            let result = lowerer.block.append_operation(stable_hlo::divide(
+                input_values[0],
+                input_values[1],
+                lowerer.location,
+            )?)?;
             Ok(vec![result.result(0).expect("stablehlo.divide should return one result").as_ref()])
         }
         XlaOperation::Neg => {
-            let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
+            let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
         }
         XlaOperation::Sin => {
-            let result =
-                lowerer
-                    .block
-                    .append_operation(stable_hlo::sine(input_values[0], Accuracy::Default, lowerer.location));
+            let result = lowerer.block.append_operation(stable_hlo::sine(
+                input_values[0],
+                Accuracy::Default,
+                lowerer.location,
+            )?)?;
             Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
         }
         XlaOperation::Cos => {
@@ -2100,7 +2128,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 input_values[0],
                 Accuracy::Default,
                 lowerer.location,
-            ));
+            )?)?;
             Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
         }
         XlaOperation::ZeroLike => lower_like_constant(
@@ -2121,7 +2149,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         ),
         XlaOperation::MatrixMultiply => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-            let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+            let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0])?;
             let result = lowerer.block.append_operation(stable_hlo::dot_general(
                 input_values[0],
                 input_values[1],
@@ -2130,12 +2158,12 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 None,
                 output_tensor_type,
                 lowerer.location,
-            ));
+            )?)?;
             Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
         }
         XlaOperation::Transpose => {
             let result =
-                lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
+                lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
         }
         XlaOperation::Scale { factor } => {
@@ -2149,7 +2177,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                     output_tensor_type,
                     &[],
                     lowerer.location,
-                ));
+                )?)?;
                 broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()
             } else {
                 factor_value
@@ -2158,7 +2186,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 input_values[0],
                 factor_broadcast,
                 lowerer.location,
-            ));
+            )?)?;
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
         XlaOperation::Reshape { .. } => {
@@ -2169,7 +2197,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 input_values[0],
                 output_shape.as_slice(),
                 lowerer.location,
-            ));
+            )?)?;
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
         XlaOperation::Condition(condition_op) => lowerer.lower_condition(condition_op.as_ref(), input_values),
@@ -2193,11 +2221,12 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             input_values,
         ),
         XlaOperation::WithShardingConstraint(op) => {
+            let sharding = op.sharding.to_mlir(lowerer.location)?;
             let operation = lowerer.block.append_operation(shardy::sharding_constraint(
                 input_values[0],
-                op.sharding.to_mlir(lowerer.location),
+                sharding,
                 lowerer.location,
-            ));
+            )?)?;
             Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
         }
         XlaOperation::Custom(custom_op) => custom_op
@@ -2302,7 +2331,7 @@ fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
         .collect::<Vec<_>>();
     context
         .tensor_type(element_type, dimensions.as_slice(), None, location)
-        .ok_or_else(|| LoweringError::InvalidTensorType { array_type: array_type.clone() })
+        .map_err(|_| LoweringError::InvalidTensorType { array_type: array_type.clone() })
 }
 
 /// Lowers one [`DataType`] to the corresponding MLIR element type.
@@ -2361,7 +2390,7 @@ fn lower_constant_elements_attribute<'c, 't>(
     match data_type {
         DataType::Boolean => context
             .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(integer_value != 0))
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => {
             context
                 .splatted_dense_attribute_elements_attribute(
@@ -2371,7 +2400,7 @@ fn lower_constant_elements_attribute<'c, 't>(
                         integer_value,
                     ),
                 )
-                .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type })
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
         }
         DataType::U1 | DataType::U2 | DataType::U4 | DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64 => {
             context
@@ -2382,86 +2411,86 @@ fn lower_constant_elements_attribute<'c, 't>(
                         integer_value,
                     ),
                 )
-                .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type })
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
         }
         DataType::BF16 => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.bfloat16_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F16 => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float16_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F32 => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float32_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F64 => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float64_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F4E2M1FN => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float4e2m1fn_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F8E3M4 => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float8e3m4_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F8E4M3 => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float8e4m3_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F8E4M3FN => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float8e4m3fn_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F8E4M3FNUZ => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float8e4m3fnuz_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F8E4M3B11FNUZ => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float8e4m3b11fnuz_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F8E5M2 => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float8e5m2_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F8E5M2FNUZ => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float8e5m2fnuz_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F8E8M0FNU => context
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float8e8m0fnu_type(), float_value),
             )
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type }),
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::Token | DataType::C64 | DataType::C128 => Err(LoweringError::UnsupportedDataType { data_type }),
     }
 }
@@ -2720,9 +2749,11 @@ mod tests {
             tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
             context: &'c MlirContext<'t>,
         ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-            context
+            let attribute = context
                 .dense_f64_elements_attribute(tensor_type, self.values.as_slice())
-                .and_then(|attribute| attribute.cast::<DenseElementsAttributeRef>())
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?;
+            attribute
+                .cast::<DenseElementsAttributeRef>()
                 .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })
         }
 
@@ -2734,10 +2765,12 @@ mod tests {
             let [value] = self.values.as_slice() else {
                 return Ok(None);
             };
+            let attribute = context
+                .dense_f64_elements_attribute(tensor_type, std::slice::from_ref(value))
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?;
             Ok(Some(
-                context
-                    .dense_f64_elements_attribute(tensor_type, std::slice::from_ref(value))
-                    .and_then(|attribute| attribute.cast::<DenseElementsAttributeRef>())
+                attribute
+                    .cast::<DenseElementsAttributeRef>()
                     .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?,
             ))
         }
@@ -2805,7 +2838,7 @@ mod tests {
             _output_types: &[ArrayType],
             lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
         ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-            let operation = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
+            let operation = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location)?)?;
             Ok(vec![operation.result(0).expect("stablehlo.negate should return one result").as_ref()])
         }
     }

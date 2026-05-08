@@ -1,4 +1,6 @@
-use crate::{DetachedOp, DialectHandle, Location, Operation, OperationBuilder, Type, Value, mlir_op, mlir_op_trait};
+use crate::{
+    DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Type, Value, mlir_op, mlir_op_trait,
+};
 
 /// Quant [`Operation`] that casts from an expressed floating-point scalar/tensor type to a quantized type.
 /// This operation is represented in MLIR as `quant.qcast`. Conceptually, it applies the quantization parameters
@@ -25,20 +27,19 @@ mlir_op_trait!(QCast, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`QCastOperation`] at the specified [`Location`]. Refer to the documentation of
 /// [`QCastOperation`] for more information on the operation semantics and constraints on the output type.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn qcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     input: V,
     output_type: T,
     location: L,
-) -> DetachedQCastOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::quant());
+) -> Result<DetachedQCastOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::quant()?)?;
     OperationBuilder::new("quant.qcast", location)
         .add_operand(input)
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `quant::qcast`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `quant::qcast`"))
+        })
 }
 
 /// Quant [`Operation`] that casts from a quantized scalar/tensor type to an expressed floating-point type.
@@ -66,20 +67,19 @@ mlir_op_trait!(DCast, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DCastOperation`] at the specified [`Location`]. Refer to the documentation of
 /// [`DCastOperation`] for more information on the operation semantics and constraints on the output type.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn dcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     input: V,
     output_type: T,
     location: L,
-) -> DetachedDCastOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::quant());
+) -> Result<DetachedDCastOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::quant()?)?;
     OperationBuilder::new("quant.dcast", location)
         .add_operand(input)
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `quant::dcast`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `quant::dcast`"))
+        })
 }
 
 /// Quant [`Operation`] that casts between a quantized scalar/tensor type and its storage scalar/tensor type.
@@ -107,20 +107,19 @@ mlir_op_trait!(SCast, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SCastOperation`] at the specified [`Location`]. Refer to the documentation of
 /// [`SCastOperation`] for more information on the operation semantics and constraints on the output type.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn scast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     input: V,
     output_type: T,
     location: L,
-) -> DetachedSCastOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::quant());
+) -> Result<DetachedSCastOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::quant()?)?;
     OperationBuilder::new("quant.scast", location)
         .add_operand(input)
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `quant::scast`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `quant::scast`"))
+        })
 }
 
 #[cfg(test)]
@@ -136,33 +135,40 @@ mod tests {
     #[test]
     fn test_qcast() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::quant());
+        context.load_dialect(DialectHandle::quant().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let input_tensor_type = context.tensor_type(f32_type, &[Size::Static(3)], None, location).unwrap();
         let output_quantized_type = context.parse_type("tensor<3x!quant.uniform<i8:f32, 0.5:5>>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_tensor_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let qcast_op = qcast(input_value, output_quantized_type, location);
-            assert_eq!(qcast_op.operands().count(), 1);
-            assert_eq!(qcast_op.results().count(), 1);
-            assert_eq!(qcast_op.result(0).unwrap().r#type(), output_quantized_type);
-            let qcast_block = block.append_operation(qcast_op);
-            block.append_operation(func::r#return(&[qcast_block.result(0).unwrap()], location));
-            func::func(
-                "qcast_test",
-                func::FuncAttributes {
-                    arguments: vec![input_tensor_type.into()],
-                    results: vec![output_quantized_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_tensor_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let qcast_op = qcast(input_value, output_quantized_type, location).unwrap();
+                assert_eq!(qcast_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(qcast_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(qcast_op.result(0).unwrap().r#type().unwrap(), output_quantized_type);
+                let qcast_block = block.append_operation(qcast_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[qcast_block.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "qcast_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_tensor_type.into()],
+                        results: vec![output_quantized_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -179,33 +185,40 @@ mod tests {
     #[test]
     fn test_dcast() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::quant());
+        context.load_dialect(DialectHandle::quant().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let input_quantized_type = context.parse_type("tensor<3x!quant.uniform<i8:f32, 0.5:5>>").unwrap();
         let output_tensor_type = context.tensor_type(f32_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_quantized_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let dcast_op = dcast(input_value, output_tensor_type, location);
-            assert_eq!(dcast_op.operands().count(), 1);
-            assert_eq!(dcast_op.results().count(), 1);
-            assert_eq!(dcast_op.result(0).unwrap().r#type(), output_tensor_type);
-            let dcast_block = block.append_operation(dcast_op);
-            block.append_operation(func::r#return(&[dcast_block.result(0).unwrap()], location));
-            func::func(
-                "dcast_test",
-                func::FuncAttributes {
-                    arguments: vec![input_quantized_type.into()],
-                    results: vec![output_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_quantized_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let dcast_op = dcast(input_value, output_tensor_type, location).unwrap();
+                assert_eq!(dcast_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(dcast_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(dcast_op.result(0).unwrap().r#type().unwrap(), output_tensor_type);
+                let dcast_block = block.append_operation(dcast_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[dcast_block.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "dcast_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_quantized_type.into()],
+                        results: vec![output_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -222,33 +235,40 @@ mod tests {
     #[test]
     fn test_scast() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::quant());
+        context.load_dialect(DialectHandle::quant().unwrap()).unwrap();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i8_type = context.signless_integer_type(8);
         let input_quantized_type = context.parse_type("tensor<3x!quant.uniform<i8:f32, 0.5:5>>").unwrap();
         let output_tensor_type = context.tensor_type(i8_type, &[Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_quantized_type, location)]);
-            let input_value = block.argument(0).unwrap();
-            let scast_op = scast(input_value, output_tensor_type, location);
-            assert_eq!(scast_op.operands().count(), 1);
-            assert_eq!(scast_op.results().count(), 1);
-            assert_eq!(scast_op.result(0).unwrap().r#type(), output_tensor_type);
-            let scast_block = block.append_operation(scast_op);
-            block.append_operation(func::r#return(&[scast_block.result(0).unwrap()], location));
-            func::func(
-                "scast_test",
-                func::FuncAttributes {
-                    arguments: vec![input_quantized_type.into()],
-                    results: vec![output_tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_quantized_type, location)]);
+                let input_value = block.argument(0).unwrap();
+                let scast_op = scast(input_value, output_tensor_type, location).unwrap();
+                assert_eq!(scast_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(scast_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(scast_op.result(0).unwrap().r#type().unwrap(), output_tensor_type);
+                let scast_block = block.append_operation(scast_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[scast_block.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "scast_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_quantized_type.into()],
+                        results: vec![output_tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

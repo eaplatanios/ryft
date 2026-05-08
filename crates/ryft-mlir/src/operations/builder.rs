@@ -5,7 +5,8 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::{
-    Attribute, Block, Context, DetachedOperation, DetachedRegion, Location, Operation, Region, StringRef, Type, Value,
+    Attribute, Block, Context, DetachedOperation, DetachedRegion, Error, Location, Operation, Region, StringRef, Type,
+    Value,
 };
 
 /// [`OperationBuilder`]s are used to build [`Operation`]s.
@@ -172,11 +173,12 @@ impl<'c, 't: 'c> OperationBuilder<'c, 't> {
 
     /// Builds and returns an [`Operation`], consuming this [`OperationBuilder`] in the process. Note that, if type
     /// inference is enabled (via [`OperationBuilder::enable_result_type_inference`]) and fails, this function will
-    /// return [`None`] and emit some diagnostics.
-    pub fn build(mut self) -> Option<DetachedOperation<'c, 't>> {
-        let operation = unsafe { DetachedOperation::from_c_api(mlirOperationCreate(&mut self.handle), self.context) };
+    /// return an [`Error`] and emit some diagnostics.
+    pub fn build(mut self) -> Result<DetachedOperation<'c, 't>, Error> {
+        let operation = unsafe { DetachedOperation::from_c_api(mlirOperationCreate(&mut self.handle), self.context) }
+            .map_err(|_| Error::invalid_argument("failed to build operation"))?;
         std::mem::forget(self);
-        operation
+        Ok(operation)
     }
 }
 
@@ -200,8 +202,6 @@ impl Drop for OperationBuilder<'_, '_> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-
-    use crate::Context;
 
     use super::*;
 
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(builder.context(), &context);
 
         let op = builder.build();
-        assert!(op.is_some());
+        assert!(op.is_ok());
         let op = op.unwrap();
         assert_eq!(op.name(), context.identifier("test.op"));
         assert_eq!(op.operand_count(), 3);
@@ -252,9 +252,15 @@ mod tests {
         assert_eq!(op.region_count(), 3);
         assert_eq!(op.successor_count(), 3);
 
-        let attribute = op.attribute("attr_name");
+        let attribute = op.attribute("attr_name").unwrap();
         assert!(attribute.is_some());
         assert_eq!(attribute.unwrap().to_string(), "\"attr_value\"");
+
+        let error = OperationBuilder::new("test.op", location).enable_result_type_inference().build();
+        assert!(matches!(
+            error,
+            Err(Error::InvalidArgument { message, .. }) if message == "failed to build operation",
+        ));
     }
 
     #[test]

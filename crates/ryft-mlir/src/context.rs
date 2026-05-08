@@ -9,7 +9,7 @@ use ryft_xla_sys::bindings::{
     mlirContextSetThreadPool,
 };
 
-use crate::ThreadPoolRef;
+use crate::{Error, ThreadPoolRef};
 
 /// Thread pool being used by a [`Context`]. This enum allows us to use safe abstractions for both [`Context`]s that
 /// own an underlying [`ThreadPoolRef`] and for [`Context`]s that use a shared one.
@@ -236,27 +236,27 @@ impl<'c, 't> From<&'c Context<'t>> for ContextRef<'c, 't> {
     }
 }
 
-/// Helper trait that is semantically equivalent to [`From`] in the presence of a [`Context`]. This is useful
+/// Helper trait that is semantically equivalent to [`TryFrom`] in the presence of a [`Context`]. This is useful
 /// for types that can be constructed from other types, but only in the presence of a [`Context`] instance
 /// (e.g., [`Attribute`](crate::Attribute)s, [`Type`](crate::Type)s, etc.).
-pub trait FromWithContext<'c, 't, T> {
-    fn from_with_context(value: T, context: &'c Context<'t>) -> Self;
+pub trait TryFromWithContext<'c, 't, T>: Sized {
+    fn try_from_with_context(value: T, context: &'c Context<'t>) -> Result<Self, Error>;
 }
 
-impl<'c, 't, T> FromWithContext<'c, 't, T> for T {
-    fn from_with_context(value: T, _context: &'c Context<'t>) -> Self {
-        value
+impl<'c, 't, T> TryFromWithContext<'c, 't, T> for T {
+    fn try_from_with_context(value: T, _context: &'c Context<'t>) -> Result<Self, Error> {
+        Ok(value)
     }
 }
 
-/// Helper trait that is to [`FromWithContext`] what [`Into`] is to [`From`].
-pub trait IntoWithContext<'c, 't, T> {
-    fn into_with_context(self, context: &'c Context<'t>) -> T;
+/// Helper trait that is to [`TryFromWithContext`] what [`TryInto`] is to [`TryFrom`].
+pub trait TryIntoWithContext<'c, 't, T> {
+    fn try_into_with_context(self, context: &'c Context<'t>) -> Result<T, Error>;
 }
 
-impl<'c, 't, T, V: FromWithContext<'c, 't, T>> IntoWithContext<'c, 't, V> for T {
-    fn into_with_context(self, context: &'c Context<'t>) -> V {
-        V::from_with_context(self, context)
+impl<'c, 't, T, V: TryFromWithContext<'c, 't, T>> TryIntoWithContext<'c, 't, V> for T {
+    fn try_into_with_context(self, context: &'c Context<'t>) -> Result<V, Error> {
+        V::try_from_with_context(self, context)
     }
 }
 

@@ -1,8 +1,8 @@
 #![allow(deprecated)]
 
 use crate::{
-    Attribute, DetachedOp, DialectHandle, IntoWithContext, Location, Operation, OperationBuilder, Type, Value,
-    mlir_enum_attribute, mlir_op, mlir_op_trait,
+    Attribute, DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, TryIntoWithContext, Type,
+    Value, mlir_enum_attribute, mlir_op, mlir_op_trait,
 };
 
 mlir_enum_attribute!(
@@ -75,11 +75,17 @@ pub const RNG_DISTRIBUTION_ATTRIBUTE: &str = "rng_distribution";
 )]
 pub trait RngOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the [`RngDistribution`] that this [`RngOperation`] is using.
-    fn rng_distribution(&self) -> RngDistribution {
-        self.attribute(RNG_DISTRIBUTION_ATTRIBUTE)
+    fn rng_distribution(&self) -> Result<RngDistribution, Error> {
+        self.attribute(RNG_DISTRIBUTION_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<RngDistributionAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("invalid '{RNG_DISTRIBUTION_ATTRIBUTE}' attribute in `stable_hlo::rng`"))
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    RNG_DISTRIBUTION_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 }
 
@@ -90,8 +96,6 @@ mlir_op_trait!(Rng, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`RngOperation`] at the specified [`Location`]. Refer to the documentation of
 /// [`RngOperation`] for information on the arguments of this function.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[deprecated(
     note = "Per [StableHLO v1.0 Cleanup #2283](https://github.com/openxla/stablehlo/pull/2283), this operation is \
     being explored for deprecation as it appears to be unused by both frameworks and compilers. As such, it has \
@@ -106,7 +110,7 @@ pub fn rng<
     A: Value<'a, 'c, 't>,
     B: Value<'b, 'c, 't>,
     S: Value<'s, 'c, 't>,
-    D: IntoWithContext<'c, 't, RngDistributionAttributeRef<'c, 't>>,
+    D: TryIntoWithContext<'c, 't, RngDistributionAttributeRef<'c, 't>>,
     L: Location<'c, 't>,
 >(
     a: A,
@@ -114,17 +118,18 @@ pub fn rng<
     shape: S,
     distribution: D,
     location: L,
-) -> DetachedRngOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedRngOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.rng", location)
         .add_operand(a)
         .add_operand(b)
         .add_operand(shape)
-        .add_attribute(RNG_DISTRIBUTION_ATTRIBUTE, distribution.into_with_context(location.context()))
+        .add_attribute(RNG_DISTRIBUTION_ATTRIBUTE, distribution.try_into_with_context(location.context())?)
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::rng`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::rng`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`RngBitGeneratorOperation::rng_algorithm`].
@@ -157,13 +162,17 @@ pub const RNG_ALGORITHM_ATTRIBUTE: &str = "rng_algorithm";
 /// for more information.
 pub trait RngBitGeneratorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the [`RngAlgorithm`] that this [`RngBitGeneratorOperation`] is using.
-    fn rng_algorithm(&self) -> RngAlgorithm {
-        self.attribute(RNG_ALGORITHM_ATTRIBUTE)
+    fn rng_algorithm(&self) -> Result<RngAlgorithm, Error> {
+        self.attribute(RNG_ALGORITHM_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<RngAlgorithmAttributeRef<'c, 't>>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| {
-                panic!("invalid '{RNG_ALGORITHM_ATTRIBUTE}' attribute in `stable_hlo::rng_bit_generator`")
-            })
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    RNG_ALGORITHM_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 }
 
@@ -173,14 +182,12 @@ mlir_op_trait!(RngBitGenerator, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`RngBitGeneratorOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`RngBitGeneratorOperation`] for information on the arguments of this function.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn rng_bit_generator<
     's,
     'c: 's,
     't: 'c,
     S: Value<'s, 'c, 't>,
-    A: IntoWithContext<'c, 't, RngAlgorithmAttributeRef<'c, 't>>,
+    A: TryIntoWithContext<'c, 't, RngAlgorithmAttributeRef<'c, 't>>,
     T: Type<'c, 't>,
     L: Location<'c, 't>,
 >(
@@ -188,16 +195,19 @@ pub fn rng_bit_generator<
     algorithm: A,
     output_type: T,
     location: L,
-) -> DetachedRngBitGeneratorOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedRngBitGeneratorOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.rng_bit_generator", location)
         .add_operand(state)
-        .add_attribute(RNG_ALGORITHM_ATTRIBUTE, algorithm.into_with_context(location.context()))
-        .add_result(state.r#type())
+        .add_attribute(RNG_ALGORITHM_ATTRIBUTE, algorithm.try_into_with_context(location.context())?)
+        .add_result(state.r#type()?)
         .add_result(output_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::rng_bit_generator`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::rng_bit_generator`"))
+        })
 }
 
 #[cfg(test)]
@@ -214,9 +224,9 @@ mod tests {
     #[test]
     fn test_rng_distribution_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_rng_distribution(RngDistribution::Normal);
+        let attribute = context.stable_hlo_rng_distribution(RngDistribution::Normal).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), RngDistribution::Normal);
+        assert_eq!(attribute.value().unwrap(), RngDistribution::Normal);
     }
 
     #[test]
@@ -224,40 +234,40 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_rng_distribution(RngDistribution::Normal);
-        let attribute_2 = context.stable_hlo_rng_distribution(RngDistribution::Normal);
+        let attribute_1 = context.stable_hlo_rng_distribution(RngDistribution::Normal).unwrap();
+        let attribute_2 = context.stable_hlo_rng_distribution(RngDistribution::Normal).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_rng_distribution(RngDistribution::Uniform);
+        let attribute_2 = context.stable_hlo_rng_distribution(RngDistribution::Uniform).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_rng_distribution(RngDistribution::Normal);
+        let attribute_2 = context.stable_hlo_rng_distribution(RngDistribution::Normal).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_rng_distribution_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_rng_distribution(RngDistribution::Normal);
+        let attribute = context.stable_hlo_rng_distribution(RngDistribution::Normal).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo<rng_distribution NORMAL>");
     }
 
     #[test]
     fn test_rng_distribution_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_rng_distribution(RngDistribution::Normal);
+        let attribute = context.stable_hlo_rng_distribution(RngDistribution::Normal).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_rng_algorithm_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry);
+        let attribute = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), RngAlgorithm::ThreeFry);
+        assert_eq!(attribute.value().unwrap(), RngAlgorithm::ThreeFry);
     }
 
     #[test]
@@ -265,31 +275,31 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry);
-        let attribute_2 = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry);
+        let attribute_1 = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry).unwrap();
+        let attribute_2 = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_rng_algorithm(RngAlgorithm::Default);
+        let attribute_2 = context.stable_hlo_rng_algorithm(RngAlgorithm::Default).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry);
+        let attribute_2 = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_rng_algorithm_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry);
+        let attribute = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo<rng_algorithm THREE_FRY>");
     }
 
     #[test]
     fn test_rng_algorithm_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry);
+        let attribute = context.stable_hlo_rng_algorithm(RngAlgorithm::ThreeFry).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -297,35 +307,41 @@ mod tests {
     fn test_rng() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let i64_type = context.signless_integer_type(64);
         let bound_type = context.tensor_type(f32_type, &[], None, location).unwrap();
         let shape_type = context.tensor_type(i64_type, &[Size::Static(2)], None, location).unwrap();
         let result_type = context.tensor_type(f32_type, &[Size::Dynamic, Size::Dynamic], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(bound_type, location), (bound_type, location), (shape_type, location)]);
-            let a = block.argument(0).unwrap();
-            let b = block.argument(1).unwrap();
-            let shape = block.argument(2).unwrap();
-            let rng_op = rng(a, b, shape, RngDistribution::Uniform, location);
-            assert_eq!(rng_op.rng_distribution(), RngDistribution::Uniform);
-            assert_eq!(rng_op.operands().count(), 3);
-            assert_eq!(rng_op.results().count(), 1);
-            let rng_block = block.append_operation(rng_op);
-            block.append_operation(func::r#return(&[rng_block.result(0).unwrap()], location));
-            func::func(
-                "rng_uniform_test",
-                func::FuncAttributes {
-                    arguments: vec![bound_type.into(), bound_type.into(), shape_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(bound_type, location), (bound_type, location), (shape_type, location)]);
+                let a = block.argument(0).unwrap();
+                let b = block.argument(1).unwrap();
+                let shape = block.argument(2).unwrap();
+                let rng_op = rng(a, b, shape, RngDistribution::Uniform, location).unwrap();
+                assert_eq!(rng_op.rng_distribution().unwrap(), RngDistribution::Uniform);
+                assert_eq!(rng_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(rng_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let rng_block = block.append_operation(rng_op).unwrap();
+                block.append_operation(func::r#return(&[rng_block.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "rng_uniform_test",
+                    func::FuncAttributes {
+                        arguments: vec![bound_type.into(), bound_type.into(), shape_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -348,35 +364,42 @@ mod tests {
     fn test_rng_bit_generator() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let ui64_type = context.unsigned_integer_type(64);
         let state_type = context.tensor_type(ui64_type, &[Size::Static(2)], None, location).unwrap();
         let ui32_type = context.unsigned_integer_type(32);
         let output_type = context.tensor_type(ui32_type, &[Size::Static(2), Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(state_type, location)]);
-            let initial_state = block.argument(0).unwrap();
-            let rng_op = rng_bit_generator(initial_state, RngAlgorithm::ThreeFry, output_type, location);
-            assert_eq!(rng_op.rng_algorithm(), RngAlgorithm::ThreeFry);
-            assert_eq!(rng_op.operands().count(), 1);
-            assert_eq!(rng_op.results().count(), 2);
-            let rng_block = block.append_operation(rng_op);
-            block.append_operation(func::r#return(
-                &[rng_block.result(0).unwrap(), rng_block.result(1).unwrap()],
-                location,
-            ));
-            func::func(
-                "rng_bit_generator_test",
-                func::FuncAttributes {
-                    arguments: vec![state_type.into()],
-                    results: vec![state_type.into(), output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(state_type, location)]);
+                let initial_state = block.argument(0).unwrap();
+                let rng_op = rng_bit_generator(initial_state, RngAlgorithm::ThreeFry, output_type, location).unwrap();
+                assert_eq!(rng_op.rng_algorithm().unwrap(), RngAlgorithm::ThreeFry);
+                assert_eq!(rng_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(rng_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                let rng_block = block.append_operation(rng_op).unwrap();
+                block
+                    .append_operation(
+                        func::r#return(&[rng_block.result(0).unwrap(), rng_block.result(1).unwrap()], location)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                func::func(
+                    "rng_bit_generator_test",
+                    func::FuncAttributes {
+                        arguments: vec![state_type.into()],
+                        results: vec![state_type.into(), output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

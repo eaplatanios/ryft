@@ -1,10 +1,9 @@
 //! The `async` dialect contains [`Operation`](crate::Operation)s for modeling asynchronous execution.
 //!
 //! Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/AsyncDialect/) for more information.
-
 use ryft_xla_sys::bindings::mlirGetDialectHandle__async__;
 
-use crate::DialectHandle;
+use crate::{DialectHandle, Error};
 
 pub mod operations;
 pub mod passes;
@@ -16,8 +15,8 @@ pub use types::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `async` [`Dialect`](crate::Dialect).
-    pub fn r#async() -> Self {
-        unsafe { Self::from_c_api(mlirGetDialectHandle__async__()).unwrap() }
+    pub fn r#async() -> Result<Self, Error> {
+        unsafe { Self::from_c_api(mlirGetDialectHandle__async__()) }
     }
 }
 
@@ -29,7 +28,7 @@ mod tests {
 
     #[test]
     fn test_async_dialect() {
-        let handle = DialectHandle::r#async();
+        let handle = DialectHandle::r#async().unwrap();
         assert_eq!(handle.namespace().unwrap(), "async");
 
         // Check that registration works (both in the context and in a registry).
@@ -40,12 +39,11 @@ mod tests {
 
         // Check that loading works.
         let context = Context::new();
-        let dialect_1 = context.load_dialect(handle);
-        assert!(dialect_1.is_some());
-        assert_eq!(dialect_1.unwrap().namespace().unwrap(), "async");
+        let dialect_1 = context.load_dialect(handle).unwrap();
+        assert_eq!(dialect_1.namespace().unwrap(), "async");
 
         // Check that comparison works.
-        let dialect_2 = context.load_dialect(DialectHandle::r#async());
+        let dialect_2 = context.load_dialect(DialectHandle::r#async().unwrap()).unwrap();
         assert_eq!(dialect_1, dialect_2);
     }
 }

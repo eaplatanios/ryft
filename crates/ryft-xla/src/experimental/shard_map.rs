@@ -1037,7 +1037,7 @@ impl ShardMap {
     pub(crate) fn to_shardy_in_shardings<'c, 't>(
         &self,
         context: &'c MlirContext<'t>,
-    ) -> TensorShardingPerValueAttributeRef<'c, 't> {
+    ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
         shardy_tensor_sharding_per_value(self.in_shardings.as_slice(), self.manual_axes(), context)
     }
 
@@ -1045,12 +1045,15 @@ impl ShardMap {
     pub(crate) fn to_shardy_out_shardings<'c, 't>(
         &self,
         context: &'c MlirContext<'t>,
-    ) -> TensorShardingPerValueAttributeRef<'c, 't> {
+    ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
         shardy_tensor_sharding_per_value(self.out_shardings.as_slice(), self.manual_axes(), context)
     }
 
     /// Builds the typed Shardy `manual_axes` attribute used by `sdy.manual_computation`.
-    pub(crate) fn to_shardy_manual_axes<'c, 't>(&self, context: &'c MlirContext<'t>) -> ManualAxesAttributeRef<'c, 't> {
+    pub(crate) fn to_shardy_manual_axes<'c, 't>(
+        &self,
+        context: &'c MlirContext<'t>,
+    ) -> Result<ManualAxesAttributeRef<'c, 't>, ryft_mlir::Error> {
         context.shardy_manual_axes(self.manual_axes())
     }
 
@@ -1745,11 +1748,11 @@ fn shardy_tensor_sharding_per_value<'c, 't>(
     shardings: &[Sharding],
     manual_axes: &[String],
     context: &'c MlirContext<'t>,
-) -> TensorShardingPerValueAttributeRef<'c, 't> {
+) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
     let shardings = shardings
         .iter()
         .map(|sharding| manual_computation_tensor_sharding(sharding, manual_axes, context))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     context.shardy_tensor_sharding_per_value(shardings.as_slice())
 }
 
@@ -1757,19 +1760,19 @@ fn manual_computation_tensor_sharding<'c, 't>(
     sharding: &Sharding,
     manual_axes: &[String],
     context: &'c MlirContext<'t>,
-) -> TensorShardingAttributeRef<'c, 't> {
+) -> Result<TensorShardingAttributeRef<'c, 't>, ryft_mlir::Error> {
     let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
-    let dim_shardings = manual_computation_dimension_shardings(sharding, manual_axes, context);
+    let dim_shardings = manual_computation_dimension_shardings(sharding, manual_axes, context)?;
     let replicated_axis_names = sharding.replicated_axes();
     let replicated_axes = replicated_axis_names
         .iter()
-        .map(|axis_name| context.shardy_axis_ref(axis_name, None))
-        .collect::<Vec<_>>();
+        .map(|axis_name| context.shardy_axis_ref(*axis_name, None))
+        .collect::<Result<Vec<_>, _>>()?;
     let unreduced_axes = sharding
         .unreduced_axes
         .iter()
-        .map(|axis_name| context.shardy_axis_ref(axis_name, None))
-        .collect::<Vec<_>>();
+        .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
+        .collect::<Result<Vec<_>, _>>()?;
     context.shardy_tensor_sharding(
         mesh_symbol_ref,
         dim_shardings.as_slice(),
@@ -1782,7 +1785,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
     sharding: &Sharding,
     manual_axes: &[String],
     context: &'c MlirContext<'t>,
-) -> Vec<DimensionShardingAttributeRef<'c, 't>> {
+) -> Result<Vec<DimensionShardingAttributeRef<'c, 't>>, ryft_mlir::Error> {
     let manual_axis_names = manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
     let free_axis_names = sharding
         .mesh
@@ -1806,8 +1809,10 @@ fn manual_computation_dimension_shardings<'c, 't>(
         .map(|partition_dimension| match partition_dimension {
             ShardingDimension::Replicated => context.shardy_dimension_sharding([], !has_unused_free_axes, None),
             ShardingDimension::Sharded(axis_names) => {
-                let axes =
-                    axis_names.iter().map(|axis_name| context.shardy_axis_ref(axis_name, None)).collect::<Vec<_>>();
+                let axes = axis_names
+                    .iter()
+                    .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
+                    .collect::<Result<Vec<_>, _>>()?;
                 let contains_free_axis =
                     axis_names.iter().any(|axis_name| free_axis_names.contains(axis_name.as_str()));
                 context.shardy_dimension_sharding(axes, !(contains_free_axis || has_unused_free_axes), None)
@@ -3381,13 +3386,15 @@ mod tests {
         assert_eq!(shard_map.local_output_shape(0, &[8]).unwrap(), vec![2]);
 
         let context = MlirContext::new();
-        let input_sharding = shard_map.in_shardings()[0].to_mlir(context.unknown_location()).to_string();
-        let output_sharding = shard_map.out_shardings()[0].to_mlir(context.unknown_location()).to_string();
+        let input_sharding = shard_map.in_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
+        let output_sharding = shard_map.out_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
         let manual_computation_attributes = shard_map.to_shardy_manual_computation_attributes();
-        let mesh_module = context.module(context.unknown_location());
+        let mesh_module = context.module(context.unknown_location()).unwrap();
         let mesh_operation = mesh_module
             .body()
-            .append_operation(shard_map.mesh().to_mlir(context.unknown_location()))
+            .unwrap()
+            .append_operation(shard_map.mesh().to_mlir(context.unknown_location()).unwrap())
+            .unwrap()
             .to_string();
 
         let mlir_program = format!(

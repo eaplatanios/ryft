@@ -19,7 +19,8 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::{
-    Attribute, AttributeRef, Context, DialectHandle, IntegerTypeRef, Type, TypeId, TypeRef, mlir_subtype_trait_impls,
+    Attribute, AttributeRef, Context, DialectHandle, Error, IntegerTypeRef, Type, TypeId, TypeRef,
+    mlir_subtype_trait_impls,
 };
 
 /// Built-in MLIR [`Type`] that represents a _quantized_ type.
@@ -32,8 +33,11 @@ pub trait QuantizedType<'c, 't: 'c>: Type<'c, 't> {
     /// necessarily correct. However, at a high level, no examples of such usage are presently known and the restriction
     /// serves some useful purposes (e.g., always being able to reverse a transformation or measure error). In most
     /// cases, this function will return [`Float32TypeRef`](crate::Float32TypeRef).
-    fn expressed_type(&self) -> TypeRef<'c, 't> {
-        unsafe { TypeRef::from_c_api(mlirQuantizedTypeGetExpressedType(self.to_c_api()), self.context()).unwrap() }
+    fn expressed_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        unsafe {
+            TypeRef::from_c_api(mlirQuantizedTypeGetExpressedType(self.to_c_api()), self.context())
+                .map_err(|_| Error::internal("expected non-null quantized expressed type"))
+        }
     }
 
     /// Returns the quantization flags of this [`QuantizedType`] as a `u32` whose bits correspond to the flags.
@@ -65,8 +69,11 @@ pub trait QuantizedType<'c, 't: 'c>: Type<'c, 't> {
 
     /// Returns the integer storage type of this [`QuantizedType`]. This is the integer type of the values stored in
     /// memory and conveys the bit width and signedness of the quantized stored values.
-    fn storage_type(&self) -> IntegerTypeRef<'c, 't> {
-        unsafe { IntegerTypeRef::from_c_api(mlirQuantizedTypeGetStorageType(self.to_c_api()), self.context()).unwrap() }
+    fn storage_type(&self) -> Result<IntegerTypeRef<'c, 't>, Error> {
+        unsafe {
+            IntegerTypeRef::from_c_api(mlirQuantizedTypeGetStorageType(self.to_c_api()), self.context())
+                .map_err(|_| Error::internal("expected non-null quantized storage type"))
+        }
     }
 
     /// Returns the minimum representable storage value for this [`QuantizedType`].
@@ -97,7 +104,7 @@ pub trait QuantizedType<'c, 't: 'c>: Type<'c, 't> {
         unsafe { mlirQuantizedTypeIsCompatibleExpressedType(self.to_c_api(), candidate.to_c_api()) }
     }
 
-    /// Returns the element type of this [`QuantizedType`] (or [`None`] if it is not a [`QuantizedType`]). If this
+    /// Returns the element type of this [`QuantizedType`] (or `Ok(None)` if it is not a [`QuantizedType`]). If this
     /// type is a primitive type, then it is returned as-is. If it is a container type, then the element type of that
     /// container type will be returned. Examples:
     ///
@@ -105,62 +112,57 @@ pub trait QuantizedType<'c, 't: 'c>: Type<'c, 't> {
     /// !quant.uniform<i8:f32, 1.0> -> !quant.uniform<i8:f32, 1.0>
     /// tensor<4x!quant.uniform<i8:f32, 1.0> -> quant.uniform<i8:f32, 1.0>
     /// ```
-    fn quantized_element_type(&self) -> Option<TypeRef<'c, 't>> {
-        unsafe { TypeRef::from_c_api(mlirQuantizedTypeGetQuantizedElementType(self.to_c_api()), self.context()) }
+    fn quantized_element_type(&self) -> Result<Option<TypeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirQuantizedTypeGetQuantizedElementType(self.to_c_api()) };
+        if handle.ptr.is_null() { Ok(None) } else { unsafe { TypeRef::from_c_api(handle, self.context()).map(Some) } }
     }
 
     /// Casts the provided `candidate` based on [`Self::storage_type`] to an equivalent [`QuantizedType`], returning
-    /// [`None`] if the cast is invalid. This is effectively the inverse of [`Self::cast_to_storage_type`]. Examples
-    /// of `candidate` types mapped to their corresponding returned types assuming that the current [`QuantizedType`]
-    /// is `!quant.uniform<i8:f32, 1.0>`:
+    /// `Ok(None)` if the cast is invalid. This is effectively the inverse of [`Self::cast_to_storage_type`].
+    /// Examples of `candidate` types mapped to their corresponding returned types assuming that the current
+    /// [`QuantizedType`] is `!quant.uniform<i8:f32, 1.0>`:
     ///
     /// ```text
     /// i8 -> !quant.uniform<i8:f32, 1.0>
     /// tensor<4xi8> -> tensor<4x!quant.uniform<i8:f32, 1.0}>>
     /// vector<4xi8> -> vector<4x!quant.uniform<i8:f32, 1.0>>
     /// ```
-    fn cast_from_storage_type<T: Type<'c, 't>>(&self, candidate: T) -> Option<TypeRef<'c, 't>> {
-        unsafe {
-            TypeRef::from_c_api(
-                mlirQuantizedTypeCastFromStorageType(self.to_c_api(), candidate.to_c_api()),
-                self.context(),
-            )
-        }
+    fn cast_from_storage_type<T: Type<'c, 't>>(&self, candidate: T) -> Result<Option<TypeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirQuantizedTypeCastFromStorageType(self.to_c_api(), candidate.to_c_api()) };
+        if handle.ptr.is_null() { Ok(None) } else { unsafe { TypeRef::from_c_api(handle, self.context()).map(Some) } }
     }
 
     /// Casts this [`QuantizedType`] to a corresponding type based on [`Self::storage_type`].
     /// This is effectively the inverse of [`Self::cast_from_storage_type`].
-    fn cast_to_storage_type(&self) -> Option<TypeRef<'c, 't>> {
-        unsafe { TypeRef::from_c_api(mlirQuantizedTypeCastToStorageType(self.to_c_api()), self.context()) }
+    fn cast_to_storage_type(&self) -> Result<Option<TypeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirQuantizedTypeCastToStorageType(self.to_c_api()) };
+        if handle.ptr.is_null() { Ok(None) } else { unsafe { TypeRef::from_c_api(handle, self.context()).map(Some) } }
     }
 
     /// Casts the provided `candidate` based on [`Self::expressed_type`] to an equivalent [`QuantizedType`], returning
-    /// [`None`] if the cast is invalid. This is effectively the inverse of [`Self::cast_to_expressed_type`]. Examples
-    /// of `candidate` types mapped to their corresponding returned types assuming that the current [`QuantizedType`]
-    /// is `!quant.uniform<i8:f32, 1.0>`:
+    /// `Ok(None)` if the cast is invalid. This is effectively the inverse of [`Self::cast_to_expressed_type`].
+    /// Examples of `candidate` types mapped to their corresponding returned types assuming that the current
+    /// [`QuantizedType`] is `!quant.uniform<i8:f32, 1.0>`:
     ///
     /// ```text
     /// f32 -> !quant.uniform<i8:f32, 1.0>
     /// tensor<4xf32> -> tensor<4x!quant.uniform<i8:f32, 1.0>>
     /// vector<4xf32> -> vector<4x!quant.uniform<i8:f32, 1.0>>
     /// ```
-    fn cast_from_expressed_type<T: Type<'c, 't>>(&self, candidate: T) -> Option<TypeRef<'c, 't>> {
-        unsafe {
-            TypeRef::from_c_api(
-                mlirQuantizedTypeCastFromExpressedType(self.to_c_api(), candidate.to_c_api()),
-                self.context(),
-            )
-        }
+    fn cast_from_expressed_type<T: Type<'c, 't>>(&self, candidate: T) -> Result<Option<TypeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirQuantizedTypeCastFromExpressedType(self.to_c_api(), candidate.to_c_api()) };
+        if handle.ptr.is_null() { Ok(None) } else { unsafe { TypeRef::from_c_api(handle, self.context()).map(Some) } }
     }
 
     /// Casts this [`QuantizedType`] to a corresponding type based on [`Self::expressed_type`].
     /// This is effectively the inverse of [`Self::cast_from_expressed_type`].
-    fn cast_to_expressed_type(&self) -> Option<TypeRef<'c, 't>> {
-        unsafe { TypeRef::from_c_api(mlirQuantizedTypeCastToExpressedType(self.to_c_api()), self.context()) }
+    fn cast_to_expressed_type(&self) -> Result<Option<TypeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirQuantizedTypeCastToExpressedType(self.to_c_api()) };
+        if handle.ptr.is_null() { Ok(None) } else { unsafe { TypeRef::from_c_api(handle, self.context()).map(Some) } }
     }
 
     /// Casts the provided `candidate` based on [`Self::expressed_type`] to an equivalent type based on
-    /// [`Self::storage_type`], returning [`None`] if the case is invalid. This is equivalent to the composition of
+    /// [`Self::storage_type`], returning `Ok(None)` if the case is invalid. This is equivalent to the composition of
     /// [`Self::cast_to_storage_type`] and [`Self::cast_from_expressed_type`], but with additional validity checks.
     /// Examples of `candidate` types mapped to their corresponding returned types assuming that the current
     /// [`QuantizedType`] is `!quant.uniform<i8:f32, 1.0>`:
@@ -168,13 +170,9 @@ pub trait QuantizedType<'c, 't: 'c>: Type<'c, 't> {
     /// ```text
     /// tensor<4xf32> -> tensor<4xi8>
     /// ```
-    fn cast_expressed_to_storage_type<T: Type<'c, 't>>(&self, candidate: T) -> Option<TypeRef<'c, 't>> {
-        unsafe {
-            TypeRef::from_c_api(
-                mlirQuantizedTypeCastExpressedToStorageType(self.to_c_api(), candidate.to_c_api()),
-                self.context(),
-            )
-        }
+    fn cast_expressed_to_storage_type<T: Type<'c, 't>>(&self, candidate: T) -> Result<Option<TypeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirQuantizedTypeCastExpressedToStorageType(self.to_c_api(), candidate.to_c_api()) };
+        if handle.ptr.is_null() { Ok(None) } else { unsafe { TypeRef::from_c_api(handle, self.context()).map(Some) } }
     }
 }
 
@@ -228,8 +226,8 @@ pub struct AnyQuantizedTypeRef<'c, 't> {
 
 impl<'c, 't> AnyQuantizedTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`AnyQuantizedTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirAnyQuantizedTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirAnyQuantizedTypeGetTypeID()) }
     }
 }
 
@@ -247,8 +245,8 @@ impl<'t> Context<'t> {
         expressed_type: ExpressedType,
         storage_type_min: i64,
         storage_type_max: i64,
-    ) -> AnyQuantizedTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::quant());
+    ) -> Result<AnyQuantizedTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::quant()?)?;
         unsafe {
             AnyQuantizedTypeRef::from_c_api(
                 mlirAnyQuantizedTypeGet(
@@ -260,7 +258,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::any_quantized_type`"))
         }
     }
 }
@@ -291,8 +289,8 @@ pub struct UniformQuantizedTypeRef<'c, 't> {
 
 impl<'c, 't> UniformQuantizedTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`UniformQuantizedTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirUniformQuantizedTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirUniformQuantizedTypeGetTypeID()) }
     }
 
     /// Returns `true` if this type represents fixed-point quantization. In MLIR, this means that the storage and
@@ -334,8 +332,8 @@ impl<'t> Context<'t> {
         zero_point: i64,
         storage_type_min: i64,
         storage_type_max: i64,
-    ) -> UniformQuantizedTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::quant());
+    ) -> Result<UniformQuantizedTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::quant()?)?;
         unsafe {
             UniformQuantizedTypeRef::from_c_api(
                 mlirUniformQuantizedTypeGet(
@@ -349,7 +347,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::uniform_quantized_type`"))
         }
     }
 }
@@ -380,8 +378,8 @@ pub struct UniformQuantizedPerAxisTypeRef<'c, 't> {
 
 impl<'c, 't> UniformQuantizedPerAxisTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`UniformQuantizedPerAxisTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirUniformQuantizedPerAxisTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirUniformQuantizedPerAxisTypeGetTypeID()) }
     }
 
     /// Returns `true` if this type represents fixed-point quantization. In MLIR, this means that the storage and
@@ -398,50 +396,60 @@ impl<'c, 't> UniformQuantizedPerAxisTypeRef<'c, 't> {
     }
 
     /// Returns the `index`-th quantized dimension index that is to be paired with the `index`-th scale and zero point
-    /// parameters of this [`UniformQuantizedPerAxisTypeRef`]. This function will return [`None`] if `index` is out of
-    /// bounds. Note that, for per-axis quantization in MLIR, the quantized dimension is shared across all entries and
-    /// therefore the same value is returned for all valid indices.
-    pub fn quantized_dimension(&self, index: usize) -> Option<usize> {
-        if index >= self.quantized_dimension_count() {
-            return None;
+    /// parameters of this [`UniformQuantizedPerAxisTypeRef`]. Note that, for per-axis quantization in MLIR, the
+    /// quantized dimension is shared across all entries and therefore the same value is returned for all valid indices.
+    pub fn quantized_dimension(&self, index: usize) -> Result<usize, Error> {
+        let quantized_dimension_count = self.quantized_dimension_count();
+        if index >= quantized_dimension_count {
+            return Err(Error::invalid_argument(format!(
+                "quantized dimension index {index} is out of bounds for {quantized_dimension_count} quantized dimensions",
+            )));
         }
-        Some(unsafe { mlirUniformQuantizedPerAxisTypeGetQuantizedDimension(self.handle).cast_unsigned() as usize })
+        Ok(unsafe { mlirUniformQuantizedPerAxisTypeGetQuantizedDimension(self.handle).cast_unsigned() as usize })
     }
 
     /// Returns all quantized dimension indices of this [`UniformQuantizedPerAxisTypeRef`]
     /// (i.e., one for each per-axis parameter entry).
     pub fn quantized_dimensions(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.quantized_dimension_count()).map(|index| self.quantized_dimension(index).unwrap())
+        (0..self.quantized_dimension_count()).map(|_| unsafe {
+            mlirUniformQuantizedPerAxisTypeGetQuantizedDimension(self.handle).cast_unsigned() as usize
+        })
     }
 
-    /// Returns the `index`-th scale parameter of this [`UniformQuantizedPerAxisTypeRef`], and [`None`]
-    /// if the provided `index` is out of bounds.
-    pub fn scale(&self, index: usize) -> Option<f64> {
-        if index >= self.quantized_dimension_count() {
-            return None;
+    /// Returns the `index`-th scale parameter of this [`UniformQuantizedPerAxisTypeRef`].
+    pub fn scale(&self, index: usize) -> Result<f64, Error> {
+        let quantized_dimension_count = self.quantized_dimension_count();
+        if index >= quantized_dimension_count {
+            return Err(Error::invalid_argument(format!(
+                "scale index {index} is out of bounds for {quantized_dimension_count} scale parameters",
+            )));
         }
-        Some(unsafe { mlirUniformQuantizedPerAxisTypeGetScale(self.handle, index.cast_signed()) })
+        Ok(unsafe { mlirUniformQuantizedPerAxisTypeGetScale(self.handle, index.cast_signed()) })
     }
 
     /// Returns all the per-axis scale parameters of this [`UniformQuantizedPerAxisTypeRef`],
     /// ordered by index along [`Self::quantized_dimensions`].
     pub fn scales(&self) -> impl Iterator<Item = f64> + '_ {
-        (0..self.quantized_dimension_count()).map(|index| self.scale(index).unwrap())
+        (0..self.quantized_dimension_count())
+            .map(|index| unsafe { mlirUniformQuantizedPerAxisTypeGetScale(self.handle, index.cast_signed()) })
     }
 
-    /// Returns the `index`-th zero-point parameter of this [`UniformQuantizedPerAxisTypeRef`], and [`None`]
-    /// if the provided `index` is out of bounds.
-    pub fn zero_point(&self, index: usize) -> Option<i64> {
-        if index >= self.quantized_dimension_count() {
-            return None;
+    /// Returns the `index`-th zero-point parameter of this [`UniformQuantizedPerAxisTypeRef`].
+    pub fn zero_point(&self, index: usize) -> Result<i64, Error> {
+        let quantized_dimension_count = self.quantized_dimension_count();
+        if index >= quantized_dimension_count {
+            return Err(Error::invalid_argument(format!(
+                "zero-point index {index} is out of bounds for {quantized_dimension_count} zero-point parameters",
+            )));
         }
-        Some(unsafe { mlirUniformQuantizedPerAxisTypeGetZeroPoint(self.handle, index.cast_signed()) })
+        Ok(unsafe { mlirUniformQuantizedPerAxisTypeGetZeroPoint(self.handle, index.cast_signed()) })
     }
 
     /// Returns all the per-axis zero-point parameters of this [`UniformQuantizedPerAxisTypeRef`],
     /// ordered by index along [`Self::quantized_dimensions`].
     pub fn zero_points(&self) -> impl Iterator<Item = i64> + '_ {
-        (0..self.quantized_dimension_count()).map(|index| self.zero_point(index).unwrap())
+        (0..self.quantized_dimension_count())
+            .map(|index| unsafe { mlirUniformQuantizedPerAxisTypeGetZeroPoint(self.handle, index.cast_signed()) })
     }
 }
 
@@ -467,11 +475,11 @@ impl<'t> Context<'t> {
         quantized_dimension: i32,
         storage_type_min: i64,
         storage_type_max: i64,
-    ) -> UniformQuantizedPerAxisTypeRef<'c, 't> {
+    ) -> Result<UniformQuantizedPerAxisTypeRef<'c, 't>, Error> {
         if scales.len() != zero_points.len() {
-            panic!("`scales` and `zero_points` have the same length");
+            return Err(Error::invalid_argument("`scales` and `zero_points` must have the same length"));
         }
-        self.load_dialect(DialectHandle::quant());
+        self.load_dialect(DialectHandle::quant()?)?;
         unsafe {
             UniformQuantizedPerAxisTypeRef::from_c_api(
                 mlirUniformQuantizedPerAxisTypeGet(
@@ -487,7 +495,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::uniform_quantized_per_axis_type`"))
         }
     }
 }
@@ -519,8 +527,8 @@ pub struct UniformQuantizedSubChannelTypeRef<'c, 't> {
 
 impl<'c, 't> UniformQuantizedSubChannelTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`UniformQuantizedSubChannelTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirUniformQuantizedSubChannelTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirUniformQuantizedSubChannelTypeGetTypeID()) }
     }
 
     /// Returns the number of blocks of this [`UniformQuantizedSubChannelTypeRef`]
@@ -530,13 +538,15 @@ impl<'c, 't> UniformQuantizedSubChannelTypeRef<'c, 't> {
     }
 
     /// Returns the `index`-th quantized dimension index that is to be paired with the `index`-th quantization block
-    /// parameters of this [`UniformQuantizedSubChannelTypeRef`]. This function will return [`None`] if `index` is out
-    /// of bounds.
-    pub fn quantized_dimension(&self, index: usize) -> Option<usize> {
-        if index >= self.block_count() {
-            return None;
+    /// parameters of this [`UniformQuantizedSubChannelTypeRef`].
+    pub fn quantized_dimension(&self, index: usize) -> Result<usize, Error> {
+        let block_count = self.block_count();
+        if index >= block_count {
+            return Err(Error::invalid_argument(format!(
+                "quantized dimension index {index} is out of bounds for {block_count} quantization blocks",
+            )));
         }
-        Some(unsafe {
+        Ok(unsafe {
             mlirUniformQuantizedSubChannelTypeGetQuantizedDimension(self.handle, index.cast_signed()).cast_unsigned()
                 as usize
         })
@@ -545,36 +555,43 @@ impl<'c, 't> UniformQuantizedSubChannelTypeRef<'c, 't> {
     /// Returns all quantized dimension indices of this [`UniformQuantizedPerAxisTypeRef`]
     /// (i.e., one for each quantization block).
     pub fn quantized_dimensions(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.block_count()).map(|index| self.quantized_dimension(index).unwrap())
+        (0..self.block_count()).map(|index| unsafe {
+            mlirUniformQuantizedSubChannelTypeGetQuantizedDimension(self.handle, index.cast_signed()).cast_unsigned()
+                as usize
+        })
     }
 
-    /// Returns the `index`-th block size parameter of this [`UniformQuantizedPerAxisTypeRef`], and [`None`]
-    /// if the provided `index` is out of bounds.
-    pub fn block_size(&self, index: usize) -> Option<i64> {
-        if index >= self.block_count() {
-            return None;
+    /// Returns the `index`-th block size parameter of this [`UniformQuantizedPerAxisTypeRef`].
+    pub fn block_size(&self, index: usize) -> Result<i64, Error> {
+        let block_count = self.block_count();
+        if index >= block_count {
+            return Err(Error::invalid_argument(format!(
+                "block size index {index} is out of bounds for {block_count} quantization blocks",
+            )));
         }
-        Some(unsafe { mlirUniformQuantizedSubChannelTypeGetBlockSize(self.handle, index.cast_signed()) })
+        Ok(unsafe { mlirUniformQuantizedSubChannelTypeGetBlockSize(self.handle, index.cast_signed()) })
     }
 
     /// Returns all the block size parameters of this [`UniformQuantizedSubChannelTypeRef`],
     /// ordered by index along [`Self::quantized_dimensions`].
     pub fn block_sizes(&self) -> impl Iterator<Item = i64> + '_ {
-        (0..self.block_count()).map(|index| self.block_size(index).unwrap())
+        (0..self.block_count())
+            .map(|index| unsafe { mlirUniformQuantizedSubChannelTypeGetBlockSize(self.handle, index.cast_signed()) })
     }
 
     /// Returns the [`AttributeRef`] that stores sub-channel scales for this [`UniformQuantizedSubChannelTypeRef`].
-    pub fn scales(&self) -> AttributeRef<'c, 't> {
+    pub fn scales(&self) -> Result<AttributeRef<'c, 't>, Error> {
         unsafe {
-            AttributeRef::from_c_api(mlirUniformQuantizedSubChannelTypeGetScales(self.handle), self.context).unwrap()
+            AttributeRef::from_c_api(mlirUniformQuantizedSubChannelTypeGetScales(self.handle), self.context)
+                .map_err(|_| Error::internal("expected non-null uniform quantized sub-channel scales"))
         }
     }
 
     /// Returns the [`AttributeRef`] that stores sub-channel zero-points for this [`UniformQuantizedSubChannelTypeRef`].
-    pub fn zero_points(&self) -> AttributeRef<'c, 't> {
+    pub fn zero_points(&self) -> Result<AttributeRef<'c, 't>, Error> {
         unsafe {
             AttributeRef::from_c_api(mlirUniformQuantizedSubChannelTypeGetZeroPoints(self.handle), self.context)
-                .unwrap()
+                .map_err(|_| Error::internal("expected non-null uniform quantized sub-channel zero-points"))
         }
     }
 }
@@ -608,11 +625,11 @@ impl<'t> Context<'t> {
         block_sizes: &[i64],
         storage_type_min: i64,
         storage_type_max: i64,
-    ) -> UniformQuantizedSubChannelTypeRef<'c, 't> {
+    ) -> Result<UniformQuantizedSubChannelTypeRef<'c, 't>, Error> {
         if quantized_dimensions.len() != block_sizes.len() {
-            panic!("`quantized_dimensions` and `block_sizes` must have the same length");
+            return Err(Error::invalid_argument("`quantized_dimensions` and `block_sizes` must have the same length"));
         }
-        self.load_dialect(DialectHandle::quant());
+        self.load_dialect(DialectHandle::quant()?)?;
         unsafe {
             UniformQuantizedSubChannelTypeRef::from_c_api(
                 mlirUniformQuantizedSubChannelTypeGet(
@@ -629,7 +646,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::uniform_quantized_sub_channel_type`"))
         }
     }
 }
@@ -660,8 +677,8 @@ pub struct CalibratedQuantizedTypeRef<'c, 't> {
 
 impl<'c, 't> CalibratedQuantizedTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`CalibratedQuantizedTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirCalibratedQuantizedTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirCalibratedQuantizedTypeGetTypeID()) }
     }
 
     /// Returns the minimum calibrated value of this [`CalibratedQuantizedTypeRef`].
@@ -691,14 +708,14 @@ impl<'t> Context<'t> {
         expressed_type: ExpressedType,
         minimum: f64,
         maximum: f64,
-    ) -> CalibratedQuantizedTypeRef<'c, 't> {
-        self.load_dialect(DialectHandle::quant());
+    ) -> Result<CalibratedQuantizedTypeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::quant()?)?;
         unsafe {
             CalibratedQuantizedTypeRef::from_c_api(
                 mlirCalibratedQuantizedTypeGet(expressed_type.to_c_api(), minimum, maximum),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::calibrated_quantized_type`"))
         }
     }
 }
@@ -720,12 +737,12 @@ mod tests {
         let expressed_type = context.float32_type();
         assert_eq!(QuantizedTypeRef::default_minimum_for_integer(true, 8), -128);
         assert_eq!(QuantizedTypeRef::default_maximum_for_integer(true, 8), 127);
-        let r#type = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127);
-        assert_eq!(r#type.dialect(), context.load_dialect(DialectHandle::quant()).unwrap());
-        assert_eq!(r#type.type_id(), AnyQuantizedTypeRef::type_id());
+        let r#type = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127).unwrap();
+        assert_eq!(r#type.dialect().unwrap(), context.load_dialect(DialectHandle::quant().unwrap()).unwrap());
+        assert_eq!(r#type.type_id().unwrap(), AnyQuantizedTypeRef::type_id().unwrap());
         assert_eq!(r#type.flags(), flags);
-        assert_eq!(r#type.storage_type(), storage_type);
-        assert_eq!(r#type.expressed_type(), expressed_type);
+        assert_eq!(r#type.storage_type().unwrap(), storage_type);
+        assert_eq!(r#type.expressed_type().unwrap(), expressed_type);
         assert_eq!(r#type.storage_type_minimum(), -128);
         assert_eq!(r#type.storage_type_maximum(), 127);
     }
@@ -736,18 +753,18 @@ mod tests {
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let type_1 = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127);
-        let type_2 = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127);
+        let type_1 = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127).unwrap();
+        let type_2 = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127).unwrap();
         assert_eq!(type_1, type_2);
 
-        let type_2 = context.any_quantized_type(flags, storage_type, expressed_type, -127, 127);
+        let type_2 = context.any_quantized_type(flags, storage_type, expressed_type, -127, 127).unwrap();
         assert_ne!(type_1, type_2);
 
         let context = Context::new();
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let type_2 = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127);
+        let type_2 = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127).unwrap();
         assert_ne!(type_1, type_2);
     }
 
@@ -757,18 +774,18 @@ mod tests {
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let r#type = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127);
+        let r#type = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127).unwrap();
         test_type_display_and_debug(r#type, "!quant.any<i8:f32>");
     }
 
     #[test]
     fn test_any_quantized_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::quant());
+        context.load_dialect(DialectHandle::quant().unwrap()).unwrap();
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let r#type = context.any_quantized_type(flags, storage_type, expressed_type, -127, 127);
+        let r#type = context.any_quantized_type(flags, storage_type, expressed_type, -127, 127).unwrap();
         assert_eq!(context.parse_type("!quant.any<i8<-127:127>:f32>").unwrap(), r#type);
     }
 
@@ -778,7 +795,7 @@ mod tests {
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let r#type = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127);
+        let r#type = context.any_quantized_type(flags, storage_type, expressed_type, -128, 127).unwrap();
         test_type_casting(r#type);
     }
 
@@ -788,9 +805,9 @@ mod tests {
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let r#type = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127);
-        assert_eq!(r#type.dialect(), context.load_dialect(DialectHandle::quant()).unwrap());
-        assert_eq!(r#type.type_id(), UniformQuantizedTypeRef::type_id());
+        let r#type = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127).unwrap();
+        assert_eq!(r#type.dialect().unwrap(), context.load_dialect(DialectHandle::quant().unwrap()).unwrap());
+        assert_eq!(r#type.type_id().unwrap(), UniformQuantizedTypeRef::type_id().unwrap());
         assert!(!r#type.is_fixed_point());
         assert_eq!(r#type.scale(), 0.25);
         assert_eq!(r#type.zero_point(), 3);
@@ -803,18 +820,18 @@ mod tests {
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let type_1 = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127);
-        let type_2 = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127);
+        let type_1 = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127).unwrap();
+        let type_2 = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127).unwrap();
         assert_eq!(type_1, type_2);
 
-        let type_2 = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.5, 3, -128, 127);
+        let type_2 = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.5, 3, -128, 127).unwrap();
         assert_ne!(type_1, type_2);
 
         let context = Context::new();
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let type_2 = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127);
+        let type_2 = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127).unwrap();
         assert_ne!(type_1, type_2);
     }
 
@@ -824,18 +841,18 @@ mod tests {
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let r#type = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -127, 127);
+        let r#type = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -127, 127).unwrap();
         test_type_display_and_debug(r#type, "!quant.uniform<i8<-127:127>:f32, 2.500000e-01:3>");
     }
 
     #[test]
     fn test_uniform_quantized_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::quant());
+        context.load_dialect(DialectHandle::quant().unwrap()).unwrap();
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let r#type = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127);
+        let r#type = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127).unwrap();
         assert_eq!(context.parse_type("!quant.uniform<i8:f32, 2.500000e-01:3>").unwrap(), r#type);
     }
 
@@ -845,7 +862,7 @@ mod tests {
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let r#type = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127);
+        let r#type = context.uniform_quantized_type(flags, storage_type, expressed_type, 0.25, 3, -128, 127).unwrap();
         test_type_casting(r#type);
     }
 
@@ -855,32 +872,30 @@ mod tests {
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let r#type = context.uniform_quantized_per_axis_type(
-            flags,
-            storage_type,
-            expressed_type,
-            &[0.25, 0.5],
-            &[3, 5],
-            1,
-            -128,
-            127,
-        );
-        assert_eq!(r#type.dialect(), context.load_dialect(DialectHandle::quant()).unwrap());
-        assert_eq!(r#type.type_id(), UniformQuantizedPerAxisTypeRef::type_id());
+        let r#type = context
+            .uniform_quantized_per_axis_type(flags, storage_type, expressed_type, &[0.25, 0.5], &[3, 5], 1, -128, 127)
+            .unwrap();
+        assert_eq!(r#type.dialect().unwrap(), context.load_dialect(DialectHandle::quant().unwrap()).unwrap());
+        assert_eq!(r#type.type_id().unwrap(), UniformQuantizedPerAxisTypeRef::type_id().unwrap());
         assert!(r#type.is_fixed_point());
         assert_eq!(r#type.quantized_dimension_count(), 2);
-        assert_eq!(r#type.quantized_dimension(0), Some(1));
-        assert_eq!(r#type.quantized_dimension(1), Some(1));
-        assert_eq!(r#type.quantized_dimension(2), None);
+        assert_eq!(r#type.quantized_dimension(0).unwrap(), 1);
+        assert_eq!(r#type.quantized_dimension(1).unwrap(), 1);
+        assert!(r#type.quantized_dimension(2).is_err());
         assert_eq!(r#type.quantized_dimensions().collect::<Vec<_>>(), vec![1, 1]);
-        assert_eq!(r#type.scale(0), Some(0.25));
-        assert_eq!(r#type.scale(1), Some(0.5));
-        assert_eq!(r#type.scale(2), None);
+        assert_eq!(r#type.scale(0).unwrap(), 0.25);
+        assert_eq!(r#type.scale(1).unwrap(), 0.5);
+        assert!(r#type.scale(2).is_err());
         assert_eq!(r#type.scales().collect::<Vec<_>>(), vec![0.25, 0.5]);
-        assert_eq!(r#type.zero_point(0), Some(3));
-        assert_eq!(r#type.zero_point(1), Some(5));
-        assert_eq!(r#type.zero_point(2), None);
+        assert_eq!(r#type.zero_point(0).unwrap(), 3);
+        assert_eq!(r#type.zero_point(1).unwrap(), 5);
+        assert!(r#type.zero_point(2).is_err());
         assert_eq!(r#type.zero_points().collect::<Vec<_>>(), vec![3, 5]);
+        assert!(
+            context
+                .uniform_quantized_per_axis_type(flags, storage_type, expressed_type, &[0.25, 0.5], &[3], 1, -128, 127,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -890,54 +905,26 @@ mod tests {
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let type_1 = context.uniform_quantized_per_axis_type(
-            flags,
-            storage_type,
-            expressed_type,
-            &[0.25, 0.5],
-            &[3, 5],
-            1,
-            -128,
-            127,
-        );
-        let type_2 = context.uniform_quantized_per_axis_type(
-            flags,
-            storage_type,
-            expressed_type,
-            &[0.25, 0.5],
-            &[3, 5],
-            1,
-            -128,
-            127,
-        );
+        let type_1 = context
+            .uniform_quantized_per_axis_type(flags, storage_type, expressed_type, &[0.25, 0.5], &[3, 5], 1, -128, 127)
+            .unwrap();
+        let type_2 = context
+            .uniform_quantized_per_axis_type(flags, storage_type, expressed_type, &[0.25, 0.5], &[3, 5], 1, -128, 127)
+            .unwrap();
         assert_eq!(type_1, type_2);
 
-        let type_2 = context.uniform_quantized_per_axis_type(
-            flags,
-            storage_type,
-            expressed_type,
-            &[0.25, 0.5],
-            &[3, 5],
-            0,
-            -128,
-            127,
-        );
+        let type_2 = context
+            .uniform_quantized_per_axis_type(flags, storage_type, expressed_type, &[0.25, 0.5], &[3, 5], 0, -128, 127)
+            .unwrap();
         assert_ne!(type_1, type_2);
 
         let context = Context::new();
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let type_2 = context.uniform_quantized_per_axis_type(
-            flags,
-            storage_type,
-            expressed_type,
-            &[0.25, 0.5],
-            &[3, 5],
-            1,
-            -128,
-            127,
-        );
+        let type_2 = context
+            .uniform_quantized_per_axis_type(flags, storage_type, expressed_type, &[0.25, 0.5], &[3, 5], 1, -128, 127)
+            .unwrap();
         assert_ne!(type_1, type_2);
     }
 
@@ -947,36 +934,22 @@ mod tests {
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let r#type = context.uniform_quantized_per_axis_type(
-            flags,
-            storage_type,
-            expressed_type,
-            &[0.25, 0.5],
-            &[3, 5],
-            1,
-            -128,
-            127,
-        );
+        let r#type = context
+            .uniform_quantized_per_axis_type(flags, storage_type, expressed_type, &[0.25, 0.5], &[3, 5], 1, -128, 127)
+            .unwrap();
         test_type_display_and_debug(r#type, "!quant.uniform<i8:f32:1, {2.500000e-01:3,5.000000e-01:5}>");
     }
 
     #[test]
     fn test_uniform_quantized_per_axis_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::quant());
+        context.load_dialect(DialectHandle::quant().unwrap()).unwrap();
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let r#type = context.uniform_quantized_per_axis_type(
-            flags,
-            storage_type,
-            expressed_type,
-            &[0.25, 0.5],
-            &[3, 5],
-            1,
-            -128,
-            127,
-        );
+        let r#type = context
+            .uniform_quantized_per_axis_type(flags, storage_type, expressed_type, &[0.25, 0.5], &[3, 5], 1, -128, 127)
+            .unwrap();
         assert_eq!(context.parse_type("!quant.uniform<i8:f32:1, {2.500000e-01:3,5.000000e-01:5}>").unwrap(), r#type);
     }
 
@@ -986,16 +959,9 @@ mod tests {
         let flags = QuantizedTypeRef::signed_flag();
         let storage_type = context.signless_integer_type(8);
         let expressed_type = context.float32_type();
-        let r#type = context.uniform_quantized_per_axis_type(
-            flags,
-            storage_type,
-            expressed_type,
-            &[0.25, 0.5],
-            &[3, 5],
-            1,
-            -128,
-            127,
-        );
+        let r#type = context
+            .uniform_quantized_per_axis_type(flags, storage_type, expressed_type, &[0.25, 0.5], &[3, 5], 1, -128, 127)
+            .unwrap();
         test_type_casting(r#type);
     }
 
@@ -1013,30 +979,47 @@ mod tests {
         let zero_points = context.dense_i64_elements_attribute(zero_point_type, &[0, 2]).unwrap();
         let scales_display = scales.to_string();
         let zero_points_display = zero_points.to_string();
-        let r#type = context.uniform_quantized_sub_channel_type(
-            flags,
-            storage_type,
-            expressed_type,
-            scales,
-            zero_points,
-            &[0, 1],
-            &[16, 8],
-            -128,
-            127,
-        );
-        assert_eq!(r#type.dialect(), context.load_dialect(DialectHandle::quant()).unwrap());
-        assert_eq!(r#type.type_id(), UniformQuantizedSubChannelTypeRef::type_id());
+        let r#type = context
+            .uniform_quantized_sub_channel_type(
+                flags,
+                storage_type,
+                expressed_type,
+                scales,
+                zero_points,
+                &[0, 1],
+                &[16, 8],
+                -128,
+                127,
+            )
+            .unwrap();
+        assert_eq!(r#type.dialect().unwrap(), context.load_dialect(DialectHandle::quant().unwrap()).unwrap());
+        assert_eq!(r#type.type_id().unwrap(), UniformQuantizedSubChannelTypeRef::type_id().unwrap());
         assert_eq!(r#type.block_count(), 2);
-        assert_eq!(r#type.quantized_dimension(0), Some(0));
-        assert_eq!(r#type.quantized_dimension(1), Some(1));
-        assert_eq!(r#type.quantized_dimension(2), None);
+        assert_eq!(r#type.quantized_dimension(0).unwrap(), 0);
+        assert_eq!(r#type.quantized_dimension(1).unwrap(), 1);
+        assert!(r#type.quantized_dimension(2).is_err());
         assert_eq!(r#type.quantized_dimensions().collect::<Vec<_>>(), vec![0, 1]);
-        assert_eq!(r#type.block_size(0), Some(16));
-        assert_eq!(r#type.block_size(1), Some(8));
-        assert_eq!(r#type.block_size(2), None);
+        assert_eq!(r#type.block_size(0).unwrap(), 16);
+        assert_eq!(r#type.block_size(1).unwrap(), 8);
+        assert!(r#type.block_size(2).is_err());
         assert_eq!(r#type.block_sizes().collect::<Vec<_>>(), vec![16, 8]);
-        assert_eq!(r#type.scales().to_string(), scales_display);
-        assert_eq!(r#type.zero_points().to_string(), zero_points_display);
+        assert_eq!(r#type.scales().unwrap().to_string(), scales_display);
+        assert_eq!(r#type.zero_points().unwrap().to_string(), zero_points_display);
+        assert!(
+            context
+                .uniform_quantized_sub_channel_type(
+                    flags,
+                    storage_type,
+                    expressed_type,
+                    scales,
+                    zero_points,
+                    &[0, 1],
+                    &[16],
+                    -128,
+                    127,
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -1052,33 +1035,37 @@ mod tests {
             context.tensor_type(context.signless_integer_type(64), &[Size::Static(2)], None, location).unwrap();
         let scales = context.dense_f32_elements_attribute(scale_type, &[0.25, 0.5]).unwrap();
         let zero_points = context.dense_i64_elements_attribute(zero_point_type, &[0, 2]).unwrap();
-        let type_1 = context.uniform_quantized_sub_channel_type(
-            flags,
-            storage_type,
-            expressed_type,
-            scales,
-            zero_points,
-            &[0, 1],
-            &[16, 8],
-            -128,
-            127,
-        );
+        let type_1 = context
+            .uniform_quantized_sub_channel_type(
+                flags,
+                storage_type,
+                expressed_type,
+                scales,
+                zero_points,
+                &[0, 1],
+                &[16, 8],
+                -128,
+                127,
+            )
+            .unwrap();
         let scale_type = context.tensor_type(context.float32_type(), &[Size::Static(2)], None, location).unwrap();
         let zero_point_type =
             context.tensor_type(context.signless_integer_type(64), &[Size::Static(2)], None, location).unwrap();
         let scales = context.dense_f32_elements_attribute(scale_type, &[0.25, 0.5]).unwrap();
         let zero_points = context.dense_i64_elements_attribute(zero_point_type, &[0, 2]).unwrap();
-        let type_2 = context.uniform_quantized_sub_channel_type(
-            flags,
-            storage_type,
-            expressed_type,
-            scales,
-            zero_points,
-            &[0, 1],
-            &[16, 8],
-            -128,
-            127,
-        );
+        let type_2 = context
+            .uniform_quantized_sub_channel_type(
+                flags,
+                storage_type,
+                expressed_type,
+                scales,
+                zero_points,
+                &[0, 1],
+                &[16, 8],
+                -128,
+                127,
+            )
+            .unwrap();
         assert_eq!(type_1, type_2);
 
         let scale_type = context.tensor_type(context.float32_type(), &[Size::Static(2)], None, location).unwrap();
@@ -1086,17 +1073,19 @@ mod tests {
             context.tensor_type(context.signless_integer_type(64), &[Size::Static(2)], None, location).unwrap();
         let scales = context.dense_f32_elements_attribute(scale_type, &[0.25, 0.5]).unwrap();
         let zero_points = context.dense_i64_elements_attribute(zero_point_type, &[0, 2]).unwrap();
-        let type_2 = context.uniform_quantized_sub_channel_type(
-            flags,
-            context.signless_integer_type(8),
-            context.float32_type(),
-            scales,
-            zero_points,
-            &[0, 1],
-            &[8, 8],
-            -128,
-            127,
-        );
+        let type_2 = context
+            .uniform_quantized_sub_channel_type(
+                flags,
+                context.signless_integer_type(8),
+                context.float32_type(),
+                scales,
+                zero_points,
+                &[0, 1],
+                &[8, 8],
+                -128,
+                127,
+            )
+            .unwrap();
         assert_ne!(type_1, type_2);
 
         let context = Context::new();
@@ -1109,17 +1098,19 @@ mod tests {
             context.tensor_type(context.signless_integer_type(64), &[Size::Static(2)], None, location).unwrap();
         let scales = context.dense_f32_elements_attribute(scale_type, &[0.25, 0.5]).unwrap();
         let zero_points = context.dense_i64_elements_attribute(zero_point_type, &[0, 2]).unwrap();
-        let type_2 = context.uniform_quantized_sub_channel_type(
-            flags,
-            storage_type,
-            expressed_type,
-            scales,
-            zero_points,
-            &[0, 1],
-            &[16, 8],
-            -128,
-            127,
-        );
+        let type_2 = context
+            .uniform_quantized_sub_channel_type(
+                flags,
+                storage_type,
+                expressed_type,
+                scales,
+                zero_points,
+                &[0, 1],
+                &[16, 8],
+                -128,
+                127,
+            )
+            .unwrap();
         assert_ne!(type_1, type_2);
     }
 
@@ -1135,24 +1126,26 @@ mod tests {
             context.tensor_type(context.signless_integer_type(64), &[Size::Static(2)], None, location).unwrap();
         let scales = context.dense_f32_elements_attribute(scale_type, &[0.25, 0.5]).unwrap();
         let zero_points = context.dense_i64_elements_attribute(zero_point_type, &[0, 2]).unwrap();
-        let r#type = context.uniform_quantized_sub_channel_type(
-            flags,
-            storage_type,
-            expressed_type,
-            scales,
-            zero_points,
-            &[0, 1],
-            &[16, 8],
-            -128,
-            127,
-        );
+        let r#type = context
+            .uniform_quantized_sub_channel_type(
+                flags,
+                storage_type,
+                expressed_type,
+                scales,
+                zero_points,
+                &[0, 1],
+                &[16, 8],
+                -128,
+                127,
+            )
+            .unwrap();
         test_type_display_and_debug(r#type, "!quant.uniform<i8:f32:{0:16, 1:8}, {2.500000e-01, 5.000000e-01:2}>");
     }
 
     #[test]
     fn test_uniform_quantized_sub_channel_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::quant());
+        context.load_dialect(DialectHandle::quant().unwrap()).unwrap();
         let parsed = context
             .parse_type("!quant.uniform<i8:f32:{0:1, 1:2}, {{2.0:10, 3.0:20}, {4.0:30, 5.0:40}, {6.0:50, 7.0:60}}>")
             .unwrap();
@@ -1183,17 +1176,19 @@ mod tests {
             context.tensor_type(context.signless_integer_type(64), &[Size::Static(2)], None, location).unwrap();
         let scales = context.dense_f32_elements_attribute(scale_type, &[0.25, 0.5]).unwrap();
         let zero_points = context.dense_i64_elements_attribute(zero_point_type, &[0, 2]).unwrap();
-        let r#type = context.uniform_quantized_sub_channel_type(
-            flags,
-            storage_type,
-            expressed_type,
-            scales,
-            zero_points,
-            &[0, 1],
-            &[16, 8],
-            -128,
-            127,
-        );
+        let r#type = context
+            .uniform_quantized_sub_channel_type(
+                flags,
+                storage_type,
+                expressed_type,
+                scales,
+                zero_points,
+                &[0, 1],
+                &[16, 8],
+                -128,
+                127,
+            )
+            .unwrap();
         test_type_casting(r#type);
     }
 
@@ -1201,9 +1196,9 @@ mod tests {
     fn test_calibrated_quantized_type() {
         let context = Context::new();
         let expressed_type = context.float32_type();
-        let r#type = context.calibrated_quantized_type(expressed_type, -1.0, 1.0);
-        assert_eq!(r#type.dialect(), context.load_dialect(DialectHandle::quant()).unwrap());
-        assert_eq!(r#type.type_id(), CalibratedQuantizedTypeRef::type_id());
+        let r#type = context.calibrated_quantized_type(expressed_type, -1.0, 1.0).unwrap();
+        assert_eq!(r#type.dialect().unwrap(), context.load_dialect(DialectHandle::quant().unwrap()).unwrap());
+        assert_eq!(r#type.type_id().unwrap(), CalibratedQuantizedTypeRef::type_id().unwrap());
         assert_eq!(r#type.minimum(), -1.0);
         assert_eq!(r#type.maximum(), 1.0);
     }
@@ -1212,37 +1207,37 @@ mod tests {
     fn test_calibrated_quantized_type_equality() {
         let context = Context::new();
 
-        let type_1 = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0);
-        let type_2 = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0);
+        let type_1 = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0).unwrap();
+        let type_2 = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0).unwrap();
         assert_eq!(type_1, type_2);
 
-        let type_2 = context.calibrated_quantized_type(context.float32_type(), -2.0, 1.0);
+        let type_2 = context.calibrated_quantized_type(context.float32_type(), -2.0, 1.0).unwrap();
         assert_ne!(type_1, type_2);
 
         let context = Context::new();
-        let type_2 = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0);
+        let type_2 = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0).unwrap();
         assert_ne!(type_1, type_2);
     }
 
     #[test]
     fn test_calibrated_quantized_type_display_and_debug() {
         let context = Context::new();
-        let r#type = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0);
+        let r#type = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0).unwrap();
         test_type_display_and_debug(r#type, "!quant.calibrated<f32<-1.000000e+00:1.000000e+00>>");
     }
 
     #[test]
     fn test_calibrated_quantized_type_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::quant());
-        let r#type = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0);
+        context.load_dialect(DialectHandle::quant().unwrap()).unwrap();
+        let r#type = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0).unwrap();
         assert_eq!(context.parse_type("!quant.calibrated<f32<-1.000000e+00:1.000000e+00>>").unwrap(), r#type);
     }
 
     #[test]
     fn test_calibrated_quantized_type_casting() {
         let context = Context::new();
-        let r#type = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0);
+        let r#type = context.calibrated_quantized_type(context.float32_type(), -1.0, 1.0).unwrap();
         test_type_casting(r#type);
     }
 }

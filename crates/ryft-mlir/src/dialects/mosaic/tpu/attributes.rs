@@ -14,7 +14,9 @@ use ryft_xla_sys::mlir::dialects::mosaic::tpu::{
     mlirMosaicTpuMemorySpaceAttrGetValue, mlirMosaicTpuMemorySpaceAttrHasCoreType,
 };
 
-use crate::{Attribute, Context, DenseInteger64ArrayAttributeRef, DialectHandle, StringRef, mlir_subtype_trait_impls};
+use crate::{
+    Attribute, Context, DenseInteger64ArrayAttributeRef, DialectHandle, Error, StringRef, mlir_subtype_trait_impls,
+};
 
 macro_rules! mosaic_tpu_enum_attribute {
     (
@@ -80,22 +82,22 @@ macro_rules! mosaic_tpu_enum_attribute {
 
         impl $attribute_name<'_, '_> {
             /// Returns the enum value stored in this attribute.
-            pub fn value(&self) -> $enum_name {
+            pub fn value(&self) -> Result<$enum_name, Error> {
                 let value = unsafe { StringRef::from_c_api(mlirMosaicTpuEnumAttrGetValue(self.handle, $ffi_kind)) };
                 value
                     .as_str()
                     .ok()
                     .and_then($enum_name::from_str)
-                    .expect(concat!("invalid Mosaic TPU `", $mnemonic, "` attribute"))
+                    .ok_or_else(|| Error::invalid_argument(concat!("invalid Mosaic TPU `", $mnemonic, "` attribute")))
             }
         }
 
         impl<'c, 't> Attribute<'c, 't> for $attribute_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
                 if !handle.ptr.is_null() && unsafe { mlirAttributeIsAMosaicTpuEnumAttr(handle, $ffi_kind) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR attribute handle"))
                 }
             }
 
@@ -114,16 +116,15 @@ macro_rules! mosaic_tpu_enum_attribute {
             #[doc = "Creates a Mosaic TPU "]
             #[doc = $description]
             #[doc = " attribute owned by this [`Context`]."]
-            pub fn $context_method<'c>(&'c self, value: $enum_name) -> $attribute_name<'c, 't> {
-                self.load_dialect(DialectHandle::mosaic_tpu());
+            pub fn $context_method<'c>(&'c self, value: $enum_name) -> Result<$attribute_name<'c, 't>, Error> {
+                self.load_dialect(DialectHandle::mosaic_tpu()?)?;
                 let value = StringRef::from(value.as_str());
-                unsafe {
-                    $attribute_name::from_c_api(
-                        mlirMosaicTpuEnumAttrGet(*self.handle.borrow_mut(), $ffi_kind, value.to_c_api()),
-                        self,
-                    )
-                    .expect(concat!("invalid arguments to `Context::", stringify!($context_method), "`"))
-                }
+                Ok(unsafe {
+                    $attribute_name {
+                        handle: mlirMosaicTpuEnumAttrGet(*self.handle.borrow_mut(), $ffi_kind, value.to_c_api()),
+                        context: self,
+                    }
+                })
             }
         }
     };
@@ -252,89 +253,89 @@ pub struct DotDimensionNumbersAttributeRef<'c, 't> {
 
 impl DotDimensionNumbersAttributeRef<'_, '_> {
     /// Returns the left-hand side contracting dimensions.
-    pub fn lhs_contracting_dims(&self) -> DenseInteger64ArrayAttributeRef<'_, '_> {
+    pub fn lhs_contracting_dims(&self) -> Result<DenseInteger64ArrayAttributeRef<'_, '_>, Error> {
         unsafe {
             DenseInteger64ArrayAttributeRef::from_c_api(
                 mlirMosaicTpuDotDimensionNumbersAttrGetLhsContractingDims(self.handle),
                 self.context,
             )
-            .expect("invalid Mosaic TPU dot-dimension-number lhs contracting dimensions")
+            .map_err(|_| Error::internal("expected non-null Mosaic TPU lhs contracting dimensions"))
         }
     }
 
     /// Returns the right-hand side contracting dimensions.
-    pub fn rhs_contracting_dims(&self) -> DenseInteger64ArrayAttributeRef<'_, '_> {
+    pub fn rhs_contracting_dims(&self) -> Result<DenseInteger64ArrayAttributeRef<'_, '_>, Error> {
         unsafe {
             DenseInteger64ArrayAttributeRef::from_c_api(
                 mlirMosaicTpuDotDimensionNumbersAttrGetRhsContractingDims(self.handle),
                 self.context,
             )
-            .expect("invalid Mosaic TPU dot-dimension-number rhs contracting dimensions")
+            .map_err(|_| Error::internal("expected non-null Mosaic TPU rhs contracting dimensions"))
         }
     }
 
     /// Returns the left-hand side non-contracting dimensions.
-    pub fn lhs_non_contracting_dims(&self) -> DenseInteger64ArrayAttributeRef<'_, '_> {
+    pub fn lhs_non_contracting_dims(&self) -> Result<DenseInteger64ArrayAttributeRef<'_, '_>, Error> {
         unsafe {
             DenseInteger64ArrayAttributeRef::from_c_api(
                 mlirMosaicTpuDotDimensionNumbersAttrGetLhsNonContractingDims(self.handle),
                 self.context,
             )
-            .expect("invalid Mosaic TPU dot-dimension-number lhs non-contracting dimensions")
+            .map_err(|_| Error::internal("expected non-null Mosaic TPU lhs non-contracting dimensions"))
         }
     }
 
     /// Returns the right-hand side non-contracting dimensions.
-    pub fn rhs_non_contracting_dims(&self) -> DenseInteger64ArrayAttributeRef<'_, '_> {
+    pub fn rhs_non_contracting_dims(&self) -> Result<DenseInteger64ArrayAttributeRef<'_, '_>, Error> {
         unsafe {
             DenseInteger64ArrayAttributeRef::from_c_api(
                 mlirMosaicTpuDotDimensionNumbersAttrGetRhsNonContractingDims(self.handle),
                 self.context,
             )
-            .expect("invalid Mosaic TPU dot-dimension-number rhs non-contracting dimensions")
+            .map_err(|_| Error::internal("expected non-null Mosaic TPU rhs non-contracting dimensions"))
         }
     }
 
     /// Returns the output dimension order.
-    pub fn output_dim_order(&self) -> DenseInteger64ArrayAttributeRef<'_, '_> {
+    pub fn output_dim_order(&self) -> Result<DenseInteger64ArrayAttributeRef<'_, '_>, Error> {
         unsafe {
             DenseInteger64ArrayAttributeRef::from_c_api(
                 mlirMosaicTpuDotDimensionNumbersAttrGetOutputDimOrder(self.handle),
                 self.context,
             )
-            .expect("invalid Mosaic TPU dot-dimension-number output dimension order")
+            .map_err(|_| Error::internal("expected non-null Mosaic TPU output dimension order"))
         }
     }
 
     /// Returns the left-hand side batch dimensions.
-    pub fn lhs_batch_dims(&self) -> DenseInteger64ArrayAttributeRef<'_, '_> {
+    pub fn lhs_batch_dims(&self) -> Result<DenseInteger64ArrayAttributeRef<'_, '_>, Error> {
         unsafe {
             DenseInteger64ArrayAttributeRef::from_c_api(
                 mlirMosaicTpuDotDimensionNumbersAttrGetLhsBatchDims(self.handle),
                 self.context,
             )
-            .expect("invalid Mosaic TPU dot-dimension-number lhs batch dimensions")
+            .map_err(|_| Error::internal("expected non-null Mosaic TPU lhs batch dimensions"))
         }
     }
 
     /// Returns the right-hand side batch dimensions.
-    pub fn rhs_batch_dims(&self) -> DenseInteger64ArrayAttributeRef<'_, '_> {
+    pub fn rhs_batch_dims(&self) -> Result<DenseInteger64ArrayAttributeRef<'_, '_>, Error> {
         unsafe {
             DenseInteger64ArrayAttributeRef::from_c_api(
                 mlirMosaicTpuDotDimensionNumbersAttrGetRhsBatchDims(self.handle),
                 self.context,
             )
-            .expect("invalid Mosaic TPU dot-dimension-number rhs batch dimensions")
+            .map_err(|_| Error::internal("expected non-null Mosaic TPU rhs batch dimensions"))
         }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for DotDimensionNumbersAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirAttributeIsAMosaicTpuDotDimensionNumbersAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -361,34 +362,34 @@ pub struct ElementWindowAttributeRef<'c, 't> {
 
 impl ElementWindowAttributeRef<'_, '_> {
     /// Returns the low padding values.
-    pub fn pad_low(&self) -> DenseInteger64ArrayAttributeRef<'_, '_> {
+    pub fn pad_low(&self) -> Result<DenseInteger64ArrayAttributeRef<'_, '_>, Error> {
         unsafe {
             DenseInteger64ArrayAttributeRef::from_c_api(
                 mlirMosaicTpuElementWindowAttrGetPadLow(self.handle),
                 self.context,
             )
-            .expect("invalid Mosaic TPU element-window low padding")
+            .map_err(|_| Error::internal("expected non-null Mosaic TPU element window low padding"))
         }
     }
 
     /// Returns the high padding values.
-    pub fn pad_high(&self) -> DenseInteger64ArrayAttributeRef<'_, '_> {
+    pub fn pad_high(&self) -> Result<DenseInteger64ArrayAttributeRef<'_, '_>, Error> {
         unsafe {
             DenseInteger64ArrayAttributeRef::from_c_api(
                 mlirMosaicTpuElementWindowAttrGetPadHigh(self.handle),
                 self.context,
             )
-            .expect("invalid Mosaic TPU element-window high padding")
+            .map_err(|_| Error::internal("expected non-null Mosaic TPU element window high padding"))
         }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for ElementWindowAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirAttributeIsAMosaicTpuElementWindowAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -414,11 +415,11 @@ pub struct VectorLayoutAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for VectorLayoutAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirAttributeIsAMosaicTpuVectorLayoutAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -444,11 +445,11 @@ pub struct TiledLayoutAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for TiledLayoutAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirAttributeIsAMosaicTpuTiledLayoutAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -519,13 +520,13 @@ impl MemorySpace {
 
 impl MemorySpaceAttributeRef<'_, '_> {
     /// Returns the memory-space value stored in this attribute.
-    pub fn value(&self) -> MemorySpace {
+    pub fn value(&self) -> Result<MemorySpace, Error> {
         let value = unsafe { StringRef::from_c_api(mlirMosaicTpuMemorySpaceAttrGetValue(self.handle)) };
         value
             .as_str()
             .ok()
             .and_then(MemorySpace::from_str)
-            .expect("invalid Mosaic TPU memory-space attribute")
+            .ok_or_else(|| Error::invalid_argument("invalid Mosaic TPU memory-space attribute"))
     }
 
     /// Returns the optional core type associated with this memory space.
@@ -539,11 +540,11 @@ impl MemorySpaceAttributeRef<'_, '_> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for MemorySpaceAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirAttributeIsAMosaicTpuMemorySpaceAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -569,11 +570,11 @@ impl<'t> Context<'t> {
         output_dim_order: &[i64],
         lhs_batch_dims: &[i64],
         rhs_batch_dims: &[i64],
-    ) -> DotDimensionNumbersAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::mosaic_tpu());
-        unsafe {
-            DotDimensionNumbersAttributeRef::from_c_api(
-                mlirMosaicTpuDotDimensionNumbersAttrGet(
+    ) -> Result<DotDimensionNumbersAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::mosaic_tpu()?)?;
+        Ok(unsafe {
+            DotDimensionNumbersAttributeRef {
+                handle: mlirMosaicTpuDotDimensionNumbersAttrGet(
                     *self.handle.borrow(),
                     lhs_contracting_dims.as_ptr(),
                     lhs_contracting_dims.len().cast_signed(),
@@ -590,10 +591,9 @@ impl<'t> Context<'t> {
                     rhs_batch_dims.as_ptr(),
                     rhs_batch_dims.len().cast_signed(),
                 ),
-                self,
-            )
-            .expect("invalid arguments to `Context::mosaic_tpu_dot_dimension_numbers_attribute`")
-        }
+                context: self,
+            }
+        })
     }
 
     /// Creates a Mosaic TPU [`ElementWindowAttributeRef`] owned by this [`Context`].
@@ -601,21 +601,20 @@ impl<'t> Context<'t> {
         &'c self,
         pad_low: &[i64],
         pad_high: &[i64],
-    ) -> ElementWindowAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::mosaic_tpu());
-        unsafe {
-            ElementWindowAttributeRef::from_c_api(
-                mlirMosaicTpuElementWindowAttrGet(
+    ) -> Result<ElementWindowAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::mosaic_tpu()?)?;
+        Ok(unsafe {
+            ElementWindowAttributeRef {
+                handle: mlirMosaicTpuElementWindowAttrGet(
                     *self.handle.borrow(),
                     pad_low.as_ptr(),
                     pad_low.len().cast_signed(),
                     pad_high.as_ptr(),
                     pad_high.len().cast_signed(),
                 ),
-                self,
-            )
-            .expect("invalid arguments to `Context::mosaic_tpu_element_window_attribute`")
-        }
+                context: self,
+            }
+        })
     }
 
     /// Creates a Mosaic TPU [`MemorySpaceAttributeRef`] owned by this [`Context`].
@@ -623,21 +622,20 @@ impl<'t> Context<'t> {
         &'c self,
         value: MemorySpace,
         core_type: Option<CoreType>,
-    ) -> MemorySpaceAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::mosaic_tpu());
+    ) -> Result<MemorySpaceAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::mosaic_tpu()?)?;
         let value = StringRef::from(value.as_str());
         let core_type_string = core_type.map(|core_type| StringRef::from(core_type.as_str()));
         let core_type = core_type_string
             .as_ref()
             .map(|core_type| unsafe { core_type.to_c_api() })
             .unwrap_or(MlirStringRef { data: std::ptr::null(), length: 0 });
-        unsafe {
-            MemorySpaceAttributeRef::from_c_api(
-                mlirMosaicTpuMemorySpaceAttrGet(*self.handle.borrow_mut(), value.to_c_api(), core_type),
-                self,
-            )
-            .expect("invalid arguments to `Context::mosaic_tpu_memory_space_attribute`")
-        }
+        Ok(unsafe {
+            MemorySpaceAttributeRef {
+                handle: mlirMosaicTpuMemorySpaceAttrGet(*self.handle.borrow_mut(), value.to_c_api(), core_type),
+                context: self,
+            }
+        })
     }
 }
 
@@ -661,12 +659,12 @@ mod tests {
             #[test]
             fn $test_name() {
                 let context = Context::new();
-                let attribute = context.$context_method($enum_name::$value);
+                let attribute = context.$context_method($enum_name::$value).unwrap();
                 assert_eq!(&context, attribute.context());
-                assert_eq!(attribute.value(), $enum_name::$value);
+                assert_eq!(attribute.value().unwrap(), $enum_name::$value);
                 test_attribute_display_and_debug(attribute, $expected);
                 test_attribute_casting(attribute);
-                assert_eq!(attribute.as_ref().cast::<$attribute_name>().unwrap().value(), $enum_name::$value);
+                assert_eq!(attribute.as_ref().cast::<$attribute_name>().unwrap().value().unwrap(), $enum_name::$value);
             }
         };
     }
@@ -746,34 +744,38 @@ mod tests {
     #[test]
     fn test_dot_dimension_numbers_attribute() {
         let context = Context::new();
-        let attribute = context.mosaic_tpu_dot_dimension_numbers_attribute(&[1], &[0], &[0], &[1], &[0, 1], &[2], &[3]);
+        let attribute = context
+            .mosaic_tpu_dot_dimension_numbers_attribute(&[1], &[0], &[0], &[1], &[0, 1], &[2], &[3])
+            .unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.lhs_contracting_dims().values().collect::<Vec<_>>(), vec![1]);
-        assert_eq!(attribute.rhs_contracting_dims().values().collect::<Vec<_>>(), vec![0]);
-        assert_eq!(attribute.lhs_non_contracting_dims().values().collect::<Vec<_>>(), vec![0]);
-        assert_eq!(attribute.rhs_non_contracting_dims().values().collect::<Vec<_>>(), vec![1]);
-        assert_eq!(attribute.output_dim_order().values().collect::<Vec<_>>(), vec![0, 1]);
-        assert_eq!(attribute.lhs_batch_dims().values().collect::<Vec<_>>(), vec![2]);
-        assert_eq!(attribute.rhs_batch_dims().values().collect::<Vec<_>>(), vec![3]);
+        assert_eq!(attribute.lhs_contracting_dims().unwrap().values().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(attribute.rhs_contracting_dims().unwrap().values().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(attribute.lhs_non_contracting_dims().unwrap().values().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(attribute.rhs_non_contracting_dims().unwrap().values().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(attribute.output_dim_order().unwrap().values().collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(attribute.lhs_batch_dims().unwrap().values().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(attribute.rhs_batch_dims().unwrap().values().collect::<Vec<_>>(), vec![3]);
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_dot_dimension_numbers_attribute_with_empty_dims() {
         let context = Context::new();
-        let attribute = context.mosaic_tpu_dot_dimension_numbers_attribute(&[1], &[0], &[0], &[], &[0, 1], &[], &[]);
-        assert_eq!(attribute.rhs_non_contracting_dims().values().collect::<Vec<_>>(), Vec::<i64>::new());
-        assert_eq!(attribute.lhs_batch_dims().values().collect::<Vec<_>>(), Vec::<i64>::new());
-        assert_eq!(attribute.rhs_batch_dims().values().collect::<Vec<_>>(), Vec::<i64>::new());
+        let attribute = context
+            .mosaic_tpu_dot_dimension_numbers_attribute(&[1], &[0], &[0], &[], &[0, 1], &[], &[])
+            .unwrap();
+        assert_eq!(attribute.rhs_non_contracting_dims().unwrap().values().collect::<Vec<_>>(), Vec::<i64>::new());
+        assert_eq!(attribute.lhs_batch_dims().unwrap().values().collect::<Vec<_>>(), Vec::<i64>::new());
+        assert_eq!(attribute.rhs_batch_dims().unwrap().values().collect::<Vec<_>>(), Vec::<i64>::new());
     }
 
     #[test]
     fn test_element_window_attribute() {
         let context = Context::new();
-        let attribute = context.mosaic_tpu_element_window_attribute(&[0, 1], &[2, 3]);
+        let attribute = context.mosaic_tpu_element_window_attribute(&[0, 1], &[2, 3]).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.pad_low().values().collect::<Vec<_>>(), vec![0, 1]);
-        assert_eq!(attribute.pad_high().values().collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(attribute.pad_low().unwrap().values().collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(attribute.pad_high().unwrap().values().collect::<Vec<_>>(), vec![2, 3]);
         test_attribute_display_and_debug(attribute, "#tpu.element_window<[0, 1], [2, 3]>");
         test_attribute_casting(attribute);
     }
@@ -781,15 +783,16 @@ mod tests {
     #[test]
     fn test_memory_space_attribute() {
         let context = Context::new();
-        let attribute = context.mosaic_tpu_memory_space_attribute(MemorySpace::Smem, None);
+        let attribute = context.mosaic_tpu_memory_space_attribute(MemorySpace::Smem, None).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), MemorySpace::Smem);
+        assert_eq!(attribute.value().unwrap(), MemorySpace::Smem);
         assert_eq!(attribute.core_type(), None);
         test_attribute_display_and_debug(attribute, "#tpu.memory_space<smem>");
         test_attribute_casting(attribute);
 
-        let attribute = context.mosaic_tpu_memory_space_attribute(MemorySpace::Vmem, Some(CoreType::VectorSubcore));
-        assert_eq!(attribute.value(), MemorySpace::Vmem);
+        let attribute =
+            context.mosaic_tpu_memory_space_attribute(MemorySpace::Vmem, Some(CoreType::VectorSubcore)).unwrap();
+        assert_eq!(attribute.value().unwrap(), MemorySpace::Vmem);
         assert_eq!(attribute.core_type(), Some(CoreType::VectorSubcore));
         test_attribute_display_and_debug(attribute, "#tpu.memory_space<vmem, sc_vector_subcore>");
     }

@@ -14,8 +14,8 @@ use ryft_xla_sys::bindings::{
 
 use crate::support::write_to_string_callback;
 use crate::{
-    AsmState, AttributeRef, BlockRef, Context, Location, LocationRef, Operation, OperationPrintingFlags, OperationRef,
-    StringRef, Type, TypeRef, mlir_subtype_trait_impls,
+    AsmState, AttributeRef, BlockRef, Context, Error, Location, LocationRef, Operation, OperationPrintingFlags,
+    OperationRef, StringRef, Type, TypeRef, mlir_subtype_trait_impls,
 };
 
 /// [`Value`]s represent the arguments of [`Block`](crate::Block)s and the results and operands of [`Operation`]s.
@@ -39,7 +39,7 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Option<Self>;
+    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Result<Self, Error>;
 
     /// Returns the [`MlirValue`] that corresponds to this [`Value`] and which can be passed to functions
     /// in the MLIR C API.
@@ -61,12 +61,12 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
     /// Tries to cast this [`Value`] to an instance of `V` (e.g., an instance of [`OperationResultRef`]).
     /// If it is not an instance of `V`, this function will return [`None`].
     fn cast<V: Value<'v, 'c, 't>>(&self) -> Option<V> {
-        unsafe { V::from_c_api(self.to_c_api(), self.context()) }
+        unsafe { V::from_c_api(self.to_c_api(), self.context()).ok() }
     }
 
     /// Up-casts this [`Value`] to an instance of [`ValueRef`] (i.e., the most generic value reference type).
     fn as_ref(&self) -> ValueRef<'v, 'c, 't> {
-        self.cast().unwrap()
+        ValueRef { handle: unsafe { self.to_c_api() }, context: self.context(), owner: PhantomData }
     }
 
     /// Returns the name of this [`Value`] (i.e., the ID that would be used to refer to it in MLIR when used as an
@@ -74,16 +74,16 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
     /// For example, arguments of [`DetachedBlock`](crate::DetachedBlock)s do not have names.
     ///
     /// Refer to the documentation of [`OperationPrintingFlags`] for more information on the arguments.
-    fn name(
-        &self,
-        use_name_location_as_prefix: bool,
-        use_local_scope: bool,
-    ) -> Result<Option<String>, std::str::Utf8Error> {
+    fn name(&self, use_name_location_as_prefix: bool, use_local_scope: bool) -> Result<Option<String>, Error> {
         unsafe {
             // It is not always safe to obtain the name of a value. We perform a few checks to ensure that we not get
             // unexpected crashes at runtime stemming from the underlying MLIR library.
             let handle = self.to_c_api();
-            let parent_operation = self.cast::<BlockArgumentRef>().and_then(|a| a.block().parent_operation());
+            let parent_operation = if let Some(argument) = self.cast::<BlockArgumentRef>() {
+                argument.block()?.parent_operation()?
+            } else {
+                None
+            };
             let operation_result = self.cast::<OperationResultRef>();
             if handle.ptr.is_null() || (operation_result.is_none() && parent_operation.is_none()) {
                 Ok(None)
@@ -98,34 +98,36 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
                     ..OperationPrintingFlags::default()
                 };
                 let asm_state = AsmState::for_value(*self, flags);
-                let mut data = (String::new(), Ok(()));
+                let mut data = (String::new(), Ok::<(), std::str::Utf8Error>(()));
                 mlirValuePrintAsOperand(
                     self.to_c_api(),
                     asm_state.to_c_api(),
                     Some(write_to_string_callback),
                     &mut data as *mut _ as *mut std::ffi::c_void,
                 );
-                data.1.map(|_| Some(data.0))
+                data.1
+                    .map(|_| Some(data.0))
+                    .map_err(|error| Error::internal(format!("failed to render MLIR value name as UTF-8: {error}")))
             }
         }
     }
 
     /// Returns the [`Location`] of this value.
-    fn location(&self) -> LocationRef<'c, 't> {
+    fn location(&self) -> Result<LocationRef<'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe { LocationRef::from_c_api(mlirValueGetLocation(self.to_c_api()), self.context()).unwrap() }
+        unsafe { LocationRef::from_c_api(mlirValueGetLocation(self.to_c_api()), self.context()) }
     }
 
     /// Returns the [`Type`] of this value.
-    fn r#type(&self) -> TypeRef<'c, 't> {
+    fn r#type(&self) -> Result<TypeRef<'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow();
-        unsafe { TypeRef::from_c_api(mlirValueGetType(self.to_c_api()), self.context()).unwrap() }
+        unsafe { TypeRef::from_c_api(mlirValueGetType(self.to_c_api()), self.context()) }
     }
 
     /// Sets the [`Type`] of this value to the provided [`Type`].
@@ -139,15 +141,18 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
 
     /// Returns an [`OperandRefIterator`] over all uses of this [`Value`] (i.e., instances where it appears
     /// as an operand in [`Operation`]s).
-    fn uses(&self) -> OperandRefIterator<'v, 'c, 't> {
+    fn uses(&self) -> Result<OperandRefIterator<'v, 'c, 't>, Error> {
         // The following context borrow ensures that access to the underlying MLIR data structures is done safely from
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         let context = self.context().borrow();
-        OperandRefIterator {
-            current_operand: unsafe { OperandRef::from_c_api(mlirValueGetFirstUse(self.to_c_api()), self.context()) },
-            _context: context,
-        }
+        let handle = unsafe { mlirValueGetFirstUse(self.to_c_api()) };
+        let current_operand = if unsafe { mlirOpOperandIsNull(handle) } {
+            None
+        } else {
+            Some(unsafe { OperandRef::from_c_api(handle, self.context())? })
+        };
+        Ok(OperandRefIterator { current_operand, error: None, _context: context })
     }
 
     /// Replaces all uses of this [`Value`] in the current [`Context`] intermediate representation (IR) with the
@@ -216,8 +221,12 @@ pub struct ValueRef<'o, 'c: 'o, 't: 'c> {
 }
 
 impl<'v, 'o: 'v, 'c, 't> Value<'v, 'c, 't> for ValueRef<'o, 'c, 't> {
-    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context, owner: PhantomData }) }
+    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR value handle"))
+        } else {
+            Ok(Self { handle, context, owner: PhantomData })
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirValue {
@@ -250,9 +259,9 @@ pub struct BlockArgumentRef<'b, 'c: 'b, 't: 'c> {
 
 impl<'b, 'c, 't> BlockArgumentRef<'b, 'c, 't> {
     /// Returns a reference to the [`Block`](crate::Block) in which this value is defined as an argument.
-    pub fn block(&self) -> BlockRef<'b, 'c, 't> {
+    pub fn block(&self) -> Result<BlockRef<'b, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe { BlockRef::from_c_api(mlirBlockArgumentGetOwner(self.handle), self.context).unwrap() }
+        unsafe { BlockRef::from_c_api(mlirBlockArgumentGetOwner(self.handle), self.context) }
     }
 
     /// Returns the index of this value in the argument list of its owning [`Block`](crate::Block).
@@ -281,11 +290,13 @@ impl<'b, 'c, 't> BlockArgumentRef<'b, 'c, 't> {
 }
 
 impl<'v, 'b: 'v, 'c, 't> Value<'v, 'c, 't> for BlockArgumentRef<'b, 'c, 't> {
-    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirValueIsABlockArgument(handle) } {
-            Some(Self { handle, context, owner: PhantomData })
+    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR value handle"))
+        } else if unsafe { mlirValueIsABlockArgument(handle) } {
+            Ok(Self { handle, context, owner: PhantomData })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR block argument value handle"))
         }
     }
 
@@ -302,7 +313,7 @@ mlir_subtype_trait_impls!(BlockArgumentRef<'b, 'c, 't> as Value, mlir_type = Val
 
 impl<'o, 'c, 't> From<BlockArgumentRef<'o, 'c, 't>> for ValueRef<'o, 'c, 't> {
     fn from(value: BlockArgumentRef<'o, 'c, 't>) -> Self {
-        value.as_ref()
+        Self { handle: value.handle, context: value.context, owner: PhantomData }
     }
 }
 
@@ -325,9 +336,9 @@ pub struct OperationResultRef<'o, 'c: 'o, 't: 'c> {
 
 impl<'o, 'c, 't> OperationResultRef<'o, 'c, 't> {
     /// Returns a [`OperationRef`] referencing the [`Operation`] that produced this value as its result.
-    pub fn operation(&self) -> OperationRef<'o, 'c, 't> {
+    pub fn operation(&self) -> Result<OperationRef<'o, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe { OperationRef::from_c_api(mlirOpResultGetOwner(self.handle), self.context).unwrap() }
+        unsafe { OperationRef::from_c_api(mlirOpResultGetOwner(self.handle), self.context) }
     }
 
     /// Returns the index of this value in the results of its owning [`Operation`].
@@ -338,11 +349,13 @@ impl<'o, 'c, 't> OperationResultRef<'o, 'c, 't> {
 }
 
 impl<'o, 'c, 't> Value<'o, 'c, 't> for OperationResultRef<'o, 'c, 't> {
-    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null() && unsafe { mlirValueIsAOpResult(handle) } {
-            Some(Self { handle, context, owner: PhantomData })
+    unsafe fn from_c_api(handle: MlirValue, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR value handle"))
+        } else if unsafe { mlirValueIsAOpResult(handle) } {
+            Ok(Self { handle, context, owner: PhantomData })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR operation result value handle"))
         }
     }
 
@@ -359,7 +372,7 @@ mlir_subtype_trait_impls!(OperationResultRef<'o, 'c, 't> as Value, mlir_type = V
 
 impl<'o, 'c, 't> From<OperationResultRef<'o, 'c, 't>> for ValueRef<'o, 'c, 't> {
     fn from(value: OperationResultRef<'o, 'c, 't>) -> Self {
-        value.as_ref()
+        Self { handle: value.handle, context: value.context, owner: PhantomData }
     }
 }
 
@@ -388,8 +401,14 @@ impl<'o, 'c, 't> OperandRef<'o, 'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirOpOperand, context: &'c Context<'t>) -> Option<Self> {
-        unsafe { if mlirOpOperandIsNull(handle) { None } else { Some(Self { handle, context, owner: PhantomData }) } }
+    pub unsafe fn from_c_api(handle: MlirOpOperand, context: &'c Context<'t>) -> Result<Self, Error> {
+        unsafe {
+            if mlirOpOperandIsNull(handle) {
+                Err(Error::internal("expected non-null MLIR operand handle"))
+            } else {
+                Ok(Self { handle, context, owner: PhantomData })
+            }
+        }
     }
 
     /// Returns the [`MlirOpOperand`] that corresponds to this [`OperandRef`] and which can be passed to functions
@@ -409,15 +428,15 @@ impl<'o, 'c, 't> OperandRef<'o, 'c, 't> {
     }
 
     /// Returns a reference to the underlying [`Value`] of this [`OperandRef`].
-    pub fn value(&self) -> ValueRef<'o, 'c, 't> {
+    pub fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe { ValueRef::from_c_api(mlirOpOperandGetValue(self.to_c_api()), self.context).unwrap() }
+        unsafe { ValueRef::from_c_api(mlirOpOperandGetValue(self.to_c_api()), self.context) }
     }
 
     /// Returns a reference to the [`Operation`] that takes this [`OperandRef`] as one of its inputs/operands.
-    pub fn operation(&self) -> OperationRef<'o, 'c, 't> {
+    pub fn operation(&self) -> Result<OperationRef<'o, 'c, 't>, Error> {
         let _guard = self.context.borrow();
-        unsafe { OperationRef::from_c_api(mlirOpOperandGetOwner(self.to_c_api()), self.context).unwrap() }
+        unsafe { OperationRef::from_c_api(mlirOpOperandGetOwner(self.to_c_api()), self.context) }
     }
 
     /// Returns the index of this [`OperandRef`] in the [`Operation`] where it is being used.
@@ -431,8 +450,11 @@ impl<'o, 'c, 't> OperandRef<'o, 'c, 't> {
 pub struct OperandRefIterator<'o, 'c: 'o, 't: 'c> {
     /// Current [`OperandRef`] in this iterator (i.e., the [`OperandRef`] that will be returned in the next call to
     /// [`OperandRefIterator::next`]). [`Operation`] operands are stored in such a way in MLIR that we can always obtain
-    /// the next use of a [`Value`] given the an [`OperandRef`] (that represents one such use).
+    /// the next use of a [`Value`] given an [`OperandRef`] that represents one such use.
     current_operand: Option<OperandRef<'o, 'c, 't>>,
+
+    /// Error encountered while preparing the next iterator item.
+    error: Option<Error>,
 
     /// [`Context`] reference that, while unused, ensures that the owning context is not modified while
     /// iterating over operands using this iterator.
@@ -440,14 +462,22 @@ pub struct OperandRefIterator<'o, 'c: 'o, 't: 'c> {
 }
 
 impl<'o, 'c, 't> Iterator for OperandRefIterator<'o, 'c, 't> {
-    type Item = OperandRef<'o, 'c, 't>;
+    type Item = Result<OperandRef<'o, 'c, 't>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let current_operand = self.current_operand.take();
-        self.current_operand = current_operand.as_ref().and_then(|operand| unsafe {
-            OperandRef::from_c_api(mlirOpOperandGetNextUse(operand.to_c_api()), operand.context())
-        });
-        current_operand
+        if let Some(error) = self.error.take() {
+            return Some(Err(error));
+        }
+
+        let current_operand = self.current_operand.take()?;
+        let handle = unsafe { mlirOpOperandGetNextUse(current_operand.to_c_api()) };
+        if !unsafe { mlirOpOperandIsNull(handle) } {
+            match unsafe { OperandRef::from_c_api(handle, current_operand.context()) } {
+                Ok(operand) => self.current_operand = Some(operand),
+                Err(error) => self.error = Some(error),
+            }
+        }
+        Some(Ok(current_operand))
     }
 }
 
@@ -479,7 +509,7 @@ mod tests {
     #[test]
     fn test_value() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::arith());
+        context.load_dialect(DialectHandle::arith().unwrap()).unwrap();
         let location = context.unknown_location();
         let index_type = context.index_type();
 
@@ -487,7 +517,7 @@ mod tests {
         let block = context.block(&[(index_type, location)]);
         let block_argument = block.argument(0).unwrap();
         assert_eq!(block_argument.context(), &context);
-        assert_eq!(block_argument.block(), block);
+        assert_eq!(block_argument.block().unwrap(), block);
 
         // Test using an operation result.
         let op = OperationBuilder::new("arith.constant", location)
@@ -497,8 +527,8 @@ mod tests {
             .unwrap();
         let result = op.result(0).unwrap();
         assert_eq!(result.context(), &context);
-        assert_eq!(result.location(), location);
-        assert_eq!(result.r#type(), index_type);
+        assert_eq!(result.location().unwrap(), location);
+        assert_eq!(result.r#type().unwrap(), index_type);
         assert_eq!(format!("{}", result), "%c0 = arith.constant 0 : index\n");
         assert_eq!(format!("{:?}", result), "OperationResultRef[%c0 = arith.constant 0 : index\n]");
 
@@ -512,7 +542,7 @@ mod tests {
         // Test null pointer edge case.
         let bad_handle = MlirValue { ptr: std::ptr::null_mut() };
         let value = unsafe { ValueRef::from_c_api(bad_handle, &context) };
-        assert!(value.is_none());
+        assert!(value.is_err());
 
         // We are also checking that [`Value::dump`] runs successfully without crashing.
         // Ideally, we would want a way to capture the standard error stream and verify that it printed the right thing.
@@ -522,7 +552,7 @@ mod tests {
     #[test]
     fn test_value_replace_uses() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::arith());
+        context.load_dialect(DialectHandle::arith().unwrap()).unwrap();
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
         let index_type = context.index_type();
@@ -559,28 +589,28 @@ mod tests {
         let block = context.block(&[(index_type, location)]);
         let mut block_argument = block.argument(0).unwrap();
         assert_eq!(block_argument.context(), &context);
-        assert_eq!(block_argument.name(false, false).ok().flatten(), None);
-        assert_eq!(block_argument.name(true, false).ok().flatten(), None);
-        assert_eq!(block_argument.name(false, true).ok().flatten(), None);
-        assert_eq!(block_argument.name(true, true).ok().flatten(), None);
-        assert_eq!(block_argument.location(), location);
-        assert_eq!(block_argument.r#type(), index_type);
+        assert_eq!(block_argument.name(false, false).unwrap(), None);
+        assert_eq!(block_argument.name(true, false).unwrap(), None);
+        assert_eq!(block_argument.name(false, true).unwrap(), None);
+        assert_eq!(block_argument.name(true, true).unwrap(), None);
+        assert_eq!(block_argument.location().unwrap(), location);
+        assert_eq!(block_argument.r#type().unwrap(), index_type);
         assert_eq!(block_argument.argument_index(), 0);
         assert!(block_argument.is::<ValueRef>());
         assert!(block_argument.is::<BlockArgumentRef>());
         assert!(!block_argument.is::<OperationResultRef>());
-        assert_eq!(block_argument.block(), block);
+        assert_eq!(block_argument.block().unwrap(), block);
         block_argument.set_type(f64_type);
-        assert_eq!(block_argument.r#type(), f64_type);
+        assert_eq!(block_argument.r#type().unwrap(), f64_type);
         let new_location = context.file_location("foo.mlir", 2, 3);
         block_argument.set_location(new_location);
-        assert_eq!(block_argument.location(), new_location);
+        assert_eq!(block_argument.location().unwrap(), new_location);
     }
 
     #[test]
     fn test_operation_result() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::arith());
+        context.load_dialect(DialectHandle::arith().unwrap()).unwrap();
         let location = context.unknown_location();
         let index_type = context.index_type();
         let op = OperationBuilder::new("arith.constant", location)
@@ -590,13 +620,13 @@ mod tests {
             .unwrap();
         let result = op.result(0).unwrap();
         assert_eq!(result.context(), &context);
-        assert_eq!(result.name(false, false).ok().flatten(), Some("%c0".to_string()));
-        assert_eq!(result.name(true, false).ok().flatten(), Some("%c0".to_string()));
-        assert_eq!(result.name(false, true).ok().flatten(), Some("%c0".to_string()));
-        assert_eq!(result.name(true, true).ok().flatten(), Some("%c0".to_string()));
-        assert_eq!(result.location(), location);
-        assert_eq!(result.r#type(), index_type);
-        assert_eq!(result.operation(), op);
+        assert_eq!(result.name(false, false).unwrap(), Some("%c0".to_string()));
+        assert_eq!(result.name(true, false).unwrap(), Some("%c0".to_string()));
+        assert_eq!(result.name(false, true).unwrap(), Some("%c0".to_string()));
+        assert_eq!(result.name(true, true).unwrap(), Some("%c0".to_string()));
+        assert_eq!(result.location().unwrap(), location);
+        assert_eq!(result.r#type().unwrap(), index_type);
+        assert_eq!(result.operation().unwrap(), op);
         assert_eq!(result.result_index(), 0);
         assert!(result.is::<ValueRef>());
         assert!(!result.is::<BlockArgumentRef>());
@@ -608,7 +638,7 @@ mod tests {
     #[test]
     fn test_operand() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::arith());
+        context.load_dialect(DialectHandle::arith().unwrap()).unwrap();
         let location = context.unknown_location();
         let index_type = context.index_type();
         let block = context.block(&[(index_type, location)]);
@@ -619,19 +649,17 @@ mod tests {
             .add_attribute("value", context.parse_attribute("0 : index").unwrap())
             .build()
             .unwrap();
-        let operand = op.operand(0);
-        assert!(operand.is_some());
-        let operand = operand.unwrap();
-        let block_argument_uses = block_argument.uses().collect::<Vec<_>>();
+        let operand = op.operand(0).unwrap();
+        let block_argument_uses = block_argument.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(block_argument_uses.len(), 1);
         let block_argument_use = block_argument_uses[0];
         assert_eq!(block_argument_use.context(), &context);
-        assert_eq!(block_argument_use.value(), block_argument);
+        assert_eq!(block_argument_use.value().unwrap(), block_argument);
         assert_eq!(operand.context(), &context);
-        assert_eq!(operand.value(), block_argument);
-        assert_eq!(block_argument_use.value(), operand.value());
-        assert_eq!(block_argument_use.operation(), op);
-        assert_eq!(operand.operation(), op);
+        assert_eq!(operand.value().unwrap(), block_argument);
+        assert_eq!(block_argument_use.value().unwrap(), operand.value().unwrap());
+        assert_eq!(block_argument_use.operation().unwrap(), op);
+        assert_eq!(operand.operation().unwrap(), op);
         assert_eq!(block_argument_use.operand_index(), 0);
         assert_eq!(operand.operand_index(), 0);
     }

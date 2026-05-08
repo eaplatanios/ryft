@@ -1394,7 +1394,10 @@ impl<'o> Array<'o> {
     ///   - `location`: MLIR location attached to the emitted mesh operation.
     ///
     /// Uses the canonical `@mesh` symbol name.
-    pub fn to_shardy_mesh_operation<'c, 't, L>(&self, location: L) -> DetachedMeshOperation<'c, 't>
+    pub fn to_shardy_mesh_operation<'c, 't, L>(
+        &self,
+        location: L,
+    ) -> Result<DetachedMeshOperation<'c, 't>, ryft_mlir::Error>
     where
         't: 'c,
         L: Location<'c, 't>,
@@ -1405,9 +1408,9 @@ impl<'o> Array<'o> {
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
     ///
     /// Uses the canonical `@mesh` symbol name.
-    pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
+    pub fn to_shardy_tensor_sharding_attribute(&self) -> Result<String, ryft_mlir::Error> {
         let context = ryft_mlir::Context::new();
-        self.sharding().to_mlir(context.unknown_location()).to_string()
+        self.sharding().to_mlir(context.unknown_location()).map(|attribute| attribute.to_string())
     }
 
     /// Converts distributed arrays to per-device execution arguments for [`ryft_pjrt::LoadedExecutable::execute`].
@@ -2571,14 +2574,16 @@ mod tests {
 
         // Derive Shardy attributes from runtime arrays (JIT-style).
         let context = ryft_mlir::Context::new();
-        let mesh_module = context.module(context.unknown_location());
+        let mesh_module = context.module(context.unknown_location()).unwrap();
         let mesh_operation = mesh_module
             .body()
-            .append_operation(lhs_array.to_shardy_mesh_operation(context.unknown_location()))
+            .unwrap()
+            .append_operation(lhs_array.to_shardy_mesh_operation(context.unknown_location()).unwrap())
+            .unwrap()
             .to_string();
-        let lhs_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute();
-        let rhs_sharding_attribute = rhs_array.to_shardy_tensor_sharding_attribute();
-        let output_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute();
+        let lhs_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute().unwrap();
+        let rhs_sharding_attribute = rhs_array.to_shardy_tensor_sharding_attribute().unwrap();
+        let output_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute().unwrap();
 
         assert_eq!(mesh_operation, "sdy.mesh @mesh = <[\"x\"=8]>");
         assert_eq!(lhs_sharding_attribute, "#sdy.sharding<@mesh, [{\"x\"}, {}]>");

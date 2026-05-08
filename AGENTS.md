@@ -62,6 +62,10 @@ update this file so that they do not need to remind you again in the future.
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
+- Prefer normal method-call syntax for receiver-based calls (for example, `self.name()`, `operation.result(0)`, or
+  `attribute.cast::<TypeAttributeRef>()`), and avoid UFCS/static-like syntax such as
+  `crate::Operation::name(self)` or `crate::Attribute::cast::<TypeAttributeRef>(&attribute)` unless disambiguation is
+  actually required.
 - When replacing a bespoke cross-cutting capability with something more general, prefer a small named trait over a
   higher-order helper function when the call sites need one reusable semantic contract (for example, broadcasting).
 - When centering a capability on a trait, move the whole API surface onto that trait instead of keeping a split between
@@ -98,7 +102,10 @@ update this file so that they do not need to remind you again in the future.
   - `std` imports
   - third-party crate imports
   - `crate::...` imports
+  - `super::...` imports
 - Use full words for variable names and avoid abbreviations or shortened versions of words.
+- When a function-like call or macro invocation argument list spans multiple lines, include a trailing comma after the
+  final argument.
 - For canonical conversion helpers in `ryft`, prefer `from_*` naming even when the conversion is fallible and returns
   `Result<_, Error>`; reserve `try_from_*` for trait-based conversions or when an infallible `from_*` already exists.
 - Always name the formatter argument `formatter` in `Display` and `Debug` implementations; do not use `f` or any other
@@ -198,6 +205,8 @@ update this file so that they do not need to remind you again in the future.
   style: ``///   - `arg_name`: description...`` and indent wrapped lines under the bullet. You may skip this section
   entirely in cases where the arguments do not need a description or where their role is clear from the main description
   of the function itself.
+- Do not end function or method rustdoc blocks with an empty `///` line immediately before the item or its attributes.
+  Keep empty rustdoc lines only for internal paragraph, list, table, or code-block separation.
 - For public `unsafe` APIs, include:
   - what handle/representation is being exposed,
   - why it is unsafe, and
@@ -301,7 +310,15 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
 - In MLIR dialect operation modules, inline operation-specific attribute, segment, and async-token access logic
   in the owning trait or constructor instead of adding module-level helper functions, unless the helper is genuinely
   shared across dialect modules. Do not add tiny private wrappers for one-line attribute casts, attribute value
-  extraction, operand segment-size extraction, operand slicing, or scalar/array attribute construction.
+  extraction, operand segment-size extraction, operand slicing, scalar/array attribute construction, or generic
+  operation-builder setup.
+- When an operation accessor needs one operand/result from an MLIR segment-size range, use
+  `dense_integer_32_array_attribute_segment_range(...)` and validate the returned range length explicitly. Do not use
+  `dense_integer_32_array_attribute_usize_value(...)` as a flat operand/result index because it returns the segment
+  length, not the segment start.
+- In `ryft-mlir`, do not use `filter_map` or `.ok()` to hide failed wrapper conversions while traversing counted MLIR
+  C API collections. Keep low-level collection APIs iterator-shaped with `impl Iterator<Item = Result<_, Error>>`
+  and make callers collect with `collect::<Result<Vec<_>, _>>()?` or handle each item explicitly.
 - In MLIR dialect operation modules, write operation traits and their `mlir_op!` / `mlir_op_trait!` declarations
   explicitly instead of adding dialect-local macros that generate the wrapper trait definitions.
 - Prefix MLIR-dialect-local declarative macros with the dialect or module prefix (for example, `gpu_`) unless they
@@ -314,6 +331,8 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
   programmatically with typed operation constructors, assert typed accessors before insertion where practical, verify
   the module, and compare the canonical `module.to_string()` output. Avoid parsing a module and walking it with helper
   functions unless the operation has no constructor or the test is explicitly about parsing behavior.
+- For MLIR dialect operation tests, write one focused test per concrete operation in the same order as the operation
+  module. Do not replace per-operation coverage with broad scenario tests that cover many operations at once.
 - In MLIR dialect operation tests, inline trivial context/registry setup at the test site instead of adding tiny helpers
   that hides only one or two lines of code.
 

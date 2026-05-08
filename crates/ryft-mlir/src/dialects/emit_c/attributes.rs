@@ -8,7 +8,7 @@ use ryft_xla_sys::bindings::{
     mlirEmitCOpaqueAttrGetTypeID, mlirEmitCOpaqueAttrGetValue,
 };
 
-use crate::{Attribute, Context, DialectHandle, StringRef, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, DialectHandle, Error, StringRef, TypeId, mlir_subtype_trait_impls};
 
 /// Emit-C comparison predicate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -51,23 +51,23 @@ impl CmpPredicate {
     }
 
     /// Constructs a [`CmpPredicate`] from its MLIR C API representation.
-    pub fn from_c_api(value: MlirEmitCCmpPredicate) -> Option<Self> {
+    pub fn from_c_api(value: MlirEmitCCmpPredicate) -> Result<Self, Error> {
         if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_EQ {
-            Some(Self::Equal)
+            Ok(Self::Equal)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_NE {
-            Some(Self::NotEqual)
+            Ok(Self::NotEqual)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_LT {
-            Some(Self::LessThan)
+            Ok(Self::LessThan)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_LE {
-            Some(Self::LessThanOrEqual)
+            Ok(Self::LessThanOrEqual)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_GT {
-            Some(Self::GreaterThan)
+            Ok(Self::GreaterThan)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_GE {
-            Some(Self::GreaterThanOrEqual)
+            Ok(Self::GreaterThanOrEqual)
         } else if value == MlirEmitCCmpPredicate_MLIR_EMITC_CMP_PREDICATE_THREE_WAY {
-            Some(Self::ThreeWay)
+            Ok(Self::ThreeWay)
         } else {
-            None
+            Err(Error::invalid_argument("invalid MLIR Emit-C comparison predicate value"))
         }
     }
 
@@ -92,23 +92,27 @@ pub struct CmpPredicateAttributeRef<'c, 't> {
 
 impl CmpPredicateAttributeRef<'_, '_> {
     /// Gets the [`TypeId`] that corresponds to [`CmpPredicateAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirEmitCCmpPredicateAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirEmitCCmpPredicateAttrGetTypeID()) }
     }
 
     /// Returns the comparison predicate stored by this attribute.
-    pub fn value(&self) -> CmpPredicate {
+    pub fn value(&self) -> Result<CmpPredicate, Error> {
         CmpPredicate::from_c_api(unsafe { mlirEmitCCmpPredicateAttrGetValue(self.handle) })
-            .expect("invalid EmitC comparison predicate")
+            .map_err(|_| Error::internal("invalid EmitC comparison predicate"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for CmpPredicateAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAEmitCCmpPredicate(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAEmitCCmpPredicate(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -137,8 +141,8 @@ pub struct OpaqueAttributeRef<'c, 't> {
 
 impl OpaqueAttributeRef<'_, '_> {
     /// Gets the [`TypeId`] that corresponds to [`OpaqueAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirEmitCOpaqueAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirEmitCOpaqueAttrGetTypeID()) }
     }
 
     /// Returns the opaque value stored by this attribute.
@@ -148,11 +152,15 @@ impl OpaqueAttributeRef<'_, '_> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for OpaqueAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAEmitCOpaque(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAEmitCOpaque(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -168,26 +176,29 @@ mlir_subtype_trait_impls!(OpaqueAttributeRef<'c, 't> as Attribute, mlir_type = A
 
 impl<'t> Context<'t> {
     /// Creates a new Emit-C [`CmpPredicateAttributeRef`] owned by this [`Context`].
-    pub fn emit_c_cmp_predicate_attribute<'c>(&'c self, predicate: CmpPredicate) -> CmpPredicateAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::emit_c());
+    pub fn emit_c_cmp_predicate_attribute<'c>(
+        &'c self,
+        predicate: CmpPredicate,
+    ) -> Result<CmpPredicateAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::emit_c()?)?;
         unsafe {
             CmpPredicateAttributeRef::from_c_api(
                 mlirEmitCCmpPredicateAttrGet(*self.handle.borrow(), predicate.to_c_api()),
                 self,
             )
-            .expect("invalid EmitC comparison predicate attribute")
+            .map_err(|_| Error::internal("invalid EmitC comparison predicate attribute"))
         }
     }
 
     /// Creates a new Emit-C [`OpaqueAttributeRef`] owned by this [`Context`].
-    pub fn emit_c_opaque_attribute<'c, S: AsRef<str>>(&'c self, value: S) -> OpaqueAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::emit_c());
+    pub fn emit_c_opaque_attribute<'c, S: AsRef<str>>(&'c self, value: S) -> Result<OpaqueAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::emit_c()?)?;
         unsafe {
             OpaqueAttributeRef::from_c_api(
                 mlirEmitCOpaqueAttrGet(*self.handle.borrow(), StringRef::from(value.as_ref()).to_c_api()),
                 self,
             )
-            .expect("invalid EmitC opaque attribute")
+            .map_err(|_| Error::internal("invalid EmitC opaque attribute"))
         }
     }
 }
@@ -209,85 +220,85 @@ mod tests {
         assert_eq!(CmpPredicate::GreaterThan.as_str(), "gt");
         assert_eq!(CmpPredicate::GreaterThanOrEqual.as_str(), "ge");
         assert_eq!(CmpPredicate::ThreeWay.as_str(), "three_way");
-        assert_eq!(CmpPredicate::from_c_api(CmpPredicate::Equal.to_c_api()), Some(CmpPredicate::Equal));
-        assert_eq!(CmpPredicate::from_c_api(u64::MAX), None);
+        assert_eq!(CmpPredicate::from_c_api(CmpPredicate::Equal.to_c_api()).unwrap(), CmpPredicate::Equal);
+        assert!(CmpPredicate::from_c_api(u64::MAX).is_err());
     }
 
     #[test]
     fn test_cmp_predicate_attribute() {
         let context = Context::new();
-        let attribute = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan);
+        let attribute = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "builtin");
-        assert_eq!(attribute.value(), CmpPredicate::LessThan);
-        assert_eq!(attribute.type_id(), CmpPredicateAttributeRef::type_id());
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "builtin");
+        assert_eq!(attribute.value().unwrap(), CmpPredicate::LessThan);
+        assert_eq!(attribute.value().unwrap(), CmpPredicate::LessThan);
     }
 
     #[test]
     fn test_cmp_predicate_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan);
-        let attribute_2 = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan);
+        let attribute_1 = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan).unwrap();
+        let attribute_2 = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.emit_c_cmp_predicate_attribute(CmpPredicate::GreaterThan);
+        let attribute_2 = context.emit_c_cmp_predicate_attribute(CmpPredicate::GreaterThan).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan);
+        let attribute_2 = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_cmp_predicate_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan);
+        let attribute = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan).unwrap();
         test_attribute_display_and_debug(attribute, "2 : i64");
     }
 
     #[test]
     fn test_cmp_predicate_attribute_casting() {
         let context = Context::new();
-        let attribute = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan);
+        let attribute = context.emit_c_cmp_predicate_attribute(CmpPredicate::LessThan).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_opaque_attribute() {
         let context = Context::new();
-        let attribute = context.emit_c_opaque_attribute("NULL");
+        let attribute = context.emit_c_opaque_attribute("NULL").unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "emitc");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "emitc");
         assert_eq!(attribute.value().as_str().unwrap(), "NULL");
-        assert_eq!(attribute.type_id(), OpaqueAttributeRef::type_id());
+        assert_eq!(attribute.type_id().unwrap(), OpaqueAttributeRef::type_id().unwrap());
     }
 
     #[test]
     fn test_opaque_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.emit_c_opaque_attribute("NULL");
-        let attribute_2 = context.emit_c_opaque_attribute("NULL");
+        let attribute_1 = context.emit_c_opaque_attribute("NULL").unwrap();
+        let attribute_2 = context.emit_c_opaque_attribute("NULL").unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.emit_c_opaque_attribute("nullptr");
+        let attribute_2 = context.emit_c_opaque_attribute("nullptr").unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.emit_c_opaque_attribute("NULL");
+        let attribute_2 = context.emit_c_opaque_attribute("NULL").unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_opaque_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.emit_c_opaque_attribute("NULL");
+        let attribute = context.emit_c_opaque_attribute("NULL").unwrap();
         test_attribute_display_and_debug(attribute, "#emitc.opaque<\"NULL\">");
     }
 
     #[test]
     fn test_opaque_attribute_casting() {
         let context = Context::new();
-        let attribute = context.emit_c_opaque_attribute("NULL");
+        let attribute = context.emit_c_opaque_attribute("NULL").unwrap();
         test_attribute_casting(attribute);
     }
 }

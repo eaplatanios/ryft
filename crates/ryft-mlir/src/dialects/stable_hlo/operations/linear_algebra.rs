@@ -3,10 +3,9 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::{
-    ArrayAttributeRef, Attribute, BooleanAttributeRef, Context, DenseBooleanArrayAttributeRef,
-    DenseInteger64ArrayAttributeRef, DetachedOp, DialectHandle, Float8Type, Float8TypeRef, FloatType, FloatTypeRef,
-    IntegerAttributeRef, IntoWithContext, Location, Operation, OperationBuilder, Type, Value, ValueRef,
-    mlir_attribute_field, mlir_enum_attribute, mlir_op, mlir_op_trait, mlir_subtype_trait_impls,
+    Attribute, Context, DetachedOp, DialectHandle, Error, Float8Type, Float8TypeRef, FloatType, FloatTypeRef, Location,
+    Operation, OperationBuilder, TryIntoWithContext, Type, Value, ValueRef, mlir_attribute_field, mlir_enum_attribute,
+    mlir_op, mlir_op_trait, mlir_subtype_trait_impls,
 };
 
 use super::{HasPadding, PADDING_ATTRIBUTE};
@@ -81,9 +80,9 @@ impl<'t> Context<'t> {
         rhs_batching_dimensions: &[usize],
         lhs_contracting_dimensions: &[usize],
         rhs_contracting_dimensions: &[usize],
-    ) -> DotDimensionsAttributeRef<'c, 't> {
+    ) -> Result<DotDimensionsAttributeRef<'c, 't>, Error> {
         // Make sure that the StableHLO dialect is loaded into the current context to prevent segmentation faults.
-        self.load_dialect(DialectHandle::stable_hlo());
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         let lhs_batching_dimensions = lhs_batching_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
         let rhs_batching_dimensions = rhs_batching_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
         let lhs_contracting_dimensions = lhs_contracting_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
@@ -108,7 +107,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_dot_dimensions`"))
         }
     }
 }
@@ -248,22 +247,34 @@ impl<'c, 't> DotAlgorithmPreset<'c, 't> {
     pub fn any_f8_any_f8_f32<L: Float8Type<'c, 't>, R: Float8Type<'c, 't>>(
         lhs_precision_type: L,
         rhs_precision_type: R,
-    ) -> Self {
-        Self::Any_F8_Any_F8_F32 {
-            lhs_precision_type: lhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
-            rhs_precision_type: rhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
-        }
+    ) -> Result<Self, Error> {
+        Ok(Self::Any_F8_Any_F8_F32 {
+            lhs_precision_type: lhs_precision_type
+                .as_ref()
+                .cast::<Float8TypeRef>()
+                .ok_or_else(|| Error::invalid_argument("invalid lhs precision type"))?,
+            rhs_precision_type: rhs_precision_type
+                .as_ref()
+                .cast::<Float8TypeRef>()
+                .ok_or_else(|| Error::invalid_argument("invalid rhs precision type"))?,
+        })
     }
 
     /// Creates a new [`DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation`].
     pub fn any_f8_any_f8_f32_fast_accumulation<L: Float8Type<'c, 't>, R: Float8Type<'c, 't>>(
         lhs_precision_type: L,
         rhs_precision_type: R,
-    ) -> Self {
-        Self::Any_F8_Any_F8_F32_Fast_Accumulation {
-            lhs_precision_type: lhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
-            rhs_precision_type: rhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
-        }
+    ) -> Result<Self, Error> {
+        Ok(Self::Any_F8_Any_F8_F32_Fast_Accumulation {
+            lhs_precision_type: lhs_precision_type
+                .as_ref()
+                .cast::<Float8TypeRef>()
+                .ok_or_else(|| Error::invalid_argument("invalid lhs precision type"))?,
+            rhs_precision_type: rhs_precision_type
+                .as_ref()
+                .cast::<Float8TypeRef>()
+                .ok_or_else(|| Error::invalid_argument("invalid rhs precision type"))?,
+        })
     }
 
     /// Creates a new [`DotAlgorithmPreset::Any_F8_Any_F8_Any`].
@@ -271,12 +282,21 @@ impl<'c, 't> DotAlgorithmPreset<'c, 't> {
         lhs_precision_type: L,
         rhs_precision_type: R,
         accumulation_type: T,
-    ) -> Self {
-        Self::Any_F8_Any_F8_Any {
-            lhs_precision_type: lhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
-            rhs_precision_type: rhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
-            accumulation_type: accumulation_type.as_ref().cast::<FloatTypeRef>().unwrap(),
-        }
+    ) -> Result<Self, Error> {
+        Ok(Self::Any_F8_Any_F8_Any {
+            lhs_precision_type: lhs_precision_type
+                .as_ref()
+                .cast::<Float8TypeRef>()
+                .ok_or_else(|| Error::invalid_argument("invalid lhs precision type"))?,
+            rhs_precision_type: rhs_precision_type
+                .as_ref()
+                .cast::<Float8TypeRef>()
+                .ok_or_else(|| Error::invalid_argument("invalid rhs precision type"))?,
+            accumulation_type: accumulation_type
+                .as_ref()
+                .cast::<FloatTypeRef>()
+                .ok_or_else(|| Error::invalid_argument("invalid accumulation type"))?,
+        })
     }
 
     /// Creates a new [`DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation`].
@@ -284,12 +304,21 @@ impl<'c, 't> DotAlgorithmPreset<'c, 't> {
         lhs_precision_type: L,
         rhs_precision_type: R,
         accumulation_type: T,
-    ) -> Self {
-        Self::Any_F8_Any_F8_Any_Fast_Accumulation {
-            lhs_precision_type: lhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
-            rhs_precision_type: rhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
-            accumulation_type: accumulation_type.as_ref().cast::<FloatTypeRef>().unwrap(),
-        }
+    ) -> Result<Self, Error> {
+        Ok(Self::Any_F8_Any_F8_Any_Fast_Accumulation {
+            lhs_precision_type: lhs_precision_type
+                .as_ref()
+                .cast::<Float8TypeRef>()
+                .ok_or_else(|| Error::invalid_argument("invalid lhs precision type"))?,
+            rhs_precision_type: rhs_precision_type
+                .as_ref()
+                .cast::<Float8TypeRef>()
+                .ok_or_else(|| Error::invalid_argument("invalid rhs precision type"))?,
+            accumulation_type: accumulation_type
+                .as_ref()
+                .cast::<FloatTypeRef>()
+                .ok_or_else(|| Error::invalid_argument("invalid accumulation type"))?,
+        })
     }
 
     /// Creates a new [`DotAlgorithmPreset::F16_F16_F16`].
@@ -348,12 +377,15 @@ impl<'c, 't> DotAlgorithmPreset<'c, 't> {
     }
 }
 
-impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> for DotAlgorithmPreset<'c, 't> {
-    fn into_with_context(self, context: &'c Context<'t>) -> Option<DotAlgorithmAttributeRef<'c, 't>> {
+impl<'c, 't> TryIntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> for DotAlgorithmPreset<'c, 't> {
+    fn try_into_with_context(
+        self,
+        context: &'c Context<'t>,
+    ) -> Result<Option<DotAlgorithmAttributeRef<'c, 't>>, Error> {
         match self {
-            DotAlgorithmPreset::Default => None,
+            DotAlgorithmPreset::Default => Ok(None),
             DotAlgorithmPreset::Any_F8_Any_F8_F32 { lhs_precision_type, rhs_precision_type } => {
-                Some(context.stable_hlo_dot_algorithm(
+                Ok(Some(context.stable_hlo_dot_algorithm(
                     lhs_precision_type,
                     rhs_precision_type,
                     context.float32_type(),
@@ -361,10 +393,10 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                     1,
                     1,
                     false,
-                ))
+                )?))
             }
             DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation { lhs_precision_type, rhs_precision_type } => {
-                Some(context.stable_hlo_dot_algorithm(
+                Ok(Some(context.stable_hlo_dot_algorithm(
                     lhs_precision_type,
                     rhs_precision_type,
                     context.float32_type(),
@@ -372,10 +404,10 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                     1,
                     1,
                     true,
-                ))
+                )?))
             }
             DotAlgorithmPreset::Any_F8_Any_F8_Any { lhs_precision_type, rhs_precision_type, accumulation_type } => {
-                Some(context.stable_hlo_dot_algorithm(
+                Ok(Some(context.stable_hlo_dot_algorithm(
                     lhs_precision_type,
                     rhs_precision_type,
                     accumulation_type,
@@ -383,13 +415,13 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                     1,
                     1,
                     false,
-                ))
+                )?))
             }
             DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation {
                 lhs_precision_type,
                 rhs_precision_type,
                 accumulation_type,
-            } => Some(context.stable_hlo_dot_algorithm(
+            } => Ok(Some(context.stable_hlo_dot_algorithm(
                 lhs_precision_type,
                 rhs_precision_type,
                 accumulation_type,
@@ -397,8 +429,8 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 1,
                 true,
-            )),
-            DotAlgorithmPreset::F16_F16_F16 => Some(context.stable_hlo_dot_algorithm(
+            )?)),
+            DotAlgorithmPreset::F16_F16_F16 => Ok(Some(context.stable_hlo_dot_algorithm(
                 context.float16_type(),
                 context.float16_type(),
                 context.float16_type(),
@@ -406,8 +438,8 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 1,
                 false,
-            )),
-            DotAlgorithmPreset::F16_F16_F32 => Some(context.stable_hlo_dot_algorithm(
+            )?)),
+            DotAlgorithmPreset::F16_F16_F32 => Ok(Some(context.stable_hlo_dot_algorithm(
                 context.float16_type(),
                 context.float16_type(),
                 context.float32_type(),
@@ -415,8 +447,8 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 1,
                 false,
-            )),
-            DotAlgorithmPreset::BF16_BF16_BF16 => Some(context.stable_hlo_dot_algorithm(
+            )?)),
+            DotAlgorithmPreset::BF16_BF16_BF16 => Ok(Some(context.stable_hlo_dot_algorithm(
                 context.bfloat16_type(),
                 context.bfloat16_type(),
                 context.bfloat16_type(),
@@ -424,8 +456,8 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 1,
                 false,
-            )),
-            DotAlgorithmPreset::BF16_BF16_F32 => Some(context.stable_hlo_dot_algorithm(
+            )?)),
+            DotAlgorithmPreset::BF16_BF16_F32 => Ok(Some(context.stable_hlo_dot_algorithm(
                 context.bfloat16_type(),
                 context.bfloat16_type(),
                 context.float32_type(),
@@ -433,8 +465,8 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 1,
                 false,
-            )),
-            DotAlgorithmPreset::BF16_BF16_F32_X3 => Some(context.stable_hlo_dot_algorithm(
+            )?)),
+            DotAlgorithmPreset::BF16_BF16_F32_X3 => Ok(Some(context.stable_hlo_dot_algorithm(
                 context.bfloat16_type(),
                 context.bfloat16_type(),
                 context.float32_type(),
@@ -442,8 +474,8 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 3,
                 false,
-            )),
-            DotAlgorithmPreset::BF16_BF16_F32_X6 => Some(context.stable_hlo_dot_algorithm(
+            )?)),
+            DotAlgorithmPreset::BF16_BF16_F32_X6 => Ok(Some(context.stable_hlo_dot_algorithm(
                 context.bfloat16_type(),
                 context.bfloat16_type(),
                 context.float32_type(),
@@ -451,8 +483,8 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 6,
                 false,
-            )),
-            DotAlgorithmPreset::BF16_BF16_F32_X9 => Some(context.stable_hlo_dot_algorithm(
+            )?)),
+            DotAlgorithmPreset::BF16_BF16_F32_X9 => Ok(Some(context.stable_hlo_dot_algorithm(
                 context.bfloat16_type(),
                 context.bfloat16_type(),
                 context.float32_type(),
@@ -460,8 +492,8 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 9,
                 false,
-            )),
-            DotAlgorithmPreset::TF32_TF32_F32 => Some(context.stable_hlo_dot_algorithm(
+            )?)),
+            DotAlgorithmPreset::TF32_TF32_F32 => Ok(Some(context.stable_hlo_dot_algorithm(
                 context.floattf32_type(),
                 context.floattf32_type(),
                 context.float32_type(),
@@ -469,8 +501,8 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 1,
                 false,
-            )),
-            DotAlgorithmPreset::TF32_TF32_F32_X3 => Some(context.stable_hlo_dot_algorithm(
+            )?)),
+            DotAlgorithmPreset::TF32_TF32_F32_X3 => Ok(Some(context.stable_hlo_dot_algorithm(
                 context.floattf32_type(),
                 context.floattf32_type(),
                 context.float32_type(),
@@ -478,8 +510,8 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 3,
                 false,
-            )),
-            DotAlgorithmPreset::F32_F32_F32 => Some(context.stable_hlo_dot_algorithm(
+            )?)),
+            DotAlgorithmPreset::F32_F32_F32 => Ok(Some(context.stable_hlo_dot_algorithm(
                 context.float32_type(),
                 context.float32_type(),
                 context.float32_type(),
@@ -487,8 +519,8 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 1,
                 false,
-            )),
-            DotAlgorithmPreset::F64_F64_F64 => Some(context.stable_hlo_dot_algorithm(
+            )?)),
+            DotAlgorithmPreset::F64_F64_F64 => Ok(Some(context.stable_hlo_dot_algorithm(
                 context.float64_type(),
                 context.float64_type(),
                 context.float64_type(),
@@ -496,7 +528,7 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
                 1,
                 1,
                 false,
-            )),
+            )?)),
         }
     }
 }
@@ -514,9 +546,9 @@ impl<'t> Context<'t> {
         rhs_component_count: usize,
         primitive_operation_count: usize,
         allow_imprecise_accumulation: bool,
-    ) -> DotAlgorithmAttributeRef<'c, 't> {
+    ) -> Result<DotAlgorithmAttributeRef<'c, 't>, Error> {
         // Make sure that the StableHLO dialect is loaded into the current context to prevent segmentation faults.
-        self.load_dialect(DialectHandle::stable_hlo());
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -536,7 +568,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_dot_algorithm`"))
         }
     }
 
@@ -544,8 +576,8 @@ impl<'t> Context<'t> {
     pub fn stable_hlo_dot_algorithm_from_preset<'c>(
         &'c self,
         preset: DotAlgorithmPreset<'c, 't>,
-    ) -> Option<DotAlgorithmAttributeRef<'c, 't>> {
-        preset.into_with_context(self)
+    ) -> Result<Option<DotAlgorithmAttributeRef<'c, 't>>, Error> {
+        preset.try_into_with_context(self)
     }
 }
 
@@ -705,42 +737,70 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &str = "algorithm";
 /// for more information.
 pub trait DotGeneralOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`DotGeneralOperation`].
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side input of this [`DotGeneralOperation`].
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the [`DotDimensionsAttributeRef`] of this [`DotGeneralOperation`], specifying its
     /// batching and contracting dimensions.
-    fn dimensions(&self) -> DotDimensionsAttributeRef<'c, 't> {
-        self.attribute(DOT_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DotDimensionsAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{DOT_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dot_general`"))
+    fn dimensions(&self) -> Result<DotDimensionsAttributeRef<'c, 't>, Error> {
+        self.attribute(DOT_DIMENSIONS_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                DOT_DIMENSIONS_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the [`Precision`] configuration of this [`DotGeneralOperation`], if specified. This configuration
     /// consists of two [`Precision`]s; one that corresponds to the left-hand side input and one that corresponds
     /// to the right-hand side input.
-    fn precision(&self) -> Option<(Precision, Precision)> {
-        let error_message = format!("invalid '{DOT_PRECISION_ATTRIBUTE}' attribute in `stable_hlo::dot_general`");
-        self.attribute(DOT_PRECISION_ATTRIBUTE).and_then(|attribute| {
-            attribute.cast::<ArrayAttributeRef>().map(|attribute| {
-                let mut elements = attribute
-                    .elements()
-                    .flat_map(|element| element.cast::<PrecisionAttributeRef>().map(|attribute| attribute.value()));
-                (elements.next().expect(&error_message), elements.next().expect(&error_message))
-            })
-        })
+    fn precision(&self) -> Result<Option<(Precision, Precision)>, Error> {
+        if !self.has_attribute(DOT_PRECISION_ATTRIBUTE) {
+            return Ok(None);
+        }
+        let attribute = self.array_attribute(DOT_PRECISION_ATTRIBUTE)?;
+        let mut elements = attribute.elements();
+        let lhs = elements
+            .next()
+            .transpose()?
+            .and_then(|element| element.cast::<PrecisionAttributeRef>())
+            .ok_or_else(|| Error::invalid_argument("invalid `precision_config` attribute in `stablehlo.dot_general`"))?
+            .value()?;
+        let rhs = elements
+            .next()
+            .transpose()?
+            .and_then(|element| element.cast::<PrecisionAttributeRef>())
+            .ok_or_else(|| Error::invalid_argument("invalid `precision_config` attribute in `stablehlo.dot_general`"))?
+            .value()?;
+        if elements.next().transpose()?.is_some() {
+            return Err(Error::invalid_argument("invalid `precision_config` attribute in `stablehlo.dot_general`"));
+        }
+        Ok(Some((lhs, rhs)))
     }
 
     /// Returns the [`DotAlgorithmAttributeRef`] of this [`DotGeneralOperation`], if specified.
-    fn algorithm(&self) -> Option<DotAlgorithmAttributeRef<'c, 't>> {
-        self.attribute(DOT_ALGORITHM_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DotAlgorithmAttributeRef>())
+    fn algorithm(&self) -> Result<Option<DotAlgorithmAttributeRef<'c, 't>>, Error> {
+        {
+            let attribute_name = DOT_ALGORITHM_ATTRIBUTE;
+            self.attribute(attribute_name)?
+                .map(|attribute| {
+                    attribute.cast().ok_or_else(|| {
+                        Error::invalid_argument(format!(
+                            "invalid `{}` attribute in `{}`",
+                            attribute_name,
+                            self.name().as_str().unwrap_or("<unknown>"),
+                        ))
+                    })
+                })
+                .transpose()
+        }
     }
 }
 
@@ -751,8 +811,6 @@ mlir_op_trait!(DotGeneral, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DotGeneralOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`DotGeneralOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn dot_general<
     'lhs,
     'rhs,
@@ -770,9 +828,9 @@ pub fn dot_general<
     algorithm: Option<DotAlgorithmAttributeRef<'c, 't>>,
     result_type: T,
     location: L,
-) -> DetachedDotGeneralOperation<'c, 't> {
+) -> Result<DetachedDotGeneralOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.dot_general", location)
         .add_operand(lhs)
         .add_operand(rhs)
@@ -781,19 +839,19 @@ pub fn dot_general<
         builder = builder.add_attribute(
             DOT_PRECISION_ATTRIBUTE,
             context.array_attribute(&[
-                context.stable_hlo_precision(lhs_precision),
-                context.stable_hlo_precision(rhs_precision),
+                context.stable_hlo_precision(lhs_precision)?,
+                context.stable_hlo_precision(rhs_precision)?,
             ]),
         );
     }
     if let Some(algorithm) = algorithm {
         builder = builder.add_attribute(DOT_ALGORITHM_ATTRIBUTE, algorithm);
     }
-    builder
-        .add_result(result_type)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::dot_general`")
+    builder.add_result(result_type).build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::dot_general`"))
+    })
 }
 
 /// StableHLO [`Attribute`] that models the dimension information in [`ConvolutionOperation`]s.
@@ -892,9 +950,9 @@ impl<'t> Context<'t> {
         output_batch_dimension: usize,
         output_feature_dimension: usize,
         output_spatial_dimensions: &[usize],
-    ) -> ConvolutionDimensionsAttributeRef<'c, 't> {
+    ) -> Result<ConvolutionDimensionsAttributeRef<'c, 't>, Error> {
         // Make sure that the StableHLO dialect is loaded into the current context to prevent segmentation faults.
-        self.load_dialect(DialectHandle::stable_hlo());
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         let input_spatial_dimensions = input_spatial_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
         let kernel_spatial_dimensions = kernel_spatial_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
         let output_spatial_dimensions = output_spatial_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>();
@@ -922,7 +980,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .unwrap()
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::stable_hlo_convolution_dimensions`"))
         }
     }
 }
@@ -954,45 +1012,59 @@ pub const CONVOLUTION_PRECISION_ATTRIBUTE: &str = "precision_config";
 /// Trait that is shared by [`ConvolutionOperation`] and [`DynamicConvolutionOperation`].
 pub trait StaticOrDynamicConvolutionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input (i.e., its first operand) of this [`StaticOrDynamicConvolutionOperation`].
-    fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the kernel (i.e., its second operand) of this [`StaticOrDynamicConvolutionOperation`].
-    fn kernel(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn kernel(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the [`ConvolutionDimensionsAttributeRef`] of this [`Operation`].
-    fn dimensions(&self) -> ConvolutionDimensionsAttributeRef<'c, 't> {
-        self.attribute(CONVOLUTION_DIMENSIONS_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<ConvolutionDimensionsAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{CONVOLUTION_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::convolution` or `stable_hlo::dynamic_conv`"))
+    fn dimensions(&self) -> Result<ConvolutionDimensionsAttributeRef<'c, 't>, Error> {
+        self.attribute(CONVOLUTION_DIMENSIONS_ATTRIBUTE)?
+            .and_then(|attribute| attribute.cast())
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    CONVOLUTION_DIMENSIONS_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })
     }
 
     /// Returns the batch group count of this [`Operation`].
-    fn batch_group_count(&self) -> usize {
-        self.attribute(CONVOLUTION_BATCH_GROUP_COUNT_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| panic!("invalid '{CONVOLUTION_BATCH_GROUP_COUNT_ATTRIBUTE}' attribute in `stable_hlo::convolution` or `stable_hlo::dynamic_conv`"))
+    fn batch_group_count(&self) -> Result<usize, Error> {
+        let value = self.integer_attribute(CONVOLUTION_BATCH_GROUP_COUNT_ATTRIBUTE)?.signless_value();
+        usize::try_from(value)
+            .map_err(|_| Error::invalid_argument("invalid `batch_group_count` attribute in `stablehlo.convolution`"))
     }
 
     /// Returns the feature group count of this [`Operation`].
-    fn feature_group_count(&self) -> usize {
-        self.attribute(CONVOLUTION_FEATURE_GROUP_COUNT_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| panic!("invalid '{CONVOLUTION_FEATURE_GROUP_COUNT_ATTRIBUTE}' attribute in `stable_hlo::convolution` or `stable_hlo::dynamic_conv`"))
+    fn feature_group_count(&self) -> Result<usize, Error> {
+        let value = self.integer_attribute(CONVOLUTION_FEATURE_GROUP_COUNT_ATTRIBUTE)?.signless_value();
+        usize::try_from(value)
+            .map_err(|_| Error::invalid_argument("invalid `feature_group_count` attribute in `stablehlo.convolution`"))
     }
 
     /// Returns the window strides of this [`Operation`], if specified. The window strides specify how large
     /// of a jump we take each time with the sliding window for each _spatial_ (i.e., non-batch-or-feature) dimension of
     /// the left-hand side input. All stride values default to one when not specified.
-    fn window_strides(&self) -> Option<Vec<usize>> {
-        self.attribute(CONVOLUTION_WINDOW_STRIDES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn window_strides(&self) -> Result<Option<Vec<usize>>, Error> {
+        if self.has_attribute(CONVOLUTION_WINDOW_STRIDES_ATTRIBUTE) {
+            self.dense_integer_64_array_attribute(CONVOLUTION_WINDOW_STRIDES_ATTRIBUTE)?
+                .values()
+                .map(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        Error::invalid_argument("invalid `window_strides` attribute in `stablehlo.convolution`")
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the left-hand side input dilation of this [`Operation`], if specified. The dilation values
@@ -1003,10 +1075,20 @@ pub trait StaticOrDynamicConvolutionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o,
     ///
     /// Refer to this [blog post](https://www.inference.vc/dilated-convolutions-and-kronecker-factorisation/)
     /// for more information on dilated convolutions.
-    fn lhs_dilation(&self) -> Option<Vec<usize>> {
-        self.attribute(CONVOLUTION_LHS_DILATION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn lhs_dilation(&self) -> Result<Option<Vec<usize>>, Error> {
+        if self.has_attribute(CONVOLUTION_LHS_DILATION_ATTRIBUTE) {
+            self.dense_integer_64_array_attribute(CONVOLUTION_LHS_DILATION_ATTRIBUTE)?
+                .values()
+                .map(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        Error::invalid_argument("invalid `lhs_dilation` attribute in `stablehlo.convolution`")
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the right-hand side input dilation of this [`Operation`], if specified. The dilation values
@@ -1017,36 +1099,59 @@ pub trait StaticOrDynamicConvolutionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o,
     ///
     /// Refer to this [blog post](https://www.inference.vc/dilated-convolutions-and-kronecker-factorisation/)
     /// for more information on dilated convolutions.
-    fn rhs_dilation(&self) -> Option<Vec<usize>> {
-        self.attribute(CONVOLUTION_RHS_DILATION_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
+    fn rhs_dilation(&self) -> Result<Option<Vec<usize>>, Error> {
+        if self.has_attribute(CONVOLUTION_RHS_DILATION_ATTRIBUTE) {
+            self.dense_integer_64_array_attribute(CONVOLUTION_RHS_DILATION_ATTRIBUTE)?
+                .values()
+                .map(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        Error::invalid_argument("invalid `rhs_dilation` attribute in `stablehlo.convolution`")
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns an optional [`Vec`] that specifies, for each _spatial_ (i.e., non-batch-or-feature) dimension of the
     /// convolution window, if that dimension of the window should be [reversed](crate::dialects::stable_hlo::reverse)
     /// or not. Defaults to `false` for all spatial dimensions, if not specified.
-    fn window_reversal(&self) -> Option<Vec<bool>> {
-        self.attribute(CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseBooleanArrayAttributeRef>())
-            .map(|attribute| attribute.values().collect())
+    fn window_reversal(&self) -> Result<Option<Vec<bool>>, Error> {
+        if self.has_attribute(CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE) {
+            self.dense_boolean_array_attribute(CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE)
+                .map(|attribute| Some(attribute.values().collect()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the [`Precision`] configuration of this [`Operation`], if specified. That configuration
     /// consists of two [`Precision`]s; one that corresponds to the left-hand side input and one that corresponds
     /// to the right-hand side input.
-    fn precision(&self) -> Option<(Precision, Precision)> {
-        let error_message = format!(
-            "invalid '{CONVOLUTION_PRECISION_ATTRIBUTE}' attribute in `stable_hlo::convolution` or `stable_hlo::dynamic_conv`",
-        );
-        self.attribute(CONVOLUTION_PRECISION_ATTRIBUTE).and_then(|attribute| {
-            attribute.cast::<ArrayAttributeRef>().map(|attribute| {
-                let mut elements = attribute
-                    .elements()
-                    .flat_map(|element| element.cast::<PrecisionAttributeRef>().map(|attribute| attribute.value()));
-                (elements.next().expect(&error_message), elements.next().expect(&error_message))
-            })
-        })
+    fn precision(&self) -> Result<Option<(Precision, Precision)>, Error> {
+        if !self.has_attribute(CONVOLUTION_PRECISION_ATTRIBUTE) {
+            return Ok(None);
+        }
+        let attribute = self.array_attribute(CONVOLUTION_PRECISION_ATTRIBUTE)?;
+        let mut elements = attribute.elements();
+        let lhs = elements
+            .next()
+            .transpose()?
+            .and_then(|element| element.cast::<PrecisionAttributeRef>())
+            .ok_or_else(|| Error::invalid_argument("invalid `precision_config` attribute in `stablehlo.convolution`"))?
+            .value()?;
+        let rhs = elements
+            .next()
+            .transpose()?
+            .and_then(|element| element.cast::<PrecisionAttributeRef>())
+            .ok_or_else(|| Error::invalid_argument("invalid `precision_config` attribute in `stablehlo.convolution`"))?
+            .value()?;
+        if elements.next().transpose()?.is_some() {
+            return Err(Error::invalid_argument("invalid `precision_config` attribute in `stablehlo.convolution`"));
+        }
+        Ok(Some((lhs, rhs)))
     }
 }
 
@@ -1239,8 +1344,6 @@ mlir_op_trait!(Convolution, @local StaticOrDynamicConvolutionOperation);
 
 /// Constructs a new detached/owned [`ConvolutionOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`ConvolutionOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[allow(clippy::too_many_arguments)]
 pub fn convolution<
     'lhs,
@@ -1265,9 +1368,9 @@ pub fn convolution<
     precision: Option<(Precision, Precision)>,
     result_type: T,
     location: L,
-) -> DetachedConvolutionOperation<'c, 't> {
+) -> Result<DetachedConvolutionOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let i64_type = context.signless_integer_type(64);
     let mut builder = OperationBuilder::new("stablehlo.convolution", location)
         .add_operand(lhs)
@@ -1285,46 +1388,44 @@ pub fn convolution<
         let window_strides = window_strides.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_WINDOW_STRIDES_ATTRIBUTE,
-            context.dense_i64_array_attribute(window_strides.as_slice()).unwrap(),
+            context.dense_i64_array_attribute(window_strides.as_slice())?,
         );
     }
     if let Some(padding) = padding {
-        builder = builder.add_attribute(PADDING_ATTRIBUTE, context.stable_hlo_padding(padding, location));
+        builder = builder.add_attribute(PADDING_ATTRIBUTE, context.stable_hlo_padding(padding, location)?);
     }
     if let Some(lhs_dilation) = lhs_dilation {
         let lhs_dilation = lhs_dilation.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_LHS_DILATION_ATTRIBUTE,
-            context.dense_i64_array_attribute(lhs_dilation.as_slice()).unwrap(),
+            context.dense_i64_array_attribute(lhs_dilation.as_slice())?,
         );
     }
     if let Some(rhs_dilation) = rhs_dilation {
         let rhs_dilation = rhs_dilation.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_RHS_DILATION_ATTRIBUTE,
-            context.dense_i64_array_attribute(rhs_dilation.as_slice()).unwrap(),
+            context.dense_i64_array_attribute(rhs_dilation.as_slice())?,
         );
     }
     if let Some(window_reversal) = window_reversal {
-        builder = builder.add_attribute(
-            CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE,
-            context.dense_bool_array_attribute(window_reversal).unwrap(),
-        );
+        builder = builder
+            .add_attribute(CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE, context.dense_bool_array_attribute(window_reversal)?);
     }
     if let Some((lhs_precision, rhs_precision)) = precision {
         builder = builder.add_attribute(
             CONVOLUTION_PRECISION_ATTRIBUTE,
             context.array_attribute(&[
-                context.stable_hlo_precision(lhs_precision),
-                context.stable_hlo_precision(rhs_precision),
+                context.stable_hlo_precision(lhs_precision)?,
+                context.stable_hlo_precision(rhs_precision)?,
             ]),
         );
     }
-    builder
-        .add_result(result_type)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::convolution`")
+    builder.add_result(result_type).build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::convolution`"))
+    })
 }
 
 /// StableHLO [`Operation`] that computes convolutions over tensors (i.e., dot products between windows of one tensor
@@ -1373,8 +1474,8 @@ pub trait DynamicConvolutionOperation<'o, 'c: 'o, 't: 'c>: StaticOrDynamicConvol
     /// two-dimensional tensor with shape `[S, 2]` where `S` is the number of _spatial_ dimensions. The first number
     /// in each pair specifies the amount of padding inserted _before_ the values of the tensor on that dimension and
     /// the second number specifies the amount of padding inserted _after_ the values of the tensor on that dimension.
-    fn padding(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn padding(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 }
 
@@ -1386,8 +1487,6 @@ mlir_op_trait!(DynamicConvolution, @local StaticOrDynamicConvolutionOperation);
 
 /// Constructs a new detached/owned [`DynamicConvolutionOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`DynamicConvolutionOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 #[allow(clippy::too_many_arguments)]
 pub fn dynamic_convolution<
     'lhs,
@@ -1414,9 +1513,9 @@ pub fn dynamic_convolution<
     precision: Option<(Precision, Precision)>,
     result_type: T,
     location: L,
-) -> DetachedDynamicConvolutionOperation<'c, 't> {
+) -> Result<DetachedDynamicConvolutionOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let i64_type = location.context().signless_integer_type(64);
     let mut builder = OperationBuilder::new("stablehlo.dynamic_conv", location)
         .add_operand(lhs)
@@ -1435,43 +1534,41 @@ pub fn dynamic_convolution<
         let window_strides = window_strides.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_WINDOW_STRIDES_ATTRIBUTE,
-            context.dense_i64_array_attribute(window_strides.as_slice()).unwrap(),
+            context.dense_i64_array_attribute(window_strides.as_slice())?,
         );
     }
     if let Some(lhs_dilation) = lhs_dilation {
         let lhs_dilation = lhs_dilation.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_LHS_DILATION_ATTRIBUTE,
-            context.dense_i64_array_attribute(lhs_dilation.as_slice()).unwrap(),
+            context.dense_i64_array_attribute(lhs_dilation.as_slice())?,
         );
     }
     if let Some(rhs_dilation) = rhs_dilation {
         let rhs_dilation = rhs_dilation.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_RHS_DILATION_ATTRIBUTE,
-            context.dense_i64_array_attribute(rhs_dilation.as_slice()).unwrap(),
+            context.dense_i64_array_attribute(rhs_dilation.as_slice())?,
         );
     }
     if let Some(window_reversal) = window_reversal {
-        builder = builder.add_attribute(
-            CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE,
-            context.dense_bool_array_attribute(window_reversal).unwrap(),
-        );
+        builder = builder
+            .add_attribute(CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE, context.dense_bool_array_attribute(window_reversal)?);
     }
     if let Some((lhs_precision, rhs_precision)) = precision {
         builder = builder.add_attribute(
             CONVOLUTION_PRECISION_ATTRIBUTE,
             context.array_attribute(&[
-                context.stable_hlo_precision(lhs_precision),
-                context.stable_hlo_precision(rhs_precision),
+                context.stable_hlo_precision(lhs_precision)?,
+                context.stable_hlo_precision(rhs_precision)?,
             ]),
         );
     }
-    builder
-        .add_result(result_type)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::dynamic_convolution`")
+    builder.add_result(result_type).build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::dynamic_convolution`"))
+    })
 }
 
 /// Name of the [`Attribute`] that is used to store [`CholeskyOperation::lower`].
@@ -1511,11 +1608,8 @@ pub const CHOLESKY_LOWER_ATTRIBUTE: &str = "lower";
 /// for more information.
 pub trait CholeskyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns whether this [`CholeskyOperation`] computes lower or an upper triangular matrices as its result.
-    fn lower(&self) -> bool {
-        self.attribute(CHOLESKY_LOWER_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("invalid '{CHOLESKY_LOWER_ATTRIBUTE}' attribute in `stable_hlo::cholesky`"))
+    fn lower(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(CHOLESKY_LOWER_ATTRIBUTE)?.value())
     }
 }
 
@@ -1526,21 +1620,22 @@ mlir_op_trait!(Cholesky, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`CholeskyOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`CholeskyOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn cholesky<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     lower: bool,
     location: L,
-) -> DetachedCholeskyOperation<'c, 't> {
-    location.context().load_dialect(DialectHandle::stable_hlo());
+) -> Result<DetachedCholeskyOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.cholesky", location)
         .add_operand(input)
         .add_attribute(CHOLESKY_LOWER_ATTRIBUTE, location.context().boolean_attribute(lower))
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::cholesky`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::cholesky`"))
+        })
 }
 
 mlir_enum_attribute!(
@@ -1627,56 +1722,43 @@ pub const TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE: &str = "transpose_a";
 /// for more information.
 pub trait TriangularSolveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the first input of this [`TriangularSolveOperation`].
-    fn a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn a(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the second input of this [`TriangularSolveOperation`].
-    fn b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn b(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns whether the coefficient matrix is placed on the left side for this [`TriangularSolveOperation`].
-    fn left_side(&self) -> bool {
-        self.attribute(TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| {
-                panic!("invalid '{TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`")
-            })
+    fn left_side(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE)?.value())
     }
 
     /// Returns whether this [`TriangularSolveOperation`] operates on lower or upper triangular matrices.
-    fn lower(&self) -> bool {
-        self.attribute(TRIANGULAR_SOLVE_LOWER_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| {
-                panic!("invalid '{TRIANGULAR_SOLVE_LOWER_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`")
-            })
+    fn lower(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(TRIANGULAR_SOLVE_LOWER_ATTRIBUTE)?.value())
     }
 
     /// Returns `true` if this [`TriangularSolveOperation`] can assume that the diagonal elements of
     /// [`TriangularSolveOperation::a`] are all equal to `1`
-    fn unit_diagonal(&self) -> bool {
-        self.attribute(TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| {
-                panic!(
-                    "invalid '{TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`"
-                )
-            })
+    fn unit_diagonal(&self) -> Result<bool, Error> {
+        Ok(self.boolean_attribute(TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE)?.value())
     }
 
     /// Returns the [`TriangularSolveTransposeType`] for this [`TriangularSolveOperation`].
-    fn transpose_a(&self) -> TriangularSolveTransposeType {
-        self.attribute(TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE)
+    fn transpose_a(&self) -> Result<TriangularSolveTransposeType, Error> {
+        self.attribute(TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<TriangularSolveTransposeTypeAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| {
-                panic!("invalid '{TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`")
-            })
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 }
 
@@ -1687,8 +1769,6 @@ mlir_op_trait!(TriangularSolve, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`TriangularSolveOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`TriangularSolveOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn triangular_solve<
     'a,
     'b,
@@ -1705,9 +1785,9 @@ pub fn triangular_solve<
     unit_diagonal: bool,
     transpose_a: TriangularSolveTransposeType,
     location: L,
-) -> DetachedTriangularSolveOperation<'c, 't> {
+) -> Result<DetachedTriangularSolveOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.triangular_solve", location)
         .add_operand(a)
         .add_operand(b)
@@ -1716,12 +1796,15 @@ pub fn triangular_solve<
         .add_attribute(TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE, context.boolean_attribute(unit_diagonal))
         .add_attribute(
             TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE,
-            context.stable_hlo_triangular_solve_transpose_type(transpose_a),
+            context.stable_hlo_triangular_solve_transpose_type(transpose_a)?,
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::triangular_solve`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::triangular_solve`"))
+        })
 }
 
 mlir_enum_attribute!(
@@ -1804,19 +1887,28 @@ pub const FFT_LENGTH_ATTRIBUTE: &str = "fft_length";
 /// for more information.
 pub trait FftOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the [`FftType`] of this [`FftOperation`].
-    fn fft_type(&self) -> FftType {
-        self.attribute(FFT_TYPE_ATTRIBUTE)
+    fn fft_type(&self) -> Result<FftType, Error> {
+        self.attribute(FFT_TYPE_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<FftTypeAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("invalid '{FFT_TYPE_ATTRIBUTE}' attribute in `stable_hlo::fft`"))
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    FFT_TYPE_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 
     /// Returns the length (i.e., number of step-wise FFT transformations) of this [`FftOperation`].
-    fn fft_length(&self) -> Vec<usize> {
-        self.attribute(FFT_LENGTH_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .map(|attribute| attribute.values().map(|value| value as usize).collect())
-            .unwrap_or_else(|| panic!("invalid '{FFT_LENGTH_ATTRIBUTE}' attribute in `stable_hlo::fft`"))
+    fn fft_length(&self) -> Result<Vec<usize>, Error> {
+        self.dense_integer_64_array_attribute(FFT_LENGTH_ATTRIBUTE)?
+            .values()
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_| Error::invalid_argument("invalid `fft_length` attribute in `stablehlo.fft`"))
+            })
+            .collect()
     }
 }
 
@@ -1827,29 +1919,26 @@ mlir_op_trait!(Fft, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`FftOperation`] at the specified [`Location`]. Refer to the
 /// documentation of [`FftOperation`] for more information on the operation semantics.
-///
-/// Note that if any of the inputs to this function are invalid, it will panic!
 pub fn fft<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     r#type: FftType,
     length: &[usize],
     location: L,
-) -> DetachedFftOperation<'c, 't> {
+) -> Result<DetachedFftOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo());
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.fft", location)
         .add_operand(input)
-        .add_attribute(FFT_TYPE_ATTRIBUTE, context.stable_hlo_fft_type(r#type))
+        .add_attribute(FFT_TYPE_ATTRIBUTE, context.stable_hlo_fft_type(r#type)?)
         .add_attribute(
             FFT_LENGTH_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(length.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())
-                .unwrap(),
+            context.dense_i64_array_attribute(length.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
         )
         .enable_result_type_inference()
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `stable_hlo::fft`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::fft`"))
+        })
 }
 
 #[cfg(test)]
@@ -1870,9 +1959,9 @@ mod tests {
     #[test]
     fn test_precision_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_precision(Precision::Highest);
+        let attribute = context.stable_hlo_precision(Precision::Highest).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), Precision::Highest);
+        assert_eq!(attribute.value().unwrap(), Precision::Highest);
     }
 
     #[test]
@@ -1880,38 +1969,38 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_precision(Precision::Highest);
-        let attribute_2 = context.stable_hlo_precision(Precision::Highest);
+        let attribute_1 = context.stable_hlo_precision(Precision::Highest).unwrap();
+        let attribute_2 = context.stable_hlo_precision(Precision::Highest).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_precision(Precision::High);
+        let attribute_2 = context.stable_hlo_precision(Precision::High).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_precision(Precision::Highest);
+        let attribute_2 = context.stable_hlo_precision(Precision::Highest).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_precision_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_precision(Precision::Highest);
+        let attribute = context.stable_hlo_precision(Precision::Highest).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo<precision HIGHEST>");
     }
 
     #[test]
     fn test_precision_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_precision(Precision::Highest);
+        let attribute = context.stable_hlo_precision(Precision::Highest).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_dot_dimensions_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]);
+        let attribute = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.lhs_batching_dimensions(), vec![0, 1]);
         assert_eq!(attribute.rhs_batching_dimensions(), vec![2, 3]);
@@ -1924,24 +2013,24 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]);
-        let attribute_2 = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]);
+        let attribute_1 = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]).unwrap();
+        let attribute_2 = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_dot_dimensions(&[2, 3], &[0], &[0], &[1]);
+        let attribute_2 = context.stable_hlo_dot_dimensions(&[2, 3], &[0], &[0], &[1]).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]);
+        let attribute_2 = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_dot_dimensions_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]);
+        let attribute = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]).unwrap();
         test_attribute_display_and_debug(
             attribute,
             "#stablehlo.dot<\
@@ -1956,7 +2045,7 @@ mod tests {
     #[test]
     fn test_dot_dimensions_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]);
+        let attribute = context.stable_hlo_dot_dimensions(&[0, 1], &[2, 3], &[4], &[5]).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -1964,11 +2053,11 @@ mod tests {
     fn test_dot_algorithm_attribute() {
         let context = Context::new();
         let f32_type = context.float32_type();
-        let attribute = context.stable_hlo_dot_algorithm(f32_type, f32_type, f32_type, 2, 3, 4, true);
+        let attribute = context.stable_hlo_dot_algorithm(f32_type, f32_type, f32_type, 2, 3, 4, true).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.lhs_precision_type(), f32_type);
-        assert_eq!(attribute.rhs_precision_type(), f32_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        assert_eq!(attribute.lhs_precision_type().unwrap(), f32_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), f32_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.lhs_component_count(), 2);
         assert_eq!(attribute.rhs_component_count(), 3);
         assert_eq!(attribute.primitive_operation_count(), 4);
@@ -1982,17 +2071,17 @@ mod tests {
         let f64_type = context.float64_type();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_dot_algorithm(f32_type, f32_type, f32_type, 1, 1, 1, false);
-        let attribute_2 = context.stable_hlo_dot_algorithm(f32_type, f32_type, f32_type, 1, 1, 1, false);
+        let attribute_1 = context.stable_hlo_dot_algorithm(f32_type, f32_type, f32_type, 1, 1, 1, false).unwrap();
+        let attribute_2 = context.stable_hlo_dot_algorithm(f32_type, f32_type, f32_type, 1, 1, 1, false).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_dot_algorithm(f32_type, f64_type, f32_type, 1, 1, 2, true);
+        let attribute_2 = context.stable_hlo_dot_algorithm(f32_type, f64_type, f32_type, 1, 1, 2, true).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_dot_algorithm(f32_type, f32_type, f32_type, 1, 1, 1, false);
+        let attribute_2 = context.stable_hlo_dot_algorithm(f32_type, f32_type, f32_type, 1, 1, 1, false).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
@@ -2001,7 +2090,7 @@ mod tests {
         let context = Context::new();
         let f32_type = context.float32_type();
         let f64_type = context.float64_type();
-        let attribute = context.stable_hlo_dot_algorithm(f32_type, f64_type, f32_type, 4, 2, 1, false);
+        let attribute = context.stable_hlo_dot_algorithm(f32_type, f64_type, f32_type, 4, 2, 1, false).unwrap();
         test_attribute_display_and_debug(
             attribute,
             "#stablehlo.dot_algorithm<\
@@ -2021,7 +2110,7 @@ mod tests {
         let context = Context::new();
         let f32_type = context.float32_type();
         let f64_type = context.float64_type();
-        let attribute = context.stable_hlo_dot_algorithm(f32_type, f64_type, f32_type, 4, 2, 1, false);
+        let attribute = context.stable_hlo_dot_algorithm(f32_type, f64_type, f32_type, 4, 2, 1, false).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -2036,133 +2125,153 @@ mod tests {
         let bf16_type = context.bfloat16_type().as_ref().cast::<FloatTypeRef>().unwrap();
         let tf32_type = context.floattf32_type().as_ref().cast::<FloatTypeRef>().unwrap();
 
-        assert_eq!(context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::Default), None);
+        assert_eq!(context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::Default).unwrap(), None);
 
         let attribute = context
-            .stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::any_f8_any_f8_f32(f8e4m3fn_type, f8e5m2_type))
+            .stable_hlo_dot_algorithm_from_preset(
+                DotAlgorithmPreset::any_f8_any_f8_f32(f8e4m3fn_type, f8e5m2_type).unwrap(),
+            )
+            .unwrap()
             .unwrap();
-        assert_eq!(attribute.lhs_precision_type(), f8e4m3fn_type);
-        assert_eq!(attribute.rhs_precision_type(), f8e5m2_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        assert_eq!(attribute.lhs_precision_type().unwrap(), f8e4m3fn_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), f8e5m2_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.primitive_operation_count(), 1);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
         let attribute = context
-            .stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::any_f8_any_f8_f32_fast_accumulation(
-                f8e4m3fn_type,
-                f8e5m2_type,
-            ))
+            .stable_hlo_dot_algorithm_from_preset(
+                DotAlgorithmPreset::any_f8_any_f8_f32_fast_accumulation(f8e4m3fn_type, f8e5m2_type).unwrap(),
+            )
+            .unwrap()
             .unwrap();
-        assert_eq!(attribute.lhs_precision_type(), f8e4m3fn_type);
-        assert_eq!(attribute.rhs_precision_type(), f8e5m2_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        assert_eq!(attribute.lhs_precision_type().unwrap(), f8e4m3fn_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), f8e5m2_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.primitive_operation_count(), 1);
         assert_eq!(attribute.allow_imprecise_accumulation(), true);
 
         let attribute = context
-            .stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::any_f8_any_f8_any(
-                f8e4m3fn_type,
-                f8e5m2_type,
-                f32_type,
-            ))
+            .stable_hlo_dot_algorithm_from_preset(
+                DotAlgorithmPreset::any_f8_any_f8_any(f8e4m3fn_type, f8e5m2_type, f32_type).unwrap(),
+            )
+            .unwrap()
             .unwrap();
-        assert_eq!(attribute.lhs_precision_type(), f8e4m3fn_type);
-        assert_eq!(attribute.rhs_precision_type(), f8e5m2_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        assert_eq!(attribute.lhs_precision_type().unwrap(), f8e4m3fn_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), f8e5m2_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.primitive_operation_count(), 1);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
         let attribute = context
-            .stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::any_f8_any_f8_any_fast_accumulation(
-                f8e4m3fn_type,
-                f8e5m2_type,
-                f32_type,
-            ))
+            .stable_hlo_dot_algorithm_from_preset(
+                DotAlgorithmPreset::any_f8_any_f8_any_fast_accumulation(f8e4m3fn_type, f8e5m2_type, f32_type).unwrap(),
+            )
+            .unwrap()
             .unwrap();
-        assert_eq!(attribute.lhs_precision_type(), f8e4m3fn_type);
-        assert_eq!(attribute.rhs_precision_type(), f8e5m2_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        assert_eq!(attribute.lhs_precision_type().unwrap(), f8e4m3fn_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), f8e5m2_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.primitive_operation_count(), 1);
         assert_eq!(attribute.allow_imprecise_accumulation(), true);
 
-        let attribute = context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::f16_f16_f16()).unwrap();
-        assert_eq!(attribute.lhs_precision_type(), f16_type);
-        assert_eq!(attribute.rhs_precision_type(), f16_type);
-        assert_eq!(attribute.accumulation_type(), f16_type);
+        let attribute =
+            context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::f16_f16_f16()).unwrap().unwrap();
+        assert_eq!(attribute.lhs_precision_type().unwrap(), f16_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), f16_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f16_type);
         assert_eq!(attribute.lhs_component_count(), 1);
         assert_eq!(attribute.rhs_component_count(), 1);
         assert_eq!(attribute.primitive_operation_count(), 1);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
-        let attribute = context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::f16_f16_f32()).unwrap();
-        assert_eq!(attribute.lhs_precision_type(), f16_type);
-        assert_eq!(attribute.rhs_precision_type(), f16_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        let attribute =
+            context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::f16_f16_f32()).unwrap().unwrap();
+        assert_eq!(attribute.lhs_precision_type().unwrap(), f16_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), f16_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.lhs_component_count(), 1);
         assert_eq!(attribute.rhs_component_count(), 1);
         assert_eq!(attribute.primitive_operation_count(), 1);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
-        let attribute = context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::bf16_bf16_bf16()).unwrap();
-        assert_eq!(attribute.lhs_precision_type(), bf16_type);
-        assert_eq!(attribute.rhs_precision_type(), bf16_type);
-        assert_eq!(attribute.accumulation_type(), bf16_type);
+        let attribute =
+            context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::bf16_bf16_bf16()).unwrap().unwrap();
+        assert_eq!(attribute.lhs_precision_type().unwrap(), bf16_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), bf16_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), bf16_type);
         assert_eq!(attribute.primitive_operation_count(), 1);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
-        let attribute = context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::bf16_bf16_f32()).unwrap();
-        assert_eq!(attribute.lhs_precision_type(), bf16_type);
-        assert_eq!(attribute.rhs_precision_type(), bf16_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        let attribute =
+            context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::bf16_bf16_f32()).unwrap().unwrap();
+        assert_eq!(attribute.lhs_precision_type().unwrap(), bf16_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), bf16_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.primitive_operation_count(), 1);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
-        let attribute = context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::bf16_bf16_f32_x3()).unwrap();
-        assert_eq!(attribute.lhs_precision_type(), bf16_type);
-        assert_eq!(attribute.rhs_precision_type(), bf16_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        let attribute = context
+            .stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::bf16_bf16_f32_x3())
+            .unwrap()
+            .unwrap();
+        assert_eq!(attribute.lhs_precision_type().unwrap(), bf16_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), bf16_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.primitive_operation_count(), 3);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
-        let attribute = context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::bf16_bf16_f32_x6()).unwrap();
-        assert_eq!(attribute.lhs_precision_type(), bf16_type);
-        assert_eq!(attribute.rhs_precision_type(), bf16_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        let attribute = context
+            .stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::bf16_bf16_f32_x6())
+            .unwrap()
+            .unwrap();
+        assert_eq!(attribute.lhs_precision_type().unwrap(), bf16_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), bf16_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.primitive_operation_count(), 6);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
-        let attribute = context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::bf16_bf16_f32_x9()).unwrap();
-        assert_eq!(attribute.lhs_precision_type(), bf16_type);
-        assert_eq!(attribute.rhs_precision_type(), bf16_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        let attribute = context
+            .stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::bf16_bf16_f32_x9())
+            .unwrap()
+            .unwrap();
+        assert_eq!(attribute.lhs_precision_type().unwrap(), bf16_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), bf16_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.primitive_operation_count(), 9);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
-        let attribute = context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::tf32_tf32_f32()).unwrap();
-        assert_eq!(attribute.lhs_precision_type(), tf32_type);
-        assert_eq!(attribute.rhs_precision_type(), tf32_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        let attribute =
+            context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::tf32_tf32_f32()).unwrap().unwrap();
+        assert_eq!(attribute.lhs_precision_type().unwrap(), tf32_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), tf32_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.primitive_operation_count(), 1);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
-        let attribute = context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::tf32_tf32_f32_x3()).unwrap();
-        assert_eq!(attribute.lhs_precision_type(), tf32_type);
-        assert_eq!(attribute.rhs_precision_type(), tf32_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        let attribute = context
+            .stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::tf32_tf32_f32_x3())
+            .unwrap()
+            .unwrap();
+        assert_eq!(attribute.lhs_precision_type().unwrap(), tf32_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), tf32_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.primitive_operation_count(), 3);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
-        let attribute = context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::f32_f32_f32()).unwrap();
-        assert_eq!(attribute.lhs_precision_type(), f32_type);
-        assert_eq!(attribute.rhs_precision_type(), f32_type);
-        assert_eq!(attribute.accumulation_type(), f32_type);
+        let attribute =
+            context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::f32_f32_f32()).unwrap().unwrap();
+        assert_eq!(attribute.lhs_precision_type().unwrap(), f32_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), f32_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f32_type);
         assert_eq!(attribute.primitive_operation_count(), 1);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
 
-        let attribute = context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::f64_f64_f64()).unwrap();
-        assert_eq!(attribute.lhs_precision_type(), f64_type);
-        assert_eq!(attribute.rhs_precision_type(), f64_type);
-        assert_eq!(attribute.accumulation_type(), f64_type);
+        let attribute =
+            context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::f64_f64_f64()).unwrap().unwrap();
+        assert_eq!(attribute.lhs_precision_type().unwrap(), f64_type);
+        assert_eq!(attribute.rhs_precision_type().unwrap(), f64_type);
+        assert_eq!(attribute.accumulation_type().unwrap(), f64_type);
         assert_eq!(attribute.primitive_operation_count(), 1);
         assert_eq!(attribute.allow_imprecise_accumulation(), false);
     }
@@ -2171,7 +2280,7 @@ mod tests {
     fn test_dot_general() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let lhs_type = context
             .tensor_type(i64_type, &[Size::Static(2), Size::Static(2), Size::Static(2)], None, location)
@@ -2182,61 +2291,69 @@ mod tests {
         let result_type = context
             .tensor_type(i64_type, &[Size::Static(2), Size::Static(2), Size::Static(2)], None, location)
             .unwrap();
-        let dimensions = context.stable_hlo_dot_dimensions(&[0], &[0], &[2], &[1]);
-        let algorithm = context.stable_hlo_dot_algorithm(
-            context.float8e5m2_type(),
-            context.float8e5m2_type(),
-            context.float32_type(),
-            1,
-            1,
-            1,
-            true,
-        );
-        module.body().append_operation({
-            let mut block = context.block(&[(lhs_type, location), (rhs_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = dot_general(lhs, rhs, dimensions, None, Some(algorithm), result_type, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.dimensions(), dimensions);
-            assert_eq!(op.precision(), None);
-            assert_eq!(op.algorithm(), Some(algorithm));
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-
-            // Test the precision attribute using a dummy op.
-            let dummy_op = dot_general(
-                lhs,
-                rhs,
-                dimensions,
-                Some((Precision::High, Precision::Highest)),
-                None,
-                result_type,
-                location,
-            );
-            assert_eq!(dummy_op.lhs(), lhs);
-            assert_eq!(dummy_op.rhs(), rhs);
-            assert_eq!(dummy_op.dimensions(), dimensions);
-            assert_eq!(dummy_op.precision(), Some((Precision::High, Precision::Highest)));
-            assert_eq!(dummy_op.algorithm(), None);
-            assert_eq!(dummy_op.operands().count(), 2);
-            assert_eq!(dummy_op.results().count(), 1);
-
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "dot_general_test",
-                func::FuncAttributes {
-                    arguments: vec![lhs_type.into(), rhs_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
+        let dimensions = context.stable_hlo_dot_dimensions(&[0], &[0], &[2], &[1]).unwrap();
+        let algorithm = context
+            .stable_hlo_dot_algorithm(
+                context.float8e5m2_type(),
+                context.float8e5m2_type(),
+                context.float32_type(),
+                1,
+                1,
+                1,
+                true,
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(lhs_type, location), (rhs_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = dot_general(lhs, rhs, dimensions, None, Some(algorithm), result_type, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.dimensions().unwrap(), dimensions);
+                assert_eq!(op.precision().unwrap(), None);
+                assert_eq!(op.algorithm().unwrap(), Some(algorithm));
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+
+                // Test the precision attribute using a dummy op.
+                let dummy_op = dot_general(
+                    lhs,
+                    rhs,
+                    dimensions,
+                    Some((Precision::High, Precision::Highest)),
+                    None,
+                    result_type,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(dummy_op.lhs().unwrap(), lhs);
+                assert_eq!(dummy_op.rhs().unwrap(), rhs);
+                assert_eq!(dummy_op.dimensions().unwrap(), dimensions);
+                assert_eq!(dummy_op.precision().unwrap(), Some((Precision::High, Precision::Highest)));
+                assert_eq!(dummy_op.algorithm().unwrap(), None);
+                assert_eq!(dummy_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(dummy_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "dot_general_test",
+                    func::FuncAttributes {
+                        arguments: vec![lhs_type.into(), rhs_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2266,7 +2383,7 @@ mod tests {
     #[test]
     fn test_convolution_dimensions_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]);
+        let attribute = context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.input_batch_dimension(), 0);
         assert_eq!(attribute.input_feature_dimension(), 3);
@@ -2284,31 +2401,35 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]);
-        let attribute_2 = context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]);
+        let attribute_1 =
+            context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]).unwrap();
+        let attribute_2 =
+            context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_convolution_dimensions(1, 0, &[2, 3], 4, 5, &[6, 7], 8, 9, &[10, 11]);
+        let attribute_2 =
+            context.stable_hlo_convolution_dimensions(1, 0, &[2, 3], 4, 5, &[6, 7], 8, 9, &[10, 11]).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]);
+        let attribute_2 =
+            context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_convolution_dimensions_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]);
+        let attribute = context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo.conv<[b, 0, 1, f]x[0, 1, i, o]->[b, 0, 1, f]>");
     }
 
     #[test]
     fn test_convolution_dimensions_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]);
+        let attribute = context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -2316,7 +2437,7 @@ mod tests {
     fn test_convolution() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let input_type = context
             .tensor_type(
@@ -2342,53 +2463,60 @@ mod tests {
                 location,
             )
             .unwrap();
-        let dimensions = context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]);
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (kernel_type, location)]);
-            let input = block.argument(0).unwrap();
-            let kernel = block.argument(1).unwrap();
-            let op = convolution(
-                input,
-                kernel,
-                dimensions,
-                2,
-                1,
-                Some(&[1, 1]),
-                Some(&[(4, 2), (0, 2)]),
-                Some(&[1, 1]),
-                Some(&[1, 1]),
-                Some(&[false, false]),
-                Some((Precision::Default, Precision::Highest)),
-                result_type,
-                location,
-            );
-            assert_eq!(op.input(), input);
-            assert_eq!(op.kernel(), kernel);
-            assert_eq!(op.dimensions(), dimensions);
-            assert_eq!(op.batch_group_count(), 2);
-            assert_eq!(op.feature_group_count(), 1);
-            assert_eq!(op.window_strides(), Some(vec![1, 1]));
-            assert_eq!(op.padding(), Some(vec![(4, 2), (0, 2)]));
-            assert_eq!(op.lhs_dilation(), Some(vec![1, 1]));
-            assert_eq!(op.rhs_dilation(), Some(vec![1, 1]));
-            assert_eq!(op.window_reversal(), Some(vec![false, false]));
-            assert_eq!(op.precision(), Some((Precision::Default, Precision::Highest)));
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "convolution_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), kernel_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let dimensions =
+            context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (kernel_type, location)]);
+                let input = block.argument(0).unwrap();
+                let kernel = block.argument(1).unwrap();
+                let op = convolution(
+                    input,
+                    kernel,
+                    dimensions,
+                    2,
+                    1,
+                    Some(&[1, 1]),
+                    Some(&[(4, 2), (0, 2)]),
+                    Some(&[1, 1]),
+                    Some(&[1, 1]),
+                    Some(&[false, false]),
+                    Some((Precision::Default, Precision::Highest)),
+                    result_type,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.kernel().unwrap(), kernel);
+                assert_eq!(op.dimensions().unwrap(), dimensions);
+                assert_eq!(op.batch_group_count().unwrap(), 2);
+                assert_eq!(op.feature_group_count().unwrap(), 1);
+                assert_eq!(op.window_strides().unwrap(), Some(vec![1, 1]));
+                assert_eq!(op.padding().unwrap(), Some(vec![(4, 2), (0, 2)]));
+                assert_eq!(op.lhs_dilation().unwrap(), Some(vec![1, 1]));
+                assert_eq!(op.rhs_dilation().unwrap(), Some(vec![1, 1]));
+                assert_eq!(op.window_reversal().unwrap(), Some(vec![false, false]));
+                assert_eq!(op.precision().unwrap(), Some((Precision::Default, Precision::Highest)));
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "convolution_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), kernel_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2421,7 +2549,7 @@ mod tests {
     fn test_dynamic_convolution() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let i64_type = context.signless_integer_type(64);
         let input_type = context
@@ -2449,51 +2577,59 @@ mod tests {
                 location,
             )
             .unwrap();
-        let dimensions = context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]);
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (kernel_type, location), (padding_type, location)]);
-            let input = block.argument(0).unwrap();
-            let kernel = block.argument(1).unwrap();
-            let padding = block.argument(2).unwrap();
-            let op = dynamic_convolution(
-                input,
-                kernel,
-                padding,
-                dimensions,
-                2,
-                1,
-                Some(&[1, 1]),
-                Some(&[1, 1]),
-                Some(&[1, 1]),
-                Some(&[false, false]),
-                Some((Precision::Default, Precision::Highest)),
-                result_type,
-                location,
-            );
-            assert_eq!(op.padding(), padding);
-            assert_eq!(op.dimensions(), dimensions);
-            assert_eq!(op.batch_group_count(), 2);
-            assert_eq!(op.feature_group_count(), 1);
-            assert_eq!(op.window_strides(), Some(vec![1, 1]));
-            assert_eq!(op.lhs_dilation(), Some(vec![1, 1]));
-            assert_eq!(op.rhs_dilation(), Some(vec![1, 1]));
-            assert_eq!(op.window_reversal(), Some(vec![false, false]));
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "dynamic_conv_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), kernel_type.into(), padding_type.into()],
-                    results: vec![result_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let dimensions =
+            context.stable_hlo_convolution_dimensions(0, 3, &[1, 2], 2, 3, &[0, 1], 0, 3, &[1, 2]).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block =
+                    context.block(&[(input_type, location), (kernel_type, location), (padding_type, location)]);
+                let input = block.argument(0).unwrap();
+                let kernel = block.argument(1).unwrap();
+                let padding = block.argument(2).unwrap();
+                let op = dynamic_convolution(
+                    input,
+                    kernel,
+                    padding,
+                    dimensions,
+                    2,
+                    1,
+                    Some(&[1, 1]),
+                    Some(&[1, 1]),
+                    Some(&[1, 1]),
+                    Some(&[false, false]),
+                    Some((Precision::Default, Precision::Highest)),
+                    result_type,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.padding().unwrap(), padding);
+                assert_eq!(op.dimensions().unwrap(), dimensions);
+                assert_eq!(op.batch_group_count().unwrap(), 2);
+                assert_eq!(op.feature_group_count().unwrap(), 1);
+                assert_eq!(op.window_strides().unwrap(), Some(vec![1, 1]));
+                assert_eq!(op.lhs_dilation().unwrap(), Some(vec![1, 1]));
+                assert_eq!(op.rhs_dilation().unwrap(), Some(vec![1, 1]));
+                assert_eq!(op.window_reversal().unwrap(), Some(vec![false, false]));
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "dynamic_conv_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), kernel_type.into(), padding_type.into()],
+                        results: vec![result_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2524,30 +2660,35 @@ mod tests {
     fn test_cholesky() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let matrix_type = context.tensor_type(f32_type, &[Size::Static(3), Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(matrix_type, location)]);
-            let input = block.argument(0).unwrap();
-            let op = cholesky(input, true, location);
-            assert_eq!(op.lower(), true);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "cholesky_test",
-                func::FuncAttributes {
-                    arguments: vec![matrix_type.into()],
-                    results: vec![matrix_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(matrix_type, location)]);
+                let input = block.argument(0).unwrap();
+                let op = cholesky(input, true, location).unwrap();
+                assert!(op.lower().unwrap());
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "cholesky_test",
+                    func::FuncAttributes {
+                        arguments: vec![matrix_type.into()],
+                        results: vec![matrix_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2564,9 +2705,10 @@ mod tests {
     #[test]
     fn test_triangular_solve_transpose_type_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint);
+        let attribute =
+            context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), TriangularSolveTransposeType::Adjoint);
+        assert_eq!(attribute.value().unwrap(), TriangularSolveTransposeType::Adjoint);
     }
 
     #[test]
@@ -2574,31 +2716,38 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint);
-        let attribute_2 = context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint);
+        let attribute_1 =
+            context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint).unwrap();
+        let attribute_2 =
+            context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::NoTranspose);
+        let attribute_2 = context
+            .stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::NoTranspose)
+            .unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint);
+        let attribute_2 =
+            context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_triangular_solve_transpose_type_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint);
+        let attribute =
+            context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo<transpose ADJOINT>");
     }
 
     #[test]
     fn test_triangular_solve_transpose_type_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint);
+        let attribute =
+            context.stable_hlo_triangular_solve_transpose_type(TriangularSolveTransposeType::Adjoint).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -2606,36 +2755,42 @@ mod tests {
     fn test_triangular_solve() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let matrix_type = context.tensor_type(f32_type, &[Size::Static(3), Size::Static(3)], None, location).unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(matrix_type, location), (matrix_type, location)]);
-            let a = block.argument(0).unwrap();
-            let b = block.argument(1).unwrap();
-            let op = triangular_solve(a, b, true, true, false, TriangularSolveTransposeType::NoTranspose, location);
-            assert_eq!(op.a(), a);
-            assert_eq!(op.b(), b);
-            assert_eq!(op.left_side(), true);
-            assert_eq!(op.lower(), true);
-            assert_eq!(op.unit_diagonal(), false);
-            assert_eq!(op.transpose_a(), TriangularSolveTransposeType::NoTranspose);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "triangular_solve_test",
-                func::FuncAttributes {
-                    arguments: vec![matrix_type.into(), matrix_type.into()],
-                    results: vec![matrix_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(matrix_type, location), (matrix_type, location)]);
+                let a = block.argument(0).unwrap();
+                let b = block.argument(1).unwrap();
+                let op = triangular_solve(a, b, true, true, false, TriangularSolveTransposeType::NoTranspose, location)
+                    .unwrap();
+                assert_eq!(op.a().unwrap(), a);
+                assert_eq!(op.b().unwrap(), b);
+                assert!(op.left_side().unwrap());
+                assert!(op.lower().unwrap());
+                assert!(!op.unit_diagonal().unwrap());
+                assert_eq!(op.transpose_a().unwrap(), TriangularSolveTransposeType::NoTranspose);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "triangular_solve_test",
+                    func::FuncAttributes {
+                        arguments: vec![matrix_type.into(), matrix_type.into()],
+                        results: vec![matrix_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -2652,9 +2807,9 @@ mod tests {
     #[test]
     fn test_fft_type_attribute() {
         let context = Context::new();
-        let attribute = context.stable_hlo_fft_type(FftType::RFFT);
+        let attribute = context.stable_hlo_fft_type(FftType::RFFT).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), FftType::RFFT);
+        assert_eq!(attribute.value().unwrap(), FftType::RFFT);
     }
 
     #[test]
@@ -2662,31 +2817,31 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.stable_hlo_fft_type(FftType::RFFT);
-        let attribute_2 = context.stable_hlo_fft_type(FftType::RFFT);
+        let attribute_1 = context.stable_hlo_fft_type(FftType::RFFT).unwrap();
+        let attribute_2 = context.stable_hlo_fft_type(FftType::RFFT).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.stable_hlo_fft_type(FftType::FFT);
+        let attribute_2 = context.stable_hlo_fft_type(FftType::FFT).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.stable_hlo_fft_type(FftType::RFFT);
+        let attribute_2 = context.stable_hlo_fft_type(FftType::RFFT).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_fft_type_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.stable_hlo_fft_type(FftType::RFFT);
+        let attribute = context.stable_hlo_fft_type(FftType::RFFT).unwrap();
         test_attribute_display_and_debug(attribute, "#stablehlo<fft_type RFFT>");
     }
 
     #[test]
     fn test_fft_type_attribute_casting() {
         let context = Context::new();
-        let attribute = context.stable_hlo_fft_type(FftType::RFFT);
+        let attribute = context.stable_hlo_fft_type(FftType::RFFT).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -2694,32 +2849,37 @@ mod tests {
     fn test_fft() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let tensor_type = context
             .tensor_type(context.complex_type(context.float32_type()), &[Size::Static(4)], None, location)
             .unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(tensor_type, location)]);
-            let input = block.argument(0).unwrap();
-            let fft_op = fft(input, FftType::FFT, &[4], location);
-            assert_eq!(fft_op.fft_type(), FftType::FFT);
-            assert_eq!(fft_op.fft_length(), vec![4]);
-            assert_eq!(fft_op.operands().count(), 1);
-            assert_eq!(fft_op.results().count(), 1);
-            let fft_block = block.append_operation(fft_op);
-            block.append_operation(func::r#return(&[fft_block.result(0).unwrap()], location));
-            func::func(
-                "fft_test",
-                func::FuncAttributes {
-                    arguments: vec![tensor_type.into()],
-                    results: vec![tensor_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let fft_op = fft(input, FftType::FFT, &[4], location).unwrap();
+                assert_eq!(fft_op.fft_type().unwrap(), FftType::FFT);
+                assert_eq!(fft_op.fft_length().unwrap(), vec![4]);
+                assert_eq!(fft_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(fft_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let fft_block = block.append_operation(fft_op).unwrap();
+                block.append_operation(func::r#return(&[fft_block.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "fft_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

@@ -2,7 +2,7 @@ use ryft_xla_sys::bindings::{
     MlirAttribute, mlirStringAttrGet, mlirStringAttrGetTypeID, mlirStringAttrGetValue, mlirStringAttrTypedGet,
 };
 
-use crate::{Attribute, Context, FromWithContext, StringRef, Type, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, StringRef, TryFromWithContext, Type, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that stores a string literal value.
 ///
@@ -29,8 +29,8 @@ pub struct StringAttributeRef<'c, 't> {
 
 impl<'c, 't> StringAttributeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`StringAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirStringAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirStringAttrGetTypeID()) }
     }
 
     /// Returns a reference to the string value that is stored in this [`StringAttributeRef`].
@@ -41,9 +41,9 @@ impl<'c, 't> StringAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(StringAttributeRef<'c, 't> as Attribute, mlir_type = Attribute, mlir_subtype = String);
 
-impl<'c, 't, 's, S: Into<StringRef<'s>>> FromWithContext<'c, 't, S> for StringAttributeRef<'c, 't> {
-    fn from_with_context(value: S, context: &'c Context<'t>) -> Self {
-        context.string_attribute(value)
+impl<'c, 't, 's, S: Into<StringRef<'s>>> TryFromWithContext<'c, 't, S> for StringAttributeRef<'c, 't> {
+    fn try_from_with_context(value: S, context: &'c Context<'t>) -> Result<Self, Error> {
+        Ok(context.string_attribute(value))
     }
 }
 
@@ -56,8 +56,8 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
-            StringAttributeRef::from_c_api(mlirStringAttrGet(*self.handle.borrow(), string.into().to_c_api()), self)
-                .unwrap()
+            let handle = mlirStringAttrGet(*self.handle.borrow(), string.into().to_c_api());
+            StringAttributeRef { handle, context: self }
         }
     }
 
@@ -68,8 +68,8 @@ impl<'t> Context<'t> {
         r#type: T,
     ) -> StringAttributeRef<'c, 't> {
         unsafe {
-            StringAttributeRef::from_c_api(mlirStringAttrTypedGet(r#type.to_c_api(), string.into().to_c_api()), self)
-                .unwrap()
+            let handle = mlirStringAttrTypedGet(r#type.to_c_api(), string.into().to_c_api());
+            StringAttributeRef { handle, context: self }
         }
     }
 }
@@ -85,11 +85,11 @@ mod tests {
     #[test]
     fn test_string_attribute_type_id() {
         let context = Context::new();
-        let string_attribute_id = StringAttributeRef::type_id();
+        let string_attribute_id = StringAttributeRef::type_id().unwrap();
         let string_attribute_1 = context.string_attribute("test");
         let string_attribute_2 = context.typed_string_attribute("test", context.none_type());
-        assert_eq!(string_attribute_1.type_id(), string_attribute_2.type_id());
-        assert_eq!(string_attribute_id, string_attribute_1.type_id());
+        assert_eq!(string_attribute_1.type_id().unwrap(), string_attribute_2.type_id().unwrap());
+        assert_eq!(string_attribute_id, string_attribute_1.type_id().unwrap());
     }
 
     #[test]

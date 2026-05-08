@@ -4,7 +4,7 @@ use ryft_xla_sys::bindings::{
     mlirUnrankedTensorTypeGetTypeID,
 };
 
-use crate::{Attribute, AttributeRef, Context, Location, Type, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, AttributeRef, Context, Error, Location, Type, TypeId, mlir_subtype_trait_impls};
 
 use super::{ShapedType, Size};
 
@@ -52,8 +52,8 @@ pub struct TensorTypeRef<'c, 't> {
 
 impl<'c, 't> TensorTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`TensorTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirRankedTensorTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirRankedTensorTypeGetTypeID()) }
     }
 
     /// Returns the rank of this [`TensorTypeRef`] (i.e., the number of dimensions it has).
@@ -63,7 +63,13 @@ impl<'c, 't> TensorTypeRef<'c, 't> {
 
     /// Returns all dimension [`Size`]s of this [`TensorTypeRef`].
     pub fn dimensions(&self) -> impl Iterator<Item = Size> {
-        (0..self.rank()).map(|dimension| self.dimension(dimension))
+        (0..self.rank()).map(|dimension| unsafe {
+            if mlirShapedTypeIsStaticDim(self.handle, dimension.cast_signed()) {
+                Size::Static(mlirShapedTypeGetDimSize(self.handle, dimension.cast_signed()) as usize)
+            } else {
+                Size::Dynamic
+            }
+        })
     }
 
     /// Returns `true` if all dimensions of this [`TensorTypeRef`] has a static size.
@@ -71,25 +77,32 @@ impl<'c, 't> TensorTypeRef<'c, 't> {
         self.dimensions().all(|dimension| dimension.is_static())
     }
 
-    /// Returns the `dimension`-th dimension [`Size`] of this [`TensorTypeRef`].
-    ///
-    /// Note that this function will panic if the provided dimension is out of bounds.
-    pub fn dimension(&self, dimension: usize) -> Size {
-        if dimension >= self.rank() {
-            panic!("dimension is out of bounds");
+    /// Returns the `dimension`-th dimension [`Size`] of this [`TensorTypeRef`], or an error if `dimension` is out of
+    /// bounds.
+    pub fn dimension(&self, dimension: usize) -> Result<Size, Error> {
+        let rank = self.rank();
+        if dimension >= rank {
+            return Err(Error::invalid_argument(format!(
+                "tensor type dimension {dimension} is out of bounds for rank {rank}"
+            )));
         }
-        unsafe {
+        Ok(unsafe {
             if mlirShapedTypeIsStaticDim(self.handle, dimension.cast_signed()) {
                 Size::Static(mlirShapedTypeGetDimSize(self.handle, dimension.cast_signed()) as usize)
             } else {
                 Size::Dynamic
             }
-        }
+        })
     }
 
     /// Returns the encoding [`Attribute`] of this [`TensorTypeRef`].
-    pub fn encoding(&self) -> Option<AttributeRef<'c, 't>> {
-        unsafe { AttributeRef::from_c_api(mlirRankedTensorTypeGetEncoding(self.handle), self.context) }
+    pub fn encoding(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirRankedTensorTypeGetEncoding(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context).map(Some) }
+        }
     }
 }
 
@@ -99,7 +112,7 @@ mlir_subtype_trait_impls!(TensorTypeRef<'c, 't> as Type, mlir_type = Type, mlir_
 
 impl<'t> Context<'t> {
     /// Creates a new [`TensorTypeRef`] owned by this [`Context`]. If any of the arguments are invalid, then this
-    /// function will return [`None`] and will also emit the appropriate diagnostics at the provided location. For
+    /// function will return an [`Error`] and will also emit the appropriate diagnostics at the provided location. For
     /// example, this can happen if `element_type` is not an [`IndexTypeRef`](crate::IndexTypeRef), an
     /// [`IntegerTypeRef`](crate::IntegerTypeRef), or a [`FloatType`](crate::FloatTypeRef).
     pub fn tensor_type<'c, T: Type<'c, 't>, L: Location<'c, 't>>(
@@ -108,7 +121,7 @@ impl<'t> Context<'t> {
         shape: &[Size],
         encoding: Option<AttributeRef<'c, 't>>,
         location: L,
-    ) -> Option<TensorTypeRef<'c, 't>> {
+    ) -> Result<TensorTypeRef<'c, 't>, Error> {
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -127,6 +140,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::tensor_type`"))
         }
     }
 }
@@ -157,8 +171,8 @@ pub struct UnrankedTensorTypeRef<'c, 't> {
 
 impl<'c, 't> UnrankedTensorTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`UnrankedTensorTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirUnrankedTensorTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirUnrankedTensorTypeGetTypeID()) }
     }
 }
 
@@ -168,14 +182,14 @@ mlir_subtype_trait_impls!(UnrankedTensorTypeRef<'c, 't> as Type, mlir_type = Typ
 
 impl<'t> Context<'t> {
     /// Creates a new [`UnrankedTensorTypeRef`] owned by this [`Context`]. If any of the arguments are invalid, then
-    /// this function will return [`None`] and will also emit the appropriate diagnostics at the provided location. For
+    /// this function will return an [`Error`] and will also emit the appropriate diagnostics at the provided location. For
     /// example, this can happen if `element_type` is not an [`IndexTypeRef`](crate::IndexTypeRef), an
     /// [`IntegerTypeRef`](crate::IntegerTypeRef), or a [`FloatType`](crate::FloatTypeRef).
     pub fn unranked_tensor_type<'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         &'c self,
         element_type: T,
         location: L,
-    ) -> Option<UnrankedTensorTypeRef<'c, 't>> {
+    ) -> Result<UnrankedTensorTypeRef<'c, 't>, Error> {
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -187,6 +201,7 @@ impl<'t> Context<'t> {
                 mlirUnrankedTensorTypeGetChecked(location.to_c_api(), element_type.to_c_api()),
                 self,
             )
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::unranked_tensor_type`"))
         }
     }
 }
@@ -203,11 +218,11 @@ mod tests {
     fn test_tensor_type_type_id() {
         let context = Context::new();
         let location = context.unknown_location();
-        let tensor_type = TensorTypeRef::type_id();
-        let tensor_type_1 = context.tensor_type(context.float32_type(), &[Size::Static(32)], None, location);
-        let tensor_type_2 = context.tensor_type(context.float32_type(), &[Size::Static(64)], None, location);
-        assert_eq!(tensor_type_1.unwrap().type_id(), tensor_type_2.unwrap().type_id());
-        assert_eq!(tensor_type, tensor_type_1.unwrap().type_id());
+        let tensor_type_id = TensorTypeRef::type_id().unwrap();
+        let tensor_type_1 = context.tensor_type(context.float32_type(), &[Size::Static(32)], None, location).unwrap();
+        let tensor_type_2 = context.tensor_type(context.float32_type(), &[Size::Static(64)], None, location).unwrap();
+        assert_eq!(tensor_type_1.type_id().unwrap(), tensor_type_2.type_id().unwrap());
+        assert_eq!(tensor_type_id, tensor_type_1.type_id().unwrap());
     }
 
     #[test]
@@ -222,19 +237,20 @@ mod tests {
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.rank(), 4);
         assert_eq!(r#type.dimensions().collect::<Vec<_>>(), shape);
-        assert_eq!(r#type.dimension(0), Size::Static(32));
-        assert_eq!(r#type.dimension(1), Size::Dynamic);
-        assert_eq!(r#type.dimension(2), Size::Dynamic);
-        assert_eq!(r#type.dimension(3), Size::Static(2));
+        assert_eq!(r#type.dimension(0).unwrap(), Size::Static(32));
+        assert_eq!(r#type.dimension(1).unwrap(), Size::Dynamic);
+        assert_eq!(r#type.dimension(2).unwrap(), Size::Dynamic);
+        assert_eq!(r#type.dimension(3).unwrap(), Size::Static(2));
+        assert!(r#type.dimension(4).is_err());
         assert!(!r#type.has_static_shape());
-        assert_eq!(r#type.element_type(), element_type);
-        assert!(r#type.encoding().is_none());
+        assert_eq!(r#type.element_type().unwrap(), element_type);
+        assert!(r#type.encoding().unwrap().is_none());
 
         // Invalid element type.
         let element_type = context.none_type();
         let shape = vec![Size::Static(32), Size::Dynamic, Size::Dynamic, Size::Static(2)];
         let r#type = context.tensor_type(element_type, &shape, None, location);
-        assert!(r#type.is_none());
+        assert!(r#type.is_err());
     }
 
     #[test]
@@ -245,19 +261,19 @@ mod tests {
         let shape = vec![Size::Static(32), Size::Dynamic];
 
         // Same types from the same context must be equal because they are "uniqued".
-        let type_1 = context.tensor_type(element_type, &shape, None, location);
-        let type_2 = context.tensor_type(element_type, &shape, None, location);
+        let type_1 = context.tensor_type(element_type, &shape, None, location).unwrap();
+        let type_2 = context.tensor_type(element_type, &shape, None, location).unwrap();
         assert_eq!(type_1, type_2);
 
         // Different shapes from the same context must not be equal.
         let shape = vec![Size::Static(32), Size::Static(16)];
-        let type_2 = context.tensor_type(element_type, &shape, None, location);
+        let type_2 = context.tensor_type(element_type, &shape, None, location).unwrap();
         assert_ne!(type_1, type_2);
 
         // Same types from different contexts must not be equal.
         let context = Context::new();
         let element_type = context.bfloat16_type();
-        let type_2 = context.tensor_type(element_type, &shape, None, location);
+        let type_2 = context.tensor_type(element_type, &shape, None, location).unwrap();
         assert_ne!(type_1, type_2);
     }
 
@@ -297,11 +313,11 @@ mod tests {
     fn test_unranked_tensor_type_type_id() {
         let context = Context::new();
         let location = context.unknown_location();
-        let unranked_tensor_type = UnrankedTensorTypeRef::type_id();
-        let unranked_tensor_type_1 = context.unranked_tensor_type(context.float32_type(), location);
-        let unranked_tensor_type_2 = context.unranked_tensor_type(context.bfloat16_type(), location);
-        assert_eq!(unranked_tensor_type_1.unwrap().type_id(), unranked_tensor_type_2.unwrap().type_id());
-        assert_eq!(unranked_tensor_type, unranked_tensor_type_1.unwrap().type_id());
+        let unranked_tensor_type_id = UnrankedTensorTypeRef::type_id().unwrap();
+        let unranked_tensor_type_1 = context.unranked_tensor_type(context.float32_type(), location).unwrap();
+        let unranked_tensor_type_2 = context.unranked_tensor_type(context.bfloat16_type(), location).unwrap();
+        assert_eq!(unranked_tensor_type_1.type_id().unwrap(), unranked_tensor_type_2.type_id().unwrap());
+        assert_eq!(unranked_tensor_type_id, unranked_tensor_type_1.type_id().unwrap());
     }
 
     #[test]
@@ -313,12 +329,12 @@ mod tests {
         let element_type = context.signless_integer_type(1);
         let r#type = context.unranked_tensor_type(element_type, location).unwrap();
         assert_eq!(&context, r#type.context());
-        assert_eq!(r#type.element_type(), element_type);
+        assert_eq!(r#type.element_type().unwrap(), element_type);
 
         // Invalid element type.
         let element_type = context.none_type();
         let r#type = context.unranked_tensor_type(element_type, location);
-        assert!(r#type.is_none());
+        assert!(r#type.is_err());
     }
 
     #[test]
@@ -328,19 +344,19 @@ mod tests {
         let element_type = context.signless_integer_type(1);
 
         // Same types from the same context must be equal because they are "uniqued".
-        let type_1 = context.unranked_tensor_type(element_type, location);
-        let type_2 = context.unranked_tensor_type(element_type, location);
+        let type_1 = context.unranked_tensor_type(element_type, location).unwrap();
+        let type_2 = context.unranked_tensor_type(element_type, location).unwrap();
         assert_eq!(type_1, type_2);
 
         // Different element types from the same context must not be equal.
         let other_element_type = context.float32_type();
-        let type_2 = context.unranked_tensor_type(other_element_type, location);
+        let type_2 = context.unranked_tensor_type(other_element_type, location).unwrap();
         assert_ne!(type_1, type_2);
 
         // Same types from different contexts must not be equal.
         let context = Context::new();
         let other_element_type = context.bfloat16_type();
-        let type_2 = context.unranked_tensor_type(other_element_type, location);
+        let type_2 = context.unranked_tensor_type(other_element_type, location).unwrap();
         assert_ne!(type_1, type_2);
     }
 

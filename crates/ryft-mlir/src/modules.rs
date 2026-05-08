@@ -1,3 +1,4 @@
+use std::ffi::CString;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -9,7 +10,7 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::dialects::builtin::{DetachedModuleOperation, ModuleOperationRef};
-use crate::{BlockRef, Context, Location, Operation, StringRef};
+use crate::{BlockRef, Context, Error, Location, Operation, StringRef};
 
 /// [`Module`]s in MLIR represent top-level [`Operation`]s (i.e., they are instances of a built-in operation type).
 /// A [`Module`] contains a single [`Region`](crate::Region) which itself contains a single [`Block`](crate::Block).
@@ -38,8 +39,12 @@ impl<'c, 't> Module<'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirModule, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context }) }
+    pub unsafe fn from_c_api(handle: MlirModule, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR module handle"))
+        } else {
+            Ok(Self { handle, context })
+        }
     }
 
     /// Returns the [`MlirModule`] that corresponds to this [`Module`] and which can be passed to functions
@@ -60,18 +65,18 @@ impl<'c, 't> Module<'c, 't> {
 
     /// Returns a reference to the [`Block`](crate::Block) that represents the body of this [`Module`]
     /// (i.e., the only [`Block`](crate::Block) it contains).
-    pub fn body<'m>(&'m self) -> BlockRef<'m, 'c, 't> {
-        unsafe { BlockRef::from_c_api(mlirModuleGetBody(self.handle), self.context).unwrap() }
+    pub fn body<'m>(&'m self) -> Result<BlockRef<'m, 'c, 't>, Error> {
+        unsafe { BlockRef::from_c_api(mlirModuleGetBody(self.handle), self.context) }
     }
 
     /// Returns a [`ModuleOperationRef`] that refers to this [`Module`].
-    pub fn as_operation<'m>(&'m self) -> ModuleOperationRef<'m, 'c, 't> {
-        unsafe { ModuleOperationRef::from_c_api(mlirModuleGetOperation(self.handle), self.context).unwrap() }
+    pub fn as_operation<'m>(&'m self) -> Result<ModuleOperationRef<'m, 'c, 't>, Error> {
+        unsafe { ModuleOperationRef::from_c_api(mlirModuleGetOperation(self.handle), self.context) }
     }
 
     /// Verifies this [`Module`] (as in, checks if it is well-defined) and returns `true` if the verification passes.
-    pub fn verify(&self) -> bool {
-        self.as_operation().verify()
+    pub fn verify(&self) -> Result<bool, Error> {
+        Ok(self.as_operation()?.verify())
     }
 
     /// Loads all [IRDL](https://mlir.llvm.org/docs/Dialects/IRDL) [`Dialect`](crate::Dialect)s in this [`Module`],
@@ -106,14 +111,14 @@ impl Hash for Module<'_, '_> {
 }
 
 impl Display for Module<'_, '_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.as_operation(), f)
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.as_operation().map_err(|_| std::fmt::Error)?, formatter)
     }
 }
 
 impl Debug for Module<'_, '_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        Debug::fmt(&self.as_operation(), f)
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&self.as_operation().map_err(|_| std::fmt::Error)?, formatter)
     }
 }
 
@@ -123,59 +128,74 @@ impl Drop for Module<'_, '_> {
     }
 }
 
-impl<'c, 't> From<DetachedModuleOperation<'c, 't>> for Module<'c, 't> {
-    fn from(value: DetachedModuleOperation<'c, 't>) -> Self {
+impl<'c, 't> TryFrom<DetachedModuleOperation<'c, 't>> for Module<'c, 't> {
+    type Error = Error;
+
+    fn try_from(value: DetachedModuleOperation<'c, 't>) -> Result<Self, Self::Error> {
         unsafe {
-            let module = Module::from_c_api(mlirModuleFromOperation(value.to_c_api()), value.context()).unwrap();
+            let module = Module::from_c_api(mlirModuleFromOperation(value.to_c_api()), value.context())?;
             std::mem::forget(value);
-            module
+            Ok(module)
         }
     }
 }
 
-impl<'c, 't> From<Module<'c, 't>> for DetachedModuleOperation<'c, 't> {
-    fn from(value: Module<'c, 't>) -> Self {
+impl<'c, 't> TryFrom<Module<'c, 't>> for DetachedModuleOperation<'c, 't> {
+    type Error = Error;
+
+    fn try_from(value: Module<'c, 't>) -> Result<Self, Self::Error> {
         unsafe {
-            let operation = DetachedModuleOperation::from_c_api(mlirModuleGetOperation(value.handle), value.context());
+            let operation = DetachedModuleOperation::from_c_api(mlirModuleGetOperation(value.handle), value.context())?;
             std::mem::forget(value);
-            operation.unwrap()
+            Ok(operation)
         }
     }
 }
 
-impl<'m, 'c, 't> From<&'m Module<'c, 't>> for ModuleOperationRef<'m, 'c, 't> {
-    fn from(value: &'m Module<'c, 't>) -> Self {
+impl<'m, 'c, 't> TryFrom<&'m Module<'c, 't>> for ModuleOperationRef<'m, 'c, 't> {
+    type Error = Error;
+
+    fn try_from(value: &'m Module<'c, 't>) -> Result<Self, Self::Error> {
         value.as_operation()
     }
 }
 
 impl<'t> Context<'t> {
     /// Creates a new (empty) [`Module`] at the specified [`Location`].
-    pub fn module<'c, L: Location<'c, 't>>(&'c self, location: L) -> Module<'c, 't> {
-        unsafe { Module::from_c_api(mlirModuleCreateEmpty(location.to_c_api()), self).unwrap() }
+    pub fn module<'c, L: Location<'c, 't>>(&'c self, location: L) -> Result<Module<'c, 't>, Error> {
+        unsafe { Module::from_c_api(mlirModuleCreateEmpty(location.to_c_api()), self) }
     }
 
-    /// Parses a [`Module`] from the provided string representation. Returns [`None`] if MLIR fails to parse
-    /// the provided string into a [`Module`] (this function will also emit diagnostics if that happens).
-    pub fn parse_module<'c, S: AsRef<str>>(&'c self, source: S) -> Option<Module<'c, 't>> {
+    /// Parses a [`Module`] from the provided string representation.
+    ///
+    /// Returns an [`Error`] if the source cannot be passed to MLIR or if MLIR fails to parse it. MLIR will also emit
+    /// diagnostics for parse failures.
+    pub fn parse_module<'c, S: AsRef<str>>(&'c self, source: S) -> Result<Module<'c, 't>, Error> {
         unsafe {
-            let source = std::ffi::CString::new(source.as_ref()).unwrap();
-            Module::from_c_api(
+            let source = CString::new(source.as_ref())
+                .map_err(|_| Error::invalid_argument("module source cannot contain nul bytes"))?;
+            let module = Module::from_c_api(
                 mlirModuleCreateParse(*self.handle.borrow_mut(), StringRef::from(source.as_c_str()).to_c_api()),
                 self,
-            )
+            );
+            module.map_err(|_| Error::parsing_error("failed to parse MLIR module"))
         }
     }
 
-    /// Parses a [`Module`] from the the contents of the file at the specified [`Path`]. Returns [`None`] if MLIR fails
-    /// to parse the provided string into a [`Module`] (this function will also emit diagnostics if that happens).
-    pub fn parse_module_from_file<'c>(&'c self, path: &Path) -> Option<Module<'c, 't>> {
+    /// Parses a [`Module`] from the the contents of the file at the specified [`Path`].
+    ///
+    /// Returns an [`Error`] if the path cannot be passed to MLIR or if MLIR fails to parse it. MLIR will also emit
+    /// diagnostics for parse failures.
+    pub fn parse_module_from_file<'c>(&'c self, path: &Path) -> Result<Module<'c, 't>, Error> {
         unsafe {
-            let path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-            Module::from_c_api(
+            let path = path.to_str().ok_or_else(|| Error::invalid_argument("module path must be valid UTF-8"))?;
+            let path =
+                CString::new(path).map_err(|_| Error::invalid_argument("module path cannot contain nul bytes"))?;
+            let module = Module::from_c_api(
                 mlirModuleCreateParseFromFile(*self.handle.borrow_mut(), StringRef::from(path.as_c_str()).to_c_api()),
                 self,
-            )
+            );
+            module.map_err(|_| Error::parsing_error("failed to parse MLIR module from file"))
         }
     }
 }
@@ -195,39 +215,40 @@ mod tests {
     #[test]
     fn test_module() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         let location = context.unknown_location();
 
         // Modules with no operations.
-        let module_0 = context.module(context.file_location("foo", 42, 42));
-        assert!(module_0.verify());
+        let module_0 = context.module(context.file_location("foo", 42, 42)).unwrap();
+        assert!(module_0.verify().unwrap());
         assert_eq!(module_0.context(), &context);
-        assert_eq!(module_0.body().operations().count(), 0);
-        assert_eq!(module_0.as_operation().name().as_str().unwrap(), "builtin.module");
+        assert_eq!(module_0.body().unwrap().operations().unwrap().count(), 0);
+        assert_eq!(module_0.as_operation().unwrap().name().as_str().unwrap(), "builtin.module");
 
         // Module with one operation.
         let mut block = context.block_with_no_arguments();
-        block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-        let function = func::func("test_function", func::FuncAttributes::default(), block.into(), location);
-        module_0.body().append_operation(function);
-        assert!(module_0.verify());
-        assert_eq!(module_0.body().operations().count(), 1);
+        block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+        let function =
+            func::func("test_function", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
+        module_0.body().unwrap().append_operation(function).unwrap();
+        assert!(module_0.verify().unwrap());
+        assert_eq!(module_0.body().unwrap().operations().unwrap().count(), 1);
     }
 
     #[test]
     fn test_module_equality_and_hashing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
-        let module_0 = context.module(context.file_location("foo", 42, 42));
-        let module_1 = context.module(context.file_location("foo", 42, 42));
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
+        let module_0 = context.module(context.file_location("foo", 42, 42)).unwrap();
+        let module_1 = context.module(context.file_location("foo", 42, 42)).unwrap();
         assert_eq!(module_0, module_0);
         assert_ne!(module_0, module_1);
         assert_ne!(module_1, module_0);
         assert_eq!(module_1, module_1);
 
         let mut map = HashMap::new();
-        map.insert(&module_0, "module_0");
-        map.insert(&module_1, "module_1");
+        assert_eq!(map.insert(&module_0, "module_0"), None);
+        assert_eq!(map.insert(&module_1, "module_1"), None);
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&module_0), Some(&"module_0"));
         assert_eq!(map.get(&module_1), Some(&"module_1"));
@@ -236,8 +257,8 @@ mod tests {
     #[test]
     fn test_module_display_and_debug() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
-        let module = context.module(context.file_location("foo", 42, 42));
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
+        let module = context.module(context.file_location("foo", 42, 42)).unwrap();
         assert_eq!(format!("{}", module), "module {\n}\n");
         assert_eq!(format!("{:?}", module), "ModuleOperationRef[module {\n}\n]");
     }
@@ -245,16 +266,19 @@ mod tests {
     #[test]
     fn test_module_casting() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
-        let module = context.module(context.file_location("foo", 42, 42));
-        assert_eq!(module.as_operation().body_region().blocks().next(), Some(module.body()));
-        assert_eq!(module.as_operation(), module.as_operation().as_ref());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
+        let module = context.module(context.file_location("foo", 42, 42)).unwrap();
+        assert_eq!(
+            module.as_operation().unwrap().body_region().unwrap().blocks().unwrap().next().unwrap().unwrap(),
+            module.body().unwrap(),
+        );
+        assert_eq!(module.as_operation().unwrap(), module.as_operation().unwrap().as_ref());
     }
 
     #[test]
     fn test_module_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
 
         // Parse a good module.
         let module = context.parse_module(indoc! {"
@@ -264,20 +288,26 @@ mod tests {
               }
             }
         "});
-        assert!(module.is_some());
+        assert!(module.is_ok());
         let module = module.unwrap();
-        assert!(module.verify());
-        assert_eq!(module.body().operations().count(), 1);
+        assert!(module.verify().unwrap());
+        assert_eq!(module.body().unwrap().operations().unwrap().count(), 1);
 
         // Trying parsing a bad module.
         let module = context.parse_module("module{");
-        assert!(module.is_none());
+        assert!(matches!(module, Err(Error::ParsingError { message, .. }) if message == "failed to parse MLIR module"));
+
+        let module = context.parse_module("module\0{}");
+        assert!(matches!(
+            module,
+            Err(Error::InvalidArgument { message, .. }) if message == "module source cannot contain nul bytes",
+        ));
     }
 
     #[test]
     fn test_module_parsing_from_file() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
 
         // Create a temporary file with our MLIR code.
         let module_path = std::env::temp_dir().join("test_module.mlir");
@@ -293,17 +323,20 @@ mod tests {
         )
         .unwrap();
         let module = context.parse_module_from_file(&module_path);
-        assert!(module.is_some());
+        assert!(module.is_ok());
         let module = module.unwrap();
-        assert!(module.verify());
-        assert_eq!(module.body().operations().count(), 1);
+        assert!(module.verify().unwrap());
+        assert_eq!(module.body().unwrap().operations().unwrap().count(), 1);
 
         // Clean up our temporary file.
         std::fs::remove_file(module_path).unwrap();
 
         // Try parsing from a bad path.
         let module = context.parse_module_from_file(Path::new("/nonexistent/path/to/file.mlir"));
-        assert!(module.is_none());
+        assert!(matches!(
+            module,
+            Err(Error::ParsingError { message, .. }) if message == "failed to parse MLIR module from file",
+        ));
     }
 
     #[test]
@@ -312,32 +345,32 @@ mod tests {
         let location = context.unknown_location();
 
         let mut region = context.region();
-        region.append_block(context.block_with_no_arguments());
-        let module = Module::from(builtin::module(region, location).unwrap());
-        let operation = ModuleOperationRef::from(&module);
+        region.append_block(context.block_with_no_arguments()).unwrap();
+        let module = Module::try_from(builtin::module(region, location).unwrap()).unwrap();
+        let operation = ModuleOperationRef::try_from(&module).unwrap();
 
         assert!(operation.verify());
-        assert_eq!(operation.symbol_name(), None);
-        assert_eq!(operation.symbol_visibility(), SymbolVisibility::Public);
+        assert_eq!(operation.symbol_name().unwrap(), None);
+        assert_eq!(operation.symbol_visibility().unwrap(), SymbolVisibility::Public);
         assert_eq!(operation.to_string(), "module {\n}\n");
 
         let mut region = context.region();
-        region.append_block(context.block_with_no_arguments());
+        region.append_block(context.block_with_no_arguments()).unwrap();
         let named_module = builtin::named_module("test_module", SymbolVisibility::Private, region, location).unwrap();
-        let module = Module::from(named_module);
-        let operation = ModuleOperationRef::from(&module);
+        let module = Module::try_from(named_module).unwrap();
+        let operation = ModuleOperationRef::try_from(&module).unwrap();
 
         assert!(operation.verify());
-        assert_eq!(operation.symbol_name().map(|name| name.as_str().unwrap()), Some("test_module"));
-        assert_eq!(operation.symbol_visibility(), SymbolVisibility::Private);
+        assert_eq!(operation.symbol_name().unwrap().map(|name| name.as_str().unwrap()), Some("test_module"));
+        assert_eq!(operation.symbol_visibility().unwrap(), SymbolVisibility::Private);
         assert_eq!(operation.to_string(), "module @test_module attributes {sym_visibility = \"private\"} {\n}\n")
     }
 
     #[test]
     fn test_module_to_operation() {
         let context = Context::new();
-        let module = context.module(context.unknown_location());
-        let operation = DetachedModuleOperation::from(module);
+        let module = context.module(context.unknown_location()).unwrap();
+        let operation = DetachedModuleOperation::try_from(module).unwrap();
         assert!(operation.verify());
         assert_eq!(operation.name().as_str().unwrap(), "builtin.module");
     }
@@ -345,11 +378,13 @@ mod tests {
     #[test]
     fn test_module_set_attribute() {
         let context = Context::new();
-        let module = context.module(context.unknown_location());
-        ModuleOperationRef::from(&module).set_attribute("sym_name", context.string_attribute("foo"));
-        assert!(ModuleOperationRef::from(&module).verify());
+        let module = context.module(context.unknown_location()).unwrap();
+        ModuleOperationRef::try_from(&module)
+            .unwrap()
+            .set_attribute("sym_name", context.string_attribute("foo"));
+        assert!(ModuleOperationRef::try_from(&module).unwrap().verify());
 
-        let attribute = ModuleOperationRef::from(&module).attribute("sym_name");
+        let attribute = ModuleOperationRef::try_from(&module).unwrap().attribute("sym_name").unwrap();
         assert!(attribute.is_some());
         assert_eq!(attribute.unwrap().to_string(), "\"foo\"");
     }
@@ -358,7 +393,7 @@ mod tests {
     fn test_module_load_irdl_dialects() {
         // We intentionally try to register multiple times to ensure that the operation is idempotent.
         let context = Context::new();
-        let module = context.module(context.unknown_location());
+        let module = context.module(context.unknown_location()).unwrap();
         for _ in 0..1000 {
             assert!(module.load_irdl_dialects());
         }

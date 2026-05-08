@@ -1,6 +1,6 @@
 use ryft_xla_sys::bindings::{MlirType, stablehloTokenTypeGet};
 
-use crate::{Context, DialectHandle, Type, mlir_subtype_trait_impls};
+use crate::{Context, DialectHandle, Error, Type, mlir_subtype_trait_impls};
 
 /// StableHLO token [`Type`]. In StableHLO, [`TokenTypeRef`]s represent tokens (i.e., opaque values produced and
 /// consumed by some operations). Tokens are used for imposing execution order on operations as described in the
@@ -23,15 +23,18 @@ mlir_subtype_trait_impls!(
 
 impl<'t> Context<'t> {
     /// Creates a new StableHLO [`TokenTypeRef`] owned by this [`Context`].
-    pub fn stable_hlo_token_type<'c>(&'c self) -> TokenTypeRef<'c, 't> {
+    pub fn stable_hlo_token_type<'c>(&'c self) -> Result<TokenTypeRef<'c, 't>, Error> {
         // Make sure that the StableHLO dialect is loaded into the current context to prevent segmentation faults.
-        self.load_dialect(DialectHandle::stable_hlo());
+        self.load_dialect(DialectHandle::stable_hlo()?)?;
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
-        unsafe { TokenTypeRef::from_c_api(stablehloTokenTypeGet(*self.handle.borrow()), self).unwrap() }
+        unsafe {
+            TokenTypeRef::from_c_api(stablehloTokenTypeGet(*self.handle.borrow()), self)
+                .map_err(|_| Error::internal("MLIR returned an invalid StableHLO token type"))
+        }
     }
 }
 
@@ -45,9 +48,9 @@ mod tests {
     #[test]
     fn test_token_type() {
         let context = Context::new();
-        let token_type = context.stable_hlo_token_type();
+        let token_type = context.stable_hlo_token_type().unwrap();
         assert_eq!(&context, token_type.context());
-        assert_eq!(token_type.dialect().namespace().unwrap(), "stablehlo");
+        assert_eq!(token_type.dialect().unwrap().namespace().unwrap(), "stablehlo");
     }
 
     #[test]
@@ -55,34 +58,34 @@ mod tests {
         let context = Context::new();
 
         // Token types from the same context must be equal because they are "uniqued".
-        let token_type_1 = context.stable_hlo_token_type();
-        let token_type_2 = context.stable_hlo_token_type();
+        let token_type_1 = context.stable_hlo_token_type().unwrap();
+        let token_type_2 = context.stable_hlo_token_type().unwrap();
         assert_eq!(token_type_1, token_type_2);
 
         // Token types from different contexts must not be equal.
         let context = Context::new();
-        let token_type_2 = context.stable_hlo_token_type();
+        let token_type_2 = context.stable_hlo_token_type().unwrap();
         assert_ne!(token_type_1, token_type_2);
     }
 
     #[test]
     fn test_token_type_display_and_debug() {
         let context = Context::new();
-        let token_type = context.stable_hlo_token_type();
+        let token_type = context.stable_hlo_token_type().unwrap();
         test_type_display_and_debug(token_type, "!stablehlo.token");
     }
 
     #[test]
     fn test_token_type_parsing() {
         let context = Context::new();
-        let token_type = context.stable_hlo_token_type();
+        let token_type = context.stable_hlo_token_type().unwrap();
         assert_eq!(context.parse_type("!stablehlo.token").unwrap(), token_type);
     }
 
     #[test]
     fn test_token_type_casting() {
         let context = Context::new();
-        let token_type = context.stable_hlo_token_type();
+        let token_type = context.stable_hlo_token_type().unwrap();
         test_type_casting(token_type);
     }
 }

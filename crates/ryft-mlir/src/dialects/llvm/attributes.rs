@@ -69,7 +69,7 @@ use ryft_xla_sys::mlir::dialects::llvm::{
 };
 
 use crate::{
-    Attribute, AttributeRef, Context, DialectHandle, FlatSymbolRefAttributeRef, FromWithContext, StringRef,
+    Attribute, AttributeRef, Context, DialectHandle, Error, FlatSymbolRefAttributeRef, StringRef, TryFromWithContext,
     mlir_subtype_trait_impls,
 };
 
@@ -99,21 +99,21 @@ macro_rules! llvm_enum_attribute {
             #[doc = "Returns the LLVM "]
             #[doc = $description]
             #[doc = " stored in this attribute."]
-            pub fn value(&self) -> $enum_name {
+            pub fn value(&self) -> Result<$enum_name, Error> {
                 $enum_name::from_c_api(unsafe { $get_value(self.handle) })
-                    .expect(concat!("invalid LLVM ", $description, " attribute value"))
+                    .map_err(|_| Error::invalid_argument(concat!("invalid LLVM ", $description, " attribute value")))
             }
         }
 
         impl<'c, 't> Attribute<'c, 't> for $attribute_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR attribute handle"));
                 }
                 if unsafe { $is_a(handle) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR attribute handle"))
                 }
             }
 
@@ -128,8 +128,8 @@ macro_rules! llvm_enum_attribute {
 
         mlir_subtype_trait_impls!($attribute_name<'c, 't> as Attribute, mlir_type = Attribute);
 
-        impl<'c, 't> FromWithContext<'c, 't, $enum_name> for $attribute_name<'c, 't> {
-            fn from_with_context(value: $enum_name, context: &'c Context<'t>) -> Self {
+        impl<'c, 't> TryFromWithContext<'c, 't, $enum_name> for $attribute_name<'c, 't> {
+            fn try_from_with_context(value: $enum_name, context: &'c Context<'t>) -> Result<Self, Error> {
                 context.$context_method(value)
             }
         }
@@ -138,12 +138,11 @@ macro_rules! llvm_enum_attribute {
             #[doc = "Creates a new LLVM "]
             #[doc = $description]
             #[doc = " attribute owned by this [`Context`]."]
-            pub fn $context_method<'c>(&'c self, value: $enum_name) -> $attribute_name<'c, 't> {
-                self.load_dialect(DialectHandle::llvm());
-                unsafe {
-                    $attribute_name::from_c_api($get(*self.handle.borrow(), value.to_c_api()), self)
-                        .expect(concat!("invalid arguments to `Context::", stringify!($context_method), "`"))
-                }
+            pub fn $context_method<'c>(&'c self, value: $enum_name) -> Result<$attribute_name<'c, 't>, Error> {
+                self.load_dialect(DialectHandle::llvm()?)?;
+                Ok(unsafe {
+                    $attribute_name { handle: $get(*self.handle.borrow(), value.to_c_api()), context: self }
+                })
             }
         }
     };
@@ -164,14 +163,14 @@ macro_rules! llvm_attribute {
         }
 
         impl<'c, 't> Attribute<'c, 't> for $attribute_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR attribute handle"));
                 }
                 if unsafe { $is_a(handle) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR attribute handle"))
                 }
             }
 
@@ -441,8 +440,12 @@ impl CallingConvention {
     }
 
     /// Returns the [`CallingConvention`] represented by `value`.
-    pub fn from_c_api(value: MlirLLVMCConv) -> Option<Self> {
-        Self::ALL.iter().copied().find(|candidate| candidate.to_c_api() == value)
+    pub fn from_c_api(value: MlirLLVMCConv) -> Result<Self, Error> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.to_c_api() == value)
+            .ok_or_else(|| Error::invalid_argument("invalid MLIR LLVM calling convention value"))
     }
 }
 
@@ -491,8 +494,12 @@ impl Comdat {
     }
 
     /// Returns the [`Comdat`] represented by `value`.
-    pub fn from_c_api(value: MlirLLVMComdat) -> Option<Self> {
-        Self::ALL.iter().copied().find(|candidate| candidate.to_c_api() == value)
+    pub fn from_c_api(value: MlirLLVMComdat) -> Result<Self, Error> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.to_c_api() == value)
+            .ok_or_else(|| Error::invalid_argument("invalid MLIR LLVM comdat value"))
     }
 }
 
@@ -577,8 +584,12 @@ impl Linkage {
     }
 
     /// Returns the [`Linkage`] represented by `value`.
-    pub fn from_c_api(value: MlirLLVMLinkage) -> Option<Self> {
-        Self::ALL.iter().copied().find(|candidate| candidate.to_c_api() == value)
+    pub fn from_c_api(value: MlirLLVMLinkage) -> Result<Self, Error> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.to_c_api() == value)
+            .ok_or_else(|| Error::invalid_argument("invalid MLIR LLVM linkage value"))
     }
 }
 
@@ -764,52 +775,69 @@ impl<'c> MdStringAttributeRef<'c, '_> {
 
 impl<'c, 't> MdConstantAttributeRef<'c, 't> {
     /// Returns the metadata constant value.
-    pub fn value(&self) -> AttributeRef<'c, 't> {
-        unsafe { AttributeRef::from_c_api(mlirLLVMMDConstantAttrGetValue(self.handle), self.context).unwrap() }
+    pub fn value(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        unsafe {
+            AttributeRef::from_c_api(mlirLLVMMDConstantAttrGetValue(self.handle), self.context)
+                .map_err(|_| Error::internal("expected non-null LLVM metadata constant value attribute"))
+        }
     }
 }
 
 impl<'c, 't> MdFuncAttributeRef<'c, 't> {
     /// Returns the referenced metadata function symbol.
-    pub fn name(&self) -> FlatSymbolRefAttributeRef<'c, 't> {
-        unsafe { FlatSymbolRefAttributeRef::from_c_api(mlirLLVMMDFuncAttrGetName(self.handle), self.context).unwrap() }
+    pub fn name(&self) -> Result<FlatSymbolRefAttributeRef<'c, 't>, Error> {
+        unsafe {
+            FlatSymbolRefAttributeRef::from_c_api(mlirLLVMMDFuncAttrGetName(self.handle), self.context)
+                .map_err(|_| Error::internal("expected non-null LLVM metadata function symbol attribute"))
+        }
     }
 }
 
 impl<'c, 't> MdNodeAttributeRef<'c, 't> {
     /// Returns the number of metadata node operands.
     pub fn operand_count(&self) -> usize {
-        usize::try_from(unsafe { mlirLLVMMDNodeAttrGetNumOperands(self.handle) })
-            .expect("invalid `#llvm.md_node` operand count")
+        unsafe { mlirLLVMMDNodeAttrGetNumOperands(self.handle).cast_unsigned() }
     }
 
     /// Returns the metadata node operands.
-    pub fn operands(&self) -> impl Iterator<Item = AttributeRef<'c, 't>> {
-        (0..self.operand_count()).map(|index| self.operand(index))
+    pub fn operands(&self) -> impl Iterator<Item = Result<AttributeRef<'c, 't>, Error>> {
+        let operand_count = self.operand_count();
+        (0..operand_count).map(|index| unsafe {
+            AttributeRef::from_c_api(mlirLLVMMDNodeAttrGetOperand(self.handle, index.cast_signed()), self.context)
+                .map_err(|_| {
+                    Error::internal(format!("expected non-null LLVM metadata node operand attribute at index {index}"))
+                })
+        })
     }
 
-    /// Returns the `index`-th metadata node operand.
-    pub fn operand(&self, index: usize) -> AttributeRef<'c, 't> {
-        if index >= self.operand_count() {
-            panic!("LLVM metadata node operand index is out of bounds");
+    /// Returns the `index`-th metadata node operand, or an error if the index is out of bounds.
+    pub fn operand(&self, index: usize) -> Result<AttributeRef<'c, 't>, Error> {
+        let operand_count = self.operand_count();
+        if index >= operand_count {
+            return Err(Error::invalid_argument(format!(
+                "llvm metadata node operand index {index} is out of bounds for operand count {operand_count}"
+            )));
         }
         unsafe {
             AttributeRef::from_c_api(mlirLLVMMDNodeAttrGetOperand(self.handle, index.cast_signed()), self.context)
-                .expect("invalid `#llvm.md_node` operand")
+                .map_err(|_| Error::internal("expected non-null LLVM metadata node operand attribute"))
         }
     }
 }
 
 impl<'t> Context<'t> {
     /// Creates a new LLVM [`AddressSpaceAttributeRef`] owned by this [`Context`].
-    pub fn llvm_address_space_attribute<'c>(&'c self, address_space: u32) -> AddressSpaceAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    pub fn llvm_address_space_attribute<'c>(
+        &'c self,
+        address_space: u32,
+    ) -> Result<AddressSpaceAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         unsafe {
             AddressSpaceAttributeRef::from_c_api(
                 mlirLlvmAddressSpaceAttrGet(*self.handle.borrow(), address_space),
                 self,
             )
-            .expect("invalid LLVM address space attribute")
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_address_space_attribute`"))
         }
     }
 
@@ -817,14 +845,14 @@ impl<'t> Context<'t> {
     pub fn llvm_frame_pointer_kind_attribute<'c>(
         &'c self,
         value: FramePointerKind,
-    ) -> FramePointerKindAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    ) -> Result<FramePointerKindAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         unsafe {
             FramePointerKindAttributeRef::from_c_api(
                 mlirLlvmFramePointerKindAttrGet(*self.handle.borrow(), value.to_c_api()),
                 self,
             )
-            .expect("invalid LLVM frame pointer kind attribute")
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_frame_pointer_kind_attribute`"))
         }
     }
 
@@ -833,8 +861,8 @@ impl<'t> Context<'t> {
         &'c self,
         opcode: u32,
         arguments: &[u64],
-    ) -> DiExpressionElemAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    ) -> Result<DiExpressionElemAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         unsafe {
             DiExpressionElemAttributeRef::from_c_api(
                 mlirLLVMDIExpressionElemAttrGet(
@@ -845,7 +873,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .expect("invalid LLVM debug info expression element attribute")
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_di_expression_elem_attribute`"))
         }
     }
 
@@ -853,51 +881,51 @@ impl<'t> Context<'t> {
     pub fn llvm_di_expression_attribute<'c>(
         &'c self,
         operations: &[DiExpressionElemAttributeRef<'c, 't>],
-    ) -> DiExpressionAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    ) -> Result<DiExpressionAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         let operations = operations.iter().map(|operation| unsafe { operation.to_c_api() }).collect::<Vec<_>>();
         unsafe {
             DiExpressionAttributeRef::from_c_api(
                 mlirLLVMDIExpressionAttrGet(*self.handle.borrow(), operations.len().cast_signed(), operations.as_ptr()),
                 self,
             )
-            .expect("invalid LLVM debug info expression attribute")
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_di_expression_attribute`"))
         }
     }
 
     /// Creates a new LLVM [`DiNullTypeAttributeRef`] owned by this [`Context`].
-    pub fn llvm_di_null_type_attribute<'c>(&'c self) -> DiNullTypeAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    pub fn llvm_di_null_type_attribute<'c>(&'c self) -> Result<DiNullTypeAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         unsafe {
             DiNullTypeAttributeRef::from_c_api(mlirLLVMDINullTypeAttrGet(*self.handle.borrow()), self)
-                .expect("invalid LLVM debug info null type attribute")
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_di_null_type_attribute`"))
         }
     }
 
     /// Creates a new LLVM [`UndefAttributeRef`] owned by this [`Context`].
-    pub fn llvm_undef_attribute<'c>(&'c self) -> UndefAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    pub fn llvm_undef_attribute<'c>(&'c self) -> Result<UndefAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         unsafe {
             UndefAttributeRef::from_c_api(mlirLlvmUndefAttrGet(*self.handle.borrow()), self)
-                .expect("invalid LLVM undef attribute")
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_undef_attribute`"))
         }
     }
 
     /// Creates a new LLVM [`PoisonAttributeRef`] owned by this [`Context`].
-    pub fn llvm_poison_attribute<'c>(&'c self) -> PoisonAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    pub fn llvm_poison_attribute<'c>(&'c self) -> Result<PoisonAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         unsafe {
             PoisonAttributeRef::from_c_api(mlirLlvmPoisonAttrGet(*self.handle.borrow()), self)
-                .expect("invalid LLVM poison attribute")
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_poison_attribute`"))
         }
     }
 
     /// Creates a new LLVM [`ZeroAttributeRef`] owned by this [`Context`].
-    pub fn llvm_zero_attribute<'c>(&'c self) -> ZeroAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    pub fn llvm_zero_attribute<'c>(&'c self) -> Result<ZeroAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         unsafe {
             ZeroAttributeRef::from_c_api(mlirLlvmZeroAttrGet(*self.handle.borrow()), self)
-                .expect("invalid LLVM zero attribute")
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_zero_attribute`"))
         }
     }
 
@@ -905,46 +933,55 @@ impl<'t> Context<'t> {
     pub fn llvm_md_string_attribute<'c, 's, S: Into<StringRef<'s>>>(
         &'c self,
         value: S,
-    ) -> MdStringAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    ) -> Result<MdStringAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         unsafe {
             MdStringAttributeRef::from_c_api(
                 mlirLLVMMDStringAttrGet(*self.handle.borrow(), value.into().to_c_api()),
                 self,
             )
-            .expect("invalid LLVM metadata string attribute")
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_md_string_attribute`"))
         }
     }
 
     /// Creates a new LLVM [`MdConstantAttributeRef`] owned by this [`Context`].
-    pub fn llvm_md_constant_attribute<'c, A: Attribute<'c, 't>>(&'c self, value: A) -> MdConstantAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    pub fn llvm_md_constant_attribute<'c, A: Attribute<'c, 't>>(
+        &'c self,
+        value: A,
+    ) -> Result<MdConstantAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         unsafe {
             MdConstantAttributeRef::from_c_api(mlirLLVMMDConstantAttrGet(*self.handle.borrow(), value.to_c_api()), self)
-                .expect("invalid LLVM metadata constant attribute")
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_md_constant_attribute`"))
         }
     }
 
     /// Creates a new LLVM [`MdFuncAttributeRef`] owned by this [`Context`].
-    pub fn llvm_md_func_attribute<'c, 's, S: Into<StringRef<'s>>>(&'c self, name: S) -> MdFuncAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    pub fn llvm_md_func_attribute<'c, 's, S: Into<StringRef<'s>>>(
+        &'c self,
+        name: S,
+    ) -> Result<MdFuncAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         let name = self.flat_symbol_ref_attribute(name);
         unsafe {
             MdFuncAttributeRef::from_c_api(mlirLLVMMDFuncAttrGet(*self.handle.borrow(), name.to_c_api()), self)
-                .expect("invalid LLVM metadata function attribute")
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_md_func_attribute`"))
         }
     }
 
     /// Creates a new LLVM [`MdNodeAttributeRef`] owned by this [`Context`].
-    pub fn llvm_md_node_attribute<'c>(&'c self, operands: &[AttributeRef<'c, 't>]) -> MdNodeAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::llvm());
+    pub fn llvm_md_node_attribute<'c>(
+        &'c self,
+        operands: &[AttributeRef<'c, 't>],
+    ) -> Result<MdNodeAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::llvm()?)?;
         let operands = operands.iter().map(|operand| unsafe { operand.to_c_api() }).collect::<Vec<_>>();
         unsafe {
             MdNodeAttributeRef::from_c_api(
                 mlirLLVMMDNodeAttrGet(*self.handle.borrow(), operands.len().cast_signed(), operands.as_ptr()),
                 self,
             )
-            .expect("invalid LLVM metadata node attribute")
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_md_node_attribute`"))
         }
     }
 }
@@ -963,70 +1000,56 @@ mod tests {
                 #[test]
                 fn [<test_ $test_name _attribute>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     assert_eq!(&context, attribute.context());
-                    assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+                    assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_equality>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute_1 = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     let attribute_2 = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     assert_eq!(attribute_1, attribute_2);
 
                     let attribute_2 = context
-                        .parse_attribute($different_source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $different_source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $different_source));
+                        .parse_attribute($different_source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $different_source));
                     assert_ne!(attribute_1, attribute_2);
 
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute_2 = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     assert_ne!(attribute_1, attribute_2);
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_display_and_debug>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     test_attribute_display_and_debug(attribute, $source);
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_casting>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     test_attribute_casting(attribute);
                 }
             }
@@ -1036,63 +1059,51 @@ mod tests {
                 #[test]
                 fn [<test_ $test_name _attribute>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     assert_eq!(&context, attribute.context());
-                    assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+                    assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_equality>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute_1 = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     let attribute_2 = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     assert_eq!(attribute_1, attribute_2);
 
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute_2 = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     assert_ne!(attribute_1, attribute_2);
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_display_and_debug>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     test_attribute_display_and_debug(attribute, $source);
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_casting>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     test_attribute_casting(attribute);
                 }
             }
@@ -1105,72 +1116,58 @@ mod tests {
                 #[test]
                 fn [<test_ $test_name _attribute>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     assert_eq!(&context, attribute.context());
-                    assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+                    assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_equality>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute_1 = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     assert_eq!(attribute_1, attribute_1);
 
                     let attribute_2 = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     assert_ne!(attribute_1, attribute_2);
 
                     let attribute_2 = context
-                        .parse_attribute($different_source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $different_source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $different_source));
+                        .parse_attribute($different_source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $different_source));
                     assert_ne!(attribute_1, attribute_2);
 
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute_2 = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     assert_ne!(attribute_1, attribute_2);
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_display_and_debug>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     test_attribute_display_and_debug(attribute, $source);
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_casting>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::llvm());
+                    context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
                     let attribute = context
-                        .parse_attribute($source)
-                        .unwrap_or_else(|| panic!("failed to parse LLVM attribute `{}`", $source))
-                        .cast::<$attribute_name>()
-                        .unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
+                        .parse_attribute($source).unwrap()
+                        .cast::<$attribute_name>().unwrap_or_else(|| panic!("failed to cast LLVM attribute `{}`", $source));
                     test_attribute_casting(attribute);
                 }
             }
@@ -1180,74 +1177,74 @@ mod tests {
     #[test]
     fn test_address_space_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_address_space_attribute(3);
+        let attribute = context.llvm_address_space_attribute(3).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
         assert_eq!(attribute.address_space(), 3);
     }
 
     #[test]
     fn test_address_space_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_address_space_attribute(3);
-        let attribute_2 = context.llvm_address_space_attribute(3);
+        let attribute_1 = context.llvm_address_space_attribute(3).unwrap();
+        let attribute_2 = context.llvm_address_space_attribute(3).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.llvm_address_space_attribute(4);
+        let attribute_2 = context.llvm_address_space_attribute(4).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_address_space_attribute(3);
+        let attribute_2 = context.llvm_address_space_attribute(3).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_address_space_attribute_display_and_debug() {
         let context = Context::new();
-        test_attribute_display_and_debug(context.llvm_address_space_attribute(3), "#llvm.address_space<3>");
+        test_attribute_display_and_debug(context.llvm_address_space_attribute(3).unwrap(), "#llvm.address_space<3>");
     }
 
     #[test]
     fn test_address_space_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context
                 .parse_attribute("#llvm.address_space<3>")
                 .unwrap()
                 .cast::<AddressSpaceAttributeRef>()
                 .unwrap(),
-            context.llvm_address_space_attribute(3),
+            context.llvm_address_space_attribute(3).unwrap(),
         );
     }
 
     #[test]
     fn test_address_space_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_address_space_attribute(3));
+        test_attribute_casting(context.llvm_address_space_attribute(3).unwrap());
     }
 
     #[test]
     fn test_calling_convention_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_calling_convention_attribute(CallingConvention::Fast);
+        let attribute = context.llvm_calling_convention_attribute(CallingConvention::Fast).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
-        assert_eq!(attribute.value(), CallingConvention::Fast);
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.value().unwrap(), CallingConvention::Fast);
     }
 
     #[test]
     fn test_calling_convention_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_calling_convention_attribute(CallingConvention::Fast);
-        let attribute_2 = context.llvm_calling_convention_attribute(CallingConvention::Fast);
+        let attribute_1 = context.llvm_calling_convention_attribute(CallingConvention::Fast).unwrap();
+        let attribute_2 = context.llvm_calling_convention_attribute(CallingConvention::Fast).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.llvm_calling_convention_attribute(CallingConvention::Cold);
+        let attribute_2 = context.llvm_calling_convention_attribute(CallingConvention::Cold).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_calling_convention_attribute(CallingConvention::Fast);
+        let attribute_2 = context.llvm_calling_convention_attribute(CallingConvention::Fast).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
@@ -1255,7 +1252,7 @@ mod tests {
     fn test_calling_convention_attribute_display_and_debug() {
         let context = Context::new();
         test_attribute_display_and_debug(
-            context.llvm_calling_convention_attribute(CallingConvention::Fast),
+            context.llvm_calling_convention_attribute(CallingConvention::Fast).unwrap(),
             "#llvm.cconv<fastcc>",
         );
     }
@@ -1263,44 +1260,44 @@ mod tests {
     #[test]
     fn test_calling_convention_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context
                 .parse_attribute("#llvm.cconv<fastcc>")
                 .unwrap()
                 .cast::<CallingConventionAttributeRef>()
                 .unwrap(),
-            context.llvm_calling_convention_attribute(CallingConvention::Fast),
+            context.llvm_calling_convention_attribute(CallingConvention::Fast).unwrap(),
         );
     }
 
     #[test]
     fn test_calling_convention_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_calling_convention_attribute(CallingConvention::Fast));
+        test_attribute_casting(context.llvm_calling_convention_attribute(CallingConvention::Fast).unwrap());
     }
 
     #[test]
     fn test_comdat_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_comdat_attribute(Comdat::NoDeduplicate);
+        let attribute = context.llvm_comdat_attribute(Comdat::NoDeduplicate).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
-        assert_eq!(attribute.value(), Comdat::NoDeduplicate);
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.value().unwrap(), Comdat::NoDeduplicate);
     }
 
     #[test]
     fn test_comdat_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_comdat_attribute(Comdat::NoDeduplicate);
-        let attribute_2 = context.llvm_comdat_attribute(Comdat::NoDeduplicate);
+        let attribute_1 = context.llvm_comdat_attribute(Comdat::NoDeduplicate).unwrap();
+        let attribute_2 = context.llvm_comdat_attribute(Comdat::NoDeduplicate).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.llvm_comdat_attribute(Comdat::Any);
+        let attribute_2 = context.llvm_comdat_attribute(Comdat::Any).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_comdat_attribute(Comdat::NoDeduplicate);
+        let attribute_2 = context.llvm_comdat_attribute(Comdat::NoDeduplicate).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
@@ -1308,7 +1305,7 @@ mod tests {
     fn test_comdat_attribute_display_and_debug() {
         let context = Context::new();
         test_attribute_display_and_debug(
-            context.llvm_comdat_attribute(Comdat::NoDeduplicate),
+            context.llvm_comdat_attribute(Comdat::NoDeduplicate).unwrap(),
             "#llvm<comdat nodeduplicate>",
         );
     }
@@ -1316,90 +1313,93 @@ mod tests {
     #[test]
     fn test_comdat_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context
                 .parse_attribute("#llvm<comdat nodeduplicate>")
                 .unwrap()
                 .cast::<ComdatAttributeRef>()
                 .unwrap(),
-            context.llvm_comdat_attribute(Comdat::NoDeduplicate),
+            context.llvm_comdat_attribute(Comdat::NoDeduplicate).unwrap(),
         );
     }
 
     #[test]
     fn test_comdat_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_comdat_attribute(Comdat::NoDeduplicate));
+        test_attribute_casting(context.llvm_comdat_attribute(Comdat::NoDeduplicate).unwrap());
     }
 
     #[test]
     fn test_linkage_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_linkage_attribute(Linkage::Internal);
+        let attribute = context.llvm_linkage_attribute(Linkage::Internal).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
-        assert_eq!(attribute.value(), Linkage::Internal);
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.value().unwrap(), Linkage::Internal);
     }
 
     #[test]
     fn test_linkage_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_linkage_attribute(Linkage::Internal);
-        let attribute_2 = context.llvm_linkage_attribute(Linkage::Internal);
+        let attribute_1 = context.llvm_linkage_attribute(Linkage::Internal).unwrap();
+        let attribute_2 = context.llvm_linkage_attribute(Linkage::Internal).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.llvm_linkage_attribute(Linkage::Private);
+        let attribute_2 = context.llvm_linkage_attribute(Linkage::Private).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_linkage_attribute(Linkage::Internal);
+        let attribute_2 = context.llvm_linkage_attribute(Linkage::Internal).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_linkage_attribute_display_and_debug() {
         let context = Context::new();
-        test_attribute_display_and_debug(context.llvm_linkage_attribute(Linkage::Internal), "#llvm.linkage<internal>");
+        test_attribute_display_and_debug(
+            context.llvm_linkage_attribute(Linkage::Internal).unwrap(),
+            "#llvm.linkage<internal>",
+        );
     }
 
     #[test]
     fn test_linkage_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context.parse_attribute("#llvm.linkage<internal>").unwrap().cast::<LinkageAttributeRef>().unwrap(),
-            context.llvm_linkage_attribute(Linkage::Internal),
+            context.llvm_linkage_attribute(Linkage::Internal).unwrap(),
         );
     }
 
     #[test]
     fn test_linkage_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_linkage_attribute(Linkage::Internal));
+        test_attribute_casting(context.llvm_linkage_attribute(Linkage::Internal).unwrap());
     }
 
     #[test]
     fn test_frame_pointer_kind_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf);
+        let attribute = context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
         assert_eq!(attribute.value(), FramePointerKind::NonLeaf);
     }
 
     #[test]
     fn test_frame_pointer_kind_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf);
-        let attribute_2 = context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf);
+        let attribute_1 = context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf).unwrap();
+        let attribute_2 = context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.llvm_frame_pointer_kind_attribute(FramePointerKind::All);
+        let attribute_2 = context.llvm_frame_pointer_kind_attribute(FramePointerKind::All).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf);
+        let attribute_2 = context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
@@ -1407,7 +1407,7 @@ mod tests {
     fn test_frame_pointer_kind_attribute_display_and_debug() {
         let context = Context::new();
         test_attribute_display_and_debug(
-            context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf),
+            context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf).unwrap(),
             "#llvm.framePointerKind<\"non-leaf\">",
         );
     }
@@ -1415,21 +1415,21 @@ mod tests {
     #[test]
     fn test_frame_pointer_kind_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context
                 .parse_attribute("#llvm.framePointerKind<\"non-leaf\">")
                 .unwrap()
                 .cast::<FramePointerKindAttributeRef>()
                 .unwrap(),
-            context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf),
+            context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf).unwrap(),
         );
     }
 
     #[test]
     fn test_frame_pointer_kind_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf));
+        test_attribute_casting(context.llvm_frame_pointer_kind_attribute(FramePointerKind::NonLeaf).unwrap());
     }
 
     parsed_llvm_attribute_tests!(
@@ -1505,23 +1505,23 @@ mod tests {
     #[test]
     fn test_di_expression_elem_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_di_expression_elem_attribute(6, &[]);
+        let attribute = context.llvm_di_expression_elem_attribute(6, &[]).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_di_expression_elem_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_di_expression_elem_attribute(6, &[]);
-        let attribute_2 = context.llvm_di_expression_elem_attribute(6, &[]);
+        let attribute_1 = context.llvm_di_expression_elem_attribute(6, &[]).unwrap();
+        let attribute_2 = context.llvm_di_expression_elem_attribute(6, &[]).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.llvm_di_expression_elem_attribute(34, &[]);
+        let attribute_2 = context.llvm_di_expression_elem_attribute(34, &[]).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_di_expression_elem_attribute(6, &[]);
+        let attribute_2 = context.llvm_di_expression_elem_attribute(6, &[]).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
@@ -1529,7 +1529,7 @@ mod tests {
     fn test_di_expression_elem_attribute_display_and_debug() {
         let context = Context::new();
         test_attribute_display_and_debug(
-            context.llvm_di_expression_elem_attribute(6, &[]),
+            context.llvm_di_expression_elem_attribute(6, &[]).unwrap(),
             "#llvm.di_expression_elemDW_OP_deref",
         );
     }
@@ -1537,42 +1537,42 @@ mod tests {
     #[test]
     fn test_di_expression_elem_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_di_expression_elem_attribute(6, &[]));
+        test_attribute_casting(context.llvm_di_expression_elem_attribute(6, &[]).unwrap());
     }
 
     #[test]
     fn test_di_expression_attribute() {
         let context = Context::new();
-        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
-        let attribute = context.llvm_di_expression_attribute(&[operation]);
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]).unwrap();
+        let attribute = context.llvm_di_expression_attribute(&[operation]).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_di_expression_attribute_equality() {
         let context = Context::new();
-        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
-        let attribute_1 = context.llvm_di_expression_attribute(&[operation]);
-        let attribute_2 = context.llvm_di_expression_attribute(&[operation]);
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]).unwrap();
+        let attribute_1 = context.llvm_di_expression_attribute(&[operation]).unwrap();
+        let attribute_2 = context.llvm_di_expression_attribute(&[operation]).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let operation = context.llvm_di_expression_elem_attribute(34, &[]);
-        let attribute_2 = context.llvm_di_expression_attribute(&[operation]);
+        let operation = context.llvm_di_expression_elem_attribute(34, &[]).unwrap();
+        let attribute_2 = context.llvm_di_expression_attribute(&[operation]).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
-        let attribute_2 = context.llvm_di_expression_attribute(&[operation]);
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]).unwrap();
+        let attribute_2 = context.llvm_di_expression_attribute(&[operation]).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_di_expression_attribute_display_and_debug() {
         let context = Context::new();
-        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]).unwrap();
         test_attribute_display_and_debug(
-            context.llvm_di_expression_attribute(&[operation]),
+            context.llvm_di_expression_attribute(&[operation]).unwrap(),
             "#llvm.di_expression<[DW_OP_deref]>",
         );
     }
@@ -1580,65 +1580,64 @@ mod tests {
     #[test]
     fn test_di_expression_attribute_parsing() {
         let context = Context::new();
-        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
-        context.load_dialect(DialectHandle::llvm());
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]).unwrap();
         assert_eq!(
             context
                 .parse_attribute("#llvm.di_expression<[DW_OP_deref]>")
                 .unwrap()
                 .cast::<DiExpressionAttributeRef>()
                 .unwrap(),
-            context.llvm_di_expression_attribute(&[operation]),
+            context.llvm_di_expression_attribute(&[operation]).unwrap(),
         );
     }
 
     #[test]
     fn test_di_expression_attribute_casting() {
         let context = Context::new();
-        let operation = context.llvm_di_expression_elem_attribute(6, &[]);
-        test_attribute_casting(context.llvm_di_expression_attribute(&[operation]));
+        let operation = context.llvm_di_expression_elem_attribute(6, &[]).unwrap();
+        test_attribute_casting(context.llvm_di_expression_attribute(&[operation]).unwrap());
     }
 
     #[test]
     fn test_di_null_type_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_di_null_type_attribute();
+        let attribute = context.llvm_di_null_type_attribute().unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_di_null_type_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_di_null_type_attribute();
-        let attribute_2 = context.llvm_di_null_type_attribute();
+        let attribute_1 = context.llvm_di_null_type_attribute().unwrap();
+        let attribute_2 = context.llvm_di_null_type_attribute().unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_di_null_type_attribute();
+        let attribute_2 = context.llvm_di_null_type_attribute().unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_di_null_type_attribute_display_and_debug() {
         let context = Context::new();
-        test_attribute_display_and_debug(context.llvm_di_null_type_attribute(), "#llvm.di_null_type");
+        test_attribute_display_and_debug(context.llvm_di_null_type_attribute().unwrap(), "#llvm.di_null_type");
     }
 
     #[test]
     fn test_di_null_type_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context.parse_attribute("#llvm.di_null_type").unwrap().cast::<DiNullTypeAttributeRef>().unwrap(),
-            context.llvm_di_null_type_attribute(),
+            context.llvm_di_null_type_attribute().unwrap(),
         );
     }
 
     #[test]
     fn test_di_null_type_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_di_null_type_attribute());
+        test_attribute_casting(context.llvm_di_null_type_attribute().unwrap());
     }
 
     parsed_llvm_attribute_tests!(
@@ -1983,85 +1982,85 @@ mod tests {
     #[test]
     fn test_undef_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_undef_attribute();
+        let attribute = context.llvm_undef_attribute().unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_undef_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_undef_attribute();
-        let attribute_2 = context.llvm_undef_attribute();
+        let attribute_1 = context.llvm_undef_attribute().unwrap();
+        let attribute_2 = context.llvm_undef_attribute().unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_undef_attribute();
+        let attribute_2 = context.llvm_undef_attribute().unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_undef_attribute_display_and_debug() {
         let context = Context::new();
-        test_attribute_display_and_debug(context.llvm_undef_attribute(), "#llvm.undef");
+        test_attribute_display_and_debug(context.llvm_undef_attribute().unwrap(), "#llvm.undef");
     }
 
     #[test]
     fn test_undef_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context.parse_attribute("#llvm.undef").unwrap().cast::<UndefAttributeRef>().unwrap(),
-            context.llvm_undef_attribute(),
+            context.llvm_undef_attribute().unwrap(),
         );
     }
 
     #[test]
     fn test_undef_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_undef_attribute());
+        test_attribute_casting(context.llvm_undef_attribute().unwrap());
     }
 
     #[test]
     fn test_poison_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_poison_attribute();
+        let attribute = context.llvm_poison_attribute().unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_poison_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_poison_attribute();
-        let attribute_2 = context.llvm_poison_attribute();
+        let attribute_1 = context.llvm_poison_attribute().unwrap();
+        let attribute_2 = context.llvm_poison_attribute().unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_poison_attribute();
+        let attribute_2 = context.llvm_poison_attribute().unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_poison_attribute_display_and_debug() {
         let context = Context::new();
-        test_attribute_display_and_debug(context.llvm_poison_attribute(), "#llvm.poison");
+        test_attribute_display_and_debug(context.llvm_poison_attribute().unwrap(), "#llvm.poison");
     }
 
     #[test]
     fn test_poison_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context.parse_attribute("#llvm.poison").unwrap().cast::<PoisonAttributeRef>().unwrap(),
-            context.llvm_poison_attribute(),
+            context.llvm_poison_attribute().unwrap(),
         );
     }
 
     #[test]
     fn test_poison_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_poison_attribute());
+        test_attribute_casting(context.llvm_poison_attribute().unwrap());
     }
 
     parsed_llvm_attribute_tests!(
@@ -2090,43 +2089,43 @@ mod tests {
     #[test]
     fn test_zero_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_zero_attribute();
+        let attribute = context.llvm_zero_attribute().unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
     }
 
     #[test]
     fn test_zero_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_zero_attribute();
-        let attribute_2 = context.llvm_zero_attribute();
+        let attribute_1 = context.llvm_zero_attribute().unwrap();
+        let attribute_2 = context.llvm_zero_attribute().unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_zero_attribute();
+        let attribute_2 = context.llvm_zero_attribute().unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_zero_attribute_display_and_debug() {
         let context = Context::new();
-        test_attribute_display_and_debug(context.llvm_zero_attribute(), "#llvm.zero");
+        test_attribute_display_and_debug(context.llvm_zero_attribute().unwrap(), "#llvm.zero");
     }
 
     #[test]
     fn test_zero_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context.parse_attribute("#llvm.zero").unwrap().cast::<ZeroAttributeRef>().unwrap(),
-            context.llvm_zero_attribute(),
+            context.llvm_zero_attribute().unwrap(),
         );
     }
 
     #[test]
     fn test_zero_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_zero_attribute());
+        test_attribute_casting(context.llvm_zero_attribute().unwrap());
     }
 
     parsed_llvm_attribute_tests!(
@@ -2203,24 +2202,24 @@ mod tests {
     #[test]
     fn test_md_string_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_md_string_attribute("foo.buffer");
+        let attribute = context.llvm_md_string_attribute("foo.buffer").unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
         assert_eq!(attribute.value().as_str().unwrap(), "foo.buffer");
     }
 
     #[test]
     fn test_md_string_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_md_string_attribute("foo.buffer");
-        let attribute_2 = context.llvm_md_string_attribute("foo.buffer");
+        let attribute_1 = context.llvm_md_string_attribute("foo.buffer").unwrap();
+        let attribute_2 = context.llvm_md_string_attribute("foo.buffer").unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.llvm_md_string_attribute("other.buffer");
+        let attribute_2 = context.llvm_md_string_attribute("other.buffer").unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_md_string_attribute("foo.buffer");
+        let attribute_2 = context.llvm_md_string_attribute("foo.buffer").unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
@@ -2228,7 +2227,7 @@ mod tests {
     fn test_md_string_attribute_display_and_debug() {
         let context = Context::new();
         test_attribute_display_and_debug(
-            context.llvm_md_string_attribute("foo.buffer"),
+            context.llvm_md_string_attribute("foo.buffer").unwrap(),
             "#llvm.md_string<\"foo.buffer\">",
         );
     }
@@ -2236,48 +2235,48 @@ mod tests {
     #[test]
     fn test_md_string_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context
                 .parse_attribute("#llvm.md_string<\"foo.buffer\">")
                 .unwrap()
                 .cast::<MdStringAttributeRef>()
                 .unwrap(),
-            context.llvm_md_string_attribute("foo.buffer"),
+            context.llvm_md_string_attribute("foo.buffer").unwrap(),
         );
     }
 
     #[test]
     fn test_md_string_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_md_string_attribute("foo.buffer"));
+        test_attribute_casting(context.llvm_md_string_attribute("foo.buffer").unwrap());
     }
 
     #[test]
     fn test_md_constant_attribute() {
         let context = Context::new();
         let value = context.integer_attribute(context.signless_integer_type(32), 42);
-        let attribute = context.llvm_md_constant_attribute(value);
+        let attribute = context.llvm_md_constant_attribute(value).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
-        assert_eq!(attribute.value(), value);
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.value().unwrap(), value);
     }
 
     #[test]
     fn test_md_constant_attribute_equality() {
         let context = Context::new();
         let value = context.integer_attribute(context.signless_integer_type(32), 42);
-        let attribute_1 = context.llvm_md_constant_attribute(value);
-        let attribute_2 = context.llvm_md_constant_attribute(value);
+        let attribute_1 = context.llvm_md_constant_attribute(value).unwrap();
+        let attribute_2 = context.llvm_md_constant_attribute(value).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         let value = context.integer_attribute(context.signless_integer_type(32), 43);
-        let attribute_2 = context.llvm_md_constant_attribute(value);
+        let attribute_2 = context.llvm_md_constant_attribute(value).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
         let value = context.integer_attribute(context.signless_integer_type(32), 42);
-        let attribute_2 = context.llvm_md_constant_attribute(value);
+        let attribute_2 = context.llvm_md_constant_attribute(value).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
@@ -2285,21 +2284,24 @@ mod tests {
     fn test_md_constant_attribute_display_and_debug() {
         let context = Context::new();
         let value = context.integer_attribute(context.signless_integer_type(32), 42);
-        test_attribute_display_and_debug(context.llvm_md_constant_attribute(value), "#llvm.md_const<42 : i32>");
+        test_attribute_display_and_debug(
+            context.llvm_md_constant_attribute(value).unwrap(),
+            "#llvm.md_const<42 : i32>",
+        );
     }
 
     #[test]
     fn test_md_constant_attribute_parsing() {
         let context = Context::new();
         let value = context.integer_attribute(context.signless_integer_type(32), 42);
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context
                 .parse_attribute("#llvm.md_const<42 : i32>")
                 .unwrap()
                 .cast::<MdConstantAttributeRef>()
                 .unwrap(),
-            context.llvm_md_constant_attribute(value),
+            context.llvm_md_constant_attribute(value).unwrap(),
         );
     }
 
@@ -2307,68 +2309,80 @@ mod tests {
     fn test_md_constant_attribute_casting() {
         let context = Context::new();
         let value = context.integer_attribute(context.signless_integer_type(32), 42);
-        test_attribute_casting(context.llvm_md_constant_attribute(value));
+        test_attribute_casting(context.llvm_md_constant_attribute(value).unwrap());
     }
 
     #[test]
     fn test_md_func_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_md_func_attribute("callee");
+        let attribute = context.llvm_md_func_attribute("callee").unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
-        assert_eq!(attribute.name().reference().as_str().unwrap(), "callee");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.name().unwrap().reference().as_str().unwrap(), "callee");
     }
 
     #[test]
     fn test_md_func_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_md_func_attribute("callee");
-        let attribute_2 = context.llvm_md_func_attribute("callee");
+        let attribute_1 = context.llvm_md_func_attribute("callee").unwrap();
+        let attribute_2 = context.llvm_md_func_attribute("callee").unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.llvm_md_func_attribute("other");
+        let attribute_2 = context.llvm_md_func_attribute("other").unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_md_func_attribute("callee");
+        let attribute_2 = context.llvm_md_func_attribute("callee").unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_md_func_attribute_display_and_debug() {
         let context = Context::new();
-        test_attribute_display_and_debug(context.llvm_md_func_attribute("callee"), "#llvm.md_func<@callee>");
+        test_attribute_display_and_debug(context.llvm_md_func_attribute("callee").unwrap(), "#llvm.md_func<@callee>");
     }
 
     #[test]
     fn test_md_func_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::llvm());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         assert_eq!(
             context.parse_attribute("#llvm.md_func<@callee>").unwrap().cast::<MdFuncAttributeRef>().unwrap(),
-            context.llvm_md_func_attribute("callee"),
+            context.llvm_md_func_attribute("callee").unwrap(),
         );
     }
 
     #[test]
     fn test_md_func_attribute_casting() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_md_func_attribute("callee"));
+        test_attribute_casting(context.llvm_md_func_attribute("callee").unwrap());
     }
 
     #[test]
     fn test_md_node_attribute() {
         let context = Context::new();
-        let constant =
-            context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
-        let string = context.llvm_md_string_attribute("foo.buffer");
-        let function = context.llvm_md_func_attribute("callee");
-        let attribute = context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]);
+        let constant = context
+            .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
+            .unwrap();
+        let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
+        let function = context.llvm_md_func_attribute("callee").unwrap();
+        let attribute =
+            context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().namespace().unwrap(), "llvm");
+        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
         assert_eq!(attribute.operand_count(), 3);
+        assert_eq!(attribute.operand(0).unwrap(), constant.as_ref());
+        assert_eq!(attribute.operand(1).unwrap(), string.as_ref());
+        assert_eq!(attribute.operand(2).unwrap(), function.as_ref());
+        assert!(attribute.operand(3).is_err());
         assert_eq!(
-            attribute.operands().map(|operand| operand.to_string()).collect::<Vec<_>>(),
+            attribute
+                .operands()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .into_iter()
+                .map(|operand| operand.to_string())
+                .collect::<Vec<_>>(),
             vec!["#llvm.md_const<42 : i32>", "#llvm.md_string<\"foo.buffer\">", "#llvm.md_func<@callee>"],
         );
     }
@@ -2376,35 +2390,41 @@ mod tests {
     #[test]
     fn test_md_node_attribute_equality() {
         let context = Context::new();
-        let constant =
-            context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
-        let string = context.llvm_md_string_attribute("foo.buffer");
-        let function = context.llvm_md_func_attribute("callee");
-        let attribute_1 = context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]);
-        let attribute_2 = context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]);
+        let constant = context
+            .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
+            .unwrap();
+        let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
+        let function = context.llvm_md_func_attribute("callee").unwrap();
+        let attribute_1 =
+            context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap();
+        let attribute_2 =
+            context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.llvm_md_node_attribute(&[constant.as_ref()]);
+        let attribute_2 = context.llvm_md_node_attribute(&[constant.as_ref()]).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let constant =
-            context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
-        let string = context.llvm_md_string_attribute("foo.buffer");
-        let function = context.llvm_md_func_attribute("callee");
-        let attribute_2 = context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]);
+        let constant = context
+            .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
+            .unwrap();
+        let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
+        let function = context.llvm_md_func_attribute("callee").unwrap();
+        let attribute_2 =
+            context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_md_node_attribute_display_and_debug() {
         let context = Context::new();
-        let constant =
-            context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
-        let string = context.llvm_md_string_attribute("foo.buffer");
-        let function = context.llvm_md_func_attribute("callee");
+        let constant = context
+            .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
+            .unwrap();
+        let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
+        let function = context.llvm_md_func_attribute("callee").unwrap();
         test_attribute_display_and_debug(
-            context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]),
+            context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap(),
             "#llvm.md_node<#llvm.md_const<42 : i32>, #llvm.md_string<\"foo.buffer\">, #llvm.md_func<@callee>>",
         );
     }
@@ -2412,11 +2432,11 @@ mod tests {
     #[test]
     fn test_md_node_attribute_parsing() {
         let context = Context::new();
-        let constant =
-            context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
-        let string = context.llvm_md_string_attribute("foo.buffer");
-        let function = context.llvm_md_func_attribute("callee");
-        context.load_dialect(DialectHandle::llvm());
+        let constant = context
+            .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
+            .unwrap();
+        let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
+        let function = context.llvm_md_func_attribute("callee").unwrap();
         assert_eq!(
             context
                 .parse_attribute(
@@ -2425,21 +2445,20 @@ mod tests {
                 .unwrap()
                 .cast::<MdNodeAttributeRef>()
                 .unwrap(),
-            context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]),
+            context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap(),
         );
     }
 
     #[test]
     fn test_md_node_attribute_casting() {
         let context = Context::new();
-        let constant =
-            context.llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
-        let string = context.llvm_md_string_attribute("foo.buffer");
-        let function = context.llvm_md_func_attribute("callee");
-        test_attribute_casting(context.llvm_md_node_attribute(&[
-            constant.as_ref(),
-            string.as_ref(),
-            function.as_ref(),
-        ]));
+        let constant = context
+            .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
+            .unwrap();
+        let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
+        let function = context.llvm_md_func_attribute("callee").unwrap();
+        test_attribute_casting(
+            context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap(),
+        );
     }
 }

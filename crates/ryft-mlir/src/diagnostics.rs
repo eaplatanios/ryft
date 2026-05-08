@@ -10,7 +10,7 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::support::write_to_formatter_callback;
-use crate::{Context, Location, LocationRef, LogicalResult};
+use crate::{Context, Error, Location, LocationRef, LogicalResult};
 
 /// Severity level of a [`Diagnostic`]. Note that if the underlying native library returns a severity level that
 /// is not recognized by this library (e.g., due to a version incompatibility), then that severity level will be
@@ -66,8 +66,12 @@ impl<'o, 'c, 't> Diagnostic<'o, 'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirDiagnostic, context: &'c Context<'t>) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, context, owner: PhantomData }) }
+    pub unsafe fn from_c_api(handle: MlirDiagnostic, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR diagnostic handle"))
+        } else {
+            Ok(Self { handle, context, owner: PhantomData })
+        }
     }
 
     /// Returns a reference to the [`Context`] that owns this [`Diagnostic`].
@@ -81,8 +85,8 @@ impl<'o, 'c, 't> Diagnostic<'o, 'c, 't> {
     }
 
     /// Returns the [`Location`] at which this [`Diagnostic`] was reported.
-    pub fn location(&self) -> LocationRef<'c, 't> {
-        unsafe { LocationRef::from_c_api(mlirDiagnosticGetLocation(self.handle), self.context).unwrap() }
+    pub fn location(&self) -> Result<LocationRef<'c, 't>, Error> {
+        unsafe { LocationRef::from_c_api(mlirDiagnosticGetLocation(self.handle), self.context) }
     }
 
     /// Returns the number of notes attached to this [`Diagnostic`].
@@ -91,18 +95,21 @@ impl<'o, 'c, 't> Diagnostic<'o, 'c, 't> {
     }
 
     /// Returns the notes attached to this [`Diagnostic`].
-    pub fn notes(&self) -> impl Iterator<Item = Self> {
-        (0..self.note_count()).map(|index| self.note(index).unwrap())
+    pub fn notes(&self) -> impl Iterator<Item = Result<Self, Error>> {
+        (0..self.note_count()).map(|index| unsafe {
+            Self::from_c_api(mlirDiagnosticGetNote(self.handle, index.cast_signed()), self.context)
+        })
     }
 
-    /// Returns the `index`-th note attached to this [`Diagnostic`]. If `index` is larger than
-    /// [`Diagnostic::note_count`], then this function will return [`None`].
-    pub fn note(&self, index: usize) -> Option<Self> {
-        if index < self.note_count() {
-            unsafe { Self::from_c_api(mlirDiagnosticGetNote(self.handle, index.cast_signed()), self.context) }
-        } else {
-            None
+    /// Returns the `index`-th note attached to this [`Diagnostic`].
+    pub fn note(&self, index: usize) -> Result<Self, Error> {
+        let note_count = self.note_count();
+        if index >= note_count {
+            return Err(Error::invalid_argument(format!(
+                "diagnostic note index {index} is out of bounds for {note_count} diagnostic notes",
+            )));
         }
+        unsafe { Self::from_c_api(mlirDiagnosticGetNote(self.handle, index.cast_signed()), self.context) }
     }
 }
 
@@ -150,8 +157,13 @@ impl<'t> Context<'t> {
         ) -> MlirLogicalResult {
             unsafe {
                 let user_data = user_data as *mut (F, &'c Context<'t>);
-                let (ref mut handler, context) = *user_data;
-                LogicalResult::from((*handler)(Diagnostic::from_c_api(diagnostic, context).unwrap())).to_c_api()
+                if let Some((handler, context)) = user_data.as_mut() {
+                    Diagnostic::from_c_api(diagnostic, context)
+                        .map(|diagnostic| LogicalResult::from((*handler)(diagnostic)).to_c_api())
+                        .unwrap_or_else(|_| LogicalResult::failure().to_c_api())
+                } else {
+                    LogicalResult::failure().to_c_api()
+                }
             }
         }
 
@@ -213,13 +225,13 @@ mod tests {
     #[test]
     fn test_null_diagnostic() {
         let context = Context::new();
-        assert!(unsafe { Diagnostic::from_c_api(MlirDiagnostic { ptr: std::ptr::null_mut() }, &context) }.is_none());
+        assert!(unsafe { Diagnostic::from_c_api(MlirDiagnostic { ptr: std::ptr::null_mut() }, &context) }.is_err());
     }
 
     #[test]
     fn test_diagnostics_handler() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::func());
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
 
         // Create a diagnostics handler that collects a bunch of information to check all accessors.
         let message = Rc::new(RefCell::new(None));
@@ -236,14 +248,14 @@ mod tests {
             let _ = diagnostic.context();
             *message_clone.borrow_mut() = Some(diagnostic.to_string());
             *severity_clone.borrow_mut() = Some(diagnostic.severity());
-            *location_clone.borrow_mut() = Some(diagnostic.location().to_string());
-            *notes_clone.borrow_mut() = diagnostic.notes().map(|note| note.to_string()).collect();
+            *location_clone.borrow_mut() = Some(diagnostic.location().unwrap().to_string());
+            *notes_clone.borrow_mut() = diagnostic.notes().map(|note| note.unwrap().to_string()).collect();
             assert!(diagnostic.note_count() > 0);
             assert_eq!(
                 diagnostic.note(0).unwrap().to_string(),
                 "see current operation: \"func.return\"(%arg0) : (i32) -> ()".to_string(),
             );
-            assert!(diagnostic.note(100).is_none());
+            assert!(diagnostic.note(100).is_err());
             assert_eq!(
                 format!("{}", diagnostic),
                 "type of return operand 0 ('i32') doesn't match function result type ('i64') in function @test",
@@ -255,16 +267,20 @@ mod tests {
             true
         });
 
-        // Create a func.func operation with mismatched function signature that will fail verification and
-        // produce diagnostics with notes.
-        context.parse_module(
-            r#"
-            module {
-                func.func @test(%arg0: i32) -> i64 {
-                    func.return %arg0 : i32
-                }
-            }
-            "#,
+        // Create a `func.func` operation with mismatched function signature that will fail verification
+        // and produce diagnostics with notes.
+        assert!(
+            context
+                .parse_module(
+                    r#"
+                    module {
+                        func.func @test(%arg0: i32) -> i64 {
+                            func.return %arg0 : i32
+                        }
+                    }
+                    "#,
+                )
+                .is_err(),
         );
 
         // Check that we captured diagnostic information.
@@ -272,7 +288,7 @@ mod tests {
             message.borrow().as_ref().unwrap(),
             "type of return operand 0 ('i32') doesn't match function result type ('i64') in function @test",
         );
-        assert_eq!(severity.borrow().unwrap(), DiagnosticSeverity::Error);
+        assert_eq!(severity.borrow().as_ref().unwrap(), &DiagnosticSeverity::Error);
         assert!(location.borrow().is_some());
         assert_eq!(
             notes.borrow().as_slice(),
@@ -281,7 +297,7 @@ mod tests {
 
         // Verify that we can detach the handler.
         context.detach_diagnostics_handler(diagnostics_handler_id);
-        context.parse_module("foo");
+        assert!(context.parse_module("foo").is_err());
         assert_eq!(
             message.borrow().as_ref().unwrap(),
             "type of return operand 0 ('i32') doesn't match function result type ('i64') in function @test",
@@ -304,7 +320,7 @@ mod tests {
             false // Do not consume the diagnostic.
         });
 
-        context.parse_module("foo");
+        assert!(context.parse_module("foo").is_err());
         assert_eq!(
             messages.borrow().as_slice(),
             &[
@@ -333,8 +349,8 @@ mod tests {
             diagnostic.to_string().contains("foo") // Consume the diagnostic if it contains "foo".
         });
 
-        context.parse_module("foo");
-        context.parse_module("bar");
+        assert!(context.parse_module("foo").is_err());
+        assert!(context.parse_module("bar").is_err());
         assert_eq!(
             messages.borrow().as_slice(),
             &[

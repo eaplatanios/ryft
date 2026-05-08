@@ -62,16 +62,16 @@ mod tests {
     #[test]
     fn test_create_gpu_passes() {
         // Verify that pass creation does not crash for the various `gpu` dialect passes.
-        let _ = create_gpu_async_region_pass();
-        let _ = create_gpu_decompose_memrefs_pass();
-        let _ = create_gpu_eliminate_barriers_pass();
-        let _ = create_gpu_kernel_outlining_pass();
-        let _ = create_gpu_launch_sink_index_computations_pass();
-        let _ = create_gpu_map_parallel_loops_pass();
-        let _ = create_gpu_module_to_binary_pass();
-        let _ = create_gpu_nvvm_attach_target_pass();
-        let _ = create_gpu_rocdl_attach_target_pass();
-        let _ = create_gpu_spirv_attach_target_pass();
-        let _ = create_gpu_xevm_attach_target_pass();
+        let _ = create_gpu_async_region_pass().unwrap();
+        let _ = create_gpu_decompose_memrefs_pass().unwrap();
+        let _ = create_gpu_eliminate_barriers_pass().unwrap();
+        let _ = create_gpu_kernel_outlining_pass().unwrap();
+        let _ = create_gpu_launch_sink_index_computations_pass().unwrap();
+        let _ = create_gpu_map_parallel_loops_pass().unwrap();
+        let _ = create_gpu_module_to_binary_pass().unwrap();
+        let _ = create_gpu_nvvm_attach_target_pass().unwrap();
+        let _ = create_gpu_rocdl_attach_target_pass().unwrap();
+        let _ = create_gpu_spirv_attach_target_pass().unwrap();
+        let _ = create_gpu_xevm_attach_target_pass().unwrap();
     }
 }

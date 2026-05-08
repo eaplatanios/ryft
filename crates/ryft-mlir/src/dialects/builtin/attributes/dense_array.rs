@@ -4,7 +4,7 @@ use ryft_xla_sys::bindings::{
     mlirAttributeIsADenseI64Array, mlirDenseArrayAttrGetTypeID,
 };
 
-use crate::{Attribute, Context, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, Context, Error, TypeId, mlir_subtype_trait_impls};
 
 /// Built-in MLIR [`Attribute`] that represents a dense unidimensional array of boolean, integer, or floating-point
 /// values. This is different from [`DenseElementsAttribute`](super::DenseElementsAttribute) in that it is a flat
@@ -46,27 +46,27 @@ pub struct DenseArrayAttributeRef<'c, 't> {
 
 impl<'c, 't> DenseArrayAttributeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`DenseArrayAttributeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirDenseArrayAttrGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirDenseArrayAttrGetTypeID()) }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for DenseArrayAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-        if !handle.ptr.is_null()
-            && unsafe {
-                mlirAttributeIsADenseBoolArray(handle)
-                    || mlirAttributeIsADenseI8Array(handle)
-                    || mlirAttributeIsADenseI16Array(handle)
-                    || mlirAttributeIsADenseI32Array(handle)
-                    || mlirAttributeIsADenseI64Array(handle)
-                    || mlirAttributeIsADenseF32Array(handle)
-                    || mlirAttributeIsADenseF64Array(handle)
-            }
-        {
-            Some(Self { handle, context })
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR attribute handle"))
+        } else if unsafe {
+            mlirAttributeIsADenseBoolArray(handle)
+                || mlirAttributeIsADenseI8Array(handle)
+                || mlirAttributeIsADenseI16Array(handle)
+                || mlirAttributeIsADenseI32Array(handle)
+                || mlirAttributeIsADenseI64Array(handle)
+                || mlirAttributeIsADenseF32Array(handle)
+                || mlirAttributeIsADenseF64Array(handle)
+        } {
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR dense array attribute handle"))
         }
     }
 
@@ -229,11 +229,17 @@ macro_rules! mlir_dense_array_attribute {
             }
 
             impl<'c, 't> Attribute<'c, 't> for [<Dense $type_name ArrayAttributeRef>]<'c, 't> {
-                unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
-                    if !handle.ptr.is_null() && unsafe { mlir_dense_array_is_a_function!($type_name)(handle) } {
-                        Some(Self { handle, context })
+                unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+                    if handle.ptr.is_null() {
+                        Err(Error::internal("expected non-null MLIR attribute handle"))
+                    } else if unsafe { mlir_dense_array_is_a_function!($type_name)(handle) } {
+                        Ok(Self { handle, context })
                     } else {
-                        None
+                        Err(Error::invalid_argument(concat!(
+                            "expected MLIR dense ",
+                            stringify!($type_name),
+                            " array attribute handle",
+                        )))
                     }
                 }
 
@@ -256,17 +262,17 @@ macro_rules! mlir_dense_array_attribute {
                 }
             }
 
-            impl<'c, 't, const N: usize> crate::FromWithContext<'c, 't, &[$type; N]>
+            impl<'c, 't, const N: usize> crate::TryFromWithContext<'c, 't, &[$type; N]>
                 for [<Dense $type_name ArrayAttributeRef>]<'c, 't>
             {
-                fn from_with_context(value: &[$type; N], context: &'c Context<'t>) -> Self {
-                    context.[<dense_ $type _array_attribute>](value).unwrap()
+                fn try_from_with_context(value: &[$type; N], context: &'c Context<'t>) -> Result<Self, Error> {
+                    context.[<dense_ $type _array_attribute>](value)
                 }
             }
 
-            impl<'c, 't> crate::FromWithContext<'c, 't, &[$type]> for [<Dense $type_name ArrayAttributeRef>]<'c, 't> {
-                fn from_with_context(value: &[$type], context: &'c Context<'t>) -> Self {
-                    context.[<dense_ $type _array_attribute>](value).unwrap()
+            impl<'c, 't> crate::TryFromWithContext<'c, 't, &[$type]> for [<Dense $type_name ArrayAttributeRef>]<'c, 't> {
+                fn try_from_with_context(value: &[$type], context: &'c Context<'t>) -> Result<Self, Error> {
+                    context.[<dense_ $type _array_attribute>](value)
                 }
             }
 
@@ -275,8 +281,10 @@ macro_rules! mlir_dense_array_attribute {
                 pub fn [<dense_ $type _array_attribute>]<'c>(
                     &'c self,
                     values: &[$type],
-                ) -> Option<[<Dense $type_name ArrayAttributeRef>]<'c, 't>> {
-                    unsafe { mlir_dense_array_constructor_call!($type_name, self, values) }
+                ) -> Result<[<Dense $type_name ArrayAttributeRef>]<'c, 't>, Error> {
+                    unsafe { mlir_dense_array_constructor_call!($type_name, self, values) }.map_err(|_| {
+                        Error::invalid_argument(concat!("invalid arguments to `Context::dense_", stringify!($type), "_array_attribute`"))
+                    })
                 }
             }
         }
@@ -295,7 +303,7 @@ mlir_dense_array_attribute!(f64, Float64, description = "64-bit floating-point n
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::IntoWithContext;
+    use crate::TryIntoWithContext;
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
 
     use super::*;
@@ -303,17 +311,18 @@ mod tests {
     #[test]
     fn test_dense_array_attribute_type_id() {
         let context = Context::new();
-        let dense_array_attribute_id = DenseArrayAttributeRef::type_id();
+        let dense_array_attribute_id = DenseArrayAttributeRef::type_id().unwrap();
         let dense_array_attribute_1 = context.dense_i32_array_attribute(&[1, 2, 3]).unwrap();
         let dense_array_attribute_2 = context.dense_i32_array_attribute(&[1, 2, 3]).unwrap();
-        assert_eq!(dense_array_attribute_1.type_id(), dense_array_attribute_2.type_id());
-        assert_eq!(dense_array_attribute_id, dense_array_attribute_1.type_id());
+        assert_eq!(dense_array_attribute_1.type_id().unwrap(), dense_array_attribute_2.type_id().unwrap());
+        assert_eq!(dense_array_attribute_id, dense_array_attribute_1.type_id().unwrap());
     }
 
     #[test]
     fn test_dense_bool_array_attribute() {
         let context = Context::new();
-        let attribute: DenseBooleanArrayAttributeRef<'_, '_> = (&[true, false, true]).into_with_context(&context);
+        let attribute: DenseBooleanArrayAttributeRef<'_, '_> =
+            (&[true, false, true]).try_into_with_context(&context).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.len(), 3);
         assert_eq!(attribute.value(0), true);

@@ -1,7 +1,7 @@
 use crate::{
-    Attribute, AttributeRef, Block, BlockRef, DetachedOp, DialectHandle, FlatSymbolRefAttributeRef,
-    IntegerAttributeRef, Location, OneResult, Operation, OperationBuilder, StringRef, Type, TypeAttributeRef, TypeRef,
-    Value, ValueRef, mlir_binary_op, mlir_generic_unary_op, mlir_op, mlir_op_trait, mlir_unary_op,
+    Attribute, AttributeRef, Block, BlockRef, DetachedOp, DialectHandle, Error, Location, OneResult, Operation,
+    OperationBuilder, StringRef, Type, TypeRef, Value, ValueRef, mlir_binary_op, mlir_generic_unary_op, mlir_op,
+    mlir_op_trait, mlir_unary_op,
 };
 
 /// Name of the attribute that stores an `llvm.mlir.constant` value.
@@ -64,19 +64,24 @@ pub const PREDICATE_ATTRIBUTE: &str = "predicate";
 /// Operation trait for `llvm.icmp`.
 pub trait IcmpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the integer comparison predicate.
-    fn predicate(&self) -> AttributeRef<'c, 't> {
-        self.attribute(PREDICATE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("invalid '{PREDICATE_ATTRIBUTE}' attribute in `llvm::icmp`"))
+    fn predicate(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute(PREDICATE_ATTRIBUTE)?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                PREDICATE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the left-hand side operand.
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side operand.
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 }
 
@@ -102,17 +107,18 @@ pub fn icmp<
     rhs: Rhs,
     result_type: T,
     location: L,
-) -> DetachedIcmpOperation<'c, 't> {
+) -> Result<DetachedIcmpOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.icmp", location)
         .add_attribute(PREDICATE_ATTRIBUTE, predicate)
         .add_operand(lhs)
         .add_operand(rhs)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::icmp`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::icmp`"))
+        })
 }
 
 /// Name of the attribute that stores LLVM fast-math flags.
@@ -121,23 +127,28 @@ pub const FASTMATH_FLAGS_ATTRIBUTE: &str = "fastmathFlags";
 /// Operation trait for `llvm.fcmp`.
 pub trait FcmpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the floating-point comparison predicate.
-    fn predicate(&self) -> AttributeRef<'c, 't> {
-        self.attribute(PREDICATE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("invalid '{PREDICATE_ATTRIBUTE}' attribute in `llvm::fcmp`"))
+    fn predicate(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute(PREDICATE_ATTRIBUTE)?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                PREDICATE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns the left-hand side operand.
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand side operand.
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the optional fast-math flags.
-    fn fastmath_flags(&self) -> Option<AttributeRef<'c, 't>> {
+    fn fastmath_flags(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute(FASTMATH_FLAGS_ATTRIBUTE)
     }
 }
@@ -165,9 +176,9 @@ pub fn fcmp<
     result_type: T,
     fastmath_flags: Option<AttributeRef<'c, 't>>,
     location: L,
-) -> DetachedFcmpOperation<'c, 't> {
+) -> Result<DetachedFcmpOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new("llvm.fcmp", location)
         .add_attribute(PREDICATE_ATTRIBUTE, predicate)
         .add_operand(lhs)
@@ -176,27 +187,26 @@ pub fn fcmp<
     if let Some(fastmath_flags) = fastmath_flags {
         builder = builder.add_attribute(FASTMATH_FLAGS_ATTRIBUTE, fastmath_flags);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::fcmp`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::fcmp`"))
+    })
 }
 
 /// Operation trait for `llvm.select`.
 pub trait SelectOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the condition operand.
-    fn condition(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn condition(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the value selected when the condition is true.
-    fn true_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn true_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the value selected when the condition is false.
-    fn false_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn false_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 }
 
@@ -221,25 +231,31 @@ pub fn select<
     true_value: T,
     false_value: F,
     location: L,
-) -> DetachedSelectOperation<'c, 't> {
+) -> Result<DetachedSelectOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.select", location)
         .add_operand(condition)
         .add_operand(true_value)
         .add_operand(false_value)
-        .add_result(true_value.r#type())
+        .add_result(true_value.r#type()?)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::select`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::select`"))
+        })
 }
 
 /// Operation trait for `llvm.mlir.constant`.
 pub trait ConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the constant value attribute.
-    fn value(&self) -> AttributeRef<'c, 't> {
-        self.attribute(VALUE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("invalid '{VALUE_ATTRIBUTE}' attribute in `llvm::constant`"))
+    fn value(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute(VALUE_ATTRIBUTE)?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                VALUE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 }
 
@@ -255,15 +271,16 @@ pub fn constant<'c, 't: 'c, A: Attribute<'c, 't>, T: Type<'c, 't>, L: Location<'
     value: A,
     result_type: T,
     location: L,
-) -> DetachedConstantOperation<'c, 't> {
+) -> Result<DetachedConstantOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.mlir.constant", location)
         .add_attribute(VALUE_ATTRIBUTE, value)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::constant`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::constant`"))
+        })
 }
 
 /// Operation trait shared by LLVM no-operand constant-like operations that produce one value.
@@ -284,14 +301,15 @@ mlir_op_trait!(Undef, @local ValueConstantOperation);
 pub fn undef<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     result_type: T,
     location: L,
-) -> DetachedUndefOperation<'c, 't> {
+) -> Result<DetachedUndefOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.mlir.undef", location)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::undef`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::undef`"))
+        })
 }
 
 /// Operation trait for `llvm.mlir.poison`.
@@ -309,14 +327,15 @@ mlir_op_trait!(Poison, @local ValueConstantOperation);
 pub fn poison<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     result_type: T,
     location: L,
-) -> DetachedPoisonOperation<'c, 't> {
+) -> Result<DetachedPoisonOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.mlir.poison", location)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::poison`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::poison`"))
+        })
 }
 
 /// Operation trait for `llvm.mlir.zero`.
@@ -334,36 +353,36 @@ mlir_op_trait!(Zero, @local ValueConstantOperation);
 pub fn zero<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     result_type: T,
     location: L,
-) -> DetachedZeroOperation<'c, 't> {
+) -> Result<DetachedZeroOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.mlir.zero", location)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::zero`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::zero`"))
+        })
 }
 
 /// Operation trait for `llvm.alloca`.
 pub trait AllocaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the runtime array size operand.
-    fn array_size(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn array_size(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the allocated element type.
-    fn element_type(&self) -> TypeRef<'c, 't> {
-        self.attribute(ELEMENT_TYPE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<TypeAttributeRef>())
-            .map(|attribute| attribute.r#type())
-            .unwrap_or_else(|| panic!("invalid '{ELEMENT_TYPE_ATTRIBUTE}' attribute in `llvm::alloca`"))
+    fn element_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.type_attribute(ELEMENT_TYPE_ATTRIBUTE)?.r#type()
     }
 
     /// Returns the optional byte alignment.
-    fn alignment(&self) -> Option<i64> {
-        self.attribute(ALIGNMENT_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
+    fn alignment(&self) -> Result<Option<i64>, Error> {
+        if self.has_attribute(ALIGNMENT_ATTRIBUTE) {
+            self.integer_attribute(ALIGNMENT_ATTRIBUTE).map(|attribute| Some(attribute.signless_value()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns `true` if this allocation uses LLVM `inalloca` argument-passing storage.
@@ -393,9 +412,9 @@ pub fn alloca<
     alignment: Option<i64>,
     inalloca: bool,
     location: L,
-) -> DetachedAllocaOperation<'c, 't> {
+) -> Result<DetachedAllocaOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new("llvm.alloca", location)
         .add_operand(array_size)
         .add_attribute(ELEMENT_TYPE_ATTRIBUTE, context.type_attribute(element_type))
@@ -409,24 +428,25 @@ pub fn alloca<
     if inalloca {
         builder = builder.add_attribute(INALLOCA_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::alloca`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::alloca`"))
+    })
 }
 
 /// Operation trait for `llvm.load`.
 pub trait LoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the pointer operand being loaded from.
-    fn address(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn address(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the optional byte alignment.
-    fn alignment(&self) -> Option<i64> {
-        self.attribute(ALIGNMENT_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
+    fn alignment(&self) -> Result<Option<i64>, Error> {
+        if self.has_attribute(ALIGNMENT_ATTRIBUTE) {
+            self.integer_attribute(ALIGNMENT_ATTRIBUTE).map(|attribute| Some(attribute.signless_value()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns `true` if this load is volatile.
@@ -447,9 +467,9 @@ pub fn load<'address, 'c: 'address, 't: 'c, A: Value<'address, 'c, 't>, R: Type<
     alignment: Option<i64>,
     is_volatile: bool,
     location: L,
-) -> DetachedLoadOperation<'c, 't> {
+) -> Result<DetachedLoadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new("llvm.load", location).add_operand(address).add_result(result_type);
     if let Some(alignment) = alignment {
         builder = builder.add_attribute(
@@ -460,29 +480,30 @@ pub fn load<'address, 'c: 'address, 't: 'c, A: Value<'address, 'c, 't>, R: Type<
     if is_volatile {
         builder = builder.add_attribute(VOLATILE_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::load`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::load`"))
+    })
 }
 
 /// Operation trait for `llvm.store`.
 pub trait StoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the value being stored.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the pointer operand being stored to.
-    fn address(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn address(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the optional byte alignment.
-    fn alignment(&self) -> Option<i64> {
-        self.attribute(ALIGNMENT_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .map(|attribute| attribute.signless_value())
+    fn alignment(&self) -> Result<Option<i64>, Error> {
+        if self.has_attribute(ALIGNMENT_ATTRIBUTE) {
+            self.integer_attribute(ALIGNMENT_ATTRIBUTE).map(|attribute| Some(attribute.signless_value()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns `true` if this store is volatile.
@@ -510,9 +531,9 @@ pub fn store<
     alignment: Option<i64>,
     is_volatile: bool,
     location: L,
-) -> DetachedStoreOperation<'c, 't> {
+) -> Result<DetachedStoreOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new("llvm.store", location).add_operand(value).add_operand(address);
     if let Some(alignment) = alignment {
         builder = builder.add_attribute(
@@ -523,17 +544,16 @@ pub fn store<
     if is_volatile {
         builder = builder.add_attribute(VOLATILE_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::store`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::store`"))
+    })
 }
 
 /// Operation trait for `llvm.return`.
 pub trait ReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the optional value being returned.
-    fn argument(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.operand_value(0)
+    fn argument(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.operand_count() == 0 { Ok(None) } else { self.operand_value(0).map(Some) }
     }
 }
 
@@ -548,28 +568,27 @@ mlir_op_trait!(Return, ZeroSuccessors);
 pub fn r#return<'argument, 'c: 'argument, 't: 'c, L: Location<'c, 't>>(
     argument: Option<ValueRef<'argument, 'c, 't>>,
     location: L,
-) -> DetachedReturnOperation<'c, 't> {
+) -> Result<DetachedReturnOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new("llvm.return", location);
     if let Some(argument) = argument {
         builder = builder.add_operand(argument);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::return`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::return`"))
+    })
 }
 
 /// Operation trait for `llvm.br`.
 pub trait BranchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the destination block.
-    fn destination(&self) -> BlockRef<'o, 'c, 't> {
-        self.successor(0).unwrap()
+    fn destination(&self) -> Result<BlockRef<'o, 'c, 't>, Error> {
+        self.successor(0)
     }
 
     /// Returns the operands forwarded to the destination block.
-    fn destination_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn destination_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 }
@@ -584,15 +603,16 @@ pub fn br<'b, 'v, 'c: 'b + 'v, 't: 'c, B: Block<'b, 'c, 't>, V: Value<'v, 'c, 't
     destination: &B,
     operands: &[V],
     location: L,
-) -> DetachedBranchOperation<'c, 't> {
+) -> Result<DetachedBranchOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.br", location)
         .add_operands(operands)
         .add_successor(destination)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::br`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::br`"))
+        })
 }
 
 /// Operation trait for `llvm.unreachable`.
@@ -606,23 +626,21 @@ mlir_op_trait!(Unreachable, ZeroRegions);
 mlir_op_trait!(Unreachable, ZeroSuccessors);
 
 /// Constructs a new detached [`UnreachableOperation`].
-pub fn unreachable<'c, 't: 'c, L: Location<'c, 't>>(location: L) -> DetachedUnreachableOperation<'c, 't> {
+pub fn unreachable<'c, 't: 'c, L: Location<'c, 't>>(
+    location: L,
+) -> Result<DetachedUnreachableOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
-    OperationBuilder::new("llvm.unreachable", location)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::unreachable`")
+    context.load_dialect(DialectHandle::llvm()?)?;
+    OperationBuilder::new("llvm.unreachable", location).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::unreachable`"))
+    })
 }
 
 /// Operation trait for `llvm.mlir.addressof`.
 pub trait AddressOfOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the referenced symbol name.
-    fn global_name(&self) -> StringRef<'c> {
-        self.attribute(GLOBAL_NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<FlatSymbolRefAttributeRef>())
-            .map(|attribute| attribute.reference())
-            .unwrap_or_else(|| panic!("invalid '{GLOBAL_NAME_ATTRIBUTE}' attribute in `llvm::address_of`"))
+    fn global_name(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.flat_symbol_ref_attribute(GLOBAL_NAME_ATTRIBUTE)?.reference())
     }
 }
 
@@ -638,15 +656,16 @@ pub fn address_of<'c, 't: 'c, S: Into<StringRef<'c>>, T: Type<'c, 't>, L: Locati
     global_name: S,
     result_type: T,
     location: L,
-) -> DetachedAddressOfOperation<'c, 't> {
+) -> Result<DetachedAddressOfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::llvm());
+    context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.mlir.addressof", location)
         .add_attribute(GLOBAL_NAME_ATTRIBUTE, context.flat_symbol_ref_attribute(global_name.into()))
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `llvm::address_of`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::address_of`"))
+        })
 }
 
 #[cfg(test)]
@@ -673,22 +692,22 @@ mod tests {
             fn $test_name() {
                 let context = Context::new();
                 let location = context.unknown_location();
-                let module = context.module(location);
+                let module = context.module(location).unwrap();
                 let value_type = context.$value_type($($value_type_arguments)*);
-                module.body().append_operation({
+                module.body().unwrap().append_operation({
                     let mut block = context.block(&[(value_type, location), (value_type, location)]);
                     let lhs = block.argument(0).unwrap();
                     let rhs = block.argument(1).unwrap();
-                    let op = $constructor(lhs, rhs, location);
-                    assert_eq!(op.lhs(), lhs);
-                    assert_eq!(op.rhs(), rhs);
-                    assert_eq!(op.output_type(), value_type);
-                    assert_eq!(op.operands().count(), 2);
-                    assert_eq!(op.results().count(), 1);
-                    assert_eq!(op.regions().count(), 0);
-                    assert_eq!(op.successors().count(), 0);
-                    let op = block.append_operation(op);
-                    block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+                    let op = $constructor(lhs, rhs, location).unwrap();
+                    assert_eq!(op.lhs().unwrap(), lhs);
+                    assert_eq!(op.rhs().unwrap(), rhs);
+                    assert_eq!(op.output_type().unwrap(), value_type);
+                    assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                    assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                    assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                    assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                    let op = block.append_operation(op).unwrap();
+                    block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                     func::func(
                         $function_name,
                         func::FuncAttributes {
@@ -696,11 +715,11 @@ mod tests {
                             results: vec![value_type.into()],
                             ..Default::default()
                         },
-                        block.into(),
+                        block.try_into().unwrap(),
                         location,
-                    )
-                });
-                assert!(module.verify());
+                    ).unwrap()
+                }).unwrap();
+                assert!(module.verify().unwrap());
                 assert_eq!(module.to_string(), indoc! { $expected });
             }
         };
@@ -718,20 +737,20 @@ mod tests {
             fn $test_name() {
                 let context = Context::new();
                 let location = context.unknown_location();
-                let module = context.module(location);
+                let module = context.module(location).unwrap();
                 let value_type = context.$value_type($($value_type_arguments)*);
-                module.body().append_operation({
+                module.body().unwrap().append_operation({
                     let mut block = context.block(&[(value_type, location)]);
                     let input = block.argument(0).unwrap();
-                    let op = $constructor(input, location);
-                    assert_eq!(op.input(), input);
-                    assert_eq!(op.output_type(), value_type);
-                    assert_eq!(op.operands().count(), 1);
-                    assert_eq!(op.results().count(), 1);
-                    assert_eq!(op.regions().count(), 0);
-                    assert_eq!(op.successors().count(), 0);
-                    let op = block.append_operation(op);
-                    block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+                    let op = $constructor(input, location).unwrap();
+                    assert_eq!(op.input().unwrap(), input);
+                    assert_eq!(op.output_type().unwrap(), value_type);
+                    assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                    assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                    assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                    assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                    let op = block.append_operation(op).unwrap();
+                    block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                     func::func(
                         $function_name,
                         func::FuncAttributes {
@@ -739,11 +758,11 @@ mod tests {
                             results: vec![value_type.into()],
                             ..Default::default()
                         },
-                        block.into(),
+                        block.try_into().unwrap(),
                         location,
-                    )
-                });
-                assert!(module.verify());
+                    ).unwrap()
+                }).unwrap();
+                assert!(module.verify().unwrap());
                 assert_eq!(module.to_string(), indoc! { $expected });
             }
         };
@@ -762,21 +781,22 @@ mod tests {
             fn $test_name() {
                 let context = Context::new();
                 let location = context.unknown_location();
-                let module = context.module(location);
-                let input_type = context.$input_type($($input_type_arguments)*);
-                let output_type = context.$output_type($($output_type_arguments)*);
-                module.body().append_operation({
+                let module = context.module(location).unwrap();
+                let input_type = llvm_generic_unary_operation_test_type!(context, $input_type($($input_type_arguments)*));
+                let output_type =
+                    llvm_generic_unary_operation_test_type!(context, $output_type($($output_type_arguments)*));
+                module.body().unwrap().append_operation({
                     let mut block = context.block(&[(input_type, location)]);
                     let input = block.argument(0).unwrap();
-                    let op = $constructor(input, output_type, location);
-                    assert_eq!(op.input(), input);
-                    assert_eq!(op.output_type(), output_type);
-                    assert_eq!(op.operands().count(), 1);
-                    assert_eq!(op.results().count(), 1);
-                    assert_eq!(op.regions().count(), 0);
-                    assert_eq!(op.successors().count(), 0);
-                    let op = block.append_operation(op);
-                    block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
+                    let op = $constructor(input, output_type, location).unwrap();
+                    assert_eq!(op.input().unwrap(), input);
+                    assert_eq!(op.output_type().unwrap(), output_type);
+                    assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                    assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                    assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                    assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                    let op = block.append_operation(op).unwrap();
+                    block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                     func::func(
                         $function_name,
                         func::FuncAttributes {
@@ -784,13 +804,22 @@ mod tests {
                             results: vec![output_type.into()],
                             ..Default::default()
                         },
-                        block.into(),
+                        block.try_into().unwrap(),
                         location,
-                    )
-                });
-                assert!(module.verify());
+                    ).unwrap()
+                }).unwrap();
+                assert!(module.verify().unwrap());
                 assert_eq!(module.to_string(), indoc! { $expected });
             }
+        };
+    }
+
+    macro_rules! llvm_generic_unary_operation_test_type {
+        ($context:ident, llvm_pointer_type($($arguments:tt)*)) => {
+            $context.llvm_pointer_type($($arguments)*).unwrap()
+        };
+        ($context:ident, $type_constructor:ident($($arguments:tt)*)) => {
+            $context.$type_constructor($($arguments)*)
         };
     }
 
@@ -1307,38 +1336,43 @@ mod tests {
     fn test_icmp() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        context.load_dialect(DialectHandle::llvm());
+        let module = context.module(location).unwrap();
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let input_type = context.signless_integer_type(32);
         let output_type = context.signless_integer_type(1);
         let predicate = context.integer_attribute(context.signless_integer_type(64), 4);
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (input_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = icmp(predicate, lhs, rhs, output_type, location);
-            assert_eq!(op.predicate(), predicate);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.output_type(), output_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_icmp_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), input_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (input_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = icmp(predicate, lhs, rhs, output_type, location).unwrap();
+                assert_eq!(op.predicate().unwrap(), predicate);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.output_type().unwrap(), output_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_icmp_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), input_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1356,40 +1390,45 @@ mod tests {
     fn test_fcmp() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        context.load_dialect(DialectHandle::llvm());
+        let module = context.module(location).unwrap();
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
         let input_type = context.float32_type();
         let output_type = context.signless_integer_type(1);
         let predicate = context.integer_attribute(context.signless_integer_type(64), 2);
         let fastmath_flags = context.parse_attribute("#llvm.fastmath<none>").unwrap();
-        module.body().append_operation({
-            let mut block = context.block(&[(input_type, location), (input_type, location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = fcmp(predicate, lhs, rhs, output_type, Some(fastmath_flags), location);
-            assert_eq!(op.predicate(), predicate);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(op.fastmath_flags().unwrap(), fastmath_flags);
-            assert_eq!(op.output_type(), output_type);
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_fcmp_test",
-                func::FuncAttributes {
-                    arguments: vec![input_type.into(), input_type.into()],
-                    results: vec![output_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (input_type, location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = fcmp(predicate, lhs, rhs, output_type, Some(fastmath_flags), location).unwrap();
+                assert_eq!(op.predicate().unwrap(), predicate);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.fastmath_flags().unwrap().unwrap(), fastmath_flags);
+                assert_eq!(op.output_type().unwrap(), output_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_fcmp_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), input_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1407,37 +1446,42 @@ mod tests {
     fn test_select() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i1_type, location), (i32_type, location), (i32_type, location)]);
-            let condition = block.argument(0).unwrap();
-            let true_value = block.argument(1).unwrap();
-            let false_value = block.argument(2).unwrap();
-            let op = select(condition, true_value, false_value, location);
-            assert_eq!(op.condition(), condition);
-            assert_eq!(op.true_value(), true_value);
-            assert_eq!(op.false_value(), false_value);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operands().count(), 3);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_select_test",
-                func::FuncAttributes {
-                    arguments: vec![i1_type.into(), i32_type.into(), i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i1_type, location), (i32_type, location), (i32_type, location)]);
+                let condition = block.argument(0).unwrap();
+                let true_value = block.argument(1).unwrap();
+                let false_value = block.argument(2).unwrap();
+                let op = select(condition, true_value, false_value, location).unwrap();
+                assert_eq!(op.condition().unwrap(), condition);
+                assert_eq!(op.true_value().unwrap(), true_value);
+                assert_eq!(op.false_value().unwrap(), false_value);
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_select_test",
+                    func::FuncAttributes {
+                        arguments: vec![i1_type.into(), i32_type.into(), i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1455,25 +1499,30 @@ mod tests {
     fn test_constant() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = constant(context.integer_attribute(i32_type, 42), i32_type, location);
-            assert_eq!(op.value(), context.integer_attribute(i32_type, 42));
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_constant_test",
-                func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = constant(context.integer_attribute(i32_type, 42), i32_type, location).unwrap();
+                assert_eq!(op.value().unwrap(), context.integer_attribute(i32_type, 42));
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_constant_test",
+                    func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1491,26 +1540,31 @@ mod tests {
     fn test_undef() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = undef(i32_type, location);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_undef_test",
-                func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = undef(i32_type, location).unwrap();
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_undef_test",
+                    func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1528,26 +1582,31 @@ mod tests {
     fn test_poison() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = poison(i32_type, location);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_poison_test",
-                func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = poison(i32_type, location).unwrap();
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_poison_test",
+                    func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1565,26 +1624,31 @@ mod tests {
     fn test_zero() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = zero(i32_type, location);
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_zero_test",
-                func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = zero(i32_type, location).unwrap();
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_zero_test",
+                    func::FuncAttributes { arguments: vec![], results: vec![i32_type.into()], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1602,36 +1666,41 @@ mod tests {
     fn test_alloca() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let pointer_type = context.llvm_pointer_type(0);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location)]);
-            let array_size = block.argument(0).unwrap();
-            let op = alloca(array_size, i32_type, pointer_type, Some(16), true, location);
-            assert_eq!(op.array_size(), array_size);
-            assert_eq!(op.element_type(), i32_type);
-            assert_eq!(op.alignment(), Some(16));
-            assert!(op.inalloca());
-            assert_eq!(op.output_type(), pointer_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_alloca_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![pointer_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location)]);
+                let array_size = block.argument(0).unwrap();
+                let op = alloca(array_size, i32_type, pointer_type, Some(16), true, location).unwrap();
+                assert_eq!(op.array_size().unwrap(), array_size);
+                assert_eq!(op.element_type().unwrap(), i32_type);
+                assert_eq!(op.alignment().unwrap(), Some(16));
+                assert!(op.inalloca());
+                assert_eq!(op.output_type().unwrap(), pointer_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_alloca_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![pointer_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1649,35 +1718,40 @@ mod tests {
     fn test_load() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let pointer_type = context.llvm_pointer_type(0);
-        module.body().append_operation({
-            let mut block = context.block(&[(pointer_type, location)]);
-            let pointer = block.argument(0).unwrap();
-            let op = load(pointer, i32_type, Some(4), true, location);
-            assert_eq!(op.address(), pointer);
-            assert_eq!(op.alignment(), Some(4));
-            assert!(op.is_volatile());
-            assert_eq!(op.output_type(), i32_type);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_load_test",
-                func::FuncAttributes {
-                    arguments: vec![pointer_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(pointer_type, location)]);
+                let pointer = block.argument(0).unwrap();
+                let op = load(pointer, i32_type, Some(4), true, location).unwrap();
+                assert_eq!(op.address().unwrap(), pointer);
+                assert_eq!(op.alignment().unwrap(), Some(4));
+                assert!(op.is_volatile());
+                assert_eq!(op.output_type().unwrap(), i32_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_load_test",
+                    func::FuncAttributes {
+                        arguments: vec![pointer_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1695,36 +1769,41 @@ mod tests {
     fn test_store() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let pointer_type = context.llvm_pointer_type(0);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (pointer_type.as_ref(), location)]);
-            let value = block.argument(0).unwrap();
-            let pointer = block.argument(1).unwrap();
-            let op = store(value, pointer, Some(4), true, location);
-            assert_eq!(op.value(), value);
-            assert_eq!(op.address(), pointer);
-            assert_eq!(op.alignment(), Some(4));
-            assert!(op.is_volatile());
-            assert_eq!(op.operands().count(), 2);
-            assert_eq!(op.results().count(), 0);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            block.append_operation(op);
-            block.append_operation(func::r#return::<ValueRef, _>(&[], location));
-            func::func(
-                "llvm_store_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into(), pointer_type.into()],
-                    results: vec![],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (pointer_type.as_ref(), location)]);
+                let value = block.argument(0).unwrap();
+                let pointer = block.argument(1).unwrap();
+                let op = store(value, pointer, Some(4), true, location).unwrap();
+                assert_eq!(op.value().unwrap(), value);
+                assert_eq!(op.address().unwrap(), pointer);
+                assert_eq!(op.alignment().unwrap(), Some(4));
+                assert!(op.is_volatile());
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_store_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into(), pointer_type.into()],
+                        results: vec![],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1742,30 +1821,35 @@ mod tests {
     fn test_return() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location)]);
-            let argument = block.argument(0).unwrap();
-            let op = r#return(Some(argument.into()), location);
-            assert_eq!(op.argument(), Some(argument.into()));
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 0);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            block.append_operation(op);
-            func::func(
-                "llvm_return_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location)]);
+                let argument = block.argument(0).unwrap();
+                let op = r#return(Some(argument.into()), location).unwrap();
+                assert_eq!(op.argument().unwrap(), Some(argument.into()));
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                block.append_operation(op).unwrap();
+                func::func(
+                    "llvm_return_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1782,36 +1866,43 @@ mod tests {
     fn test_br() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation({
-            let mut entry_block = context.block(&[(i32_type, location)]);
-            let mut target_block = context.block(&[(i32_type, location)]);
-            let argument = entry_block.argument(0).unwrap();
-            let op = br(&target_block, &[argument], location);
-            assert_eq!(op.destination(), BlockRef::from(&target_block));
-            assert_eq!(op.destination_operands(), vec![argument]);
-            assert_eq!(op.operands().count(), 1);
-            assert_eq!(op.results().count(), 0);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 1);
-            entry_block.append_operation(op);
-            target_block.append_operation(func::r#return(&[target_block.argument(0).unwrap()], location));
-            let mut region = context.region();
-            region.append_block(entry_block);
-            region.append_block(target_block);
-            func::func(
-                "llvm_br_test",
-                func::FuncAttributes {
-                    arguments: vec![i32_type.into()],
-                    results: vec![i32_type.into()],
-                    ..Default::default()
-                },
-                region,
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut entry_block = context.block(&[(i32_type, location)]);
+                let mut target_block = context.block(&[(i32_type, location)]);
+                let argument = entry_block.argument(0).unwrap();
+                let op = br(&target_block, &[argument], location).unwrap();
+                assert_eq!(op.destination().unwrap(), target_block.as_ref());
+                assert_eq!(op.destination_operands().unwrap(), vec![argument]);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                entry_block.append_operation(op).unwrap();
+                target_block
+                    .append_operation(func::r#return(&[target_block.argument(0).unwrap()], location).unwrap())
+                    .unwrap();
+                let mut region = context.region();
+                region.append_block(entry_block).unwrap();
+                region.append_block(target_block).unwrap();
+                func::func(
+                    "llvm_br_test",
+                    func::FuncAttributes {
+                        arguments: vec![i32_type.into()],
+                        results: vec![i32_type.into()],
+                        ..Default::default()
+                    },
+                    region,
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1830,23 +1921,28 @@ mod tests {
     fn test_unreachable() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = unreachable(location);
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 0);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            block.append_operation(op);
-            func::func(
-                "llvm_unreachable_test",
-                func::FuncAttributes { arguments: vec![], results: vec![], ..Default::default() },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        let module = context.module(location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = unreachable(location).unwrap();
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                block.append_operation(op).unwrap();
+                func::func(
+                    "llvm_unreachable_test",
+                    func::FuncAttributes { arguments: vec![], results: vec![], ..Default::default() },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1863,40 +1959,53 @@ mod tests {
     fn test_address_of() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let pointer_type = context.llvm_pointer_type(0);
+        let module = context.module(location).unwrap();
+        let pointer_type = context.llvm_pointer_type(0).unwrap();
         let input_types: [TypeRef; 0] = [];
-        module.body().append_operation(
-            OperationBuilder::new("llvm.func", location)
-                .add_attribute("sym_name", context.string_attribute("global"))
-                .add_attribute(
-                    "function_type",
-                    context.type_attribute(context.llvm_function_type(pointer_type, &input_types, false)),
-                )
-                .add_attribute("linkage", context.llvm_linkage_attribute(Linkage::External))
-                .add_region(context.region())
-                .build()
-                .expect("invalid `llvm.func` declaration"),
-        );
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = address_of("global", pointer_type, location);
-            assert_eq!(op.global_name().as_str(), Ok("global"));
-            assert_eq!(op.output_type(), pointer_type);
-            assert_eq!(op.operands().count(), 0);
-            assert_eq!(op.results().count(), 1);
-            assert_eq!(op.regions().count(), 0);
-            assert_eq!(op.successors().count(), 0);
-            let op = block.append_operation(op);
-            block.append_operation(func::r#return(&[op.result(0).unwrap()], location));
-            func::func(
-                "llvm_address_of_test",
-                func::FuncAttributes { arguments: vec![], results: vec![pointer_type.into()], ..Default::default() },
-                block.into(),
-                location,
+        module
+            .body()
+            .unwrap()
+            .append_operation(
+                OperationBuilder::new("llvm.func", location)
+                    .add_attribute("sym_name", context.string_attribute("global"))
+                    .add_attribute(
+                        "function_type",
+                        context.type_attribute(context.llvm_function_type(pointer_type, &input_types, false).unwrap()),
+                    )
+                    .add_attribute("linkage", context.llvm_linkage_attribute(Linkage::External).unwrap())
+                    .add_region(context.region())
+                    .build()
+                    .expect("invalid `llvm.func` declaration"),
             )
-        });
-        assert!(module.verify());
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = address_of("global", pointer_type, location).unwrap();
+                assert_eq!(op.global_name().unwrap().as_str(), Ok("global"));
+                assert_eq!(op.output_type().unwrap(), pointer_type);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "llvm_address_of_test",
+                    func::FuncAttributes {
+                        arguments: vec![],
+                        results: vec![pointer_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

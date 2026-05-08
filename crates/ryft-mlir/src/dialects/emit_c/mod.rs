@@ -6,10 +6,9 @@
 //! platform-sized integer types.
 //!
 //! Refer to the [official MLIR Emit-C documentation](https://mlir.llvm.org/docs/Dialects/emitc/) for more information.
-
 use ryft_xla_sys::bindings::mlirGetDialectHandle__emitc__;
 
-use crate::DialectHandle;
+use crate::{DialectHandle, Error};
 
 pub mod attributes;
 pub mod operations;
@@ -21,8 +20,8 @@ pub use types::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `emitc` [`Dialect`](crate::Dialect).
-    pub fn emit_c() -> Self {
-        unsafe { Self::from_c_api(mlirGetDialectHandle__emitc__()).unwrap() }
+    pub fn emit_c() -> Result<Self, Error> {
+        unsafe { Self::from_c_api(mlirGetDialectHandle__emitc__()) }
     }
 }
 
@@ -34,7 +33,7 @@ mod tests {
 
     #[test]
     fn test_emit_c_dialect() {
-        let handle = DialectHandle::emit_c();
+        let handle = DialectHandle::emit_c().unwrap();
         assert_eq!(handle.namespace().unwrap(), "emitc");
 
         // Check that registration works both in the context and in a registry.
@@ -45,12 +44,11 @@ mod tests {
 
         // Check that loading works.
         let context = Context::new();
-        let dialect_1 = context.load_dialect(handle);
-        assert!(dialect_1.is_some());
-        assert_eq!(dialect_1.unwrap().namespace().unwrap(), "emitc");
+        let dialect_1 = context.load_dialect(handle).unwrap();
+        assert_eq!(dialect_1.namespace().unwrap(), "emitc");
 
         // Check that comparison works.
-        let dialect_2 = context.load_dialect(DialectHandle::emit_c());
+        let dialect_2 = context.load_dialect(DialectHandle::emit_c().unwrap()).unwrap();
         assert_eq!(dialect_1, dialect_2);
     }
 }

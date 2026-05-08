@@ -3,7 +3,7 @@ use ryft_xla_sys::bindings::{
     mlirVectorTypeGetScalableChecked, mlirVectorTypeGetTypeID, mlirVectorTypeIsDimScalable, mlirVectorTypeIsScalable,
 };
 
-use crate::{Context, Location, Type, TypeId, mlir_subtype_trait_impls};
+use crate::{Context, Error, Location, Type, TypeId, mlir_subtype_trait_impls};
 
 use super::ShapedType;
 
@@ -48,8 +48,8 @@ pub struct VectorTypeRef<'c, 't> {
 
 impl<'c, 't> VectorTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`VectorTypeRef`].
-    pub fn type_id() -> TypeId<'static> {
-        unsafe { TypeId::from_c_api(mlirVectorTypeGetTypeID()).unwrap() }
+    pub fn type_id() -> Result<TypeId<'static>, Error> {
+        unsafe { TypeId::from_c_api(mlirVectorTypeGetTypeID()) }
     }
 
     /// Returns the rank of this [`VectorTypeRef`] (i.e., the number of dimensions it has).
@@ -59,22 +59,31 @@ impl<'c, 't> VectorTypeRef<'c, 't> {
 
     /// Returns all dimension [`VectorTypeDimension`]s of this [`VectorTypeRef`].
     pub fn dimensions(&self) -> impl Iterator<Item = VectorTypeDimension> {
-        (0..self.rank()).map(|dimension| self.dimension(dimension))
+        (0..self.rank()).map(|dimension| {
+            let size = unsafe { mlirShapedTypeGetDimSize(self.to_c_api(), dimension.cast_signed()) as usize };
+            if unsafe { mlirVectorTypeIsDimScalable(self.handle, dimension.cast_signed()) } {
+                VectorTypeDimension::Scalable(size)
+            } else {
+                VectorTypeDimension::Fixed(size)
+            }
+        })
     }
 
-    /// Returns the `dimension`-th [`VectorTypeDimension`] of this [`VectorTypeRef`].
-    ///
-    /// Note that this function will panic if the provided dimension is out of bounds.
-    pub fn dimension(&self, dimension: usize) -> VectorTypeDimension {
-        if dimension >= self.rank() {
-            panic!("dimension is out of bounds");
+    /// Returns the `dimension`-th [`VectorTypeDimension`] of this [`VectorTypeRef`], or an error if `dimension` is out
+    /// of bounds.
+    pub fn dimension(&self, dimension: usize) -> Result<VectorTypeDimension, Error> {
+        let rank = self.rank();
+        if dimension >= rank {
+            return Err(Error::invalid_argument(format!(
+                "vector type dimension {dimension} is out of bounds for rank {rank}"
+            )));
         }
         let size = unsafe { mlirShapedTypeGetDimSize(self.to_c_api(), dimension.cast_signed()) as usize };
-        if self.is_dimension_scalable(dimension) {
+        Ok(if unsafe { mlirVectorTypeIsDimScalable(self.handle, dimension.cast_signed()) } {
             VectorTypeDimension::Scalable(size)
         } else {
             VectorTypeDimension::Fixed(size)
-        }
+        })
     }
 
     /// Returns `true` if this [`VectorTypeRef`] is scalable (i.e., has at least one scalable dimension),
@@ -83,14 +92,16 @@ impl<'c, 't> VectorTypeRef<'c, 't> {
         unsafe { mlirVectorTypeIsScalable(self.handle) }
     }
 
-    /// Returns `true` if the `dimension`-th dimension of this [`VectorTypeRef`] is scalable, and `false` otherwise.
-    ///
-    /// Note that this function will panic if the provided dimension is out of bounds.
-    pub fn is_dimension_scalable(&self, dimension: usize) -> bool {
-        if dimension >= self.rank() {
-            panic!("dimension is out of bounds");
+    /// Returns `true` if the `dimension`-th dimension of this [`VectorTypeRef`] is scalable, `false` if it is not, and
+    /// an error if `dimension` is out of bounds.
+    pub fn is_dimension_scalable(&self, dimension: usize) -> Result<bool, Error> {
+        let rank = self.rank();
+        if dimension >= rank {
+            return Err(Error::invalid_argument(format!(
+                "vector type dimension {dimension} is out of bounds for rank {rank}"
+            )));
         }
-        unsafe { mlirVectorTypeIsDimScalable(self.handle, dimension.cast_signed()) }
+        Ok(unsafe { mlirVectorTypeIsDimScalable(self.handle, dimension.cast_signed()) })
     }
 }
 
@@ -100,7 +111,7 @@ mlir_subtype_trait_impls!(VectorTypeRef<'c, 't> as Type, mlir_type = Type, mlir_
 
 impl<'t> Context<'t> {
     /// Creates a new [`VectorTypeRef`] owned by this [`Context`]. If any of the arguments are invalid, then this
-    /// function will return [`None`] and will also emit the appropriate diagnostics at the provided location. For
+    /// function will return an [`Error`] and will also emit the appropriate diagnostics at the provided location. For
     /// example, this can happen if `element_type` is not an [`IndexTypeRef`](crate::IndexTypeRef), an
     /// [`IntegerTypeRef`](crate::IntegerTypeRef), or a [`FloatType`](crate::FloatTypeRef).
     pub fn vector_type<'c, T: Type<'c, 't>, L: Location<'c, 't>>(
@@ -108,7 +119,7 @@ impl<'t> Context<'t> {
         element_type: T,
         shape: &[VectorTypeDimension],
         location: L,
-    ) -> Option<VectorTypeRef<'c, 't>> {
+    ) -> Result<VectorTypeRef<'c, 't>, Error> {
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
@@ -145,6 +156,7 @@ impl<'t> Context<'t> {
                 )
             };
             VectorTypeRef::from_c_api(handle, self)
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::vector_type`"))
         }
     }
 }
@@ -161,11 +173,13 @@ mod tests {
     fn test_vector_type_type_id() {
         let context = Context::new();
         let location = context.unknown_location();
-        let vector_type = VectorTypeRef::type_id();
-        let vector_type_1 = context.vector_type(context.float32_type(), &[VectorTypeDimension::Fixed(16)], location);
-        let vector_type_2 = context.vector_type(context.float32_type(), &[VectorTypeDimension::Fixed(32)], location);
-        assert_eq!(vector_type_1.unwrap().type_id(), vector_type_2.unwrap().type_id());
-        assert_eq!(vector_type, vector_type_1.unwrap().type_id());
+        let vector_type_id = VectorTypeRef::type_id().unwrap();
+        let vector_type_1 =
+            context.vector_type(context.float32_type(), &[VectorTypeDimension::Fixed(16)], location).unwrap();
+        let vector_type_2 =
+            context.vector_type(context.float32_type(), &[VectorTypeDimension::Fixed(32)], location).unwrap();
+        assert_eq!(vector_type_1.type_id().unwrap(), vector_type_2.type_id().unwrap());
+        assert_eq!(vector_type_id, vector_type_1.type_id().unwrap());
     }
 
     #[test]
@@ -180,18 +194,22 @@ mod tests {
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.rank(), 1);
         assert_eq!(r#type.dimensions().collect::<Vec<_>>(), shape);
-        assert_eq!(r#type.dimension(0), VectorTypeDimension::Fixed(16));
+        assert_eq!(r#type.dimension(0).unwrap(), VectorTypeDimension::Fixed(16));
+        assert!(r#type.dimension(1).is_err());
         assert!(!r#type.is_scalable());
-        assert!(!r#type.is_dimension_scalable(0));
-        assert_eq!(r#type.element_type(), element_type);
+        assert!(!r#type.is_dimension_scalable(0).unwrap());
+        assert!(r#type.is_dimension_scalable(1).is_err());
+        assert_eq!(r#type.element_type().unwrap(), element_type);
 
         // Scalable dimension.
         let shape = vec![VectorTypeDimension::Scalable(4)];
         let r#type = context.vector_type(element_type, &shape, location).unwrap();
         assert_eq!(r#type.rank(), 1);
-        assert_eq!(r#type.dimension(0), VectorTypeDimension::Scalable(4));
+        assert_eq!(r#type.dimension(0).unwrap(), VectorTypeDimension::Scalable(4));
+        assert!(r#type.dimension(1).is_err());
         assert!(r#type.is_scalable());
-        assert!(r#type.is_dimension_scalable(0));
+        assert!(r#type.is_dimension_scalable(0).unwrap());
+        assert!(r#type.is_dimension_scalable(1).is_err());
 
         // Mixed dimensions.
         let shape = vec![
@@ -203,20 +221,22 @@ mod tests {
         let r#type = context.vector_type(element_type, &shape, location).unwrap();
         assert_eq!(r#type.rank(), 4);
         assert_eq!(r#type.dimensions().collect::<Vec<_>>(), shape);
-        assert_eq!(r#type.dimension(0), VectorTypeDimension::Fixed(32));
-        assert_eq!(r#type.dimension(1), VectorTypeDimension::Scalable(4));
-        assert_eq!(r#type.dimension(2), VectorTypeDimension::Scalable(2));
-        assert_eq!(r#type.dimension(3), VectorTypeDimension::Fixed(2));
+        assert_eq!(r#type.dimension(0).unwrap(), VectorTypeDimension::Fixed(32));
+        assert_eq!(r#type.dimension(1).unwrap(), VectorTypeDimension::Scalable(4));
+        assert_eq!(r#type.dimension(2).unwrap(), VectorTypeDimension::Scalable(2));
+        assert_eq!(r#type.dimension(3).unwrap(), VectorTypeDimension::Fixed(2));
+        assert!(r#type.dimension(4).is_err());
         assert!(r#type.is_scalable());
-        assert!(!r#type.is_dimension_scalable(0));
-        assert!(r#type.is_dimension_scalable(1));
-        assert!(r#type.is_dimension_scalable(2));
-        assert!(!r#type.is_dimension_scalable(3));
+        assert!(!r#type.is_dimension_scalable(0).unwrap());
+        assert!(r#type.is_dimension_scalable(1).unwrap());
+        assert!(r#type.is_dimension_scalable(2).unwrap());
+        assert!(!r#type.is_dimension_scalable(3).unwrap());
+        assert!(r#type.is_dimension_scalable(4).is_err());
 
         // Invalid element type.
         let shape = vec![VectorTypeDimension::Fixed(16)];
         let r#type = context.vector_type(context.none_type(), &shape, location);
-        assert!(r#type.is_none());
+        assert!(r#type.is_err());
     }
 
     #[test]
@@ -227,25 +247,25 @@ mod tests {
         let shape = vec![VectorTypeDimension::Fixed(16)];
 
         // Same types from the same context must be equal because they are "uniqued".
-        let type_1 = context.vector_type(element_type, &shape, location);
-        let type_2 = context.vector_type(element_type, &shape, location);
+        let type_1 = context.vector_type(element_type, &shape, location).unwrap();
+        let type_2 = context.vector_type(element_type, &shape, location).unwrap();
         assert_eq!(type_1, type_2);
 
         // Different shapes from the same context must not be equal.
         let other_shape = vec![VectorTypeDimension::Fixed(32)];
-        let type_2 = context.vector_type(element_type, &other_shape, location);
+        let type_2 = context.vector_type(element_type, &other_shape, location).unwrap();
         assert_ne!(type_1, type_2);
 
         // Fixed vs scalable dimensions must not be equal.
         let scalable_shape = vec![VectorTypeDimension::Scalable(16)];
-        let type_2 = context.vector_type(element_type, &scalable_shape, location);
+        let type_2 = context.vector_type(element_type, &scalable_shape, location).unwrap();
         assert_ne!(type_1, type_2);
 
         // Same types from different contexts must not be equal.
         let context = Context::new();
         let location = context.unknown_location();
         let element_type = context.float32_type();
-        let type_2 = context.vector_type(element_type, &shape, location);
+        let type_2 = context.vector_type(element_type, &shape, location).unwrap();
         assert_ne!(type_1, type_2);
     }
 

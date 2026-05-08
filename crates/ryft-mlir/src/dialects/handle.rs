@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use ryft_xla_sys::bindings::{MlirDialectHandle, mlirDialectHandleGetNamespace};
 
-use crate::{Context, StringRef};
+use crate::{Context, Error, StringRef};
 
 /// [`DialectHandle`]s are the means by which dialects can be referred to and registered in MLIR.
 #[derive(Copy, Clone, Debug)]
@@ -23,8 +23,12 @@ impl<'c, 't> DialectHandle<'c, 't> {
     /// safe and should not be necessary outside of this library. However, it is still supported via making functions
     /// like this one public so that users of this library can extend it with yet unsupported features that the
     /// underlying MLIR C API supports.
-    pub unsafe fn from_c_api(handle: MlirDialectHandle) -> Option<Self> {
-        if handle.ptr.is_null() { None } else { Some(Self { handle, owner: PhantomData }) }
+    pub unsafe fn from_c_api(handle: MlirDialectHandle) -> Result<Self, Error> {
+        if handle.ptr.is_null() {
+            Err(Error::internal("expected non-null MLIR dialect handle"))
+        } else {
+            Ok(Self { handle, owner: PhantomData })
+        }
     }
 
     /// Returns the [`MlirDialectHandle`] that corresponds to this [`DialectHandle`]
@@ -53,25 +57,25 @@ mod tests {
 
     #[test]
     fn test_dialect_handle() {
-        assert_eq!(DialectHandle::affine().namespace().unwrap(), "affine");
-        assert_eq!(DialectHandle::r#async().namespace().unwrap(), "async");
-        assert_eq!(DialectHandle::emit_c().namespace().unwrap(), "emitc");
-        assert_eq!(DialectHandle::func().namespace().unwrap(), "func");
-        assert_eq!(DialectHandle::gpu().namespace().unwrap(), "gpu");
-        assert_eq!(DialectHandle::linalg().namespace().unwrap(), "linalg");
-        assert_eq!(DialectHandle::nvgpu().namespace().unwrap(), "nvgpu");
-        assert_eq!(DialectHandle::sparse_tensor().namespace().unwrap(), "sparse_tensor");
-        assert_eq!(DialectHandle::tensor().namespace().unwrap(), "tensor");
-        assert_eq!(DialectHandle::transform().namespace().unwrap(), "transform");
+        assert_eq!(DialectHandle::affine().unwrap().namespace().unwrap(), "affine");
+        assert_eq!(DialectHandle::r#async().unwrap().namespace().unwrap(), "async");
+        assert_eq!(DialectHandle::emit_c().unwrap().namespace().unwrap(), "emitc");
+        assert_eq!(DialectHandle::func().unwrap().namespace().unwrap(), "func");
+        assert_eq!(DialectHandle::gpu().unwrap().namespace().unwrap(), "gpu");
+        assert_eq!(DialectHandle::linalg().unwrap().namespace().unwrap(), "linalg");
+        assert_eq!(DialectHandle::nvgpu().unwrap().namespace().unwrap(), "nvgpu");
+        assert_eq!(DialectHandle::sparse_tensor().unwrap().namespace().unwrap(), "sparse_tensor");
+        assert_eq!(DialectHandle::tensor().unwrap().namespace().unwrap(), "tensor");
+        assert_eq!(DialectHandle::transform().unwrap().namespace().unwrap(), "transform");
 
         // Check that we can construct multiple handles for the same dialect.
-        let handle_1 = DialectHandle::gpu();
-        let handle_2 = DialectHandle::gpu();
+        let handle_1 = DialectHandle::gpu().unwrap();
+        let handle_2 = DialectHandle::gpu().unwrap();
         assert_eq!(handle_1.namespace().unwrap(), handle_2.namespace().unwrap());
 
         // Check that dialect handles integrate properly with the MLIR C API.
-        let handle = unsafe { DialectHandle::from_c_api(DialectHandle::gpu().to_c_api()) };
-        assert!(handle.is_some());
+        let handle = unsafe { DialectHandle::from_c_api(DialectHandle::gpu().unwrap().to_c_api()) };
+        assert!(handle.is_ok());
         assert_eq!(handle.unwrap().namespace().unwrap(), "gpu");
     }
 }

@@ -1,7 +1,7 @@
 use crate::{
     ArrayAttributeRef, Attribute, AttributeRef, DenseInteger64ArrayAttributeRef, DetachedOp, DetachedRegion,
-    DialectHandle, FlatSymbolRefAttributeRef, FunctionTypeRef, IntoWithContext, Location, Operation, OperationBuilder,
-    RegionRef, StringAttributeRef, StringRef, Type, TypeAttributeRef, TypeRef, Value, ValueRef, mlir_op, mlir_op_trait,
+    DialectHandle, Error, FlatSymbolRefAttributeRef, FunctionTypeRef, Location, Operation, OperationBuilder, RegionRef,
+    StringAttributeRef, StringRef, TryIntoWithContext, Type, TypeRef, Value, ValueRef, mlir_op, mlir_op_trait,
 };
 
 use super::{CmpPredicate, CmpPredicateAttributeRef};
@@ -12,16 +12,13 @@ pub const FILE_ID_ATTRIBUTE: &str = "id";
 /// Operation trait for `emitc.file`.
 pub trait FileOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the file identifier used by `mlir-translate-file-id`.
-    fn id(&self) -> StringRef<'c> {
-        self.attribute(FILE_ID_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{FILE_ID_ATTRIBUTE}' attribute in `emitc::file`"))
+    fn id(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(FILE_ID_ATTRIBUTE)?.string())
     }
 
     /// Returns the file body region.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -33,49 +30,50 @@ mlir_op_trait!(File, SymbolTable);
 mlir_op_trait!(File, ZeroSuccessors);
 
 /// Constructs a new detached [`FileOperation`].
-pub fn file<'c, 't: 'c, I: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
+pub fn file<'c, 't: 'c, I: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
     id: I,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedFileOperation<'c, 't> {
+) -> Result<DetachedFileOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.file", location)
-        .add_attribute(FILE_ID_ATTRIBUTE, id.into_with_context(context))
+        .add_attribute(FILE_ID_ATTRIBUTE, id.try_into_with_context(context)?)
         .add_region(body)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::file`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::file`"))
+        })
 }
 
 /// Common API for single-operand Emit-C expression operations.
 pub trait UnaryExpressionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns this operation's operand.
-    fn operand(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn operand(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns this operation's result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
 /// Common API for two-operand Emit-C expression operations.
 pub trait BinaryExpressionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand-side operand.
-    fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the right-hand-side operand.
-    fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns this operation's result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -101,15 +99,16 @@ pub fn address_of<
     reference: Reference,
     result_type: ResultType,
     location: L,
-) -> DetachedAddressOfOperation<'c, 't> {
+) -> Result<DetachedAddressOfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.address_of", location)
         .add_operand(reference)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::address_of`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::address_of`"))
+        })
 }
 
 /// Operation trait for `emitc.add`.
@@ -136,15 +135,16 @@ pub fn add<
     rhs: Rhs,
     result_type: ResultType,
     location: L,
-) -> DetachedAddOperation<'c, 't> {
+) -> Result<DetachedAddOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.add", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::add`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::add`"))
+        })
 }
 
 /// Name of the `emitc.apply` operator attribute.
@@ -153,11 +153,8 @@ pub const APPLICABLE_OPERATOR_ATTRIBUTE: &str = "applicableOperator";
 /// Operation trait for `emitc.apply`.
 pub trait ApplyOperation<'o, 'c: 'o, 't: 'c>: UnaryExpressionOperation<'o, 'c, 't> {
     /// Returns the operator applied by this deprecated operation.
-    fn applicable_operator(&self) -> StringRef<'c> {
-        self.attribute(APPLICABLE_OPERATOR_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{APPLICABLE_OPERATOR_ATTRIBUTE}' attribute in `emitc::apply`"))
+    fn applicable_operator(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(APPLICABLE_OPERATOR_ATTRIBUTE)?.string())
     }
 }
 
@@ -175,23 +172,24 @@ pub fn apply<
     't: 'c,
     Operand: Value<'operand, 'c, 't>,
     ResultType: Type<'c, 't>,
-    O: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    O: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     L: Location<'c, 't>,
 >(
     applicable_operator: O,
     operand: Operand,
     result_type: ResultType,
     location: L,
-) -> DetachedApplyOperation<'c, 't> {
+) -> Result<DetachedApplyOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.apply", location)
-        .add_attribute(APPLICABLE_OPERATOR_ATTRIBUTE, applicable_operator.into_with_context(context))
+        .add_attribute(APPLICABLE_OPERATOR_ATTRIBUTE, applicable_operator.try_into_with_context(context)?)
         .add_operand(operand)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::apply`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::apply`"))
+        })
 }
 
 /// Operation trait for `emitc.bitwise_and`.
@@ -218,15 +216,18 @@ pub fn bitwise_and<
     rhs: Rhs,
     result_type: ResultType,
     location: L,
-) -> DetachedBitwiseAndOperation<'c, 't> {
+) -> Result<DetachedBitwiseAndOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_and", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::bitwise_and`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::bitwise_and`"))
+        })
 }
 
 /// Operation trait for `emitc.bitwise_left_shift`.
@@ -253,15 +254,18 @@ pub fn bitwise_left_shift<
     rhs: Rhs,
     result_type: ResultType,
     location: L,
-) -> DetachedBitwiseLeftShiftOperation<'c, 't> {
+) -> Result<DetachedBitwiseLeftShiftOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_left_shift", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::bitwise_left_shift`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::bitwise_left_shift`"))
+        })
 }
 
 /// Operation trait for `emitc.bitwise_not`.
@@ -286,15 +290,18 @@ pub fn bitwise_not<
     operand: Operand,
     result_type: ResultType,
     location: L,
-) -> DetachedBitwiseNotOperation<'c, 't> {
+) -> Result<DetachedBitwiseNotOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_not", location)
         .add_operand(operand)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::bitwise_not`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::bitwise_not`"))
+        })
 }
 
 /// Operation trait for `emitc.bitwise_or`.
@@ -321,15 +328,16 @@ pub fn bitwise_or<
     rhs: Rhs,
     result_type: ResultType,
     location: L,
-) -> DetachedBitwiseOrOperation<'c, 't> {
+) -> Result<DetachedBitwiseOrOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_or", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::bitwise_or`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::bitwise_or`"))
+        })
 }
 
 /// Operation trait for `emitc.bitwise_right_shift`.
@@ -356,15 +364,18 @@ pub fn bitwise_right_shift<
     rhs: Rhs,
     result_type: ResultType,
     location: L,
-) -> DetachedBitwiseRightShiftOperation<'c, 't> {
+) -> Result<DetachedBitwiseRightShiftOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_right_shift", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::bitwise_right_shift`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::bitwise_right_shift`"))
+        })
 }
 
 /// Operation trait for `emitc.bitwise_xor`.
@@ -391,15 +402,18 @@ pub fn bitwise_xor<
     rhs: Rhs,
     result_type: ResultType,
     location: L,
-) -> DetachedBitwiseXorOperation<'c, 't> {
+) -> Result<DetachedBitwiseXorOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_xor", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::bitwise_xor`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::bitwise_xor`"))
+        })
 }
 
 /// Name of the `emitc.call_opaque` callee attribute.
@@ -414,31 +428,32 @@ pub const TEMPLATE_ARGS_ATTRIBUTE: &str = "template_args";
 /// Operation trait for `emitc.call_opaque`.
 pub trait CallOpaqueOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the opaque callee name.
-    fn callee(&self) -> StringRef<'c> {
-        self.attribute(CALLEE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{CALLEE_ATTRIBUTE}' attribute in `emitc::call_opaque`"))
+    fn callee(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(CALLEE_ATTRIBUTE)?.string())
     }
 
     /// Returns the optional argument-order attribute.
-    fn args(&self) -> Option<ArrayAttributeRef<'c, 't>> {
-        self.attribute(ARGS_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn args(&self) -> Result<Option<ArrayAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(ARGS_ATTRIBUTE) { self.array_attribute(ARGS_ATTRIBUTE).map(Some) } else { Ok(None) }
     }
 
     /// Returns the optional template-arguments attribute.
-    fn template_args(&self) -> Option<ArrayAttributeRef<'c, 't>> {
-        self.attribute(TEMPLATE_ARGS_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn template_args(&self) -> Result<Option<ArrayAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(TEMPLATE_ARGS_ATTRIBUTE) {
+            self.array_attribute(TEMPLATE_ARGS_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the call operands.
-    fn arguments(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn arguments(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the call results.
-    fn outputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        self.results().map(|result| result.as_ref()).collect()
+    fn outputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.results().map(|result| result.map(|result| result.as_ref())).collect()
     }
 }
 
@@ -451,7 +466,7 @@ pub fn call_opaque<
     'operand,
     'c: 'operand,
     't: 'c,
-    C: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    C: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     L: Location<'c, 't>,
 >(
     callee: C,
@@ -460,11 +475,11 @@ pub fn call_opaque<
     args: Option<ArrayAttributeRef<'c, 't>>,
     template_args: Option<ArrayAttributeRef<'c, 't>>,
     location: L,
-) -> DetachedCallOpaqueOperation<'c, 't> {
+) -> Result<DetachedCallOpaqueOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.call_opaque", location)
-        .add_attribute(CALLEE_ATTRIBUTE, callee.into_with_context(context))
+        .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)
         .add_operands(operands)
         .add_results(result_types);
     if let Some(args) = args {
@@ -473,10 +488,11 @@ pub fn call_opaque<
     if let Some(template_args) = template_args {
         builder = builder.add_attribute(TEMPLATE_ARGS_ATTRIBUTE, template_args);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::call_opaque`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::call_opaque`"))
+    })
 }
 
 /// Operation trait for `emitc.cast`.
@@ -501,15 +517,16 @@ pub fn cast<
     source: Source,
     result_type: ResultType,
     location: L,
-) -> DetachedCastOperation<'c, 't> {
+) -> Result<DetachedCastOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.cast", location)
         .add_operand(source)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::cast`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::cast`"))
+        })
 }
 
 /// Name of the `emitc.cmp` predicate attribute.
@@ -518,11 +535,17 @@ pub const CMP_PREDICATE_ATTRIBUTE: &str = "predicate";
 /// Operation trait for `emitc.cmp`.
 pub trait CmpOperation<'o, 'c: 'o, 't: 'c>: BinaryExpressionOperation<'o, 'c, 't> {
     /// Returns the comparison predicate.
-    fn predicate(&self) -> CmpPredicate {
-        self.attribute(CMP_PREDICATE_ATTRIBUTE)
+    fn predicate(&self) -> Result<CmpPredicate, Error> {
+        self.attribute(CMP_PREDICATE_ATTRIBUTE)?
             .and_then(|attribute| attribute.cast::<CmpPredicateAttributeRef>())
-            .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("invalid '{CMP_PREDICATE_ATTRIBUTE}' attribute in `emitc::cmp`"))
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "missing or invalid `{}` attribute in `{}`",
+                    CMP_PREDICATE_ATTRIBUTE,
+                    self.name().as_str().unwrap_or("<unknown>"),
+                ))
+            })?
+            .value()
     }
 }
 
@@ -548,16 +571,17 @@ pub fn cmp<
     rhs: Rhs,
     result_type: ResultType,
     location: L,
-) -> DetachedCmpOperation<'c, 't> {
+) -> Result<DetachedCmpOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.cmp", location)
-        .add_attribute(CMP_PREDICATE_ATTRIBUTE, context.emit_c_cmp_predicate_attribute(predicate))
+        .add_attribute(CMP_PREDICATE_ATTRIBUTE, context.emit_c_cmp_predicate_attribute(predicate)?)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::cmp`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::cmp`"))
+        })
 }
 
 /// Name of the `emitc.constant` and `emitc.variable` value attribute.
@@ -566,14 +590,19 @@ pub const VALUE_ATTRIBUTE: &str = "value";
 /// Operation trait for `emitc.constant`.
 pub trait ConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the constant value attribute.
-    fn value(&self) -> AttributeRef<'c, 't> {
-        self.attribute(VALUE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("invalid '{VALUE_ATTRIBUTE}' attribute in `emitc::constant`"))
+    fn value(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute(VALUE_ATTRIBUTE)?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                VALUE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -589,15 +618,16 @@ pub fn constant<'c, 't: 'c, A: Attribute<'c, 't>, ResultType: Type<'c, 't>, L: L
     value: A,
     result_type: ResultType,
     location: L,
-) -> DetachedConstantOperation<'c, 't> {
+) -> Result<DetachedConstantOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.constant", location)
         .add_attribute(VALUE_ATTRIBUTE, value)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::constant`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::constant`"))
+        })
 }
 
 /// Operation trait for `emitc.dereference`.
@@ -622,15 +652,18 @@ pub fn dereference<
     pointer: Pointer,
     result_type: ResultType,
     location: L,
-) -> DetachedDereferenceOperation<'c, 't> {
+) -> Result<DetachedDereferenceOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.dereference", location)
         .add_operand(pointer)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::dereference`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::dereference`"))
+        })
 }
 
 /// Operation trait for `emitc.div`.
@@ -657,15 +690,16 @@ pub fn div<
     rhs: Rhs,
     result_type: ResultType,
     location: L,
-) -> DetachedDivOperation<'c, 't> {
+) -> Result<DetachedDivOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.div", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::div`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::div`"))
+        })
 }
 
 /// Name of the `emitc.expression` no-inline attribute.
@@ -674,7 +708,7 @@ pub const DO_NOT_INLINE_ATTRIBUTE: &str = "do_not_inline";
 /// Operation trait for `emitc.expression`.
 pub trait ExpressionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the operands passed as block arguments to the expression body.
-    fn definitions(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn definitions(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
@@ -684,13 +718,13 @@ pub trait ExpressionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns this operation's result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 
     /// Returns the expression body region.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -708,9 +742,9 @@ pub fn expression<'definition, 'c: 'definition, 't: 'c, L: Location<'c, 't>>(
     region: DetachedRegion<'c, 't>,
     do_not_inline: bool,
     location: L,
-) -> DetachedExpressionOperation<'c, 't> {
+) -> Result<DetachedExpressionOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.expression", location)
         .add_operands(definitions)
         .add_result(result_type)
@@ -718,32 +752,31 @@ pub fn expression<'definition, 'c: 'definition, 't: 'c, L: Location<'c, 't>>(
     if do_not_inline {
         builder = builder.add_attribute(DO_NOT_INLINE_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::expression`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::expression`"))
+    })
 }
 
 /// Operation trait for `emitc.for`.
 pub trait ForOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the lower bound.
-    fn lower_bound(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn lower_bound(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the upper bound.
-    fn upper_bound(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn upper_bound(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the loop step.
-    fn step(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn step(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns the loop body region.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -768,34 +801,33 @@ pub fn r#for<
     step: Step,
     region: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedForOperation<'c, 't> {
+) -> Result<DetachedForOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.for", location)
         .add_operands(&[lower_bound.as_ref(), upper_bound.as_ref(), step.as_ref()])
         .add_region(region)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::for`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::for`"))
+        })
 }
 
 /// Operation trait for `emitc.call`.
 pub trait CallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the callee symbol.
-    fn callee(&self) -> FlatSymbolRefAttributeRef<'c, 't> {
-        self.attribute(CALLEE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{CALLEE_ATTRIBUTE}' attribute in `emitc::call`"))
+    fn callee(&self) -> Result<FlatSymbolRefAttributeRef<'c, 't>, Error> {
+        self.flat_symbol_ref_attribute(CALLEE_ATTRIBUTE)
     }
 
     /// Returns the call operands.
-    fn arguments(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn arguments(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 
     /// Returns the call results.
-    fn outputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        self.results().map(|result| result.as_ref()).collect()
+    fn outputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.results().map(|result| result.map(|result| result.as_ref())).collect()
     }
 }
 
@@ -808,7 +840,7 @@ pub fn call<
     'operand,
     'c: 'operand,
     't: 'c,
-    C: IntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
+    C: TryIntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
     L: Location<'c, 't>,
 >(
     callee: C,
@@ -817,11 +849,11 @@ pub fn call<
     arg_attrs: Option<ArrayAttributeRef<'c, 't>>,
     res_attrs: Option<ArrayAttributeRef<'c, 't>>,
     location: L,
-) -> DetachedCallOperation<'c, 't> {
+) -> Result<DetachedCallOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.call", location)
-        .add_attribute(CALLEE_ATTRIBUTE, callee.into_with_context(context))
+        .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)
         .add_operands(operands)
         .add_results(result_types);
     if let Some(arg_attrs) = arg_attrs {
@@ -830,19 +862,16 @@ pub fn call<
     if let Some(res_attrs) = res_attrs {
         builder = builder.add_attribute(RES_ATTRS_ATTRIBUTE, res_attrs);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::call`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::call`"))
+    })
 }
 
 /// Operation trait for `emitc.declare_func`.
 pub trait DeclareFuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the declared function symbol.
-    fn symbol_name(&self) -> FlatSymbolRefAttributeRef<'c, 't> {
-        self.attribute(SYMBOL_NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{SYMBOL_NAME_ATTRIBUTE}' attribute in `emitc::declare_func`"))
+    fn symbol_name(&self) -> Result<FlatSymbolRefAttributeRef<'c, 't>, Error> {
+        self.flat_symbol_ref_attribute(SYMBOL_NAME_ATTRIBUTE)
     }
 }
 
@@ -851,17 +880,25 @@ mlir_op_trait!(DeclareFunc, ZeroRegions);
 mlir_op_trait!(DeclareFunc, ZeroSuccessors);
 
 /// Constructs a new detached [`DeclareFuncOperation`].
-pub fn declare_func<'c, 't: 'c, S: IntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>, L: Location<'c, 't>>(
+pub fn declare_func<
+    'c,
+    't: 'c,
+    S: TryIntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
+    L: Location<'c, 't>,
+>(
     symbol_name: S,
     location: L,
-) -> DetachedDeclareFuncOperation<'c, 't> {
+) -> Result<DetachedDeclareFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.declare_func", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.into_with_context(context))
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::declare_func`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::declare_func`"))
+        })
 }
 
 /// Name of MLIR symbol-name attributes.
@@ -882,29 +919,30 @@ pub const RES_ATTRS_ATTRIBUTE: &str = "res_attrs";
 /// Operation trait for `emitc.func`.
 pub trait FuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the function symbol name.
-    fn symbol_name(&self) -> StringRef<'c> {
-        self.attribute(SYMBOL_NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{SYMBOL_NAME_ATTRIBUTE}' attribute in `emitc::func`"))
+    fn symbol_name(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(SYMBOL_NAME_ATTRIBUTE)?.string())
     }
 
     /// Returns the function type.
-    fn function_type(&self) -> FunctionTypeRef<'c, 't> {
-        self.attribute(FUNCTION_TYPE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<TypeAttributeRef>())
-            .and_then(|attribute| attribute.r#type().cast())
-            .unwrap_or_else(|| panic!("invalid '{FUNCTION_TYPE_ATTRIBUTE}' attribute in `emitc::func`"))
+    fn function_type(&self) -> Result<FunctionTypeRef<'c, 't>, Error> {
+        self.type_attribute(FUNCTION_TYPE_ATTRIBUTE)?
+            .r#type()?
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid `function_type` attribute in `emitc.func`"))
     }
 
     /// Returns optional C/C++ specifiers such as `static` or `inline`.
-    fn specifiers(&self) -> Option<ArrayAttributeRef<'c, 't>> {
-        self.attribute(SPECIFIERS_ATTRIBUTE).and_then(|attribute| attribute.cast())
+    fn specifiers(&self) -> Result<Option<ArrayAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(SPECIFIERS_ATTRIBUTE) {
+            self.array_attribute(SPECIFIERS_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the function body region.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -915,7 +953,7 @@ mlir_op_trait!(Func, OneRegion);
 mlir_op_trait!(Func, ZeroSuccessors);
 
 /// Constructs a new detached [`FuncOperation`].
-pub fn func<'c, 't: 'c, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
+pub fn func<'c, 't: 'c, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
     name: N,
     function_type: FunctionTypeRef<'c, 't>,
     body: DetachedRegion<'c, 't>,
@@ -923,11 +961,11 @@ pub fn func<'c, 't: 'c, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, 
     arg_attrs: Option<ArrayAttributeRef<'c, 't>>,
     res_attrs: Option<ArrayAttributeRef<'c, 't>>,
     location: L,
-) -> DetachedFuncOperation<'c, 't> {
+) -> Result<DetachedFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.func", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.into_with_context(context))
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
         .add_attribute(FUNCTION_TYPE_ATTRIBUTE, context.type_attribute(function_type))
         .add_region(body);
     if let Some(specifiers) = specifiers {
@@ -939,17 +977,16 @@ pub fn func<'c, 't: 'c, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, 
     if let Some(res_attrs) = res_attrs {
         builder = builder.add_attribute(RES_ATTRS_ATTRIBUTE, res_attrs);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::func`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::func`"))
+    })
 }
 
 /// Operation trait for `emitc.return`.
 pub trait ReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the optional returned value.
-    fn value(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.operand_value(0)
+    fn value(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.operand_count() == 0 { Ok(None) } else { self.operand_value(0).map(Some) }
     }
 }
 
@@ -962,17 +999,16 @@ mlir_op_trait!(Return, ZeroSuccessors);
 pub fn r#return<'value, 'c: 'value, 't: 'c, L: Location<'c, 't>>(
     value: Option<ValueRef<'value, 'c, 't>>,
     location: L,
-) -> DetachedReturnOperation<'c, 't> {
+) -> Result<DetachedReturnOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.return", location);
     if let Some(value) = value {
         builder = builder.add_operand(value);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::return`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::return`"))
+    })
 }
 
 /// Name of the `emitc.include` include attribute.
@@ -984,11 +1020,8 @@ pub const IS_STANDARD_INCLUDE_ATTRIBUTE: &str = "is_standard_include";
 /// Operation trait for `emitc.include`.
 pub trait IncludeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the included path or header name.
-    fn include(&self) -> StringRef<'c> {
-        self.attribute(INCLUDE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{INCLUDE_ATTRIBUTE}' attribute in `emitc::include`"))
+    fn include(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(INCLUDE_ATTRIBUTE)?.string())
     }
 
     /// Returns whether this is a standard include rendered with angle brackets.
@@ -1002,37 +1035,33 @@ mlir_op_trait!(Include, ZeroRegions);
 mlir_op_trait!(Include, ZeroSuccessors);
 
 /// Constructs a new detached [`IncludeOperation`].
-pub fn include<'c, 't: 'c, I: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
+pub fn include<'c, 't: 'c, I: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
     include: I,
     is_standard_include: bool,
     location: L,
-) -> DetachedIncludeOperation<'c, 't> {
+) -> Result<DetachedIncludeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.include", location)
-        .add_attribute(INCLUDE_ATTRIBUTE, include.into_with_context(context));
+        .add_attribute(INCLUDE_ATTRIBUTE, include.try_into_with_context(context)?);
     if is_standard_include {
         builder = builder.add_attribute(IS_STANDARD_INCLUDE_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::include`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::include`"))
+    })
 }
 
 /// Operation trait for `emitc.literal`.
 pub trait LiteralOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the literal source spelling.
-    fn value(&self) -> StringRef<'c> {
-        self.attribute(VALUE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{VALUE_ATTRIBUTE}' attribute in `emitc::literal`"))
+    fn value(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(VALUE_ATTRIBUTE)?.string())
     }
 
     /// Returns this operation's result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -1046,22 +1075,23 @@ mlir_op_trait!(Literal, ZeroSuccessors);
 pub fn literal<
     'c,
     't: 'c,
-    V: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    V: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     ResultType: Type<'c, 't>,
     L: Location<'c, 't>,
 >(
     value: V,
     result_type: ResultType,
     location: L,
-) -> DetachedLiteralOperation<'c, 't> {
+) -> Result<DetachedLiteralOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.literal", location)
-        .add_attribute(VALUE_ATTRIBUTE, value.into_with_context(context))
+        .add_attribute(VALUE_ATTRIBUTE, value.try_into_with_context(context)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::literal`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::literal`"))
+        })
 }
 
 /// Operation trait for `emitc.logical_and`.
@@ -1086,16 +1116,19 @@ pub fn logical_and<
     lhs: Lhs,
     rhs: Rhs,
     location: L,
-) -> DetachedLogicalAndOperation<'c, 't> {
+) -> Result<DetachedLogicalAndOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let result_type = context.signless_integer_type(1);
     OperationBuilder::new("emitc.logical_and", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::logical_and`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::logical_and`"))
+        })
 }
 
 /// Operation trait for `emitc.logical_not`.
@@ -1112,16 +1145,19 @@ mlir_op_trait!(LogicalNot, @local UnaryExpressionOperation);
 pub fn logical_not<'operand, 'c: 'operand, 't: 'c, Operand: Value<'operand, 'c, 't>, L: Location<'c, 't>>(
     operand: Operand,
     location: L,
-) -> DetachedLogicalNotOperation<'c, 't> {
+) -> Result<DetachedLogicalNotOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let result_type = context.signless_integer_type(1);
     OperationBuilder::new("emitc.logical_not", location)
         .add_operand(operand)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::logical_not`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::logical_not`"))
+        })
 }
 
 /// Operation trait for `emitc.logical_or`.
@@ -1146,16 +1182,17 @@ pub fn logical_or<
     lhs: Lhs,
     rhs: Rhs,
     location: L,
-) -> DetachedLogicalOrOperation<'c, 't> {
+) -> Result<DetachedLogicalOrOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let result_type = context.signless_integer_type(1);
     OperationBuilder::new("emitc.logical_or", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::logical_or`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::logical_or`"))
+        })
 }
 
 /// Operation trait for `emitc.load`.
@@ -1180,15 +1217,16 @@ pub fn load<
     operand: Operand,
     result_type: ResultType,
     location: L,
-) -> DetachedLoadOperation<'c, 't> {
+) -> Result<DetachedLoadOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.load", location)
         .add_operand(operand)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::load`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::load`"))
+        })
 }
 
 /// Operation trait for `emitc.mul`.
@@ -1215,15 +1253,16 @@ pub fn mul<
     rhs: Rhs,
     result_type: ResultType,
     location: L,
-) -> DetachedMulOperation<'c, 't> {
+) -> Result<DetachedMulOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.mul", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::mul`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::mul`"))
+        })
 }
 
 /// Operation trait for `emitc.rem`.
@@ -1250,15 +1289,16 @@ pub fn rem<
     rhs: Rhs,
     result_type: ResultType,
     location: L,
-) -> DetachedRemOperation<'c, 't> {
+) -> Result<DetachedRemOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.rem", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::rem`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::rem`"))
+        })
 }
 
 /// Operation trait for `emitc.sub`.
@@ -1285,15 +1325,16 @@ pub fn sub<
     rhs: Rhs,
     result_type: ResultType,
     location: L,
-) -> DetachedSubOperation<'c, 't> {
+) -> Result<DetachedSubOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.sub", location)
         .add_operands(&[lhs.as_ref(), rhs.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::sub`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::sub`"))
+        })
 }
 
 /// Name of member-selection attributes.
@@ -1302,11 +1343,8 @@ pub const MEMBER_ATTRIBUTE: &str = "member";
 /// Operation trait for `emitc.member`.
 pub trait MemberOperation<'o, 'c: 'o, 't: 'c>: UnaryExpressionOperation<'o, 'c, 't> {
     /// Returns the selected member name.
-    fn member(&self) -> StringRef<'c> {
-        self.attribute(MEMBER_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{MEMBER_ATTRIBUTE}' attribute in `emitc::member`"))
+    fn member(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(MEMBER_ATTRIBUTE)?.string())
     }
 }
 
@@ -1324,33 +1362,31 @@ pub fn member<
     't: 'c,
     Operand: Value<'operand, 'c, 't>,
     ResultType: Type<'c, 't>,
-    M: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    M: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     L: Location<'c, 't>,
 >(
     member: M,
     operand: Operand,
     result_type: ResultType,
     location: L,
-) -> DetachedMemberOperation<'c, 't> {
+) -> Result<DetachedMemberOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.member", location)
-        .add_attribute(MEMBER_ATTRIBUTE, member.into_with_context(context))
+        .add_attribute(MEMBER_ATTRIBUTE, member.try_into_with_context(context)?)
         .add_operand(operand)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::member`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::member`"))
+        })
 }
 
 /// Operation trait for `emitc.member_of_ptr`.
 pub trait MemberOfPtrOperation<'o, 'c: 'o, 't: 'c>: UnaryExpressionOperation<'o, 'c, 't> {
     /// Returns the selected member name.
-    fn member(&self) -> StringRef<'c> {
-        self.attribute(MEMBER_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{MEMBER_ATTRIBUTE}' attribute in `emitc::member_of_ptr`"))
+    fn member(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(MEMBER_ATTRIBUTE)?.string())
     }
 }
 
@@ -1368,45 +1404,48 @@ pub fn member_of_ptr<
     't: 'c,
     Operand: Value<'operand, 'c, 't>,
     ResultType: Type<'c, 't>,
-    M: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    M: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     L: Location<'c, 't>,
 >(
     member: M,
     operand: Operand,
     result_type: ResultType,
     location: L,
-) -> DetachedMemberOfPtrOperation<'c, 't> {
+) -> Result<DetachedMemberOfPtrOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.member_of_ptr", location)
-        .add_attribute(MEMBER_ATTRIBUTE, member.into_with_context(context))
+        .add_attribute(MEMBER_ATTRIBUTE, member.try_into_with_context(context)?)
         .add_operand(operand)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::member_of_ptr`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::member_of_ptr`"))
+        })
 }
 
 /// Operation trait for `emitc.conditional`.
 pub trait ConditionalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the condition operand.
-    fn condition(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn condition(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the value used when the condition is true.
-    fn true_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn true_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 
     /// Returns the value used when the condition is false.
-    fn false_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(2).unwrap()
+    fn false_value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
     }
 
     /// Returns this operation's result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -1433,15 +1472,18 @@ pub fn conditional<
     false_value: FalseValue,
     result_type: ResultType,
     location: L,
-) -> DetachedConditionalOperation<'c, 't> {
+) -> Result<DetachedConditionalOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.conditional", location)
         .add_operands(&[condition.as_ref(), true_value.as_ref(), false_value.as_ref()])
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::conditional`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::conditional`"))
+        })
 }
 
 /// Operation trait for `emitc.unary_minus`.
@@ -1466,15 +1508,18 @@ pub fn unary_minus<
     operand: Operand,
     result_type: ResultType,
     location: L,
-) -> DetachedUnaryMinusOperation<'c, 't> {
+) -> Result<DetachedUnaryMinusOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.unary_minus", location)
         .add_operand(operand)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::unary_minus`")
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::unary_minus`"))
+        })
 }
 
 /// Operation trait for `emitc.unary_plus`.
@@ -1499,28 +1544,34 @@ pub fn unary_plus<
     operand: Operand,
     result_type: ResultType,
     location: L,
-) -> DetachedUnaryPlusOperation<'c, 't> {
+) -> Result<DetachedUnaryPlusOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.unary_plus", location)
         .add_operand(operand)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::unary_plus`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::unary_plus`"))
+        })
 }
 
 /// Operation trait for `emitc.variable`.
 pub trait VariableOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the initial value attribute.
-    fn value(&self) -> AttributeRef<'c, 't> {
-        self.attribute(VALUE_ATTRIBUTE)
-            .unwrap_or_else(|| panic!("invalid '{VALUE_ATTRIBUTE}' attribute in `emitc::variable`"))
+    fn value(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        self.attribute(VALUE_ATTRIBUTE)?.ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing `{}` attribute in `{}`",
+                VALUE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
     }
 
     /// Returns this operation's allocated result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -1535,15 +1586,16 @@ pub fn variable<'c, 't: 'c, A: Attribute<'c, 't>, ResultType: Type<'c, 't>, L: L
     value: A,
     result_type: ResultType,
     location: L,
-) -> DetachedVariableOperation<'c, 't> {
+) -> Result<DetachedVariableOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.variable", location)
         .add_attribute(VALUE_ATTRIBUTE, value)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::variable`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::variable`"))
+        })
 }
 
 /// Name of the `emitc.global` type attribute.
@@ -1564,23 +1616,17 @@ pub const CONST_SPECIFIER_ATTRIBUTE: &str = "const_specifier";
 /// Operation trait for `emitc.global`.
 pub trait GlobalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the global symbol name.
-    fn symbol_name(&self) -> StringRef<'c> {
-        self.attribute(SYMBOL_NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{SYMBOL_NAME_ATTRIBUTE}' attribute in `emitc::global`"))
+    fn symbol_name(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(SYMBOL_NAME_ATTRIBUTE)?.string())
     }
 
     /// Returns the global variable type.
-    fn r#type(&self) -> TypeRef<'c, 't> {
-        self.attribute(TYPE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<TypeAttributeRef>())
-            .map(|attribute| attribute.r#type())
-            .unwrap_or_else(|| panic!("invalid '{TYPE_ATTRIBUTE}' attribute in `emitc::global`"))
+    fn r#type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.type_attribute(TYPE_ATTRIBUTE)?.r#type()
     }
 
     /// Returns the optional initial value.
-    fn initial_value(&self) -> Option<AttributeRef<'c, 't>> {
+    fn initial_value(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute(INITIAL_VALUE_ATTRIBUTE)
     }
 
@@ -1610,7 +1656,7 @@ mlir_op_trait!(Global, ZeroSuccessors);
 pub fn global<
     'c,
     't: 'c,
-    N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     GlobalType: Type<'c, 't>,
     L: Location<'c, 't>,
 >(
@@ -1621,11 +1667,11 @@ pub fn global<
     static_specifier: bool,
     const_specifier: bool,
     location: L,
-) -> DetachedGlobalOperation<'c, 't> {
+) -> Result<DetachedGlobalOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.global", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.into_with_context(context))
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
         .add_attribute(TYPE_ATTRIBUTE, context.type_attribute(r#type));
     if let Some(initial_value) = initial_value {
         builder = builder.add_attribute(INITIAL_VALUE_ATTRIBUTE, initial_value);
@@ -1639,10 +1685,9 @@ pub fn global<
     if const_specifier {
         builder = builder.add_attribute(CONST_SPECIFIER_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::global`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::global`"))
+    })
 }
 
 /// Name of the symbol-reference attribute used by `emitc.get_global`.
@@ -1651,15 +1696,13 @@ pub const NAME_ATTRIBUTE: &str = "name";
 /// Operation trait for `emitc.get_global`.
 pub trait GetGlobalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the referenced global name.
-    fn name(&self) -> FlatSymbolRefAttributeRef<'c, 't> {
-        self.attribute(NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{NAME_ATTRIBUTE}' attribute in `emitc::get_global`"))
+    fn name(&self) -> Result<FlatSymbolRefAttributeRef<'c, 't>, Error> {
+        self.flat_symbol_ref_attribute(NAME_ATTRIBUTE)
     }
 
     /// Returns this operation's result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -1673,36 +1716,34 @@ mlir_op_trait!(GetGlobal, ZeroSuccessors);
 pub fn get_global<
     'c,
     't: 'c,
-    N: IntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
+    N: TryIntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
     ResultType: Type<'c, 't>,
     L: Location<'c, 't>,
 >(
     name: N,
     result_type: ResultType,
     location: L,
-) -> DetachedGetGlobalOperation<'c, 't> {
+) -> Result<DetachedGetGlobalOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.get_global", location)
-        .add_attribute(NAME_ATTRIBUTE, name.into_with_context(context))
+        .add_attribute(NAME_ATTRIBUTE, name.try_into_with_context(context)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::get_global`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::get_global`"))
+        })
 }
 
 /// Operation trait for `emitc.verbatim`.
 pub trait VerbatimOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the verbatim format string.
-    fn value(&self) -> StringRef<'c> {
-        self.attribute(VALUE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{VALUE_ATTRIBUTE}' attribute in `emitc::verbatim`"))
+    fn value(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(VALUE_ATTRIBUTE)?.string())
     }
 
     /// Returns the format arguments.
-    fn format_arguments(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn format_arguments(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().collect()
     }
 }
@@ -1716,33 +1757,34 @@ pub fn verbatim<
     'argument,
     'c: 'argument,
     't: 'c,
-    V: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    V: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     L: Location<'c, 't>,
 >(
     value: V,
     format_arguments: &[ValueRef<'argument, 'c, 't>],
     location: L,
-) -> DetachedVerbatimOperation<'c, 't> {
+) -> Result<DetachedVerbatimOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.verbatim", location)
-        .add_attribute(VALUE_ATTRIBUTE, value.into_with_context(context))
+        .add_attribute(VALUE_ATTRIBUTE, value.try_into_with_context(context)?)
         .add_operands(format_arguments)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::verbatim`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::verbatim`"))
+        })
 }
 
 /// Operation trait for `emitc.assign`.
 pub trait AssignOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the lvalue being assigned.
-    fn variable(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn variable(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the assigned value.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(1).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 }
 
@@ -1763,21 +1805,22 @@ pub fn assign<
     variable: Variable,
     value: AssignedValue,
     location: L,
-) -> DetachedAssignOperation<'c, 't> {
+) -> Result<DetachedAssignOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.assign", location)
         .add_operands(&[variable.as_ref(), value.as_ref()])
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::assign`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::assign`"))
+        })
 }
 
 /// Operation trait for `emitc.yield`.
 pub trait YieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the optional yielded value.
-    fn value(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.operand_value(0)
+    fn value(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.operand_count() == 0 { Ok(None) } else { self.operand_value(0).map(Some) }
     }
 }
 
@@ -1789,34 +1832,33 @@ mlir_op_trait!(Yield, ZeroSuccessors);
 pub fn r#yield<'value, 'c: 'value, 't: 'c, L: Location<'c, 't>>(
     value: Option<ValueRef<'value, 'c, 't>>,
     location: L,
-) -> DetachedYieldOperation<'c, 't> {
+) -> Result<DetachedYieldOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.yield", location);
     if let Some(value) = value {
         builder = builder.add_operand(value);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::yield`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::yield`"))
+    })
 }
 
 /// Operation trait for `emitc.if`.
 pub trait IfOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the condition.
-    fn condition(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn condition(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the then region.
-    fn then_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn then_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns the else region.
-    fn else_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(1).unwrap()
+    fn else_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(1)
     }
 }
 
@@ -1829,32 +1871,33 @@ pub fn r#if<'condition, 'c: 'condition, 't: 'c, Condition: Value<'condition, 'c,
     then_region: DetachedRegion<'c, 't>,
     else_region: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedIfOperation<'c, 't> {
+) -> Result<DetachedIfOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.if", location)
         .add_operand(condition)
         .add_regions(vec![then_region, else_region])
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::if`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::if`"))
+        })
 }
 
 /// Operation trait for `emitc.subscript`.
 pub trait SubscriptOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the indexed value.
-    fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the index operands.
-    fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
+    fn indices(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         self.operand_values().skip(1).collect()
     }
 
     /// Returns this operation's result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -1877,16 +1920,17 @@ pub fn subscript<
     indices: &[ValueRef<'index, 'c, 't>],
     result_type: ResultType,
     location: L,
-) -> DetachedSubscriptOperation<'c, 't> {
+) -> Result<DetachedSubscriptOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.subscript", location)
         .add_operand(value)
         .add_operands(indices)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::subscript`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::subscript`"))
+        })
 }
 
 /// Name of the `emitc.switch` cases attribute.
@@ -1895,25 +1939,23 @@ pub const CASES_ATTRIBUTE: &str = "cases";
 /// Operation trait for `emitc.switch`.
 pub trait SwitchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the switched value.
-    fn argument(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn argument(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
     /// Returns the case values.
-    fn cases(&self) -> DenseInteger64ArrayAttributeRef<'c, 't> {
-        self.attribute(CASES_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{CASES_ATTRIBUTE}' attribute in `emitc::switch`"))
+    fn cases(&self) -> Result<DenseInteger64ArrayAttributeRef<'c, 't>, Error> {
+        self.dense_integer_64_array_attribute(CASES_ATTRIBUTE)
     }
 
     /// Returns the default region.
-    fn default_region(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn default_region(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns the case regions.
-    fn case_regions(&self) -> Vec<RegionRef<'o, 'c, 't>> {
-        (1..self.region_count()).map(|index| self.region(index).unwrap()).collect()
+    fn case_regions(&self) -> Result<Vec<RegionRef<'o, 'c, 't>>, Error> {
+        (1..self.region_count()).map(|index| self.region(index)).collect()
     }
 }
 
@@ -1927,18 +1969,19 @@ pub fn switch<'argument, 'c: 'argument, 't: 'c, Argument: Value<'argument, 'c, '
     default_region: DetachedRegion<'c, 't>,
     case_regions: Vec<DetachedRegion<'c, 't>>,
     location: L,
-) -> DetachedSwitchOperation<'c, 't> {
+) -> Result<DetachedSwitchOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut regions = vec![default_region];
     regions.extend(case_regions);
     OperationBuilder::new("emitc.switch", location)
         .add_operand(argument)
-        .add_attribute(CASES_ATTRIBUTE, context.dense_i64_array_attribute(cases).unwrap())
+        .add_attribute(CASES_ATTRIBUTE, context.dense_i64_array_attribute(cases)?)
         .add_regions(regions)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::switch`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::switch`"))
+        })
 }
 
 /// Name of the `emitc.class` final specifier.
@@ -1947,11 +1990,8 @@ pub const FINAL_SPECIFIER_ATTRIBUTE: &str = "final_specifier";
 /// Operation trait for `emitc.class`.
 pub trait ClassOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the class symbol name.
-    fn symbol_name(&self) -> StringRef<'c> {
-        self.attribute(SYMBOL_NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{SYMBOL_NAME_ATTRIBUTE}' attribute in `emitc::class`"))
+    fn symbol_name(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(SYMBOL_NAME_ATTRIBUTE)?.string())
     }
 
     /// Returns whether this class has a `final` specifier.
@@ -1960,8 +2000,8 @@ pub trait ClassOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the class body.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 }
 
@@ -1974,46 +2014,39 @@ mlir_op_trait!(Class, SymbolTable);
 mlir_op_trait!(Class, ZeroSuccessors);
 
 /// Constructs a new detached [`ClassOperation`].
-pub fn class<'c, 't: 'c, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
+pub fn class<'c, 't: 'c, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
     symbol_name: N,
     final_specifier: bool,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedClassOperation<'c, 't> {
+) -> Result<DetachedClassOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.class", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.into_with_context(context))
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
         .add_region(body);
     if final_specifier {
         builder = builder.add_attribute(FINAL_SPECIFIER_ATTRIBUTE, context.unit_attribute());
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::class`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::class`"))
+    })
 }
 
 /// Operation trait for `emitc.field`.
 pub trait FieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the field symbol name.
-    fn symbol_name(&self) -> StringRef<'c> {
-        self.attribute(SYMBOL_NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<StringAttributeRef>())
-            .map(|attribute| attribute.string())
-            .unwrap_or_else(|| panic!("invalid '{SYMBOL_NAME_ATTRIBUTE}' attribute in `emitc::field`"))
+    fn symbol_name(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.string_attribute(SYMBOL_NAME_ATTRIBUTE)?.string())
     }
 
     /// Returns the field type.
-    fn r#type(&self) -> TypeRef<'c, 't> {
-        self.attribute(TYPE_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast::<TypeAttributeRef>())
-            .map(|attribute| attribute.r#type())
-            .unwrap_or_else(|| panic!("invalid '{TYPE_ATTRIBUTE}' attribute in `emitc::field`"))
+    fn r#type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        self.type_attribute(TYPE_ATTRIBUTE)?.r#type()
     }
 
     /// Returns the optional initial value.
-    fn initial_value(&self) -> Option<AttributeRef<'c, 't>> {
+    fn initial_value(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         self.attribute(INITIAL_VALUE_ATTRIBUTE)
     }
 }
@@ -2028,7 +2061,7 @@ mlir_op_trait!(Field, ZeroSuccessors);
 pub fn field<
     'c,
     't: 'c,
-    N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
+    N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
     FieldType: Type<'c, 't>,
     L: Location<'c, 't>,
 >(
@@ -2036,19 +2069,18 @@ pub fn field<
     r#type: FieldType,
     initial_value: Option<AttributeRef<'c, 't>>,
     location: L,
-) -> DetachedFieldOperation<'c, 't> {
+) -> Result<DetachedFieldOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.field", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.into_with_context(context))
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
         .add_attribute(TYPE_ATTRIBUTE, context.type_attribute(r#type));
     if let Some(initial_value) = initial_value {
         builder = builder.add_attribute(INITIAL_VALUE_ATTRIBUTE, initial_value);
     }
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::field`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::field`"))
+    })
 }
 
 /// Name of the `emitc.get_field` field-name attribute.
@@ -2057,15 +2089,13 @@ pub const FIELD_NAME_ATTRIBUTE: &str = "field_name";
 /// Operation trait for `emitc.get_field`.
 pub trait GetFieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the referenced field name.
-    fn field_name(&self) -> FlatSymbolRefAttributeRef<'c, 't> {
-        self.attribute(FIELD_NAME_ATTRIBUTE)
-            .and_then(|attribute| attribute.cast())
-            .unwrap_or_else(|| panic!("invalid '{FIELD_NAME_ATTRIBUTE}' attribute in `emitc::get_field`"))
+    fn field_name(&self) -> Result<FlatSymbolRefAttributeRef<'c, 't>, Error> {
+        self.flat_symbol_ref_attribute(FIELD_NAME_ATTRIBUTE)
     }
 
     /// Returns this operation's result.
-    fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_ref()
+    fn output(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        Ok(self.result(0)?.as_ref())
     }
 }
 
@@ -2079,34 +2109,35 @@ mlir_op_trait!(GetField, ZeroSuccessors);
 pub fn get_field<
     'c,
     't: 'c,
-    N: IntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
+    N: TryIntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
     ResultType: Type<'c, 't>,
     L: Location<'c, 't>,
 >(
     field_name: N,
     result_type: ResultType,
     location: L,
-) -> DetachedGetFieldOperation<'c, 't> {
+) -> Result<DetachedGetFieldOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
+    context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.get_field", location)
-        .add_attribute(FIELD_NAME_ATTRIBUTE, field_name.into_with_context(context))
+        .add_attribute(FIELD_NAME_ATTRIBUTE, field_name.try_into_with_context(context)?)
         .add_result(result_type)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::get_field`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::get_field`"))
+        })
 }
 
 /// Operation trait for `emitc.do`.
 pub trait DoOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the body region.
-    fn body(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(0).unwrap()
+    fn body(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(0)
     }
 
     /// Returns the condition region.
-    fn condition(&self) -> RegionRef<'o, 'c, 't> {
-        self.region(1).unwrap()
+    fn condition(&self) -> Result<RegionRef<'o, 'c, 't>, Error> {
+        self.region(1)
     }
 }
 
@@ -2118,14 +2149,14 @@ pub fn r#do<'c, 't: 'c, L: Location<'c, 't>>(
     body: DetachedRegion<'c, 't>,
     condition: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedDoOperation<'c, 't> {
+) -> Result<DetachedDoOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::emit_c());
-    OperationBuilder::new("emitc.do", location)
-        .add_regions(vec![body, condition])
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `emit_c::do`")
+    context.load_dialect(DialectHandle::emit_c()?)?;
+    OperationBuilder::new("emitc.do", location).add_regions(vec![body, condition]).build().and_then(
+        |operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::do`"))
+        },
+    )
 }
 
 #[cfg(test)]
@@ -2141,14 +2172,14 @@ mod tests {
     fn test_file() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let mut body = context.block_with_no_arguments();
-        body.append_operation(include("stdint.h", true, location));
-        let op = file("generated.cc", body.into(), location);
-        assert_eq!(op.id().as_str().unwrap(), "generated.cc");
-        assert_eq!(op.body().blocks().count(), 1);
-        module.body().append_operation(op);
-        assert!(module.verify());
+        body.append_operation(include("stdint.h", true, location).unwrap()).unwrap();
+        let op = file("generated.cc", body.try_into().unwrap(), location).unwrap();
+        assert_eq!(op.id().unwrap().as_str().unwrap(), "generated.cc");
+        assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
+        module.body().unwrap().append_operation(op).unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2165,23 +2196,33 @@ mod tests {
     fn test_address_of() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
-        let pointer_i32_type = context.emit_c_pointer_type(i32_type);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type).unwrap();
+        let pointer_i32_type = context.emit_c_pointer_type(i32_type).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[pointer_i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let variable_op =
-                block.append_operation(variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location));
-            let op = address_of(variable_op.result(0).unwrap().as_ref(), pointer_i32_type, location);
-            assert_eq!(UnaryExpressionOperation::operand(&op), variable_op.result(0).unwrap().as_ref());
-            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("address_of", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let variable_op = block
+                    .append_operation(
+                        variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location).unwrap(),
+                    )
+                    .unwrap();
+                let op =
+                    address_of(variable_op.as_ref().result(0).unwrap().as_ref(), pointer_i32_type, location).unwrap();
+                assert_eq!(op.operand_value(0).unwrap(), variable_op.as_ref().result(0).unwrap().as_ref());
+                assert_eq!(op.operand_value(0).unwrap(), variable_op.as_ref().result(0).unwrap().as_ref());
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("address_of", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2200,23 +2241,29 @@ mod tests {
     fn test_add() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = add(lhs, rhs, i32_type, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("add", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = add(lhs, rhs, i32_type, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("add", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2234,25 +2281,34 @@ mod tests {
     fn test_apply() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
-        let pointer_i32_type = context.emit_c_pointer_type(i32_type);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type).unwrap();
+        let pointer_i32_type = context.emit_c_pointer_type(i32_type).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[pointer_i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let variable_op =
-                block.append_operation(variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location));
-            let variable_value = variable_op.result(0).unwrap().as_ref();
-            let op = apply("&", variable_value, pointer_i32_type, location);
-            assert_eq!(op.applicable_operator().as_str().unwrap(), "&");
-            assert_eq!(UnaryExpressionOperation::operand(&op), variable_value);
-            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), pointer_i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("apply", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let variable_op = block
+                    .append_operation(
+                        variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location).unwrap(),
+                    )
+                    .unwrap();
+                let variable_value = variable_op.as_ref().result(0).unwrap().as_ref();
+                let op = apply("&", variable_value, pointer_i32_type, location).unwrap();
+                assert_eq!(op.applicable_operator().unwrap().as_str().unwrap(), "&");
+                assert_eq!(op.operand_value(0).unwrap(), variable_value);
+                assert_eq!(op.applicable_operator().unwrap().as_str().unwrap(), "&");
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("apply", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2271,23 +2327,29 @@ mod tests {
     fn test_bitwise_and() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = bitwise_and(lhs, rhs, i32_type, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("bitwise_and", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = bitwise_and(lhs, rhs, i32_type, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("bitwise_and", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2305,23 +2367,30 @@ mod tests {
     fn test_bitwise_left_shift() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = bitwise_left_shift(lhs, rhs, i32_type, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("bitwise_left_shift", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = bitwise_left_shift(lhs, rhs, i32_type, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("bitwise_left_shift", function_type, block.try_into().unwrap(), None, None, None, location)
+                    .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2339,20 +2408,26 @@ mod tests {
     fn test_bitwise_not() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let operand = block.argument(0).unwrap();
-            let op = bitwise_not(operand, i32_type, location);
-            assert_eq!(UnaryExpressionOperation::operand(&op), operand);
-            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("bitwise_not", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let operand = block.argument(0).unwrap();
+                let op = bitwise_not(operand, i32_type, location).unwrap();
+                assert_eq!(op.operand_value(0).unwrap(), operand);
+                assert_eq!(op.operand_value(0).unwrap(), operand);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("bitwise_not", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2370,23 +2445,29 @@ mod tests {
     fn test_bitwise_or() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = bitwise_or(lhs, rhs, i32_type, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("bitwise_or", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = bitwise_or(lhs, rhs, i32_type, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("bitwise_or", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2404,23 +2485,30 @@ mod tests {
     fn test_bitwise_right_shift() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = bitwise_right_shift(lhs, rhs, i32_type, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("bitwise_right_shift", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = bitwise_right_shift(lhs, rhs, i32_type, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("bitwise_right_shift", function_type, block.try_into().unwrap(), None, None, None, location)
+                    .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2438,23 +2526,29 @@ mod tests {
     fn test_bitwise_xor() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = bitwise_xor(lhs, rhs, i32_type, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("bitwise_xor", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = bitwise_xor(lhs, rhs, i32_type, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("bitwise_xor", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2472,25 +2566,32 @@ mod tests {
     fn test_call_opaque() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let argument = block.argument(0).unwrap();
-            let op = call_opaque("opaque", &[argument.as_ref()], &[i32_type.as_ref()], None, None, location);
-            assert_eq!(op.callee().as_str().unwrap(), "opaque");
-            assert!(op.args().is_none());
-            assert!(op.template_args().is_none());
-            assert_eq!(op.arguments(), vec![argument.as_ref()]);
-            assert_eq!(op.outputs().len(), 1);
-            assert_eq!(op.outputs()[0].r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("call_opaque", function_type, block.into(), None, None, None, location)
-        });
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let argument = block.argument(0).unwrap();
+                let op =
+                    call_opaque("opaque", &[argument.as_ref()], &[i32_type.as_ref()], None, None, location).unwrap();
+                assert_eq!(op.callee().unwrap().as_str().unwrap(), "opaque");
+                assert!(op.args().unwrap().is_none());
+                assert!(op.template_args().unwrap().is_none());
+                assert_eq!(op.arguments().unwrap(), vec![argument.as_ref()]);
+                assert_eq!(op.outputs().unwrap().len(), 1);
+                assert_eq!(op.outputs().unwrap()[0].r#type().unwrap(), i32_type.as_ref());
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("call_opaque", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2508,22 +2609,28 @@ mod tests {
     fn test_cast() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let opaque_int_type = context.emit_c_opaque_type("int");
+        let opaque_int_type = context.emit_c_opaque_type("int").unwrap();
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[opaque_int_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let source = block.argument(0).unwrap();
-            let op = cast(source, opaque_int_type, location);
-            assert_eq!(UnaryExpressionOperation::operand(&op), source);
-            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), opaque_int_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("cast", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let source = block.argument(0).unwrap();
+                let op = cast(source, opaque_int_type, location).unwrap();
+                assert_eq!(op.operand_value(0).unwrap(), source);
+                assert_eq!(op.operand_value(0).unwrap(), source);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("cast", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2541,25 +2648,31 @@ mod tests {
     fn test_cmp() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i1_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = cmp(CmpPredicate::LessThan, lhs, rhs, i1_type, location);
-            assert_eq!(op.predicate(), CmpPredicate::LessThan);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("cmp", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = cmp(CmpPredicate::LessThan, lhs, rhs, i1_type, location).unwrap();
+                assert_eq!(op.predicate().unwrap(), CmpPredicate::LessThan);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.predicate().unwrap(), CmpPredicate::LessThan);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("cmp", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2577,19 +2690,25 @@ mod tests {
     fn test_constant() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = constant(context.integer_attribute(i32_type, 3), i32_type, location);
-            assert_eq!(op.value().to_string(), "3 : i32");
-            assert_eq!(ConstantOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("constant", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = constant(context.integer_attribute(i32_type, 3), i32_type, location).unwrap();
+                assert_eq!(op.value().unwrap().to_string(), "3 : i32");
+                assert_eq!(op.value().unwrap().to_string(), "3 : i32");
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("constant", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2607,26 +2726,42 @@ mod tests {
     fn test_dereference() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
-        let pointer_i32_type = context.emit_c_pointer_type(i32_type);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type).unwrap();
+        let pointer_i32_type = context.emit_c_pointer_type(i32_type).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let variable_op =
-                block.append_operation(variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location));
-            let address_op =
-                block.append_operation(address_of(variable_op.result(0).unwrap().as_ref(), pointer_i32_type, location));
-            let op = dereference(address_op.result(0).unwrap().as_ref(), lvalue_i32_type, location);
-            assert_eq!(UnaryExpressionOperation::operand(&op), address_op.result(0).unwrap().as_ref());
-            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-            let op = block.append_operation(op);
-            let load_op = block.append_operation(load(op.result(0).unwrap().as_ref(), i32_type, location));
-            block.append_operation(r#return(Some(load_op.result(0).unwrap().as_ref()), location));
-            func("dereference", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let variable_op = block
+                    .append_operation(
+                        variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location).unwrap(),
+                    )
+                    .unwrap();
+                let address_op = block
+                    .append_operation(
+                        address_of(variable_op.as_ref().result(0).unwrap().as_ref(), pointer_i32_type, location)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let op =
+                    dereference(address_op.as_ref().result(0).unwrap().as_ref(), lvalue_i32_type, location).unwrap();
+                assert_eq!(op.operand_value(0).unwrap(), address_op.as_ref().result(0).unwrap().as_ref());
+                assert_eq!(op.operand_value(0).unwrap(), address_op.as_ref().result(0).unwrap().as_ref());
+                let op = block.append_operation(op).unwrap();
+                let load_op = block
+                    .append_operation(load(op.as_ref().result(0).unwrap().as_ref(), i32_type, location).unwrap())
+                    .unwrap();
+                block
+                    .append_operation(r#return(Some(load_op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("dereference", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2647,23 +2782,29 @@ mod tests {
     fn test_div() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = div(lhs, rhs, i32_type, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("div", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = div(lhs, rhs, i32_type, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("div", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2681,32 +2822,40 @@ mod tests {
     fn test_expression() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let mut region = context.region();
-            let mut body = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let body_lhs = body.argument(0).unwrap();
-            let body_rhs = body.argument(1).unwrap();
-            let add_op = body.append_operation(add(body_lhs, body_rhs, i32_type, location));
-            body.append_operation(r#yield(Some(add_op.result(0).unwrap().as_ref()), location));
-            region.append_block(body);
-            let op = expression(&[lhs.as_ref(), rhs.as_ref()], i32_type.as_ref(), region.into(), true, location);
-            assert_eq!(op.definitions(), vec![lhs.as_ref(), rhs.as_ref()]);
-            assert!(op.do_not_inline());
-            assert_eq!(ExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            assert_eq!(op.body().blocks().count(), 1);
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("expression", function_type, block.into(), None, None, None, location)
-        });
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let mut region = context.region();
+                let mut body = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let body_lhs = body.argument(0).unwrap();
+                let body_rhs = body.argument(1).unwrap();
+                let add_op = body.append_operation(add(body_lhs, body_rhs, i32_type, location).unwrap()).unwrap();
+                body.append_operation(r#yield(Some(add_op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                region.append_block(body).unwrap();
+                let op = expression(&[lhs.as_ref(), rhs.as_ref()], i32_type.as_ref(), region.into(), true, location)
+                    .unwrap();
+                assert_eq!(op.definitions().unwrap(), vec![lhs.as_ref(), rhs.as_ref()]);
+                assert!(op.do_not_inline());
+                assert_eq!(op.output().unwrap().r#type().unwrap(), i32_type.as_ref());
+                assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("expression", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2727,31 +2876,35 @@ mod tests {
     fn test_for() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref(), i32_type.as_ref()], &[]);
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (i32_type.as_ref(), location),
-                (i32_type.as_ref(), location),
-                (i32_type.as_ref(), location),
-            ]);
-            let lower_bound = block.argument(0).unwrap();
-            let upper_bound = block.argument(1).unwrap();
-            let step = block.argument(2).unwrap();
-            let mut body = context.block(&[(i32_type.as_ref(), location)]);
-            body.append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location));
-            let op = r#for(lower_bound, upper_bound, step, body.into(), location);
-            assert_eq!(op.lower_bound(), lower_bound);
-            assert_eq!(op.upper_bound(), upper_bound);
-            assert_eq!(op.step(), step);
-            assert_eq!(op.body().blocks().count(), 1);
-            block.append_operation(op);
-            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
-            func("for", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (i32_type.as_ref(), location),
+                    (i32_type.as_ref(), location),
+                    (i32_type.as_ref(), location),
+                ]);
+                let lower_bound = block.argument(0).unwrap();
+                let upper_bound = block.argument(1).unwrap();
+                let step = block.argument(2).unwrap();
+                let mut body = context.block(&[(i32_type.as_ref(), location)]);
+                body.append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
+                let op = r#for(lower_bound, upper_bound, step, body.try_into().unwrap(), location).unwrap();
+                assert_eq!(op.lower_bound().unwrap(), lower_bound);
+                assert_eq!(op.upper_bound().unwrap(), upper_bound);
+                assert_eq!(op.step().unwrap(), step);
+                assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
+                block.append_operation(op).unwrap();
+                block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
+                func("for", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2770,29 +2923,39 @@ mod tests {
     fn test_call() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let callee_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
         let caller_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let argument = block.argument(0).unwrap();
-            block.append_operation(r#return(Some(argument.as_ref()), location));
-            func("callee", callee_type, block.into(), None, None, None, location)
-        });
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let argument = block.argument(0).unwrap();
-            let op = call("callee", &[argument.as_ref()], &[i32_type.as_ref()], None, None, location);
-            assert_eq!(op.callee().reference().as_str().unwrap(), "callee");
-            assert_eq!(op.arguments(), vec![argument.as_ref()]);
-            assert_eq!(op.outputs().len(), 1);
-            assert_eq!(op.outputs()[0].r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("caller", caller_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let argument = block.argument(0).unwrap();
+                block.append_operation(r#return(Some(argument.as_ref()), location).unwrap()).unwrap();
+                func("callee", callee_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let argument = block.argument(0).unwrap();
+                let op = call("callee", &[argument.as_ref()], &[i32_type.as_ref()], None, None, location).unwrap();
+                assert_eq!(op.callee().unwrap().reference().as_str().unwrap(), "callee");
+                assert_eq!(op.arguments().unwrap(), vec![argument.as_ref()]);
+                assert_eq!(op.outputs().unwrap().len(), 1);
+                assert_eq!(op.outputs().unwrap()[0].r#type().unwrap(), i32_type.as_ref());
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("caller", caller_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2813,17 +2976,21 @@ mod tests {
     fn test_declare_func() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[]);
-        let op = declare_func("declared", location);
-        assert_eq!(op.symbol_name().reference().as_str().unwrap(), "declared");
-        module.body().append_operation(op);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
-            func("declared", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        let op = declare_func("declared", location).unwrap();
+        assert_eq!(op.symbol_name().unwrap().reference().as_str().unwrap(), "declared");
+        module.body().unwrap().append_operation(op).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
+                func("declared", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2841,18 +3008,19 @@ mod tests {
     fn test_func() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[]);
         let specifiers = context.array_attribute(&[context.string_attribute("static")]);
         let mut block = context.block_with_no_arguments();
-        block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
-        let op = func("empty", function_type, block.into(), Some(specifiers), None, None, location);
-        assert_eq!(op.symbol_name().as_str().unwrap(), "empty");
-        assert_eq!(op.function_type(), function_type);
-        assert_eq!(op.specifiers().unwrap().len(), 1);
-        assert_eq!(op.body().blocks().count(), 1);
-        module.body().append_operation(op);
-        assert!(module.verify());
+        block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
+        let op =
+            func("empty", function_type, block.try_into().unwrap(), Some(specifiers), None, None, location).unwrap();
+        assert_eq!(op.symbol_name().unwrap().as_str().unwrap(), "empty");
+        assert_eq!(op.function_type().unwrap(), function_type);
+        assert_eq!(op.specifiers().unwrap().unwrap().len(), 1);
+        assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
+        module.body().unwrap().append_operation(op).unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2869,20 +3037,25 @@ mod tests {
     fn test_return() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let constant_op =
-                block.append_operation(constant(context.integer_attribute(i32_type, 1), i32_type, location));
-            let op = r#return(Some(constant_op.result(0).unwrap().as_ref()), location);
-            assert_eq!(op.value(), Some(constant_op.result(0).unwrap().as_ref()));
-            block.append_operation(op);
-            func("return", function_type, block.into(), None, None, None, location)
-        });
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let constant_op = block
+                    .append_operation(constant(context.integer_attribute(i32_type, 1), i32_type, location).unwrap())
+                    .unwrap();
+                let op = r#return(Some(constant_op.as_ref().result(0).unwrap().as_ref()), location).unwrap();
+                assert_eq!(op.value().unwrap(), Some(constant_op.as_ref().result(0).unwrap().as_ref()));
+                block.append_operation(op).unwrap();
+                func("return", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2900,13 +3073,13 @@ mod tests {
     fn test_include() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let op = include("stdint.h", true, location);
-        assert_eq!(op.include().as_str().unwrap(), "stdint.h");
+        let module = context.module(location).unwrap();
+        let op = include("stdint.h", true, location).unwrap();
+        assert_eq!(op.include().unwrap().as_str().unwrap(), "stdint.h");
         assert!(op.is_standard_include());
-        module.body().append_operation(op);
+        module.body().unwrap().append_operation(op).unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2921,19 +3094,25 @@ mod tests {
     fn test_literal() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
-        let opaque_pointer_type = context.emit_c_opaque_type("int *");
+        let module = context.module(location).unwrap();
+        let opaque_pointer_type = context.emit_c_opaque_type("int *").unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[opaque_pointer_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = literal("nullptr", opaque_pointer_type, location);
-            assert_eq!(op.value().as_str().unwrap(), "nullptr");
-            assert_eq!(LiteralOperation::output(&op).r#type(), opaque_pointer_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("literal", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = literal("nullptr", opaque_pointer_type, location).unwrap();
+                assert_eq!(op.value().unwrap().as_str().unwrap(), "nullptr");
+                assert_eq!(op.value().unwrap().as_str().unwrap(), "nullptr");
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("literal", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2951,23 +3130,29 @@ mod tests {
     fn test_logical_and() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i1_type.as_ref(), i1_type.as_ref()], &[i1_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i1_type.as_ref(), location), (i1_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = logical_and(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("logical_and", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i1_type.as_ref(), location), (i1_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = logical_and(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("logical_and", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -2985,20 +3170,26 @@ mod tests {
     fn test_logical_not() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[i1_type.as_ref()], &[i1_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i1_type.as_ref(), location)]);
-            let operand = block.argument(0).unwrap();
-            let op = logical_not(operand, location);
-            assert_eq!(UnaryExpressionOperation::operand(&op), operand);
-            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("logical_not", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i1_type.as_ref(), location)]);
+                let operand = block.argument(0).unwrap();
+                let op = logical_not(operand, location).unwrap();
+                assert_eq!(op.operand_value(0).unwrap(), operand);
+                assert_eq!(op.operand_value(0).unwrap(), operand);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("logical_not", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3016,23 +3207,29 @@ mod tests {
     fn test_logical_or() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i1_type.as_ref(), i1_type.as_ref()], &[i1_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i1_type.as_ref(), location), (i1_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = logical_or(lhs, rhs, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i1_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("logical_or", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i1_type.as_ref(), location), (i1_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = logical_or(lhs, rhs, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("logical_or", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3050,23 +3247,32 @@ mod tests {
     fn test_load() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let variable_op =
-                block.append_operation(variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location));
-            let variable_value = variable_op.result(0).unwrap().as_ref();
-            let op = load(variable_value, i32_type, location);
-            assert_eq!(UnaryExpressionOperation::operand(&op), variable_value);
-            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("load", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let variable_op = block
+                    .append_operation(
+                        variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location).unwrap(),
+                    )
+                    .unwrap();
+                let variable_value = variable_op.as_ref().result(0).unwrap().as_ref();
+                let op = load(variable_value, i32_type, location).unwrap();
+                assert_eq!(op.operand_value(0).unwrap(), variable_value);
+                assert_eq!(op.operand_value(0).unwrap(), variable_value);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("load", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3085,23 +3291,29 @@ mod tests {
     fn test_mul() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = mul(lhs, rhs, i32_type, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("mul", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = mul(lhs, rhs, i32_type, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("mul", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3119,23 +3331,29 @@ mod tests {
     fn test_rem() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = rem(lhs, rhs, i32_type, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("rem", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = rem(lhs, rhs, i32_type, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("rem", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3153,23 +3371,29 @@ mod tests {
     fn test_sub() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let op = sub(lhs, rhs, i32_type, location);
-            assert_eq!(op.lhs(), lhs);
-            assert_eq!(op.rhs(), rhs);
-            assert_eq!(BinaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("sub", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let op = sub(lhs, rhs, i32_type, location).unwrap();
+                assert_eq!(op.lhs().unwrap(), lhs);
+                assert_eq!(op.rhs().unwrap(), rhs);
+                assert_eq!(op.lhs().unwrap(), lhs);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("sub", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3187,27 +3411,38 @@ mod tests {
     fn test_member() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let opaque_box_type = context.emit_c_opaque_type("Box");
-        let lvalue_box_type = context.emit_c_lvalue_type(opaque_box_type);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let opaque_box_type = context.emit_c_opaque_type("Box").unwrap();
+        let lvalue_box_type = context.emit_c_lvalue_type(opaque_box_type).unwrap();
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let variable_op =
-                block.append_operation(variable(context.emit_c_opaque_attribute("box"), lvalue_box_type, location));
-            let variable_value = variable_op.result(0).unwrap().as_ref();
-            let op = member("field", variable_value, lvalue_i32_type, location);
-            assert_eq!(op.member().as_str().unwrap(), "field");
-            assert_eq!(UnaryExpressionOperation::operand(&op), variable_value);
-            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-            let op = block.append_operation(op);
-            let load_op = block.append_operation(load(op.result(0).unwrap().as_ref(), i32_type, location));
-            block.append_operation(r#return(Some(load_op.result(0).unwrap().as_ref()), location));
-            func("member", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let variable_op = block
+                    .append_operation(
+                        variable(context.emit_c_opaque_attribute("box").unwrap(), lvalue_box_type, location).unwrap(),
+                    )
+                    .unwrap();
+                let variable_value = variable_op.as_ref().result(0).unwrap().as_ref();
+                let op = member("field", variable_value, lvalue_i32_type, location).unwrap();
+                assert_eq!(op.member().unwrap().as_str().unwrap(), "field");
+                assert_eq!(op.operand_value(0).unwrap(), variable_value);
+                assert_eq!(op.member().unwrap().as_str().unwrap(), "field");
+                let op = block.append_operation(op).unwrap();
+                let load_op = block
+                    .append_operation(load(op.as_ref().result(0).unwrap().as_ref(), i32_type, location).unwrap())
+                    .unwrap();
+                block
+                    .append_operation(r#return(Some(load_op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("member", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3227,31 +3462,44 @@ mod tests {
     fn test_member_of_ptr() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let opaque_box_type = context.emit_c_opaque_type("Box");
-        let pointer_box_type = context.emit_c_pointer_type(opaque_box_type);
-        let lvalue_pointer_box_type = context.emit_c_lvalue_type(pointer_box_type);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let opaque_box_type = context.emit_c_opaque_type("Box").unwrap();
+        let pointer_box_type = context.emit_c_pointer_type(opaque_box_type).unwrap();
+        let lvalue_pointer_box_type = context.emit_c_lvalue_type(pointer_box_type).unwrap();
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let variable_op = block.append_operation(variable(
-                context.emit_c_opaque_attribute("box_ptr"),
-                lvalue_pointer_box_type,
-                location,
-            ));
-            let variable_value = variable_op.result(0).unwrap().as_ref();
-            let op = member_of_ptr("field", variable_value, lvalue_i32_type, location);
-            assert_eq!(op.member().as_str().unwrap(), "field");
-            assert_eq!(UnaryExpressionOperation::operand(&op), variable_value);
-            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-            let op = block.append_operation(op);
-            let load_op = block.append_operation(load(op.result(0).unwrap().as_ref(), i32_type, location));
-            block.append_operation(r#return(Some(load_op.result(0).unwrap().as_ref()), location));
-            func("member_of_ptr", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let variable_op = block
+                    .append_operation(
+                        variable(
+                            context.emit_c_opaque_attribute("box_ptr").unwrap(),
+                            lvalue_pointer_box_type,
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let variable_value = variable_op.as_ref().result(0).unwrap().as_ref();
+                let op = member_of_ptr("field", variable_value, lvalue_i32_type, location).unwrap();
+                assert_eq!(op.member().unwrap().as_str().unwrap(), "field");
+                assert_eq!(op.operand_value(0).unwrap(), variable_value);
+                assert_eq!(op.member().unwrap().as_str().unwrap(), "field");
+                let op = block.append_operation(op).unwrap();
+                let load_op = block
+                    .append_operation(load(op.as_ref().result(0).unwrap().as_ref(), i32_type, location).unwrap())
+                    .unwrap();
+                block
+                    .append_operation(r#return(Some(load_op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("member_of_ptr", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3271,32 +3519,38 @@ mod tests {
     fn test_conditional() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let i32_type = context.signless_integer_type(32);
         let function_type = context.function_type::<TypeRef, TypeRef>(
             &[i1_type.as_ref(), i32_type.as_ref(), i32_type.as_ref()],
             &[i32_type.as_ref()],
         );
-        module.body().append_operation({
-            let mut block = context.block(&[
-                (i1_type.as_ref(), location),
-                (i32_type.as_ref(), location),
-                (i32_type.as_ref(), location),
-            ]);
-            let condition = block.argument(0).unwrap();
-            let true_value = block.argument(1).unwrap();
-            let false_value = block.argument(2).unwrap();
-            let op = conditional(condition, true_value, false_value, i32_type, location);
-            assert_eq!(op.condition(), condition);
-            assert_eq!(op.true_value(), true_value);
-            assert_eq!(op.false_value(), false_value);
-            assert_eq!(ConditionalOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("conditional", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (i1_type.as_ref(), location),
+                    (i32_type.as_ref(), location),
+                    (i32_type.as_ref(), location),
+                ]);
+                let condition = block.argument(0).unwrap();
+                let true_value = block.argument(1).unwrap();
+                let false_value = block.argument(2).unwrap();
+                let op = conditional(condition, true_value, false_value, i32_type, location).unwrap();
+                assert_eq!(op.condition().unwrap(), condition);
+                assert_eq!(op.true_value().unwrap(), true_value);
+                assert_eq!(op.false_value().unwrap(), false_value);
+                assert_eq!(op.condition().unwrap(), condition);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("conditional", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3314,20 +3568,26 @@ mod tests {
     fn test_unary_minus() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let operand = block.argument(0).unwrap();
-            let op = unary_minus(operand, i32_type, location);
-            assert_eq!(UnaryExpressionOperation::operand(&op), operand);
-            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("unary_minus", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let operand = block.argument(0).unwrap();
+                let op = unary_minus(operand, i32_type, location).unwrap();
+                assert_eq!(op.operand_value(0).unwrap(), operand);
+                assert_eq!(op.operand_value(0).unwrap(), operand);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("unary_minus", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3345,20 +3605,26 @@ mod tests {
     fn test_unary_plus() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let operand = block.argument(0).unwrap();
-            let op = unary_plus(operand, i32_type, location);
-            assert_eq!(UnaryExpressionOperation::operand(&op), operand);
-            assert_eq!(UnaryExpressionOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("unary_plus", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let operand = block.argument(0).unwrap();
+                let op = unary_plus(operand, i32_type, location).unwrap();
+                assert_eq!(op.operand_value(0).unwrap(), operand);
+                assert_eq!(op.operand_value(0).unwrap(), operand);
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("unary_plus", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3376,20 +3642,24 @@ mod tests {
     fn test_variable() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[]);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location);
-            assert_eq!(op.value().to_string(), "0 : i32");
-            assert_eq!(VariableOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-            block.append_operation(op);
-            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
-            func("variable", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location).unwrap();
+                assert_eq!(op.value().unwrap().to_string(), "0 : i32");
+                assert_eq!(op.value().unwrap().to_string(), "0 : i32");
+                block.append_operation(op).unwrap();
+                block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
+                func("variable", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3407,19 +3677,18 @@ mod tests {
     fn test_global() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let initial_value = context.integer_attribute(i32_type, 7).as_ref();
-        let op = global("counter", i32_type, Some(initial_value), false, true, true, location);
-        assert_eq!(op.symbol_name().as_str().unwrap(), "counter");
-        assert_eq!(op.r#type(), i32_type.as_ref());
-        assert_eq!(op.initial_value(), Some(initial_value));
+        let op = global("counter", i32_type, Some(initial_value), false, true, true, location).unwrap();
+        assert_eq!(op.symbol_name().unwrap().as_str().unwrap(), "counter");
+        assert_eq!(op.r#type().unwrap(), i32_type.as_ref());
+        assert_eq!(op.initial_value().unwrap(), Some(initial_value));
         assert!(!op.extern_specifier());
         assert!(op.static_specifier());
         assert!(op.const_specifier());
-        module.body().append_operation(op);
-
-        assert!(module.verify());
+        module.body().unwrap().append_operation(op).unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3434,22 +3703,34 @@ mod tests {
     fn test_get_global() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
-        module.body().append_operation(global("counter", i32_type, None, true, false, false, location));
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = get_global("counter", lvalue_i32_type, location);
-            assert_eq!(GetGlobalOperation::name(&op).reference().as_str().unwrap(), "counter");
-            assert_eq!(GetGlobalOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-            let op = block.append_operation(op);
-            let load_op = block.append_operation(load(op.result(0).unwrap().as_ref(), i32_type, location));
-            block.append_operation(r#return(Some(load_op.result(0).unwrap().as_ref()), location));
-            func("get_global", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation(global("counter", i32_type, None, true, false, false, location).unwrap())
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = get_global("counter", lvalue_i32_type, location).unwrap();
+                assert_eq!(GetGlobalOperation::name(&op).unwrap().reference().as_str().unwrap(), "counter");
+                assert_eq!(GetGlobalOperation::name(&op).unwrap().reference().as_str().unwrap(), "counter");
+                let op = block.append_operation(op).unwrap();
+                let load_op = block
+                    .append_operation(load(op.as_ref().result(0).unwrap().as_ref(), i32_type, location).unwrap())
+                    .unwrap();
+                block
+                    .append_operation(r#return(Some(load_op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("get_global", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3469,20 +3750,24 @@ mod tests {
     fn test_verbatim() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let argument = block.argument(0).unwrap();
-            let op = verbatim("value = {}", &[argument.as_ref()], location);
-            assert_eq!(op.value().as_str().unwrap(), "value = {}");
-            assert_eq!(op.format_arguments(), vec![argument.as_ref()]);
-            block.append_operation(op);
-            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
-            func("verbatim", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let argument = block.argument(0).unwrap();
+                let op = verbatim("value = {}", &[argument.as_ref()], location).unwrap();
+                assert_eq!(op.value().unwrap().as_str().unwrap(), "value = {}");
+                assert_eq!(op.format_arguments().unwrap(), vec![argument.as_ref()]);
+                block.append_operation(op).unwrap();
+                block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
+                func("verbatim", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3500,24 +3785,31 @@ mod tests {
     fn test_assign() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let value = block.argument(0).unwrap();
-            let variable_op =
-                block.append_operation(variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location));
-            let variable_value = variable_op.result(0).unwrap().as_ref();
-            let op = assign(variable_value, value, location);
-            assert_eq!(op.variable(), variable_value);
-            assert_eq!(op.value(), value);
-            block.append_operation(op);
-            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
-            func("assign", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let value = block.argument(0).unwrap();
+                let variable_op = block
+                    .append_operation(
+                        variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location).unwrap(),
+                    )
+                    .unwrap();
+                let variable_value = variable_op.as_ref().result(0).unwrap().as_ref();
+                let op = assign(variable_value, value, location).unwrap();
+                assert_eq!(op.variable().unwrap(), variable_value);
+                assert_eq!(op.value().unwrap(), value);
+                block.append_operation(op).unwrap();
+                block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
+                func("assign", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3536,35 +3828,41 @@ mod tests {
     fn test_yield() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type =
             context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref(), i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let lhs = block.argument(0).unwrap();
-            let rhs = block.argument(1).unwrap();
-            let mut region = context.region();
-            let mut body = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
-            let body_lhs = body.argument(0).unwrap();
-            let body_rhs = body.argument(1).unwrap();
-            let add_op = body.append_operation(add(body_lhs, body_rhs, i32_type, location));
-            let op = r#yield(Some(add_op.result(0).unwrap().as_ref()), location);
-            assert_eq!(op.value(), Some(add_op.result(0).unwrap().as_ref()));
-            body.append_operation(op);
-            region.append_block(body);
-            let expression_op = block.append_operation(expression(
-                &[lhs.as_ref(), rhs.as_ref()],
-                i32_type.as_ref(),
-                region.into(),
-                true,
-                location,
-            ));
-            block.append_operation(r#return(Some(expression_op.result(0).unwrap().as_ref()), location));
-            func("yield", function_type, block.into(), None, None, None, location)
-        });
-
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let lhs = block.argument(0).unwrap();
+                let rhs = block.argument(1).unwrap();
+                let mut region = context.region();
+                let mut body = context.block(&[(i32_type.as_ref(), location), (i32_type.as_ref(), location)]);
+                let body_lhs = body.argument(0).unwrap();
+                let body_rhs = body.argument(1).unwrap();
+                let add_op = body.append_operation(add(body_lhs, body_rhs, i32_type, location).unwrap()).unwrap();
+                let op = r#yield(Some(add_op.as_ref().result(0).unwrap().as_ref()), location).unwrap();
+                assert_eq!(op.value().unwrap(), Some(add_op.as_ref().result(0).unwrap().as_ref()));
+                body.append_operation(op).unwrap();
+                region.append_block(body).unwrap();
+                let expression_op = block
+                    .append_operation(
+                        expression(&[lhs.as_ref(), rhs.as_ref()], i32_type.as_ref(), region.into(), true, location)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                block
+                    .append_operation(
+                        r#return(Some(expression_op.as_ref().result(0).unwrap().as_ref()), location).unwrap(),
+                    )
+                    .unwrap();
+                func("yield", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3585,25 +3883,34 @@ mod tests {
     fn test_if() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[i1_type.as_ref()], &[]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i1_type.as_ref(), location)]);
-            let condition = block.argument(0).unwrap();
-            let mut then_region = context.block_with_no_arguments();
-            then_region.append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location));
-            let mut else_region = context.block_with_no_arguments();
-            else_region.append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location));
-            let op = r#if(condition, then_region.into(), else_region.into(), location);
-            assert_eq!(op.condition(), condition);
-            assert_eq!(op.then_region().blocks().count(), 1);
-            assert_eq!(op.else_region().blocks().count(), 1);
-            block.append_operation(op);
-            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
-            func("if", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i1_type.as_ref(), location)]);
+                let condition = block.argument(0).unwrap();
+                let mut then_region = context.block_with_no_arguments();
+                then_region
+                    .append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap())
+                    .unwrap();
+                let mut else_region = context.block_with_no_arguments();
+                else_region
+                    .append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap())
+                    .unwrap();
+                let op = r#if(condition, then_region.try_into().unwrap(), else_region.try_into().unwrap(), location)
+                    .unwrap();
+                assert_eq!(op.condition().unwrap(), condition);
+                assert_eq!(op.then_region().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.else_region().unwrap().blocks().unwrap().count(), 1);
+                block.append_operation(op).unwrap();
+                block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
+                func("if", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3623,26 +3930,34 @@ mod tests {
     fn test_subscript() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
-        let array_i32_type = context.emit_c_array_type(i32_type, &[4]);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type);
+        let array_i32_type = context.emit_c_array_type(i32_type, &[4]).unwrap();
+        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type).unwrap();
         let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[i32_type.as_ref()]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let index = block.argument(0).unwrap();
-            let array_op = block.append_operation(literal("values", array_i32_type, location));
-            let array_value = array_op.result(0).unwrap().as_ref();
-            let op = subscript(array_value, &[index.as_ref()], lvalue_i32_type, location);
-            assert_eq!(op.value(), array_value);
-            assert_eq!(op.indices(), vec![index.as_ref()]);
-            assert_eq!(SubscriptOperation::output(&op).r#type(), lvalue_i32_type.as_ref());
-            let op = block.append_operation(op);
-            let load_op = block.append_operation(load(op.result(0).unwrap().as_ref(), i32_type, location));
-            block.append_operation(r#return(Some(load_op.result(0).unwrap().as_ref()), location));
-            func("subscript", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let index = block.argument(0).unwrap();
+                let array_op = block.append_operation(literal("values", array_i32_type, location).unwrap()).unwrap();
+                let array_value = array_op.as_ref().result(0).unwrap().as_ref();
+                let op = subscript(array_value, &[index.as_ref()], lvalue_i32_type, location).unwrap();
+                assert_eq!(op.value().unwrap(), array_value);
+                assert_eq!(op.indices().unwrap(), vec![index.as_ref()]);
+                assert_eq!(op.output().unwrap().r#type().unwrap(), lvalue_i32_type.as_ref());
+                let op = block.append_operation(op).unwrap();
+                let load_op = block
+                    .append_operation(load(op.as_ref().result(0).unwrap().as_ref(), i32_type, location).unwrap())
+                    .unwrap();
+                block
+                    .append_operation(r#return(Some(load_op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("subscript", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3662,26 +3977,41 @@ mod tests {
     fn test_switch() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[i32_type.as_ref()], &[]);
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type.as_ref(), location)]);
-            let argument = block.argument(0).unwrap();
-            let mut default_region = context.block_with_no_arguments();
-            default_region.append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location));
-            let mut case_region = context.block_with_no_arguments();
-            case_region.append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location));
-            let op = switch(argument, &[1], default_region.into(), vec![case_region.into()], location);
-            assert_eq!(op.argument(), argument);
-            assert_eq!(op.cases().values().collect::<Vec<_>>(), vec![1]);
-            assert_eq!(op.default_region().blocks().count(), 1);
-            assert_eq!(op.case_regions().len(), 1);
-            block.append_operation(op);
-            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
-            func("switch", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type.as_ref(), location)]);
+                let argument = block.argument(0).unwrap();
+                let mut default_region = context.block_with_no_arguments();
+                default_region
+                    .append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap())
+                    .unwrap();
+                let mut case_region = context.block_with_no_arguments();
+                case_region
+                    .append_operation(r#yield(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap())
+                    .unwrap();
+                let op = switch(
+                    argument,
+                    &[1],
+                    default_region.try_into().unwrap(),
+                    vec![case_region.try_into().unwrap()],
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.argument().unwrap(), argument);
+                assert_eq!(op.cases().unwrap().values().collect::<Vec<_>>(), vec![1]);
+                assert_eq!(op.default_region().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.case_regions().unwrap().len(), 1);
+                block.append_operation(op).unwrap();
+                block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
+                func("switch", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             // The MLIR printer currently emits a trailing space after the `emitc.switch` argument type.
@@ -3705,16 +4035,16 @@ mod tests {
     fn test_class() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let mut body = context.block_with_no_arguments();
-        body.append_operation(field("value", context.signless_integer_type(32), None, location));
-        let op = class("Box", true, body.into(), location);
-        assert_eq!(op.symbol_name().as_str().unwrap(), "Box");
+        body.append_operation(field("value", context.signless_integer_type(32), None, location).unwrap())
+            .unwrap();
+        let op = class("Box", true, body.try_into().unwrap(), location).unwrap();
+        assert_eq!(op.symbol_name().unwrap().as_str().unwrap(), "Box");
         assert!(op.final_specifier());
-        assert_eq!(op.body().blocks().count(), 1);
-        module.body().append_operation(op);
-
-        assert!(module.verify());
+        assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
+        module.body().unwrap().append_operation(op).unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3731,18 +4061,21 @@ mod tests {
     fn test_field() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let initial_value = context.integer_attribute(i32_type, 7).as_ref();
         let mut body = context.block_with_no_arguments();
-        let op = field("value", i32_type, Some(initial_value), location);
-        assert_eq!(op.symbol_name().as_str().unwrap(), "value");
-        assert_eq!(op.r#type(), i32_type.as_ref());
-        assert_eq!(op.initial_value(), Some(initial_value));
-        body.append_operation(op);
-        module.body().append_operation(class("Box", false, body.into(), location));
-
-        assert!(module.verify());
+        let op = field("value", i32_type, Some(initial_value), location).unwrap();
+        assert_eq!(op.symbol_name().unwrap().as_str().unwrap(), "value");
+        assert_eq!(op.r#type().unwrap(), i32_type.as_ref());
+        assert_eq!(op.initial_value().unwrap(), Some(initial_value));
+        body.append_operation(op).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(class("Box", false, body.try_into().unwrap(), location).unwrap())
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3759,22 +4092,30 @@ mod tests {
     fn test_get_field() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[i32_type.as_ref()]);
         let mut class_body = context.block_with_no_arguments();
-        class_body.append_operation(field("value", i32_type, None, location));
-        class_body.append_operation({
-            let mut block = context.block_with_no_arguments();
-            let op = get_field("value", i32_type, location);
-            assert_eq!(op.field_name().reference().as_str().unwrap(), "value");
-            assert_eq!(GetFieldOperation::output(&op).r#type(), i32_type.as_ref());
-            let op = block.append_operation(op);
-            block.append_operation(r#return(Some(op.result(0).unwrap().as_ref()), location));
-            func("get_field", function_type, block.into(), None, None, None, location)
-        });
-        module.body().append_operation(class("Box", false, class_body.into(), location));
-        assert!(module.verify());
+        class_body.append_operation(field("value", i32_type, None, location).unwrap()).unwrap();
+        class_body
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let op = get_field("value", i32_type, location).unwrap();
+                assert_eq!(op.field_name().unwrap().reference().as_str().unwrap(), "value");
+                assert_eq!(op.field_name().unwrap().reference().as_str().unwrap(), "value");
+                let op = block.append_operation(op).unwrap();
+                block
+                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                func("get_field", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(class("Box", false, class_body.try_into().unwrap(), location).unwrap())
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"
@@ -3795,37 +4136,45 @@ mod tests {
     fn test_do() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[]);
-        module.body().append_operation({
-            let mut block = context.block_with_no_arguments();
-            let mut body = context.block_with_no_arguments();
-            body.append_operation(verbatim("side_effect()", &[], location));
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block_with_no_arguments();
+                let mut body = context.block_with_no_arguments();
+                body.append_operation(verbatim("side_effect()", &[], location).unwrap()).unwrap();
 
-            let mut condition = context.block_with_no_arguments();
-            let mut expression_region = context.region();
-            let mut expression_body = context.block_with_no_arguments();
-            let literal_op = expression_body.append_operation(literal("true", i1_type, location));
-            expression_body.append_operation(r#yield(Some(literal_op.result(0).unwrap().as_ref()), location));
-            expression_region.append_block(expression_body);
-            let expression_op = condition.append_operation(expression(
-                &[],
-                i1_type.as_ref(),
-                expression_region.into(),
-                false,
-                location,
-            ));
-            condition.append_operation(r#yield(Some(expression_op.result(0).unwrap().as_ref()), location));
+                let mut condition = context.block_with_no_arguments();
+                let mut expression_region = context.region();
+                let mut expression_body = context.block_with_no_arguments();
+                let literal_op = expression_body.append_operation(literal("true", i1_type, location).unwrap()).unwrap();
+                expression_body
+                    .append_operation(r#yield(Some(literal_op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
+                    .unwrap();
+                expression_region.append_block(expression_body).unwrap();
+                let expression_op = condition
+                    .append_operation(
+                        expression(&[], i1_type.as_ref(), expression_region.into(), false, location).unwrap(),
+                    )
+                    .unwrap();
+                condition
+                    .append_operation(
+                        r#yield(Some(expression_op.as_ref().result(0).unwrap().as_ref()), location).unwrap(),
+                    )
+                    .unwrap();
 
-            let op = r#do(body.into(), condition.into(), location);
-            assert_eq!(op.body().blocks().count(), 1);
-            assert_eq!(op.condition().blocks().count(), 1);
-            block.append_operation(op);
-            block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location));
-            func("do", function_type, block.into(), None, None, None, location)
-        });
-        assert!(module.verify());
+                let op = r#do(body.try_into().unwrap(), condition.try_into().unwrap(), location).unwrap();
+                assert_eq!(op.body().unwrap().blocks().unwrap().count(), 1);
+                assert_eq!(op.condition().unwrap().blocks().unwrap().count(), 1);
+                block.append_operation(op).unwrap();
+                block.append_operation(r#return(Option::<ValueRef<'_, '_, '_>>::None, location).unwrap()).unwrap();
+                func("do", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {r#"

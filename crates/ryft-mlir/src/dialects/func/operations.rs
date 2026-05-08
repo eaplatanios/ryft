@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use crate::{
-    Attribute, AttributeRef, CALLEE_ATTRIBUTE, Call, Callee, DetachedOp, DetachedRegion, DialectHandle,
+    AttributeRef, CALLEE_ATTRIBUTE, Call, Callee, DetachedOp, DetachedRegion, DialectHandle, Error,
     FUNCTION_TYPE_ATTRIBUTE, FlatSymbolRefAttributeRef, FunctionTypeRef, HasCallableArgumentAndResultAttributes,
-    IntoWithContext, Location, Operation, OperationBuilder, SYMBOL_NAME_ATTRIBUTE, SYMBOL_VISIBILITY_ATTRIBUTE,
-    StringAttributeRef, StringRef, SymbolVisibility, Type, TypeAndAttributes, Value, ValueAndAttributes, ValueRef,
+    Location, Operation, OperationBuilder, SYMBOL_NAME_ATTRIBUTE, SYMBOL_VISIBILITY_ATTRIBUTE, StringAttributeRef,
+    StringRef, SymbolVisibility, TryIntoWithContext, Type, TypeAndAttributes, Value, ValueAndAttributes, ValueRef,
     mlir_op, mlir_op_trait,
 };
 
@@ -24,17 +24,17 @@ use crate::{
 /// for more information.
 pub trait CallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the symbol of the [`Function`](crate::Function) that is being called.
-    fn function(&self) -> StringRef<'c> {
-        self.attribute(CALLEE_ATTRIBUTE).unwrap().cast::<FlatSymbolRefAttributeRef>().unwrap().reference()
+    fn function(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.flat_symbol_ref_attribute(CALLEE_ATTRIBUTE)?.reference())
     }
 
-    /// Returns an [`Iterator`] over the argument [`Value`]s (i.e., the operands) of this [`CallOperation`].
+    /// Returns the argument [`Value`]s (i.e., the operands) of this [`CallOperation`].
     ///
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`](crate::Context)
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn arguments(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
-        self.operand_values()
+    fn arguments(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.operand_values().collect()
     }
 
     /// Returns the value of the `no_inline` [`Attribute`] for this [`Operation`]. If `true`, then the compiler will be
@@ -50,16 +50,14 @@ mlir_op_trait!(Call, HasCallableArgumentAndResultAttributes);
 mlir_op_trait!(Call, MemRefsNormalizable);
 
 impl<'o, 'c: 'o, 't: 'c> Call<'o, 'c, 't> for DetachedCallOperation<'c, 't> {
-    fn callee(&self) -> Callee<'o, 'c, 't> {
-        let attribute = self.attribute(CALLEE_ATTRIBUTE).unwrap();
-        Callee::Symbol(attribute.cast::<FlatSymbolRefAttributeRef>().unwrap())
+    fn callee(&self) -> Result<Callee<'o, 'c, 't>, Error> {
+        Ok(Callee::Symbol(self.flat_symbol_ref_attribute(CALLEE_ATTRIBUTE)?))
     }
 }
 
 impl<'o, 'c: 'o, 't: 'c> Call<'o, 'c, 't> for CallOperationRef<'o, 'c, 't> {
-    fn callee(&self) -> Callee<'o, 'c, 't> {
-        let attribute = self.attribute(CALLEE_ATTRIBUTE).unwrap();
-        Callee::Symbol(attribute.cast::<FlatSymbolRefAttributeRef>().unwrap())
+    fn callee(&self) -> Result<Callee<'o, 'c, 't>, Error> {
+        Ok(Callee::Symbol(self.flat_symbol_ref_attribute(CALLEE_ATTRIBUTE)?))
     }
 }
 
@@ -85,17 +83,17 @@ pub fn call<
     'c: 'v,
     't: 'c,
     's,
-    C: IntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
+    C: TryIntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
     L: Location<'c, 't>,
 >(
     callee: C,
     properties: CallProperties<'v, 'c, 't, 's>,
     location: L,
-) -> DetachedCallOperation<'c, 't> {
+) -> Result<DetachedCallOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::func());
+    context.load_dialect(DialectHandle::func()?)?;
     let mut builder = OperationBuilder::new("func.call", location)
-        .add_attribute(CALLEE_ATTRIBUTE, callee.into_with_context(context))
+        .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)
         .add_operands(&properties.arguments.iter().map(|argument| argument.value).collect::<Vec<_>>())
         .add_results(&properties.results.iter().map(|result| result.r#type).collect::<Vec<_>>());
 
@@ -103,24 +101,23 @@ pub fn call<
         builder = DetachedCallOperation::<'c, 't>::add_callable_argument_attributes(
             builder,
             properties.arguments.iter().map(|argument| &argument.attributes),
-        );
+        )?;
     }
 
     if properties.results.iter().any(|result| result.attributes.is_some()) {
         builder = DetachedCallOperation::<'c, 't>::add_callable_result_attributes(
             builder,
             properties.results.iter().map(|result| &result.attributes),
-        );
+        )?;
     }
 
     if properties.no_inline {
         builder = builder.add_attribute(FUNCTION_NO_INLINE_ATTRIBUTE, context.unit_attribute());
     }
 
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `func::call`")
+    builder.build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `func::call`"))
+    })
 }
 
 /// [`Operation`] that represents an indirect call to a [`Value`] of function type (i.e., [`FunctionTypeRef`]). The
@@ -141,17 +138,17 @@ pub fn call<
 /// for more information.
 pub trait CallIndirectOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the [`Value`] that represents the [`Function`](crate::Function) that is being called.
-    fn function(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand_value(0).unwrap()
+    fn function(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
     }
 
-    /// Returns an [`Iterator`] over the argument [`Value`]s (i.e., the operands) of this [`CallOperation`].
+    /// Returns the argument [`Value`]s (i.e., the operands) of this [`CallOperation`].
     ///
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`](crate::Context)
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn arguments(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
-        self.operand_values().skip(1)
+    fn arguments(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.operand_values().skip(1).collect()
     }
 }
 
@@ -159,14 +156,14 @@ mlir_op!(CallIndirect);
 mlir_op_trait!(CallIndirect, HasCallableArgumentAndResultAttributes);
 
 impl<'o, 'c: 'o, 't: 'c> Call<'o, 'c, 't> for DetachedCallIndirectOperation<'c, 't> {
-    fn callee(&self) -> Callee<'o, 'c, 't> {
-        Callee::Value(self.function())
+    fn callee(&self) -> Result<Callee<'o, 'c, 't>, Error> {
+        Ok(Callee::Value(self.function()?))
     }
 }
 
 impl<'o, 'c: 'o, 't: 'c> Call<'o, 'c, 't> for CallIndirectOperationRef<'o, 'c, 't> {
-    fn callee(&self) -> Callee<'o, 'c, 't> {
-        Callee::Value(self.function())
+    fn callee(&self) -> Result<Callee<'o, 'c, 't>, Error> {
+        Ok(Callee::Value(self.function()?))
     }
 }
 
@@ -189,9 +186,9 @@ pub fn call_indirect<'f, 'v, 'c: 'f + 'v, 't: 'c, 's, C: Value<'f, 'c, 't>, L: L
     callee: C,
     properties: CallIndirectProperties<'v, 'c, 't, 's>,
     location: L,
-) -> DetachedCallIndirectOperation<'c, 't> {
+) -> Result<DetachedCallIndirectOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::func());
+    context.load_dialect(DialectHandle::func()?)?;
     let mut builder = OperationBuilder::new("func.call_indirect", location)
         .add_operand(callee)
         .add_operands(&properties.arguments.iter().map(|argument| argument.value).collect::<Vec<_>>())
@@ -201,20 +198,21 @@ pub fn call_indirect<'f, 'v, 'c: 'f + 'v, 't: 'c, 's, C: Value<'f, 'c, 't>, L: L
         builder = DetachedCallIndirectOperation::<'c, 't>::add_callable_argument_attributes(
             builder,
             properties.arguments.iter().map(|argument| &argument.attributes),
-        );
+        )?;
     }
 
     if properties.results.iter().any(|result| result.attributes.is_some()) {
         builder = DetachedCallIndirectOperation::<'c, 't>::add_callable_result_attributes(
             builder,
             properties.results.iter().map(|result| &result.attributes),
-        );
+        )?;
     }
 
-    builder
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `func::call_indirect`")
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `func::call_indirect`"))
+    })
 }
 
 /// Name of the [`Attribute`] that is used to store [`ConstantOperation::function`].
@@ -244,17 +242,15 @@ pub const FUNCTION_CONSTANT_VALUE_ATTRIBUTE: &str = "value";
 /// for more information.
 pub trait ConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the symbol of the underlying [`Function`](crate::Function) value.
-    fn function(&self) -> StringRef<'c> {
-        self.attribute(FUNCTION_CONSTANT_VALUE_ATTRIBUTE)
-            .unwrap()
-            .cast::<FlatSymbolRefAttributeRef>()
-            .unwrap()
-            .reference()
+    fn function(&self) -> Result<StringRef<'c>, Error> {
+        Ok(self.flat_symbol_ref_attribute(FUNCTION_CONSTANT_VALUE_ATTRIBUTE)?.reference())
     }
 
     /// Returns the [`FunctionTypeRef`] of the underlying [`Function`](crate::Function) value.
-    fn function_type(&self) -> FunctionTypeRef<'c, 't> {
-        self.result_type(0).unwrap().cast().unwrap()
+    fn function_type(&self) -> Result<FunctionTypeRef<'c, 't>, Error> {
+        self.result_type(0)?
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid result type in `func.constant`"))
     }
 }
 
@@ -272,22 +268,23 @@ mlir_op_trait!(Constant, ZeroOperands);
 pub fn constant<
     'c,
     't: 'c,
-    V: IntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
-    T: IntoWithContext<'c, 't, FunctionTypeRef<'c, 't>>,
+    V: TryIntoWithContext<'c, 't, FlatSymbolRefAttributeRef<'c, 't>>,
+    T: TryIntoWithContext<'c, 't, FunctionTypeRef<'c, 't>>,
     L: Location<'c, 't>,
 >(
     function: V,
     function_type: T,
     location: L,
-) -> DetachedConstantOperation<'c, 't> {
+) -> Result<DetachedConstantOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::func());
+    context.load_dialect(DialectHandle::func()?)?;
     OperationBuilder::new("func.constant", location)
-        .add_attribute(FUNCTION_CONSTANT_VALUE_ATTRIBUTE, function.into_with_context(context))
-        .add_result(function_type.into_with_context(context))
+        .add_attribute(FUNCTION_CONSTANT_VALUE_ATTRIBUTE, function.try_into_with_context(context)?)
+        .add_result(function_type.try_into_with_context(context)?)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `func::constant`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `func::constant`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`FuncOperation::no_inline`].
@@ -405,17 +402,17 @@ impl Default for FuncAttributes<'_, '_, '_> {
 /// Constructs a new detached/owned [`FuncOperation`] at the specified [`Location`] with the provided name,
 /// [`FuncAttributes`], and body. Refer to the documentation of [`FuncOperation`] and [`FuncAttributes`] for more
 /// information.
-pub fn func<'c, 't: 'c, 's, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
+pub fn func<'c, 't: 'c, 's, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>, L: Location<'c, 't>>(
     name: N,
     attributes: FuncAttributes<'c, 't, 's>,
     body: DetachedRegion<'c, 't>,
     location: L,
-) -> DetachedFuncOperation<'c, 't> {
+) -> Result<DetachedFuncOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::func());
+    context.load_dialect(DialectHandle::func()?)?;
 
     let mut builder = OperationBuilder::new("func.func", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.into_with_context(context));
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?);
 
     builder = builder.add_attribute(
         FUNCTION_TYPE_ATTRIBUTE,
@@ -429,14 +426,14 @@ pub fn func<'c, 't: 'c, 's, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't
         builder = DetachedFuncOperation::<'c, 't>::add_callable_argument_attributes(
             builder,
             attributes.arguments.iter().map(|argument| &argument.attributes),
-        );
+        )?;
     }
 
     if attributes.results.iter().any(|result| result.attributes.is_some()) {
         builder = DetachedFuncOperation::<'c, 't>::add_callable_result_attributes(
             builder,
             attributes.results.iter().map(|result| &result.attributes),
-        );
+        )?;
     }
 
     if attributes.visibility != SymbolVisibility::default() {
@@ -456,11 +453,9 @@ pub fn func<'c, 't: 'c, 's, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't
         builder = builder.add_attribute(*attribute_name, *attribute)
     }
 
-    builder
-        .add_region(body)
-        .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `func::func`")
+    builder.add_region(body).build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `func::func`"))
+    })
 }
 
 /// [`Operation`] that represents a return operation from within a [`FuncOperation`]. It takes variable number of
@@ -482,13 +477,13 @@ pub fn func<'c, 't: 'c, 's, N: IntoWithContext<'c, 't, StringAttributeRef<'c, 't
 /// Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/Func/#funcreturn-funcreturnop)
 /// for more information.
 pub trait ReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
-    /// Returns an [`Iterator`] over the return [`Value`]s (i.e., the operands) of this [`ReturnOperation`].
+    /// Returns the return [`Value`]s (i.e., the operands) of this [`ReturnOperation`].
     ///
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`](crate::Context)
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn values(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
-        self.operand_values()
+    fn values(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.operand_values().collect()
     }
 }
 
@@ -504,14 +499,15 @@ mlir_op_trait!(Return, ZeroRegions);
 pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     values: &[V],
     location: L,
-) -> DetachedReturnOperation<'c, 't> {
+) -> Result<DetachedReturnOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::func());
+    context.load_dialect(DialectHandle::func()?)?;
     OperationBuilder::new("func.return", location)
         .add_operands(values)
         .build()
-        .and_then(|operation| unsafe { operation.cast() })
-        .expect("invalid arguments to `func::return`")
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `func::return`"))
+        })
 }
 
 #[cfg(test)]
@@ -521,7 +517,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::{Block, Context, Function, OpRef, Operation};
+    use crate::{Attribute, Block, Context, Function, OpRef, Operation};
 
     use super::*;
 
@@ -529,13 +525,13 @@ mod tests {
         context: &'c Context<'t>,
         r#type: T,
         location: L,
-    ) -> DetachedFuncOperation<'c, 't> {
+    ) -> Result<DetachedFuncOperation<'c, 't>, Error> {
         let mut block = context.block(&[(r#type, location)]);
-        block.append_operation(r#return(&[block.argument(0).unwrap()], location));
+        block.append_operation(r#return(&[block.argument(0).unwrap()], location).unwrap()).unwrap();
         func(
             "identity",
             FuncAttributes { arguments: vec![r#type.into()], results: vec![r#type.into()], ..Default::default() },
-            vec![block].into_with_context(&context),
+            vec![block].try_into_with_context(&context)?,
             location,
         )
     }
@@ -544,48 +540,61 @@ mod tests {
     fn test_simple_func_and_call() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
 
-        module.body().append_operation(identity_func(&context, context.float32_type(), location));
+        module
+            .body()
+            .unwrap()
+            .append_operation(identity_func(&context, context.float32_type(), location).unwrap())
+            .unwrap();
 
         // Define a function called `caller` which calls `identity` from within its body.
-        module.body().append_operation({
-            let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
-            let op = call(
-                "identity",
-                CallProperties {
-                    arguments: vec![block.argument(0).unwrap().into()],
-                    results: vec![f32_type.into()],
-                    no_inline: false,
-                },
-                location,
-            );
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f32_type, location), (f32_type, location)]);
+                let op = call(
+                    "identity",
+                    CallProperties {
+                        arguments: vec![block.argument(0).unwrap().into()],
+                        results: vec![f32_type.into()],
+                        no_inline: false,
+                    },
+                    location,
+                )
+                .unwrap();
 
-            // Check that the `function` accessor of [`CallOperation`] works as expected.
-            assert_eq!(op.function().as_str().unwrap(), "identity");
+                // Check that the `function` accessor of [`CallOperation`] works as expected.
+                assert_eq!(op.function().unwrap().as_str().unwrap(), "identity");
 
-            // Check that the `arguments` accessor of [`CallOperation`] works as expected.
-            assert_eq!(op.arguments().collect::<Vec<_>>().len(), 1);
+                // Check that the `arguments` accessor of [`CallOperation`] works as expected.
+                assert_eq!(op.arguments().unwrap().into_iter().collect::<Vec<_>>().len(), 1);
 
-            // Check that the `results` accessor of [`CallOperation`] works as expected.
-            assert_eq!(op.results().collect::<Vec<_>>().len(), 1);
+                // Check that the `results` accessor of [`CallOperation`] works as expected.
+                assert_eq!(
+                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(),
+                    1
+                );
 
-            let op = block.append_operation(op);
-            block.append_operation(r#return(&[op.result(0).unwrap()], location));
-            func(
-                "caller",
-                FuncAttributes {
-                    arguments: vec![f32_type.into(), f32_type.into()],
-                    results: vec![f32_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func(
+                    "caller",
+                    FuncAttributes {
+                        arguments: vec![f32_type.into(), f32_type.into()],
+                        results: vec![f32_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -606,40 +615,46 @@ mod tests {
     fn test_recursive_func_and_call() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let index_type = context.index_type();
 
         // Define a function called `foo` which calls itself from within its body.
-        module.body().append_operation({
-            let mut block = context.block(&[(index_type, location)]);
-            let op = call(
-                "foo",
-                CallProperties {
-                    arguments: vec![block.argument(0).unwrap().into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                location,
-            );
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(index_type, location)]);
+                let op = call(
+                    "foo",
+                    CallProperties {
+                        arguments: vec![block.argument(0).unwrap().into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    location,
+                )
+                .unwrap();
 
-            // Check that the `function` accessor of [`CallOperation`] works as expected.
-            assert_eq!(op.function().as_str().unwrap(), "foo");
+                // Check that the `function` accessor of [`CallOperation`] works as expected.
+                assert_eq!(op.function().unwrap().as_str().unwrap(), "foo");
 
-            let op = block.append_operation(op);
-            block.append_operation(r#return(&[op.result(0).unwrap()], location));
-            func(
-                "foo",
-                FuncAttributes {
-                    arguments: vec![index_type.into()],
-                    results: vec![index_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func(
+                    "foo",
+                    FuncAttributes {
+                        arguments: vec![index_type.into()],
+                        results: vec![index_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -657,13 +672,17 @@ mod tests {
     fn test_func_and_call_with_no_inline() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
 
-        module.body().append_operation(identity_func(&context, i32_type, location));
+        module
+            .body()
+            .unwrap()
+            .append_operation(identity_func(&context, i32_type, location).unwrap())
+            .unwrap();
 
         // Define a function called `caller` which calls `identity` from within its body with the `no_inline` attribute.
-        module.body().append_operation({
+        module.body().unwrap().append_operation({
             let mut block = context.block(&[(i32_type, location)]);
             let op = call(
                 "identity",
@@ -673,7 +692,8 @@ mod tests {
                     no_inline: true,
                 },
                 location,
-            );
+            )
+            .unwrap();
             assert_eq!(
                 format!("{:?}", op),
                 "DetachedCallOperation[%0 = func.call @identity(<<UNKNOWN SSA VALUE>>) {no_inline} : (i32) -> i32\n]",
@@ -688,7 +708,8 @@ mod tests {
                     no_inline: true,
                 },
                 location,
-            );
+            )
+            .unwrap();
             assert_ne!(op, dummy_op);
             let mut map = HashMap::new();
             map.insert(&op, "op");
@@ -697,7 +718,7 @@ mod tests {
             assert_eq!(map.get(&op), Some(&"op"));
             assert_eq!(map.get(&dummy_op), Some(&"dummy_op"));
             let mut map = HashMap::new();
-            let op_ref = CallOperationRef::from(&op).as_ref();
+            let op_ref = op.as_ref().as_ref();
             let dummy_op_ref = dummy_op.as_ref();
             map.insert(&op_ref, "op");
             map.insert(&dummy_op_ref, "dummy_op");
@@ -706,23 +727,23 @@ mod tests {
             assert_eq!(map.get(&dummy_op_ref), Some(&"dummy_op"));
 
             // Check that the `callee` and `function` accessors of [`CallOperation`] work as expected.
-            assert!(matches!(op.callee(), Callee::Symbol(_)));
-            assert_eq!(op.function().as_str().unwrap(), "identity");
+            assert!(matches!(op.callee().unwrap(), Callee::Symbol(_)));
+            assert_eq!(op.function().unwrap().as_str().unwrap(), "identity");
 
             let op_ref = unsafe { op.as_ref().cast::<CallOperationRef>() }.unwrap();
-            assert!(matches!(op_ref.callee(), Callee::Symbol(_)));
+            assert!(matches!(op_ref.callee().unwrap(), Callee::Symbol(_)));
 
             // Check that the `no_inline` accessor of [`CallOperation`] works as expected.
             assert!(op.no_inline());
 
             // Check that the `arguments` accessor of [`CallOperation`] works as expected.
-            assert_eq!(op.arguments().collect::<Vec<_>>().len(), 1);
+            assert_eq!(op.arguments().unwrap().into_iter().collect::<Vec<_>>().len(), 1);
 
             // Check that the `results` accessor of [`CallOperation`] works as expected.
-            assert_eq!(op.results().collect::<Vec<_>>().len(), 1);
+            assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(), 1);
 
-            let op = block.append_operation(op);
-            block.append_operation(r#return(&[op.result(0).unwrap()], location));
+            let op = block.append_operation(op).unwrap();
+            block.append_operation(r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
             func(
                 "caller",
                 FuncAttributes {
@@ -730,12 +751,12 @@ mod tests {
                     results: vec![i32_type.into()],
                     ..Default::default()
                 },
-                block.into(),
+                block.try_into().unwrap(),
                 location,
-            )
-        });
+            ).unwrap()
+        }).unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -756,85 +777,115 @@ mod tests {
     fn test_func_with_multiple_arguments() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
 
-        module.body().append_operation(identity_func(&context, f64_type, location));
+        module
+            .body()
+            .unwrap()
+            .append_operation(identity_func(&context, f64_type, location).unwrap())
+            .unwrap();
 
         // Define a function called `multi_arg` which calls `identity` from within its body.
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
-            block.append_operation(call(
-                "identity",
-                CallProperties {
-                    arguments: vec![ValueAndAttributes {
-                        value: block.argument(2).unwrap().as_ref(),
-                        attributes: Some(HashMap::from([(
-                            StringRef::from("dummy"),
-                            context.string_attribute("42").as_ref(),
-                        )])),
-                    }],
-                    results: vec![TypeAndAttributes {
-                        r#type: f64_type.as_ref(),
-                        attributes: Some(HashMap::from([(
-                            StringRef::from("42"),
-                            context.string_attribute("dummy").as_ref(),
-                        )])),
-                    }],
-                    ..Default::default()
-                },
-                location,
-            ));
-            block.append_operation(call(
-                "identity",
-                CallProperties {
-                    arguments: vec![block.argument(1).unwrap().into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                location,
-            ));
-            let call_op = block.append_operation(call(
-                "identity",
-                CallProperties {
-                    arguments: vec![block.argument(0).unwrap().into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                location,
-            ));
-            block.append_operation(r#return(&[call_op.result(0).unwrap()], location));
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
+                block
+                    .append_operation(
+                        call(
+                            "identity",
+                            CallProperties {
+                                arguments: vec![ValueAndAttributes {
+                                    value: block.argument(2).unwrap().as_ref(),
+                                    attributes: Some(HashMap::from([(
+                                        StringRef::from("dummy"),
+                                        context.string_attribute("42").as_ref(),
+                                    )])),
+                                }],
+                                results: vec![TypeAndAttributes {
+                                    r#type: f64_type.as_ref(),
+                                    attributes: Some(HashMap::from([(
+                                        StringRef::from("42"),
+                                        context.string_attribute("dummy").as_ref(),
+                                    )])),
+                                }],
+                                ..Default::default()
+                            },
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                block
+                    .append_operation(
+                        call(
+                            "identity",
+                            CallProperties {
+                                arguments: vec![block.argument(1).unwrap().into()],
+                                results: vec![f64_type.into()],
+                                ..Default::default()
+                            },
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let call_op = block
+                    .append_operation(
+                        call(
+                            "identity",
+                            CallProperties {
+                                arguments: vec![block.argument(0).unwrap().into()],
+                                results: vec![f64_type.into()],
+                                ..Default::default()
+                            },
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                block.append_operation(r#return(&[call_op.result(0).unwrap()], location).unwrap()).unwrap();
 
-            let func_op = func(
-                "multi_arg",
-                FuncAttributes {
-                    arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            );
+                let func_op = func(
+                    "multi_arg",
+                    FuncAttributes {
+                        arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
+                        results: vec![f64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap();
 
-            assert_eq!(func_op.operands().collect::<Vec<_>>().len(), 0);
-            assert_eq!(func_op.results().collect::<Vec<_>>().len(), 0);
+                assert_eq!(
+                    func_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(),
+                    0
+                );
+                assert_eq!(
+                    func_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(),
+                    0
+                );
 
-            // Check that the `arguments` accessor of [`FuncOperation`] works as expected.
-            assert_eq!(func_op.function_argument_types().len(), 3);
+                // Check that the `arguments` accessor of [`FuncOperation`] works as expected.
+                assert_eq!(func_op.function_argument_types().unwrap().len(), 3);
 
-            // Check that the `results` accessor of [`FuncOperation`] works as expected.
-            assert_eq!(func_op.function_result_types().len(), 1);
+                // Check that the `results` accessor of [`FuncOperation`] works as expected.
+                assert_eq!(func_op.function_result_types().unwrap().len(), 1);
 
-            // Check that the `no_inline` accessor of [`FuncOperation`] works as expected.
-            assert!(!func_op.no_inline());
+                // Check that the `no_inline` accessor of [`FuncOperation`] works as expected.
+                assert!(!func_op.no_inline());
 
-            // Check that the `llvm_emit_c_interface` accessor of [`FuncOperation`] works as expected.
-            assert!(!func_op.llvm_emit_c_interface());
+                // Check that the `llvm_emit_c_interface` accessor of [`FuncOperation`] works as expected.
+                assert!(!func_op.llvm_emit_c_interface());
 
-            func_op
-        });
+                func_op
+            })
+            .unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -860,55 +911,70 @@ mod tests {
     fn test_func_and_call_with_multiple_arguments() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
 
         // Define a function called `multi_arg` which takes three arguments.
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
-            block.append_operation(r#return::<ValueRef, _>(&[], location));
-            func(
-                "multi_arg",
-                FuncAttributes {
-                    arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
-                    results: vec![],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
+                block.append_operation(r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func(
+                    "multi_arg",
+                    FuncAttributes {
+                        arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
+                        results: vec![],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
 
         // Define a function called `multi_arg_caller` which calls `multi_arg` from within its body.
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
-            block.append_operation(call(
-                "multi_arg",
-                CallProperties {
-                    arguments: vec![
-                        block.argument(2).unwrap().into(),
-                        block.argument(1).unwrap().into(),
-                        block.argument(0).unwrap().into(),
-                    ],
-                    results: vec![],
-                    ..Default::default()
-                },
-                location,
-            ));
-            block.append_operation(r#return(&[block.argument(1).unwrap()], location));
-            func(
-                "multi_arg_caller",
-                FuncAttributes {
-                    arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
-                    results: vec![f64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
+                block
+                    .append_operation(
+                        call(
+                            "multi_arg",
+                            CallProperties {
+                                arguments: vec![
+                                    block.argument(2).unwrap().into(),
+                                    block.argument(1).unwrap().into(),
+                                    block.argument(0).unwrap().into(),
+                                ],
+                                results: vec![],
+                                ..Default::default()
+                            },
+                            location,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                block.append_operation(r#return(&[block.argument(1).unwrap()], location).unwrap()).unwrap();
+                func(
+                    "multi_arg_caller",
+                    FuncAttributes {
+                        arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
+                        results: vec![f64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -929,71 +995,81 @@ mod tests {
     fn test_func_constant_and_call_indirect() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
         let i64_type = context.signless_integer_type(64);
         let function_type = context.function_type(&[f64_type], &[f64_type]);
 
-        module.body().append_operation(identity_func(&context, f64_type, location));
+        module
+            .body()
+            .unwrap()
+            .append_operation(identity_func(&context, f64_type, location).unwrap())
+            .unwrap();
 
         // Define a function called `caller` which calls `identity` from within its body.
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type.as_ref(), location), (i64_type.as_ref(), location)]);
-            let constant_op = constant("identity", function_type, location);
-            assert_eq!(constant_op.function(), StringRef::from("identity"));
-            assert_eq!(constant_op.function_type(), function_type);
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type.as_ref(), location), (i64_type.as_ref(), location)]);
+                let constant_op = constant("identity", function_type, location).unwrap();
+                assert_eq!(constant_op.function().unwrap(), StringRef::from("identity"));
+                assert_eq!(constant_op.function_type().unwrap(), function_type);
 
-            let identity = block.append_operation(constant_op);
+                let identity = block.append_operation(constant_op).unwrap();
 
-            let op = call_indirect(
-                identity.result(0).unwrap(),
-                CallIndirectProperties {
-                    arguments: vec![ValueAndAttributes {
-                        value: block.argument(0).unwrap().as_ref(),
-                        attributes: Some(HashMap::from([(
-                            StringRef::from("dummy"),
-                            context.string_attribute("42").as_ref(),
-                        )])),
-                    }],
-                    results: vec![TypeAndAttributes {
-                        r#type: f64_type.as_ref(),
-                        attributes: Some(HashMap::from([(
-                            StringRef::from("42"),
-                            context.string_attribute("dummy").as_ref(),
-                        )])),
-                    }],
-                    ..Default::default()
-                },
-                location,
-            );
+                let op = call_indirect(
+                    identity.result(0).unwrap(),
+                    CallIndirectProperties {
+                        arguments: vec![ValueAndAttributes {
+                            value: block.argument(0).unwrap().as_ref(),
+                            attributes: Some(HashMap::from([(
+                                StringRef::from("dummy"),
+                                context.string_attribute("42").as_ref(),
+                            )])),
+                        }],
+                        results: vec![TypeAndAttributes {
+                            r#type: f64_type.as_ref(),
+                            attributes: Some(HashMap::from([(
+                                StringRef::from("42"),
+                                context.string_attribute("dummy").as_ref(),
+                            )])),
+                        }],
+                        ..Default::default()
+                    },
+                    location,
+                )
+                .unwrap();
 
-            // Check that the `callee` accessor of [`CallOperation`] works as expected.
-            assert!(matches!(op.callee(), Callee::Value(_)));
+                // Check that the `callee` accessor of [`CallOperation`] works as expected.
+                assert!(matches!(op.callee().unwrap(), Callee::Value(_)));
 
-            let op_ref = unsafe { op.as_ref().cast::<CallIndirectOperationRef>() }.unwrap();
-            assert!(matches!(op_ref.callee(), Callee::Value(_)));
+                let op_ref = unsafe { op.as_ref().cast::<CallIndirectOperationRef>() }.unwrap();
+                assert!(matches!(op_ref.callee().unwrap(), Callee::Value(_)));
 
-            // Check that the `function` accessor of [`CallIndirectOperation`] works as expected.
-            assert_eq!(op.function(), identity.result(0).unwrap());
+                // Check that the `function` accessor of [`CallIndirectOperation`] works as expected.
+                assert_eq!(op.function().unwrap(), identity.result(0).unwrap());
 
-            // Check that the `arguments` accessor of [`CallIndirectOperation`] works as expected.
-            assert_eq!(op.arguments().collect::<Vec<_>>().len(), 1);
+                // Check that the `arguments` accessor of [`CallIndirectOperation`] works as expected.
+                assert_eq!(op.arguments().unwrap().into_iter().collect::<Vec<_>>().len(), 1);
 
-            block.append_operation(op);
-            block.append_operation(r#return(&[block.argument(1).unwrap()], location));
-            func(
-                "caller",
-                FuncAttributes {
-                    arguments: vec![f64_type.into(), i64_type.into()],
-                    results: vec![i64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
+                block.append_operation(op).unwrap();
+                block.append_operation(r#return(&[block.argument(1).unwrap()], location).unwrap()).unwrap();
+                func(
+                    "caller",
+                    FuncAttributes {
+                        arguments: vec![f64_type.into(), i64_type.into()],
+                        results: vec![i64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1018,44 +1094,55 @@ mod tests {
     fn test_func_with_no_inline() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
 
         // Define a function called `no_inline_function` that has the `no_inline` attribute.
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
-            block.append_operation(r#return(&[block.argument(1).unwrap()], location));
-            let func_op = func(
-                "no_inline_function",
-                FuncAttributes {
-                    arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
-                    results: vec![f64_type.into()],
-                    no_inline: true,
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            );
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
+                block.append_operation(r#return(&[block.argument(1).unwrap()], location).unwrap()).unwrap();
+                let func_op = func(
+                    "no_inline_function",
+                    FuncAttributes {
+                        arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
+                        results: vec![f64_type.into()],
+                        no_inline: true,
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap();
 
-            assert_eq!(func_op.operands().collect::<Vec<_>>().len(), 0);
-            assert_eq!(func_op.results().collect::<Vec<_>>().len(), 0);
+                assert_eq!(
+                    func_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(),
+                    0
+                );
+                assert_eq!(
+                    func_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(),
+                    0
+                );
 
-            // Check that the `arguments` accessor of [`FuncOperation`] works as expected.
-            assert_eq!(func_op.function_argument_types().len(), 3);
+                // Check that the `arguments` accessor of [`FuncOperation`] works as expected.
+                assert_eq!(func_op.function_argument_types().unwrap().len(), 3);
 
-            // Check that the `results` accessor of [`FuncOperation`] works as expected.
-            assert_eq!(func_op.function_result_types().len(), 1);
+                // Check that the `results` accessor of [`FuncOperation`] works as expected.
+                assert_eq!(func_op.function_result_types().unwrap().len(), 1);
 
-            // Check that the `no_inline` accessor of [`FuncOperation`] works as expected.
-            assert!(func_op.no_inline());
+                // Check that the `no_inline` accessor of [`FuncOperation`] works as expected.
+                assert!(func_op.no_inline());
 
-            // Check that the `llvm_emit_c_interface` accessor of [`FuncOperation`] works as expected.
-            assert!(!func_op.llvm_emit_c_interface());
+                // Check that the `llvm_emit_c_interface` accessor of [`FuncOperation`] works as expected.
+                assert!(!func_op.llvm_emit_c_interface());
 
-            func_op
-        });
+                func_op
+            })
+            .unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1072,44 +1159,55 @@ mod tests {
     fn test_func_with_llvm_emit_c_interface() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
 
         // Define a function called `c_function` that has the `llvm.emit_c_interface` attribute.
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
-            block.append_operation(r#return(&[block.argument(1).unwrap()], location));
-            let func_op = func(
-                "c_function",
-                FuncAttributes {
-                    arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
-                    results: vec![f64_type.into()],
-                    llvm_emit_c_interface: true,
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            );
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
+                block.append_operation(r#return(&[block.argument(1).unwrap()], location).unwrap()).unwrap();
+                let func_op = func(
+                    "c_function",
+                    FuncAttributes {
+                        arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
+                        results: vec![f64_type.into()],
+                        llvm_emit_c_interface: true,
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap();
 
-            assert_eq!(func_op.operands().collect::<Vec<_>>().len(), 0);
-            assert_eq!(func_op.results().collect::<Vec<_>>().len(), 0);
+                assert_eq!(
+                    func_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(),
+                    0
+                );
+                assert_eq!(
+                    func_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(),
+                    0
+                );
 
-            // Check that the `arguments` accessor of [`FuncOperation`] works as expected.
-            assert_eq!(func_op.function_argument_types().len(), 3);
+                // Check that the `arguments` accessor of [`FuncOperation`] works as expected.
+                assert_eq!(func_op.function_argument_types().unwrap().len(), 3);
 
-            // Check that the `results` accessor of [`FuncOperation`] works as expected.
-            assert_eq!(func_op.function_result_types().len(), 1);
+                // Check that the `results` accessor of [`FuncOperation`] works as expected.
+                assert_eq!(func_op.function_result_types().unwrap().len(), 1);
 
-            // Check that the `no_inline` accessor of [`FuncOperation`] works as expected.
-            assert!(!func_op.no_inline());
+                // Check that the `no_inline` accessor of [`FuncOperation`] works as expected.
+                assert!(!func_op.no_inline());
 
-            // Check that the `llvm_emit_c_interface` accessor of [`FuncOperation`] works as expected.
-            assert!(func_op.llvm_emit_c_interface());
+                // Check that the `llvm_emit_c_interface` accessor of [`FuncOperation`] works as expected.
+                assert!(func_op.llvm_emit_c_interface());
 
-            func_op
-        });
+                func_op
+            })
+            .unwrap();
 
-        assert!(module.verify());
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1126,29 +1224,34 @@ mod tests {
     fn test_func_with_multiple_attributes() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
-            block.append_operation(r#return(&[block.argument(1).unwrap()], location));
-            func(
-                "custom_function",
-                FuncAttributes {
-                    visibility: SymbolVisibility::Private,
-                    arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
-                    results: vec![f64_type.into()],
-                    no_inline: true,
-                    llvm_emit_c_interface: true,
-                    other_attributes: HashMap::from([
-                        ("custom.custom_1", context.unit_attribute().as_ref()),
-                        ("custom.custom_2", context.string_attribute("42").as_ref()),
-                    ]),
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
+                block.append_operation(r#return(&[block.argument(1).unwrap()], location).unwrap()).unwrap();
+                func(
+                    "custom_function",
+                    FuncAttributes {
+                        visibility: SymbolVisibility::Private,
+                        arguments: vec![f64_type.into(), f64_type.into(), f64_type.into()],
+                        results: vec![f64_type.into()],
+                        no_inline: true,
+                        llvm_emit_c_interface: true,
+                        other_attributes: HashMap::from([
+                            ("custom.custom_1", context.unit_attribute().as_ref()),
+                            ("custom.custom_2", context.string_attribute("42").as_ref()),
+                        ]),
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1165,45 +1268,50 @@ mod tests {
     fn test_func_with_argument_and_result_attributes() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f64_type = context.float64_type();
-        module.body().append_operation({
-            let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
-            block.append_operation(r#return(&[block.argument(1).unwrap()], location));
-            func(
-                "custom_function",
-                FuncAttributes {
-                    visibility: SymbolVisibility::Private,
-                    arguments: vec![
-                        f64_type.into(),
-                        TypeAndAttributes {
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(f64_type, location), (f64_type, location), (f64_type, location)]);
+                block.append_operation(r#return(&[block.argument(1).unwrap()], location).unwrap()).unwrap();
+                func(
+                    "custom_function",
+                    FuncAttributes {
+                        visibility: SymbolVisibility::Private,
+                        arguments: vec![
+                            f64_type.into(),
+                            TypeAndAttributes {
+                                r#type: f64_type.as_ref(),
+                                attributes: Some(HashMap::from([
+                                    ("custom.there".into(), context.unit_attribute().as_ref()),
+                                    ("custom.we".into(), context.string_attribute("are").as_ref()),
+                                ])),
+                            },
+                            f64_type.into(),
+                        ],
+                        results: vec![TypeAndAttributes {
                             r#type: f64_type.as_ref(),
-                            attributes: Some(HashMap::from([
-                                ("custom.there".into(), context.unit_attribute().as_ref()),
-                                ("custom.we".into(), context.string_attribute("are").as_ref()),
-                            ])),
-                        },
-                        f64_type.into(),
-                    ],
-                    results: vec![TypeAndAttributes {
-                        r#type: f64_type.as_ref(),
-                        attributes: Some(HashMap::from([(
-                            "custom.yes".into(),
-                            context.boolean_attribute(false).as_ref(),
-                        )])),
-                    }],
-                    no_inline: true,
-                    llvm_emit_c_interface: true,
-                    other_attributes: HashMap::from([
-                        ("custom.custom_1", context.unit_attribute().as_ref()),
-                        ("custom.custom_2", context.string_attribute("42").as_ref()),
-                    ]),
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+                            attributes: Some(HashMap::from([(
+                                "custom.yes".into(),
+                                context.boolean_attribute(false).as_ref(),
+                            )])),
+                        }],
+                        no_inline: true,
+                        llvm_emit_c_interface: true,
+                        other_attributes: HashMap::from([
+                            ("custom.custom_1", context.unit_attribute().as_ref()),
+                            ("custom.custom_2", context.string_attribute("42").as_ref()),
+                        ]),
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1220,21 +1328,28 @@ mod tests {
     fn test_external_func() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let f32_type = context.float32_type();
         let i32_type = context.signless_integer_type(32);
-        module.body().append_operation(func(
-            "external_function",
-            FuncAttributes {
-                arguments: vec![i32_type.into(), f32_type.into()],
-                results: vec![i32_type.into()],
-                visibility: SymbolVisibility::Private,
-                ..Default::default()
-            },
-            context.region(),
-            location,
-        ));
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation(
+                func(
+                    "external_function",
+                    FuncAttributes {
+                        arguments: vec![i32_type.into(), f32_type.into()],
+                        results: vec![i32_type.into()],
+                        visibility: SymbolVisibility::Private,
+                        ..Default::default()
+                    },
+                    context.region(),
+                    location,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1249,24 +1364,29 @@ mod tests {
     fn test_func_return_void() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32).as_ref();
         let f64_type = context.float64_type().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (f64_type, location)]);
-            block.append_operation(r#return::<ValueRef, _>(&[], location));
-            func(
-                "return_multiple",
-                FuncAttributes {
-                    arguments: vec![i32_type.into(), f64_type.into()],
-                    results: vec![],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (f64_type, location)]);
+                block.append_operation(r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                func(
+                    "return_multiple",
+                    FuncAttributes {
+                        arguments: vec![i32_type.into(), f64_type.into()],
+                        results: vec![],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"
@@ -1283,26 +1403,34 @@ mod tests {
     fn test_func_return_multiple_values() {
         let context = Context::new();
         let location = context.unknown_location();
-        let module = context.module(location);
+        let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32).as_ref();
         let f64_type = context.float64_type().as_ref();
-        module.body().append_operation({
-            let mut block = context.block(&[(i32_type, location), (f64_type, location)]);
-            let return_op = r#return(&[block.argument(0).unwrap(), block.argument(1).unwrap()], location);
-            assert_eq!(return_op.values().collect::<Vec<_>>(), block.arguments().collect::<Vec<_>>());
-            block.append_operation(return_op);
-            func(
-                "return_multiple",
-                FuncAttributes {
-                    arguments: vec![i32_type.into(), f64_type.into()],
-                    results: vec![i32_type.into(), f64_type.into()],
-                    ..Default::default()
-                },
-                block.into(),
-                location,
-            )
-        });
-        assert!(module.verify());
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(i32_type, location), (f64_type, location)]);
+                let return_op = r#return(&[block.argument(0).unwrap(), block.argument(1).unwrap()], location).unwrap();
+                assert_eq!(
+                    return_op.values().unwrap().into_iter().collect::<Vec<_>>(),
+                    block.arguments().collect::<Result<Vec<_>, _>>().unwrap()
+                );
+                block.append_operation(return_op).unwrap();
+                func(
+                    "return_multiple",
+                    FuncAttributes {
+                        arguments: vec![i32_type.into(), f64_type.into()],
+                        results: vec![i32_type.into(), f64_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
         assert_eq!(
             module.to_string(),
             indoc! {"

@@ -16,8 +16,8 @@ use ryft_xla_sys::mlir::dialects::gpu::{
 };
 
 use crate::{
-    AffineMap, ArrayAttributeRef, Attribute, AttributeRef, Context, DialectHandle, DictionaryAttributeRef,
-    FromWithContext, FunctionTypeRef, StringRef, Type, mlir_subtype_trait_impls,
+    AffineMap, ArrayAttributeRef, Attribute, AttributeRef, Context, DialectHandle, DictionaryAttributeRef, Error,
+    FunctionTypeRef, StringRef, Type, mlir_subtype_trait_impls,
 };
 
 /// GPU compilation object format.
@@ -49,13 +49,13 @@ impl ObjectFormat {
     }
 
     /// Constructs an [`ObjectFormat`] from the integer value used by the MLIR C API.
-    pub fn from_c_api(value: u32) -> Option<Self> {
+    pub fn from_c_api(value: u32) -> Result<Self, Error> {
         match value {
-            1 => Some(Self::Offload),
-            2 => Some(Self::Assembly),
-            3 => Some(Self::Binary),
-            4 => Some(Self::FatBinary),
-            _ => None,
+            1 => Ok(Self::Offload),
+            2 => Ok(Self::Assembly),
+            3 => Ok(Self::Binary),
+            4 => Ok(Self::FatBinary),
+            _ => Err(Error::invalid_argument("invalid MLIR GPU object format value")),
         }
     }
 }
@@ -78,13 +78,17 @@ pub struct ObjectAttributeRef<'c, 't> {
 
 impl<'c, 't> ObjectAttributeRef<'c, 't> {
     /// Returns the GPU target attribute.
-    pub fn target(&self) -> AttributeRef<'c, 't> {
-        unsafe { AttributeRef::from_c_api(mlirGPUObjectAttrGetTarget(self.handle), self.context).unwrap() }
+    pub fn target(&self) -> Result<AttributeRef<'c, 't>, Error> {
+        unsafe {
+            AttributeRef::from_c_api(mlirGPUObjectAttrGetTarget(self.handle), self.context)
+                .map_err(|_| Error::invalid_argument("invalid `target` field in `#gpu.object` attribute"))
+        }
     }
 
     /// Returns the object format.
-    pub fn format(&self) -> ObjectFormat {
-        ObjectFormat::from_c_api(unsafe { mlirGPUObjectAttrGetFormat(self.handle) }).expect("invalid GPU object format")
+    pub fn format(&self) -> Result<ObjectFormat, Error> {
+        ObjectFormat::from_c_api(unsafe { mlirGPUObjectAttrGetFormat(self.handle) })
+            .map_err(|_| Error::invalid_argument("invalid GPU object format"))
     }
 
     /// Returns the serialized object payload.
@@ -93,30 +97,30 @@ impl<'c, 't> ObjectAttributeRef<'c, 't> {
     }
 
     /// Returns the optional properties dictionary.
-    pub fn properties(&self) -> Option<AttributeRef<'c, 't>> {
+    pub fn properties(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         if unsafe { mlirGPUObjectAttrHasProperties(self.handle) } {
-            unsafe { AttributeRef::from_c_api(mlirGPUObjectAttrGetProperties(self.handle), self.context) }
+            unsafe { AttributeRef::from_c_api(mlirGPUObjectAttrGetProperties(self.handle), self.context).map(Some) }
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Returns the optional kernel table attribute.
-    pub fn kernels(&self) -> Option<AttributeRef<'c, 't>> {
+    pub fn kernels(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
         if unsafe { mlirGPUObjectAttrHasKernels(self.handle) } {
-            unsafe { AttributeRef::from_c_api(mlirGPUObjectAttrGetKernels(self.handle), self.context) }
+            unsafe { AttributeRef::from_c_api(mlirGPUObjectAttrGetKernels(self.handle), self.context).map(Some) }
         } else {
-            None
+            Ok(None)
         }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for ObjectAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirAttributeIsAGPUObjectAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -146,11 +150,15 @@ pub struct KernelMetadataAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for KernelMetadataAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAGpuKernelMetadataAttr(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAGpuKernelMetadataAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -178,11 +186,15 @@ pub struct KernelTableAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for KernelTableAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAGpuKernelTableAttr(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAGpuKernelTableAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -210,11 +222,15 @@ pub struct SelectObjectAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for SelectObjectAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAGpuSelectObjectAttr(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAGpuSelectObjectAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -277,25 +293,25 @@ macro_rules! gpu_enum_attribute {
 
         impl<'c, 't> $attribute_name<'c, 't> {
             /// Returns the enum value stored in this attribute.
-            pub fn value(&self) -> $enum_name {
+            pub fn value(&self) -> Result<$enum_name, Error> {
                 let value = unsafe { StringRef::from_c_api(mlirGpuEnumAttrGetValue(self.handle, $ffi_kind)) };
                 value
                     .as_str()
                     .ok()
                     .and_then($enum_name::from_str)
-                    .expect(concat!("invalid `#gpu.", $mnemonic, "` attribute"))
+                    .ok_or_else(|| Error::invalid_argument(concat!("invalid `#gpu.", $mnemonic, "` attribute")))
             }
         }
 
         impl<'c, 't> Attribute<'c, 't> for $attribute_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR attribute handle"));
                 }
                 if unsafe { mlirAttributeIsAGpuEnumAttr(handle, $ffi_kind) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR attribute handle"))
                 }
             }
 
@@ -310,25 +326,19 @@ macro_rules! gpu_enum_attribute {
 
         mlir_subtype_trait_impls!($attribute_name<'c, 't> as Attribute, mlir_type = Attribute);
 
-        impl<'c, 't> FromWithContext<'c, 't, $enum_name> for $attribute_name<'c, 't> {
-            fn from_with_context(value: $enum_name, context: &'c Context<'t>) -> Self {
-                context.$context_method(value)
-            }
-        }
-
         impl<'t> Context<'t> {
             #[doc = "Creates a GPU "]
             #[doc = $description]
             #[doc = " attribute owned by this [`Context`]."]
-            pub fn $context_method<'c>(&'c self, value: $enum_name) -> $attribute_name<'c, 't> {
-                self.load_dialect(DialectHandle::gpu());
+            pub fn $context_method<'c>(&'c self, value: $enum_name) -> Result<$attribute_name<'c, 't>, Error> {
+                self.load_dialect(DialectHandle::gpu()?)?;
                 let value = StringRef::from(value.as_str());
                 unsafe {
                     $attribute_name::from_c_api(
                         mlirGpuEnumAttrGet(*self.handle.borrow_mut(), $ffi_kind, value.to_c_api()),
                         self,
                     )
-                    .expect(concat!("invalid arguments to `Context::", stringify!($context_method), "`"))
+                    .map_err(|_| Error::invalid_argument(concat!("invalid arguments to `Context::", stringify!($context_method), "`")))
                 }
             }
         }
@@ -583,25 +593,25 @@ macro_rules! gpu_mapping_id_attribute {
 
         impl<'c, 't> $attribute_name<'c, 't> {
             /// Returns the mapping identifier stored in this attribute.
-            pub fn value(&self) -> MappingId {
+            pub fn value(&self) -> Result<MappingId, Error> {
                 let value = unsafe { StringRef::from_c_api(mlirGpuMappingAttrGetValue(self.handle, $ffi_kind)) };
                 value
                     .as_str()
                     .ok()
                     .and_then(MappingId::from_str)
-                    .expect(concat!("invalid `#gpu.", $mnemonic, "` attribute"))
+                    .ok_or_else(|| Error::invalid_argument(concat!("invalid `#gpu.", $mnemonic, "` attribute")))
             }
         }
 
         impl<'c, 't> Attribute<'c, 't> for $attribute_name<'c, 't> {
-            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+            unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
                 if handle.ptr.is_null() {
-                    return None;
+                    return Err(Error::internal("expected non-null MLIR attribute handle"));
                 }
                 if unsafe { mlirAttributeIsAGpuMappingAttr(handle, $ffi_kind) } {
-                    Some(Self { handle, context })
+                    Ok(Self { handle, context })
                 } else {
-                    None
+                    Err(Error::invalid_argument("expected MLIR attribute handle"))
                 }
             }
 
@@ -616,25 +626,19 @@ macro_rules! gpu_mapping_id_attribute {
 
         mlir_subtype_trait_impls!($attribute_name<'c, 't> as Attribute, mlir_type = Attribute);
 
-        impl<'c, 't> FromWithContext<'c, 't, MappingId> for $attribute_name<'c, 't> {
-            fn from_with_context(value: MappingId, context: &'c Context<'t>) -> Self {
-                context.$context_method(value)
-            }
-        }
-
         impl<'t> Context<'t> {
             #[doc = "Creates a GPU "]
             #[doc = $description]
             #[doc = " device mapping attribute owned by this [`Context`]."]
-            pub fn $context_method<'c>(&'c self, value: MappingId) -> $attribute_name<'c, 't> {
-                self.load_dialect(DialectHandle::gpu());
+            pub fn $context_method<'c>(&'c self, value: MappingId) -> Result<$attribute_name<'c, 't>, Error> {
+                self.load_dialect(DialectHandle::gpu()?)?;
                 let value = StringRef::from(value.as_str());
                 unsafe {
                     $attribute_name::from_c_api(
                         mlirGpuMappingAttrGet(*self.handle.borrow_mut(), $ffi_kind, value.to_c_api()),
                         self,
                     )
-                    .expect(concat!("invalid arguments to `Context::", stringify!($context_method), "`"))
+                    .map_err(|_| Error::invalid_argument(concat!("invalid arguments to `Context::", stringify!($context_method), "`")))
                 }
             }
         }
@@ -699,11 +703,15 @@ impl<'c, 't> MappingMaskAttributeRef<'c, 't> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for MappingMaskAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAGpuMappingMaskAttr(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAGpuMappingMaskAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -717,12 +725,6 @@ impl<'c, 't> Attribute<'c, 't> for MappingMaskAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(MappingMaskAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
-impl<'c, 't> FromWithContext<'c, 't, u64> for MappingMaskAttributeRef<'c, 't> {
-    fn from_with_context(value: u64, context: &'c Context<'t>) -> Self {
-        context.gpu_mapping_mask_attribute(value)
-    }
-}
-
 /// GPU memory-space mapping [`Attribute`].
 #[derive(Copy, Clone)]
 pub struct MemorySpaceMappingAttributeRef<'c, 't> {
@@ -735,18 +737,23 @@ pub struct MemorySpaceMappingAttributeRef<'c, 't> {
 
 impl<'c, 't> MemorySpaceMappingAttributeRef<'c, 't> {
     /// Returns the memory space stored in this mapping attribute.
-    pub fn address_space(&self) -> AddressSpace {
+    pub fn address_space(&self) -> Result<AddressSpace, Error> {
         let value = unsafe { StringRef::from_c_api(mlirGpuMemorySpaceMappingAttrGetAddressSpace(self.handle)) };
-        value.as_str().ok().and_then(AddressSpace::from_str).expect("invalid `#gpu.memory_space` attribute")
+        let value = value.as_str().map_err(|_| Error::invalid_argument("invalid `#gpu.memory_space` attribute"))?;
+        AddressSpace::from_str(value).ok_or_else(|| Error::invalid_argument("invalid `#gpu.memory_space` attribute"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for MemorySpaceMappingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
-        if unsafe { mlirAttributeIsAGpuMemorySpaceMappingAttr(handle) } { Some(Self { handle, context }) } else { None }
+        if unsafe { mlirAttributeIsAGpuMemorySpaceMappingAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
     }
 
     unsafe fn to_c_api(&self) -> MlirAttribute {
@@ -759,12 +766,6 @@ impl<'c, 't> Attribute<'c, 't> for MemorySpaceMappingAttributeRef<'c, 't> {
 }
 
 mlir_subtype_trait_impls!(MemorySpaceMappingAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
-
-impl<'c, 't> FromWithContext<'c, 't, AddressSpace> for MemorySpaceMappingAttributeRef<'c, 't> {
-    fn from_with_context(value: AddressSpace, context: &'c Context<'t>) -> Self {
-        context.gpu_memory_space_mapping_attribute(value)
-    }
-}
 
 /// Processor identifier for GPU parallel-loop mapping attributes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -832,41 +833,41 @@ pub struct ParallelLoopDimMappingAttributeRef<'c, 't> {
 
 impl<'c, 't> ParallelLoopDimMappingAttributeRef<'c, 't> {
     /// Returns the processor mapped to this loop dimension.
-    pub fn processor(&self) -> Processor {
+    pub fn processor(&self) -> Result<Processor, Error> {
         let processor = unsafe { StringRef::from_c_api(mlirGpuParallelLoopDimMappingAttrGetProcessor(self.handle)) };
         processor
             .as_str()
             .ok()
             .and_then(Processor::from_str)
-            .expect("invalid `processor` field in `#gpu.loop_dim_map` attribute")
+            .ok_or_else(|| Error::invalid_argument("invalid `processor` field in `#gpu.loop_dim_map` attribute"))
     }
 
     /// Returns the affine map used to preprocess processor identifiers.
-    pub fn map(&self) -> AffineMap<'c, 't> {
+    pub fn map(&self) -> Result<AffineMap<'c, 't>, Error> {
         unsafe {
             AffineMap::from_c_api(mlirGpuParallelLoopDimMappingAttrGetMap(self.handle), self.context)
-                .expect("invalid `map` field in `#gpu.loop_dim_map` attribute")
+                .map_err(|_| Error::invalid_argument("invalid `map` field in `#gpu.loop_dim_map` attribute"))
         }
     }
 
     /// Returns the affine map used to compute the processor identifier bound.
-    pub fn bound(&self) -> AffineMap<'c, 't> {
+    pub fn bound(&self) -> Result<AffineMap<'c, 't>, Error> {
         unsafe {
             AffineMap::from_c_api(mlirGpuParallelLoopDimMappingAttrGetBound(self.handle), self.context)
-                .expect("invalid `bound` field in `#gpu.loop_dim_map` attribute")
+                .map_err(|_| Error::invalid_argument("invalid `bound` field in `#gpu.loop_dim_map` attribute"))
         }
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for ParallelLoopDimMappingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if handle.ptr.is_null() {
-            return None;
+            return Err(Error::internal("expected non-null MLIR attribute handle"));
         }
         if unsafe { mlirAttributeIsAGpuParallelLoopDimMappingAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -883,11 +884,11 @@ mlir_subtype_trait_impls!(ParallelLoopDimMappingAttributeRef<'c, 't> as Attribut
 
 impl<'t> Context<'t> {
     /// Creates a GPU [`MappingMaskAttributeRef`] owned by this [`Context`].
-    pub fn gpu_mapping_mask_attribute<'c>(&'c self, mask: u64) -> MappingMaskAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::gpu());
+    pub fn gpu_mapping_mask_attribute<'c>(&'c self, mask: u64) -> Result<MappingMaskAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::gpu()?)?;
         unsafe {
             MappingMaskAttributeRef::from_c_api(mlirGpuMappingMaskAttrGet(*self.handle.borrow_mut(), mask), self)
-                .expect("invalid arguments to `Context::gpu_mapping_mask_attribute`")
+                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::gpu_mapping_mask_attribute`"))
         }
     }
 
@@ -895,15 +896,15 @@ impl<'t> Context<'t> {
     pub fn gpu_memory_space_mapping_attribute<'c>(
         &'c self,
         address_space: AddressSpace,
-    ) -> MemorySpaceMappingAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::gpu());
+    ) -> Result<MemorySpaceMappingAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::gpu()?)?;
         let address_space = StringRef::from(address_space.as_str());
         unsafe {
             MemorySpaceMappingAttributeRef::from_c_api(
                 mlirGpuMemorySpaceMappingAttrGet(*self.handle.borrow_mut(), address_space.to_c_api()),
                 self,
             )
-            .expect("invalid arguments to `Context::gpu_memory_space_mapping_attribute`")
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::gpu_memory_space_mapping_attribute`"))
         }
     }
 
@@ -919,8 +920,8 @@ impl<'t> Context<'t> {
         processor: Processor,
         map: AffineMap<'c, 't>,
         bound: AffineMap<'c, 't>,
-    ) -> ParallelLoopDimMappingAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::gpu());
+    ) -> Result<ParallelLoopDimMappingAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::gpu()?)?;
         let processor = StringRef::from(processor.as_str());
         unsafe {
             ParallelLoopDimMappingAttributeRef::from_c_api(
@@ -932,7 +933,9 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .expect("invalid arguments to `Context::gpu_parallel_loop_dim_mapping_attribute`")
+            .map_err(|_| {
+                Error::invalid_argument("invalid arguments to `Context::gpu_parallel_loop_dim_mapping_attribute`")
+            })
         }
     }
 
@@ -960,21 +963,25 @@ impl<'t> Context<'t> {
         function_type: FunctionTypeRef<'c, 't>,
         argument_attributes: Option<ArrayAttributeRef<'c, 't>>,
         metadata: Option<DictionaryAttributeRef<'c, 't>>,
-    ) -> KernelMetadataAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::gpu());
+    ) -> Result<KernelMetadataAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::gpu()?)?;
         let name = StringRef::from(name);
-        unsafe {
+        Ok(unsafe {
             let argument_attributes = argument_attributes
                 .map(|attribute| attribute.to_c_api())
                 .unwrap_or_else(|| self.null_attribute().to_c_api());
             let metadata =
                 metadata.map(|attribute| attribute.to_c_api()).unwrap_or_else(|| self.null_attribute().to_c_api());
-            KernelMetadataAttributeRef::from_c_api(
-                mlirGpuKernelMetadataAttrGet(name.to_c_api(), function_type.to_c_api(), argument_attributes, metadata),
-                self,
-            )
-            .expect("invalid arguments to `Context::gpu_kernel_metadata_attribute`")
-        }
+            KernelMetadataAttributeRef {
+                handle: mlirGpuKernelMetadataAttrGet(
+                    name.to_c_api(),
+                    function_type.to_c_api(),
+                    argument_attributes,
+                    metadata,
+                ),
+                context: self,
+            }
+        })
     }
 
     /// Creates a GPU [`KernelTableAttributeRef`] owned by this [`Context`].
@@ -985,16 +992,19 @@ impl<'t> Context<'t> {
     pub fn gpu_kernel_table_attribute<'c>(
         &'c self,
         kernels: &[KernelMetadataAttributeRef<'c, 't>],
-    ) -> KernelTableAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::gpu());
-        unsafe {
+    ) -> Result<KernelTableAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::gpu()?)?;
+        Ok(unsafe {
             let kernels = kernels.iter().map(|kernel| kernel.to_c_api()).collect::<Vec<_>>();
-            KernelTableAttributeRef::from_c_api(
-                mlirGpuKernelTableAttrGet(*self.handle.borrow_mut(), kernels.len().cast_signed(), kernels.as_ptr()),
-                self,
-            )
-            .expect("invalid arguments to `Context::gpu_kernel_table_attribute`")
-        }
+            KernelTableAttributeRef {
+                handle: mlirGpuKernelTableAttrGet(
+                    *self.handle.borrow_mut(),
+                    kernels.len().cast_signed(),
+                    kernels.as_ptr(),
+                ),
+                context: self,
+            }
+        })
     }
 
     /// Creates a GPU [`SelectObjectAttributeRef`] owned by this [`Context`].
@@ -1005,16 +1015,15 @@ impl<'t> Context<'t> {
     pub fn gpu_select_object_attribute<'c>(
         &'c self,
         target: Option<AttributeRef<'c, 't>>,
-    ) -> SelectObjectAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::gpu());
-        unsafe {
+    ) -> Result<SelectObjectAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::gpu()?)?;
+        Ok(unsafe {
             let target = target.unwrap_or_else(|| self.null_attribute());
-            SelectObjectAttributeRef::from_c_api(
-                mlirGpuSelectObjectAttrGet(*self.handle.borrow_mut(), target.to_c_api()),
-                self,
-            )
-            .expect("invalid arguments to `Context::gpu_select_object_attribute`")
-        }
+            SelectObjectAttributeRef {
+                handle: mlirGpuSelectObjectAttrGet(*self.handle.borrow_mut(), target.to_c_api()),
+                context: self,
+            }
+        })
     }
 
     /// Creates a GPU [`ObjectAttributeRef`] owned by this [`Context`].
@@ -1033,9 +1042,9 @@ impl<'t> Context<'t> {
         object: S,
         properties: Option<AttributeRef<'c, 't>>,
         kernels: Option<AttributeRef<'c, 't>>,
-    ) -> ObjectAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::gpu());
-        unsafe {
+    ) -> Result<ObjectAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::gpu()?)?;
+        Ok(unsafe {
             let properties = properties.unwrap_or_else(|| self.null_attribute());
             let kernels = kernels.unwrap_or_else(|| self.null_attribute());
             let object = StringRef::from(object.as_ref());
@@ -1057,8 +1066,8 @@ impl<'t> Context<'t> {
                     kernels.to_c_api(),
                 )
             };
-            ObjectAttributeRef::from_c_api(handle, self).expect("invalid arguments to `Context::gpu_object_attribute`")
-        }
+            ObjectAttributeRef { handle, context: self }
+        })
     }
 }
 
@@ -1076,11 +1085,11 @@ mod tests {
         assert_eq!(ObjectFormat::Assembly.as_str(), "assembly");
         assert_eq!(ObjectFormat::Binary.as_str(), "bin");
         assert_eq!(ObjectFormat::FatBinary.as_str(), "fatbin");
-        assert_eq!(ObjectFormat::from_c_api(1), Some(ObjectFormat::Offload));
-        assert_eq!(ObjectFormat::from_c_api(2), Some(ObjectFormat::Assembly));
-        assert_eq!(ObjectFormat::from_c_api(3), Some(ObjectFormat::Binary));
-        assert_eq!(ObjectFormat::from_c_api(4), Some(ObjectFormat::FatBinary));
-        assert_eq!(ObjectFormat::from_c_api(0), None);
+        assert_eq!(ObjectFormat::from_c_api(1).unwrap(), ObjectFormat::Offload);
+        assert_eq!(ObjectFormat::from_c_api(2).unwrap(), ObjectFormat::Assembly);
+        assert_eq!(ObjectFormat::from_c_api(3).unwrap(), ObjectFormat::Binary);
+        assert_eq!(ObjectFormat::from_c_api(4).unwrap(), ObjectFormat::FatBinary);
+        assert!(ObjectFormat::from_c_api(0).is_err());
     }
 
     #[test]
@@ -1088,14 +1097,15 @@ mod tests {
         let context = Context::new();
         let target = context.unit_attribute();
         let properties = context.dictionary_attribute(&[]);
-        let attribute =
-            context.gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", Some(properties.as_ref()), None);
+        let attribute = context
+            .gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", Some(properties.as_ref()), None)
+            .unwrap();
 
-        assert_eq!(attribute.target(), target);
-        assert_eq!(attribute.format(), ObjectFormat::FatBinary);
+        assert_eq!(attribute.target().unwrap(), target);
+        assert_eq!(attribute.format().unwrap(), ObjectFormat::FatBinary);
         assert_eq!(attribute.object().as_str(), Ok("payload"));
-        assert_eq!(attribute.properties(), Some(properties.as_ref()));
-        assert_eq!(attribute.kernels(), None);
+        assert_eq!(attribute.properties().unwrap(), Some(properties.as_ref()));
+        assert_eq!(attribute.kernels().unwrap(), None);
     }
 
     #[test]
@@ -1104,18 +1114,18 @@ mod tests {
         let target = context.unit_attribute();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", None, None);
-        let attribute_2 = context.gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", None, None);
+        let attribute_1 = context.gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", None, None).unwrap();
+        let attribute_2 = context.gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", None, None).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.gpu_object_attribute(target, ObjectFormat::Binary, "payload", None, None);
+        let attribute_2 = context.gpu_object_attribute(target, ObjectFormat::Binary, "payload", None, None).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
         let target = context.unit_attribute();
-        let attribute_2 = context.gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", None, None);
+        let attribute_2 = context.gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", None, None).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
@@ -1123,7 +1133,7 @@ mod tests {
     fn test_object_attribute_display_and_debug() {
         let context = Context::new();
         let target = context.unit_attribute();
-        let attribute = context.gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", None, None);
+        let attribute = context.gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", None, None).unwrap();
         test_attribute_display_and_debug(attribute, "#gpu.object<unit, \"payload\">");
     }
 
@@ -1131,7 +1141,7 @@ mod tests {
     fn test_object_attribute_casting() {
         let context = Context::new();
         let target = context.unit_attribute();
-        let attribute = context.gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", None, None);
+        let attribute = context.gpu_object_attribute(target, ObjectFormat::FatBinary, "payload", None, None).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -1141,21 +1151,22 @@ mod tests {
         let function_type = context.function_type::<crate::TypeRef, crate::TypeRef>(&[], &[]);
         let metadata = context.dictionary_attribute(&[]);
 
-        let kernel_metadata = context.gpu_kernel_metadata_attribute("kernel", function_type, None, Some(metadata));
+        let kernel_metadata =
+            context.gpu_kernel_metadata_attribute("kernel", function_type, None, Some(metadata)).unwrap();
         test_attribute_display_and_debug(kernel_metadata, r#"#gpu.kernel_metadata<"kernel", () -> (), metadata = {}>"#);
         test_attribute_casting(kernel_metadata);
 
-        let kernel_table = context.gpu_kernel_table_attribute(&[kernel_metadata]);
+        let kernel_table = context.gpu_kernel_table_attribute(&[kernel_metadata]).unwrap();
         test_attribute_display_and_debug(
             kernel_table,
             r#"#gpu.kernel_table<[#gpu.kernel_metadata<"kernel", () -> (), metadata = {}>]>"#,
         );
         test_attribute_casting(kernel_table);
 
-        let empty_kernel_table = context.gpu_kernel_table_attribute(&[]);
+        let empty_kernel_table = context.gpu_kernel_table_attribute(&[]).unwrap();
         test_attribute_display_and_debug(empty_kernel_table, "#gpu.kernel_table<>");
 
-        let select_object = context.gpu_select_object_attribute(None);
+        let select_object = context.gpu_select_object_attribute(None).unwrap();
         test_attribute_display_and_debug(select_object, "#gpu.select_object");
         test_attribute_casting(select_object);
     }
@@ -1163,9 +1174,9 @@ mod tests {
     #[test]
     fn test_address_space_attribute() {
         let context = Context::new();
-        let attribute = context.gpu_address_space_attribute(AddressSpace::Workgroup);
+        let attribute = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), AddressSpace::Workgroup);
+        assert_eq!(attribute.value().unwrap(), AddressSpace::Workgroup);
     }
 
     #[test]
@@ -1173,40 +1184,40 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.gpu_address_space_attribute(AddressSpace::Workgroup);
-        let attribute_2 = context.gpu_address_space_attribute(AddressSpace::Workgroup);
+        let attribute_1 = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap();
+        let attribute_2 = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.gpu_address_space_attribute(AddressSpace::Private);
+        let attribute_2 = context.gpu_address_space_attribute(AddressSpace::Private).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.gpu_address_space_attribute(AddressSpace::Workgroup);
+        let attribute_2 = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_address_space_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.gpu_address_space_attribute(AddressSpace::Workgroup);
+        let attribute = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap();
         test_attribute_display_and_debug(attribute, "#gpu.address_space<workgroup>");
     }
 
     #[test]
     fn test_address_space_attribute_casting() {
         let context = Context::new();
-        let attribute = context.gpu_address_space_attribute(AddressSpace::Workgroup);
+        let attribute = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_dimension_attribute() {
         let context = Context::new();
-        let attribute = context.gpu_dimension_attribute(Dimension::X);
+        let attribute = context.gpu_dimension_attribute(Dimension::X).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), Dimension::X);
+        assert_eq!(attribute.value().unwrap(), Dimension::X);
     }
 
     #[test]
@@ -1214,40 +1225,40 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.gpu_dimension_attribute(Dimension::X);
-        let attribute_2 = context.gpu_dimension_attribute(Dimension::X);
+        let attribute_1 = context.gpu_dimension_attribute(Dimension::X).unwrap();
+        let attribute_2 = context.gpu_dimension_attribute(Dimension::X).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.gpu_dimension_attribute(Dimension::Y);
+        let attribute_2 = context.gpu_dimension_attribute(Dimension::Y).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.gpu_dimension_attribute(Dimension::X);
+        let attribute_2 = context.gpu_dimension_attribute(Dimension::X).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_dimension_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.gpu_dimension_attribute(Dimension::X);
+        let attribute = context.gpu_dimension_attribute(Dimension::X).unwrap();
         test_attribute_display_and_debug(attribute, "#gpu<dim x>");
     }
 
     #[test]
     fn test_dimension_attribute_casting() {
         let context = Context::new();
-        let attribute = context.gpu_dimension_attribute(Dimension::X);
+        let attribute = context.gpu_dimension_attribute(Dimension::X).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_all_reduce_operation_kind_attribute() {
         let context = Context::new();
-        let attribute = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add);
+        let attribute = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), AllReduceOperationKind::Add);
+        assert_eq!(attribute.value().unwrap(), AllReduceOperationKind::Add);
     }
 
     #[test]
@@ -1255,40 +1266,40 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add);
-        let attribute_2 = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add);
+        let attribute_1 = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add).unwrap();
+        let attribute_2 = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Xor);
+        let attribute_2 = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Xor).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add);
+        let attribute_2 = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_all_reduce_operation_kind_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add);
+        let attribute = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add).unwrap();
         test_attribute_display_and_debug(attribute, "#gpu<all_reduce_op add>");
     }
 
     #[test]
     fn test_all_reduce_operation_kind_attribute_casting() {
         let context = Context::new();
-        let attribute = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add);
+        let attribute = context.gpu_all_reduce_operation_kind_attribute(AllReduceOperationKind::Add).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_shuffle_mode_attribute() {
         let context = Context::new();
-        let attribute = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor);
+        let attribute = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), ShuffleMode::Xor);
+        assert_eq!(attribute.value().unwrap(), ShuffleMode::Xor);
     }
 
     #[test]
@@ -1296,40 +1307,40 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor);
-        let attribute_2 = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor);
+        let attribute_1 = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor).unwrap();
+        let attribute_2 = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.gpu_shuffle_mode_attribute(ShuffleMode::Down);
+        let attribute_2 = context.gpu_shuffle_mode_attribute(ShuffleMode::Down).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor);
+        let attribute_2 = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_shuffle_mode_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor);
+        let attribute = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor).unwrap();
         test_attribute_display_and_debug(attribute, "#gpu<shuffle_mode xor>");
     }
 
     #[test]
     fn test_shuffle_mode_attribute_casting() {
         let context = Context::new();
-        let attribute = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor);
+        let attribute = context.gpu_shuffle_mode_attribute(ShuffleMode::Xor).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_mma_elementwise_operation_attribute() {
         let context = Context::new();
-        let attribute = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat);
+        let attribute = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), MmaElementwiseOperation::AddFloat);
+        assert_eq!(attribute.value().unwrap(), MmaElementwiseOperation::AddFloat);
     }
 
     #[test]
@@ -1337,40 +1348,42 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat);
-        let attribute_2 = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat);
+        let attribute_1 = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat).unwrap();
+        let attribute_2 = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::MultiplyFloat);
+        let attribute_2 =
+            context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::MultiplyFloat).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat);
+        let attribute_2 = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_mma_elementwise_operation_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat);
+        let attribute = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat).unwrap();
         test_attribute_display_and_debug(attribute, "#gpu<mma_element_wise addf>");
     }
 
     #[test]
     fn test_mma_elementwise_operation_attribute_casting() {
         let context = Context::new();
-        let attribute = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat);
+        let attribute = context.gpu_mma_elementwise_operation_attribute(MmaElementwiseOperation::AddFloat).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_prune_2_to_4_sparse_matrix_flag_attribute() {
         let context = Context::new();
-        let attribute = context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly);
+        let attribute =
+            context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), Prune2To4SparseMatrixFlag::PruneOnly);
+        assert_eq!(attribute.value().unwrap(), Prune2To4SparseMatrixFlag::PruneOnly);
     }
 
     #[test]
@@ -1378,41 +1391,47 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly);
-        let attribute_2 = context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly);
+        let attribute_1 =
+            context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly).unwrap();
+        let attribute_2 =
+            context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 =
-            context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneAndCheck);
+        let attribute_2 = context
+            .gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneAndCheck)
+            .unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly);
+        let attribute_2 =
+            context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_prune_2_to_4_sparse_matrix_flag_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly);
+        let attribute =
+            context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly).unwrap();
         test_attribute_display_and_debug(attribute, "#gpu<prune_2to4_spmat_flag PRUNE_ONLY>");
     }
 
     #[test]
     fn test_prune_2_to_4_sparse_matrix_flag_attribute_casting() {
         let context = Context::new();
-        let attribute = context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly);
+        let attribute =
+            context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(Prune2To4SparseMatrixFlag::PruneOnly).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_matrix_transpose_mode_attribute() {
         let context = Context::new();
-        let attribute = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose);
+        let attribute = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), MatrixTransposeMode::NonTranspose);
+        assert_eq!(attribute.value().unwrap(), MatrixTransposeMode::NonTranspose);
     }
 
     #[test]
@@ -1420,40 +1439,40 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose);
-        let attribute_2 = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose);
+        let attribute_1 = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose).unwrap();
+        let attribute_2 = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::Transpose);
+        let attribute_2 = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::Transpose).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose);
+        let attribute_2 = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_matrix_transpose_mode_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose);
+        let attribute = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose).unwrap();
         test_attribute_display_and_debug(attribute, "#gpu<mat_transpose_mode NON_TRANSPOSE>");
     }
 
     #[test]
     fn test_matrix_transpose_mode_attribute_casting() {
         let context = Context::new();
-        let attribute = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose);
+        let attribute = context.gpu_matrix_transpose_mode_attribute(MatrixTransposeMode::NonTranspose).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_sp_gemm_work_kind_attribute() {
         let context = Context::new();
-        let attribute = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation);
+        let attribute = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), SpGemmWorkKind::WorkEstimation);
+        assert_eq!(attribute.value().unwrap(), SpGemmWorkKind::WorkEstimation);
     }
 
     #[test]
@@ -1461,40 +1480,40 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation);
-        let attribute_2 = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation);
+        let attribute_1 = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation).unwrap();
+        let attribute_2 = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::Compute);
+        let attribute_2 = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::Compute).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation);
+        let attribute_2 = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_sp_gemm_work_kind_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation);
+        let attribute = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation).unwrap();
         test_attribute_display_and_debug(attribute, "#gpu<spgemm_work_estimation_or_compute_kind WORK_ESTIMATION>");
     }
 
     #[test]
     fn test_sp_gemm_work_kind_attribute_casting() {
         let context = Context::new();
-        let attribute = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation);
+        let attribute = context.gpu_sp_gemm_work_kind_attribute(SpGemmWorkKind::WorkEstimation).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_broadcast_type_attribute() {
         let context = Context::new();
-        let attribute = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane);
+        let attribute = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane).unwrap();
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.value(), BroadcastType::FirstActiveLane);
+        assert_eq!(attribute.value().unwrap(), BroadcastType::FirstActiveLane);
     }
 
     #[test]
@@ -1502,31 +1521,31 @@ mod tests {
         let context = Context::new();
 
         // Same attributes from the same context must be equal because they are "uniqued".
-        let attribute_1 = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane);
-        let attribute_2 = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane);
+        let attribute_1 = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane).unwrap();
+        let attribute_2 = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
         // Different attributes from the same context must not be equal.
-        let attribute_2 = context.gpu_broadcast_type_attribute(BroadcastType::SpecificLane);
+        let attribute_2 = context.gpu_broadcast_type_attribute(BroadcastType::SpecificLane).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         // Same attributes from different contexts must not be equal.
         let context = Context::new();
-        let attribute_2 = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane);
+        let attribute_2 = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_broadcast_type_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane);
+        let attribute = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane).unwrap();
         test_attribute_display_and_debug(attribute, "#gpu<broadcast first_active_lane>");
     }
 
     #[test]
     fn test_broadcast_type_attribute_casting() {
         let context = Context::new();
-        let attribute = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane);
+        let attribute = context.gpu_broadcast_type_attribute(BroadcastType::FirstActiveLane).unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -1561,80 +1580,86 @@ mod tests {
     #[test]
     fn test_device_mapping_attributes() {
         let context = Context::new();
-        let block = context.gpu_block_mapping_attribute(MappingId::DimensionX);
-        let warpgroup = context.gpu_warpgroup_mapping_attribute(MappingId::DimensionY);
-        let warp = context.gpu_warp_mapping_attribute(MappingId::DimensionZ);
-        let thread = context.gpu_thread_mapping_attribute(MappingId::LinearDimension0);
-        let lane = context.gpu_lane_mapping_attribute(MappingId::LinearDimension1);
-        let mask = context.gpu_mapping_mask_attribute(3);
-        let memory_space = context.gpu_memory_space_mapping_attribute(AddressSpace::Workgroup);
+        let block = context.gpu_block_mapping_attribute(MappingId::DimensionX).unwrap();
+        let warpgroup = context.gpu_warpgroup_mapping_attribute(MappingId::DimensionY).unwrap();
+        let warp = context.gpu_warp_mapping_attribute(MappingId::DimensionZ).unwrap();
+        let thread = context.gpu_thread_mapping_attribute(MappingId::LinearDimension0).unwrap();
+        let lane = context.gpu_lane_mapping_attribute(MappingId::LinearDimension1).unwrap();
+        let mask = context.gpu_mapping_mask_attribute(3).unwrap();
+        let memory_space = context.gpu_memory_space_mapping_attribute(AddressSpace::Workgroup).unwrap();
 
         assert_eq!(&context, block.context());
-        assert_eq!(block.value(), MappingId::DimensionX);
-        assert_eq!(warpgroup.value(), MappingId::DimensionY);
-        assert_eq!(warp.value(), MappingId::DimensionZ);
-        assert_eq!(thread.value(), MappingId::LinearDimension0);
-        assert_eq!(lane.value(), MappingId::LinearDimension1);
+        assert_eq!(block.value().unwrap(), MappingId::DimensionX);
+        assert_eq!(warpgroup.value().unwrap(), MappingId::DimensionY);
+        assert_eq!(warp.value().unwrap(), MappingId::DimensionZ);
+        assert_eq!(thread.value().unwrap(), MappingId::LinearDimension0);
+        assert_eq!(lane.value().unwrap(), MappingId::LinearDimension1);
         assert_eq!(mask.mask(), 3);
-        assert_eq!(memory_space.address_space(), AddressSpace::Workgroup);
+        assert_eq!(memory_space.address_space().unwrap(), AddressSpace::Workgroup);
     }
 
     #[test]
     fn test_device_mapping_attributes_equality() {
         let context = Context::new();
 
-        let attribute_1 = context.gpu_block_mapping_attribute(MappingId::DimensionX);
-        let attribute_2 = context.gpu_block_mapping_attribute(MappingId::DimensionX);
+        let attribute_1 = context.gpu_block_mapping_attribute(MappingId::DimensionX).unwrap();
+        let attribute_2 = context.gpu_block_mapping_attribute(MappingId::DimensionX).unwrap();
         assert_eq!(attribute_1, attribute_2);
-        let attribute_2 = context.gpu_block_mapping_attribute(MappingId::DimensionY);
+        let attribute_2 = context.gpu_block_mapping_attribute(MappingId::DimensionY).unwrap();
         assert_ne!(attribute_1, attribute_2);
         let context_2 = Context::new();
-        let attribute_2 = context_2.gpu_block_mapping_attribute(MappingId::DimensionX);
+        let attribute_2 = context_2.gpu_block_mapping_attribute(MappingId::DimensionX).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         assert_eq!(
-            context.gpu_warpgroup_mapping_attribute(MappingId::DimensionX),
-            context.gpu_warpgroup_mapping_attribute(MappingId::DimensionX),
+            context.gpu_warpgroup_mapping_attribute(MappingId::DimensionX).unwrap(),
+            context.gpu_warpgroup_mapping_attribute(MappingId::DimensionX).unwrap(),
         );
         assert_eq!(
-            context.gpu_warp_mapping_attribute(MappingId::DimensionX),
-            context.gpu_warp_mapping_attribute(MappingId::DimensionX),
+            context.gpu_warp_mapping_attribute(MappingId::DimensionX).unwrap(),
+            context.gpu_warp_mapping_attribute(MappingId::DimensionX).unwrap(),
         );
         assert_eq!(
-            context.gpu_thread_mapping_attribute(MappingId::DimensionX),
-            context.gpu_thread_mapping_attribute(MappingId::DimensionX),
+            context.gpu_thread_mapping_attribute(MappingId::DimensionX).unwrap(),
+            context.gpu_thread_mapping_attribute(MappingId::DimensionX).unwrap(),
         );
         assert_eq!(
-            context.gpu_lane_mapping_attribute(MappingId::LinearDimension0),
-            context.gpu_lane_mapping_attribute(MappingId::LinearDimension0),
+            context.gpu_lane_mapping_attribute(MappingId::LinearDimension0).unwrap(),
+            context.gpu_lane_mapping_attribute(MappingId::LinearDimension0).unwrap(),
         );
-        assert_eq!(context.gpu_mapping_mask_attribute(3), context.gpu_mapping_mask_attribute(3));
+        assert_eq!(context.gpu_mapping_mask_attribute(3).unwrap(), context.gpu_mapping_mask_attribute(3).unwrap());
         assert_eq!(
-            context.gpu_memory_space_mapping_attribute(AddressSpace::Workgroup),
-            context.gpu_memory_space_mapping_attribute(AddressSpace::Workgroup),
+            context.gpu_memory_space_mapping_attribute(AddressSpace::Workgroup).unwrap(),
+            context.gpu_memory_space_mapping_attribute(AddressSpace::Workgroup).unwrap(),
         );
     }
 
     #[test]
     fn test_device_mapping_attributes_display_and_debug() {
         let context = Context::new();
-        test_attribute_display_and_debug(context.gpu_block_mapping_attribute(MappingId::DimensionX), "#gpu.block<x>");
         test_attribute_display_and_debug(
-            context.gpu_warpgroup_mapping_attribute(MappingId::DimensionY),
+            context.gpu_block_mapping_attribute(MappingId::DimensionX).unwrap(),
+            "#gpu.block<x>",
+        );
+        test_attribute_display_and_debug(
+            context.gpu_warpgroup_mapping_attribute(MappingId::DimensionY).unwrap(),
             "#gpu.warpgroup<y>",
         );
-        test_attribute_display_and_debug(context.gpu_warp_mapping_attribute(MappingId::DimensionZ), "#gpu.warp<z>");
         test_attribute_display_and_debug(
-            context.gpu_thread_mapping_attribute(MappingId::LinearDimension0),
+            context.gpu_warp_mapping_attribute(MappingId::DimensionZ).unwrap(),
+            "#gpu.warp<z>",
+        );
+        test_attribute_display_and_debug(
+            context.gpu_thread_mapping_attribute(MappingId::LinearDimension0).unwrap(),
             "#gpu.thread<linear_dim_0>",
         );
         test_attribute_display_and_debug(
-            context.gpu_lane_mapping_attribute(MappingId::LinearDimension1),
+            context.gpu_lane_mapping_attribute(MappingId::LinearDimension1).unwrap(),
             "#gpu.lane<linear_dim_1>",
         );
-        test_attribute_display_and_debug(context.gpu_mapping_mask_attribute(3), "#gpu.mask<3>");
+        test_attribute_display_and_debug(context.gpu_mapping_mask_attribute(3).unwrap(), "#gpu.mask<3>");
         test_attribute_display_and_debug(
-            context.gpu_memory_space_mapping_attribute(AddressSpace::Workgroup),
+            context.gpu_memory_space_mapping_attribute(AddressSpace::Workgroup).unwrap(),
             "#gpu.memory_space<workgroup>",
         );
     }
@@ -1642,13 +1667,13 @@ mod tests {
     #[test]
     fn test_device_mapping_attributes_casting() {
         let context = Context::new();
-        test_attribute_casting(context.gpu_block_mapping_attribute(MappingId::DimensionX));
-        test_attribute_casting(context.gpu_warpgroup_mapping_attribute(MappingId::DimensionY));
-        test_attribute_casting(context.gpu_warp_mapping_attribute(MappingId::DimensionZ));
-        test_attribute_casting(context.gpu_thread_mapping_attribute(MappingId::LinearDimension0));
-        test_attribute_casting(context.gpu_lane_mapping_attribute(MappingId::LinearDimension1));
-        test_attribute_casting(context.gpu_mapping_mask_attribute(3));
-        test_attribute_casting(context.gpu_memory_space_mapping_attribute(AddressSpace::Workgroup));
+        test_attribute_casting(context.gpu_block_mapping_attribute(MappingId::DimensionX).unwrap());
+        test_attribute_casting(context.gpu_warpgroup_mapping_attribute(MappingId::DimensionY).unwrap());
+        test_attribute_casting(context.gpu_warp_mapping_attribute(MappingId::DimensionZ).unwrap());
+        test_attribute_casting(context.gpu_thread_mapping_attribute(MappingId::LinearDimension0).unwrap());
+        test_attribute_casting(context.gpu_lane_mapping_attribute(MappingId::LinearDimension1).unwrap());
+        test_attribute_casting(context.gpu_mapping_mask_attribute(3).unwrap());
+        test_attribute_casting(context.gpu_memory_space_mapping_attribute(AddressSpace::Workgroup).unwrap());
     }
 
     #[test]
@@ -1656,15 +1681,16 @@ mod tests {
         let context = Context::new();
         let map = context.identity_affine_map(1);
         let bound = context.identity_affine_map(1);
-        let attribute = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound);
+        let attribute = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound).unwrap();
         let mappings = context.gpu_parallel_loop_mapping_attribute(&[attribute]);
 
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.processor(), Processor::BlockX);
-        assert_eq!(attribute.map(), map);
-        assert_eq!(attribute.bound(), bound);
+        assert_eq!(attribute.processor().unwrap(), Processor::BlockX);
+        assert_eq!(attribute.map().unwrap(), map);
+        assert_eq!(attribute.bound().unwrap(), bound);
         assert_eq!(mappings.len(), 1);
-        assert_eq!(mappings.element(0), attribute.as_ref());
+        assert_eq!(mappings.element(0).unwrap(), attribute.as_ref());
+        assert!(mappings.element(1).is_err());
     }
 
     #[test]
@@ -1673,17 +1699,17 @@ mod tests {
         let map = context.identity_affine_map(1);
         let bound = context.identity_affine_map(1);
 
-        let attribute_1 = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound);
-        let attribute_2 = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound);
+        let attribute_1 = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound).unwrap();
+        let attribute_2 = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.gpu_parallel_loop_dim_mapping_attribute(Processor::ThreadX, map, bound);
+        let attribute_2 = context.gpu_parallel_loop_dim_mapping_attribute(Processor::ThreadX, map, bound).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
         let map = context.identity_affine_map(1);
         let bound = context.identity_affine_map(1);
-        let attribute_2 = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound);
+        let attribute_2 = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
@@ -1692,7 +1718,7 @@ mod tests {
         let context = Context::new();
         let map = context.identity_affine_map(1);
         let bound = context.identity_affine_map(1);
-        let attribute = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound);
+        let attribute = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound).unwrap();
         test_attribute_display_and_debug(
             attribute,
             "#gpu.loop_dim_map<processor = block_x, map = (d0) -> (d0), bound = (d0) -> (d0)>",
@@ -1704,7 +1730,7 @@ mod tests {
         let context = Context::new();
         let map = context.identity_affine_map(1);
         let bound = context.identity_affine_map(1);
-        let attribute = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound);
+        let attribute = context.gpu_parallel_loop_dim_mapping_attribute(Processor::BlockX, map, bound).unwrap();
         test_attribute_casting(attribute);
     }
 }
