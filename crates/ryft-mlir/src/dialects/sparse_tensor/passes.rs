@@ -77,21 +77,21 @@ mod tests {
     #[test]
     fn test_create_sparse_tensor_passes() {
         // Verify that pass creation does not crash for the various `sparse_tensor` dialect passes.
-        let _ = create_sparse_tensor_lower_foreach_to_scf_pass();
-        let _ = create_sparse_tensor_lower_sparse_iteration_to_scf_pass();
-        let _ = create_sparse_tensor_lower_sparse_ops_to_foreach_pass();
-        let _ = create_sparse_tensor_pre_sparsification_rewrite_pass();
-        let _ = create_sparse_tensor_sparse_assembler_pass();
-        let _ = create_sparse_tensor_sparse_buffer_rewrite_pass();
-        let _ = create_sparse_tensor_sparse_gpu_codegen_pass();
-        let _ = create_sparse_tensor_sparse_reinterpret_map_pass();
-        let _ = create_sparse_tensor_sparse_collapse_pass();
-        let _ = create_sparse_tensor_sparse_tensor_codegen_pass();
-        let _ = create_sparse_tensor_sparse_tensor_conversion_pass();
-        let _ = create_sparse_tensor_sparse_vectorization_pass();
-        let _ = create_sparse_tensor_sparsification_and_bufferization_pass();
-        let _ = create_sparse_tensor_sparsification_pass();
-        let _ = create_sparse_tensor_stage_sparse_operations_pass();
-        let _ = create_sparse_tensor_storage_specifier_to_llvm_pass();
+        let _ = create_sparse_tensor_lower_foreach_to_scf_pass().unwrap();
+        let _ = create_sparse_tensor_lower_sparse_iteration_to_scf_pass().unwrap();
+        let _ = create_sparse_tensor_lower_sparse_ops_to_foreach_pass().unwrap();
+        let _ = create_sparse_tensor_pre_sparsification_rewrite_pass().unwrap();
+        let _ = create_sparse_tensor_sparse_assembler_pass().unwrap();
+        let _ = create_sparse_tensor_sparse_buffer_rewrite_pass().unwrap();
+        let _ = create_sparse_tensor_sparse_gpu_codegen_pass().unwrap();
+        let _ = create_sparse_tensor_sparse_reinterpret_map_pass().unwrap();
+        let _ = create_sparse_tensor_sparse_collapse_pass().unwrap();
+        let _ = create_sparse_tensor_sparse_tensor_codegen_pass().unwrap();
+        let _ = create_sparse_tensor_sparse_tensor_conversion_pass().unwrap();
+        let _ = create_sparse_tensor_sparse_vectorization_pass().unwrap();
+        let _ = create_sparse_tensor_sparsification_and_bufferization_pass().unwrap();
+        let _ = create_sparse_tensor_sparsification_pass().unwrap();
+        let _ = create_sparse_tensor_stage_sparse_operations_pass().unwrap();
+        let _ = create_sparse_tensor_storage_specifier_to_llvm_pass().unwrap();
     }
 }

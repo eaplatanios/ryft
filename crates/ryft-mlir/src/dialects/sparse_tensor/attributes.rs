@@ -25,7 +25,7 @@ use ryft_xla_sys::mlir::dialects::sparse_tensor::{
     mlirSparseTensorEnumAttrGet, mlirSparseTensorEnumAttrGetValue,
 };
 
-use crate::{AffineMap, Attribute, AttributeRef, Context, DialectHandle, FromWithContext, mlir_subtype_trait_impls};
+use crate::{AffineMap, Attribute, AttributeRef, Context, DialectHandle, Error, mlir_subtype_trait_impls};
 
 /// Sparse tensor level format used by [`SparseTensorEncodingAttributeRef`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -64,15 +64,15 @@ impl LevelFormat {
 
     /// Constructs a [`LevelFormat`] from the MLIR C API representation.
     #[allow(non_upper_case_globals)]
-    pub fn from_c_api(value: MlirSparseTensorLevelFormat) -> Option<Self> {
+    pub fn from_c_api(value: MlirSparseTensorLevelFormat) -> Result<Self, Error> {
         match value {
-            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_DENSE => Some(Self::Dense),
-            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_BATCH => Some(Self::Batch),
-            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_COMPRESSED => Some(Self::Compressed),
-            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_SINGLETON => Some(Self::Singleton),
-            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_LOOSE_COMPRESSED => Some(Self::LooseCompressed),
-            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_N_OUT_OF_M => Some(Self::NOutOfM),
-            _ => None,
+            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_DENSE => Ok(Self::Dense),
+            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_BATCH => Ok(Self::Batch),
+            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_COMPRESSED => Ok(Self::Compressed),
+            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_SINGLETON => Ok(Self::Singleton),
+            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_LOOSE_COMPRESSED => Ok(Self::LooseCompressed),
+            MlirSparseTensorLevelFormat_MLIR_SPARSE_TENSOR_LEVEL_N_OUT_OF_M => Ok(Self::NOutOfM),
+            _ => Err(Error::invalid_argument("invalid MLIR sparse tensor level format value")),
         }
     }
 }
@@ -130,9 +130,9 @@ impl LevelType {
     }
 
     /// Returns the level format.
-    pub fn format(&self) -> LevelFormat {
+    pub fn format(&self) -> Result<LevelFormat, Error> {
         LevelFormat::from_c_api((self.bits & 0xffff0000) as MlirSparseTensorLevelFormat)
-            .expect("invalid sparse tensor level format")
+            .map_err(|_| Error::invalid_argument("invalid sparse tensor level format"))
     }
 
     /// Returns `true` if this level type has the provided non-default property.
@@ -141,20 +141,20 @@ impl LevelType {
     }
 
     /// Returns the `n` value for structured n-out-of-m level types.
-    pub fn structured_n(&self) -> Option<u32> {
-        if self.format() == LevelFormat::NOutOfM {
-            Some(unsafe { mlirSparseTensorEncodingAttrGetStructuredN(self.bits) })
+    pub fn structured_n(&self) -> Result<Option<u32>, Error> {
+        if self.format()? == LevelFormat::NOutOfM {
+            Ok(Some(unsafe { mlirSparseTensorEncodingAttrGetStructuredN(self.bits) }))
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Returns the `m` value for structured n-out-of-m level types.
-    pub fn structured_m(&self) -> Option<u32> {
-        if self.format() == LevelFormat::NOutOfM {
-            Some(unsafe { mlirSparseTensorEncodingAttrGetStructuredM(self.bits) })
+    pub fn structured_m(&self) -> Result<Option<u32>, Error> {
+        if self.format()? == LevelFormat::NOutOfM {
+            Ok(Some(unsafe { mlirSparseTensorEncodingAttrGetStructuredM(self.bits) }))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -212,11 +212,11 @@ impl SparseTensorDimSliceAttributeRef<'_, '_> {
 }
 
 impl<'c, 't> Attribute<'c, 't> for SparseTensorDimSliceAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirAttributeIsASparseTensorDimSliceAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -258,24 +258,24 @@ impl<'c, 't> SparseTensorEncodingAttributeRef<'c, 't> {
     }
 
     /// Returns the level format for `level`.
-    pub fn level_format(&self, level: usize) -> LevelFormat {
+    pub fn level_format(&self, level: usize) -> Result<LevelFormat, Error> {
         LevelFormat::from_c_api(unsafe { mlirSparseTensorEncodingAttrGetLvlFmt(self.handle, level.cast_signed()) })
-            .expect("invalid sparse tensor level format")
+            .map_err(|_| Error::internal("invalid sparse tensor level format"))
     }
 
     /// Returns the dimension-to-level affine map.
-    pub fn dimension_to_level(&self) -> AffineMap<'c, 't> {
+    pub fn dimension_to_level(&self) -> Result<AffineMap<'c, 't>, Error> {
         unsafe {
             AffineMap::from_c_api(mlirSparseTensorEncodingAttrGetDimToLvl(self.handle), self.context)
-                .expect("invalid sparse tensor dimension-to-level map")
+                .map_err(|_| Error::internal("invalid sparse tensor dimension-to-level map"))
         }
     }
 
     /// Returns the level-to-dimension affine map.
-    pub fn level_to_dimension(&self) -> AffineMap<'c, 't> {
+    pub fn level_to_dimension(&self) -> Result<AffineMap<'c, 't>, Error> {
         unsafe {
             AffineMap::from_c_api(mlirSparseTensorEncodingAttrGetLvlToDim(self.handle), self.context)
-                .expect("invalid sparse tensor level-to-dimension map")
+                .map_err(|_| Error::internal("invalid sparse tensor level-to-dimension map"))
         }
     }
 
@@ -290,17 +290,27 @@ impl<'c, 't> SparseTensorEncodingAttributeRef<'c, 't> {
     }
 
     /// Returns the optional explicit value used by binary-valued sparse tensors.
-    pub fn explicit_value(&self) -> Option<AttributeRef<'c, 't>> {
-        unsafe { AttributeRef::from_c_api(mlirSparseTensorEncodingAttrGetExplicitVal(self.handle), self.context) }
+    pub fn explicit_value(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirSparseTensorEncodingAttrGetExplicitVal(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context).map(Some) }
+        }
     }
 
     /// Returns the optional implicit value for unstored tensor entries.
-    pub fn implicit_value(&self) -> Option<AttributeRef<'c, 't>> {
-        unsafe { AttributeRef::from_c_api(mlirSparseTensorEncodingAttrGetImplicitVal(self.handle), self.context) }
+    pub fn implicit_value(&self) -> Result<Option<AttributeRef<'c, 't>>, Error> {
+        let handle = unsafe { mlirSparseTensorEncodingAttrGetImplicitVal(self.handle) };
+        if handle.ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { AttributeRef::from_c_api(handle, self.context).map(Some) }
+        }
     }
 
     /// Returns the dimension-slice metadata in dimension order.
-    pub fn dimension_slices(&self) -> Vec<SparseTensorDimSliceAttributeRef<'c, 't>> {
+    pub fn dimension_slices(&self) -> Result<Vec<SparseTensorDimSliceAttributeRef<'c, 't>>, Error> {
         let count = unsafe { mlirSparseTensorEncodingAttrGetDimSliceCount(self.handle).cast_unsigned() };
         (0..count)
             .map(|dimension| unsafe {
@@ -308,18 +318,18 @@ impl<'c, 't> SparseTensorEncodingAttributeRef<'c, 't> {
                     mlirSparseTensorEncodingAttrGetDimSlice(self.handle, dimension.cast_signed()),
                     self.context,
                 )
-                .expect("invalid sparse tensor dimension slice")
+                .map_err(|_| Error::internal("invalid sparse tensor dimension slice"))
             })
             .collect()
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for SparseTensorEncodingAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null() && unsafe { mlirAttributeIsASparseTensorEncodingAttr(handle) } {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -407,19 +417,19 @@ pub struct StorageSpecifierKindAttributeRef<'c, 't> {
 
 impl StorageSpecifierKindAttributeRef<'_, '_> {
     /// Returns the storage-specifier kind stored in this attribute.
-    pub fn value(&self) -> StorageSpecifierKind {
+    pub fn value(&self) -> Result<StorageSpecifierKind, Error> {
         StorageSpecifierKind::from_value(unsafe {
             mlirSparseTensorEnumAttrGetValue(
                 self.handle,
                 MlirSparseTensorEnumAttribute::MLIR_SPARSE_TENSOR_ENUM_ATTRIBUTE_STORAGE_SPECIFIER_KIND,
             )
         })
-        .expect("invalid sparse tensor storage specifier kind")
+        .ok_or_else(|| Error::internal("invalid sparse tensor storage specifier kind"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for StorageSpecifierKindAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null()
             && unsafe {
                 mlirAttributeIsASparseTensorEnumAttr(
@@ -428,9 +438,9 @@ impl<'c, 't> Attribute<'c, 't> for StorageSpecifierKindAttributeRef<'c, 't> {
                 )
             }
         {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -444,12 +454,6 @@ impl<'c, 't> Attribute<'c, 't> for StorageSpecifierKindAttributeRef<'c, 't> {
 }
 
 mlir_subtype_trait_impls!(StorageSpecifierKindAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
-
-impl<'c, 't> FromWithContext<'c, 't, StorageSpecifierKind> for StorageSpecifierKindAttributeRef<'c, 't> {
-    fn from_with_context(value: StorageSpecifierKind, context: &'c Context<'t>) -> Self {
-        context.sparse_tensor_storage_specifier_kind_attribute(value)
-    }
-}
 
 /// Sparse tensor sorting algorithm.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -512,19 +516,19 @@ pub struct SortKindAttributeRef<'c, 't> {
 
 impl SortKindAttributeRef<'_, '_> {
     /// Returns the sort kind stored in this attribute.
-    pub fn value(&self) -> SortKind {
+    pub fn value(&self) -> Result<SortKind, Error> {
         SortKind::from_value(unsafe {
             mlirSparseTensorEnumAttrGetValue(
                 self.handle,
                 MlirSparseTensorEnumAttribute::MLIR_SPARSE_TENSOR_ENUM_ATTRIBUTE_SORT_KIND,
             )
         })
-        .expect("invalid sparse tensor sort kind")
+        .ok_or_else(|| Error::internal("invalid sparse tensor sort kind"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for SortKindAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null()
             && unsafe {
                 mlirAttributeIsASparseTensorEnumAttr(
@@ -533,9 +537,9 @@ impl<'c, 't> Attribute<'c, 't> for SortKindAttributeRef<'c, 't> {
                 )
             }
         {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -549,12 +553,6 @@ impl<'c, 't> Attribute<'c, 't> for SortKindAttributeRef<'c, 't> {
 }
 
 mlir_subtype_trait_impls!(SortKindAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
-
-impl<'c, 't> FromWithContext<'c, 't, SortKind> for SortKindAttributeRef<'c, 't> {
-    fn from_with_context(value: SortKind, context: &'c Context<'t>) -> Self {
-        context.sparse_tensor_sort_kind_attribute(value)
-    }
-}
 
 /// Sparse tensor coordinate translation direction.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -605,19 +603,19 @@ pub struct CoordinateTranslationDirectionAttributeRef<'c, 't> {
 
 impl CoordinateTranslationDirectionAttributeRef<'_, '_> {
     /// Returns the coordinate-translation direction stored in this attribute.
-    pub fn value(&self) -> CoordinateTranslationDirection {
+    pub fn value(&self) -> Result<CoordinateTranslationDirection, Error> {
         CoordinateTranslationDirection::from_value(unsafe {
             mlirSparseTensorEnumAttrGetValue(
                 self.handle,
                 MlirSparseTensorEnumAttribute::MLIR_SPARSE_TENSOR_ENUM_ATTRIBUTE_CRD_TRANS_DIRECTION,
             )
         })
-        .expect("invalid sparse tensor coordinate translation direction")
+        .ok_or_else(|| Error::internal("invalid sparse tensor coordinate translation direction"))
     }
 }
 
 impl<'c, 't> Attribute<'c, 't> for CoordinateTranslationDirectionAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Option<Self> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
         if !handle.ptr.is_null()
             && unsafe {
                 mlirAttributeIsASparseTensorEnumAttr(
@@ -626,9 +624,9 @@ impl<'c, 't> Attribute<'c, 't> for CoordinateTranslationDirectionAttributeRef<'c
                 )
             }
         {
-            Some(Self { handle, context })
+            Ok(Self { handle, context })
         } else {
-            None
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
         }
     }
 
@@ -646,14 +644,6 @@ mlir_subtype_trait_impls!(
     mlir_type = Attribute,
 );
 
-impl<'c, 't> FromWithContext<'c, 't, CoordinateTranslationDirection>
-    for CoordinateTranslationDirectionAttributeRef<'c, 't>
-{
-    fn from_with_context(value: CoordinateTranslationDirection, context: &'c Context<'t>) -> Self {
-        context.sparse_tensor_coordinate_translation_direction_attribute(value)
-    }
-}
-
 impl<'t> Context<'t> {
     /// Creates a new sparse tensor dimension-slice attribute owned by this [`Context`].
     pub fn sparse_tensor_dim_slice_attribute<'c>(
@@ -661,14 +651,14 @@ impl<'t> Context<'t> {
         offset: i64,
         size: i64,
         stride: i64,
-    ) -> SparseTensorDimSliceAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::sparse_tensor());
+    ) -> Result<SparseTensorDimSliceAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::sparse_tensor()?)?;
         unsafe {
             SparseTensorDimSliceAttributeRef::from_c_api(
                 mlirSparseTensorDimSliceAttrGet(*self.handle.borrow(), offset, size, stride),
                 self,
             )
-            .expect("invalid sparse tensor dimension slice attribute")
+            .map_err(|_| Error::internal("invalid sparse tensor dimension slice attribute"))
         }
     }
 
@@ -683,8 +673,8 @@ impl<'t> Context<'t> {
         explicit_value: Option<AttributeRef<'c, 't>>,
         implicit_value: Option<AttributeRef<'c, 't>>,
         dimension_slices: &[SparseTensorDimSliceAttributeRef<'c, 't>],
-    ) -> SparseTensorEncodingAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::sparse_tensor());
+    ) -> Result<SparseTensorEncodingAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::sparse_tensor()?)?;
         let level_types = level_types.iter().map(LevelType::to_c_api).collect::<Vec<_>>();
         let dimension_slices = dimension_slices
             .iter()
@@ -727,15 +717,15 @@ impl<'t> Context<'t> {
             }
         };
         unsafe { SparseTensorEncodingAttributeRef::from_c_api(handle, self) }
-            .expect("invalid sparse tensor encoding attribute")
+            .map_err(|_| Error::internal("invalid sparse tensor encoding attribute"))
     }
 
     /// Creates a new sparse tensor storage-specifier kind attribute owned by this [`Context`].
     pub fn sparse_tensor_storage_specifier_kind_attribute<'c>(
         &'c self,
         value: StorageSpecifierKind,
-    ) -> StorageSpecifierKindAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::sparse_tensor());
+    ) -> Result<StorageSpecifierKindAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::sparse_tensor()?)?;
         unsafe {
             StorageSpecifierKindAttributeRef::from_c_api(
                 mlirSparseTensorEnumAttrGet(
@@ -745,13 +735,16 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .expect("invalid sparse tensor storage specifier kind attribute")
+            .map_err(|_| Error::internal("invalid sparse tensor storage specifier kind attribute"))
         }
     }
 
     /// Creates a new sparse tensor sort-kind attribute owned by this [`Context`].
-    pub fn sparse_tensor_sort_kind_attribute<'c>(&'c self, value: SortKind) -> SortKindAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::sparse_tensor());
+    pub fn sparse_tensor_sort_kind_attribute<'c>(
+        &'c self,
+        value: SortKind,
+    ) -> Result<SortKindAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::sparse_tensor()?)?;
         unsafe {
             SortKindAttributeRef::from_c_api(
                 mlirSparseTensorEnumAttrGet(
@@ -761,7 +754,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .expect("invalid sparse tensor sort kind attribute")
+            .map_err(|_| Error::internal("invalid sparse tensor sort kind attribute"))
         }
     }
 
@@ -769,8 +762,8 @@ impl<'t> Context<'t> {
     pub fn sparse_tensor_coordinate_translation_direction_attribute<'c>(
         &'c self,
         value: CoordinateTranslationDirection,
-    ) -> CoordinateTranslationDirectionAttributeRef<'c, 't> {
-        self.load_dialect(DialectHandle::sparse_tensor());
+    ) -> Result<CoordinateTranslationDirectionAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::sparse_tensor()?)?;
         unsafe {
             CoordinateTranslationDirectionAttributeRef::from_c_api(
                 mlirSparseTensorEnumAttrGet(
@@ -780,7 +773,7 @@ impl<'t> Context<'t> {
                 ),
                 self,
             )
-            .expect("invalid sparse tensor coordinate translation direction attribute")
+            .map_err(|_| Error::internal("invalid sparse tensor coordinate translation direction attribute"))
         }
     }
 }
@@ -797,7 +790,7 @@ mod tests {
     #[test]
     fn test_level_type() {
         let level_type = LevelType::new(LevelFormat::Compressed, &[LevelProperty::NonUnique]);
-        assert_eq!(level_type.format(), LevelFormat::Compressed);
+        assert_eq!(level_type.format().unwrap(), LevelFormat::Compressed);
         assert!(level_type.has_property(LevelProperty::NonUnique));
         assert!(!level_type.has_property(LevelProperty::NonOrdered));
         assert_eq!(LevelType::from_c_api(level_type.to_c_api()), level_type);
@@ -807,15 +800,16 @@ mod tests {
     #[test]
     fn test_level_type_structured() {
         let level_type = LevelType::n_out_of_m(2, 4);
-        assert_eq!(level_type.format(), LevelFormat::NOutOfM);
-        assert_eq!(level_type.structured_n(), Some(2));
-        assert_eq!(level_type.structured_m(), Some(4));
+        assert_eq!(level_type.format().unwrap(), LevelFormat::NOutOfM);
+        assert_eq!(level_type.structured_n().unwrap(), Some(2));
+        assert_eq!(level_type.structured_m().unwrap(), Some(4));
     }
 
     #[test]
     fn test_dim_slice_attribute() {
         let context = Context::new();
-        let attribute = context.sparse_tensor_dim_slice_attribute(1, SparseTensorDimSliceAttributeRef::DYNAMIC, 2);
+        let attribute =
+            context.sparse_tensor_dim_slice_attribute(1, SparseTensorDimSliceAttributeRef::DYNAMIC, 2).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.offset(), 1);
         assert_eq!(attribute.size(), SparseTensorDimSliceAttributeRef::DYNAMIC);
@@ -825,30 +819,32 @@ mod tests {
     #[test]
     fn test_dim_slice_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.sparse_tensor_dim_slice_attribute(1, 4, 2);
-        let attribute_2 = context.sparse_tensor_dim_slice_attribute(1, 4, 2);
+        let attribute_1 = context.sparse_tensor_dim_slice_attribute(1, 4, 2).unwrap();
+        let attribute_2 = context.sparse_tensor_dim_slice_attribute(1, 4, 2).unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.sparse_tensor_dim_slice_attribute(1, 4, 1);
+        let attribute_2 = context.sparse_tensor_dim_slice_attribute(1, 4, 1).unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.sparse_tensor_dim_slice_attribute(1, 4, 2);
+        let attribute_2 = context.sparse_tensor_dim_slice_attribute(1, 4, 2).unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_dim_slice_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.sparse_tensor_dim_slice_attribute(1, SparseTensorDimSliceAttributeRef::DYNAMIC, 2);
+        let attribute =
+            context.sparse_tensor_dim_slice_attribute(1, SparseTensorDimSliceAttributeRef::DYNAMIC, 2).unwrap();
         test_attribute_display_and_debug(attribute, "#sparse_tensor<slice(1, ?, 2)>");
     }
 
     #[test]
     fn test_dim_slice_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::sparse_tensor());
-        let attribute = context.sparse_tensor_dim_slice_attribute(1, SparseTensorDimSliceAttributeRef::DYNAMIC, 2);
+        context.load_dialect(DialectHandle::sparse_tensor().unwrap()).unwrap();
+        let attribute =
+            context.sparse_tensor_dim_slice_attribute(1, SparseTensorDimSliceAttributeRef::DYNAMIC, 2).unwrap();
         assert_eq!(
             context
                 .parse_attribute("#sparse_tensor<slice(1, ?, 2)>")
@@ -862,102 +858,115 @@ mod tests {
     #[test]
     fn test_dim_slice_attribute_casting() {
         let context = Context::new();
-        let attribute = context.sparse_tensor_dim_slice_attribute(1, SparseTensorDimSliceAttributeRef::DYNAMIC, 2);
+        let attribute =
+            context.sparse_tensor_dim_slice_attribute(1, SparseTensorDimSliceAttributeRef::DYNAMIC, 2).unwrap();
         test_attribute_casting(attribute);
     }
 
     #[test]
     fn test_encoding_attribute() {
         let context = Context::new();
-        let slice = context.sparse_tensor_dim_slice_attribute(1, SparseTensorDimSliceAttributeRef::DYNAMIC, 2);
+        let slice = context.sparse_tensor_dim_slice_attribute(1, SparseTensorDimSliceAttributeRef::DYNAMIC, 2).unwrap();
         let dimension_to_level = context.identity_affine_map(1);
-        let attribute = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(dimension_to_level),
-            None,
-            32,
-            64,
-            None,
-            None,
-            &[slice],
-        );
+        let attribute = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(dimension_to_level),
+                None,
+                32,
+                64,
+                None,
+                None,
+                &[slice],
+            )
+            .unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.level_rank(), 1);
         assert_eq!(attribute.level_types(), vec![LevelType::from(LevelFormat::Compressed)]);
         assert_eq!(attribute.level_type(0), LevelType::from(LevelFormat::Compressed));
-        assert_eq!(attribute.level_format(0), LevelFormat::Compressed);
-        assert_eq!(attribute.dimension_to_level(), dimension_to_level);
+        assert_eq!(attribute.level_format(0).unwrap(), LevelFormat::Compressed);
+        assert_eq!(attribute.dimension_to_level().unwrap(), dimension_to_level);
         assert_eq!(attribute.position_width(), 32);
         assert_eq!(attribute.coordinate_width(), 64);
-        assert_eq!(attribute.explicit_value(), None);
-        assert_eq!(attribute.implicit_value(), None);
-        assert_eq!(attribute.dimension_slices(), vec![slice]);
+        assert_eq!(attribute.explicit_value().unwrap(), None);
+        assert_eq!(attribute.implicit_value().unwrap(), None);
+        assert_eq!(attribute.dimension_slices().unwrap(), vec![slice]);
     }
 
     #[test]
     fn test_encoding_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            32,
-            64,
-            None,
-            None,
-            &[],
-        );
-        let attribute_2 = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            32,
-            64,
-            None,
-            None,
-            &[],
-        );
+        let attribute_1 = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                32,
+                64,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        let attribute_2 = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                32,
+                64,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Dense)],
-            Some(context.identity_affine_map(1)),
-            None,
-            32,
-            64,
-            None,
-            None,
-            &[],
-        );
+        let attribute_2 = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Dense)],
+                Some(context.identity_affine_map(1)),
+                None,
+                32,
+                64,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            32,
-            64,
-            None,
-            None,
-            &[],
-        );
+        let attribute_2 = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                32,
+                64,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
     fn test_encoding_attribute_display_and_debug() {
         let context = Context::new();
-        let attribute = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            32,
-            64,
-            None,
-            None,
-            &[],
-        );
+        let attribute = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                32,
+                64,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         test_attribute_display_and_debug(
             attribute,
             "#sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed), posWidth = 32, crdWidth = 64 }>",
@@ -967,17 +976,19 @@ mod tests {
     #[test]
     fn test_encoding_attribute_parsing() {
         let context = Context::new();
-        context.load_dialect(DialectHandle::sparse_tensor());
-        let attribute = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            32,
-            64,
-            None,
-            None,
-            &[],
-        );
+        context.load_dialect(DialectHandle::sparse_tensor().unwrap()).unwrap();
+        let attribute = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                32,
+                64,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         assert_eq!(
             context
                 .parse_attribute(
@@ -993,16 +1004,18 @@ mod tests {
     #[test]
     fn test_encoding_attribute_casting() {
         let context = Context::new();
-        let attribute = context.sparse_tensor_encoding_attribute(
-            &[LevelType::from(LevelFormat::Compressed)],
-            Some(context.identity_affine_map(1)),
-            None,
-            32,
-            64,
-            None,
-            None,
-            &[],
-        );
+        let attribute = context
+            .sparse_tensor_encoding_attribute(
+                &[LevelType::from(LevelFormat::Compressed)],
+                Some(context.identity_affine_map(1)),
+                None,
+                32,
+                64,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
         test_attribute_casting(attribute);
     }
 
@@ -1021,31 +1034,31 @@ mod tests {
                 #[test]
                 fn [<test_ $test_name _attribute>]() {
                     let context = Context::new();
-                    let attribute = context.$constructor($enum_name::$first);
+                    let attribute = context.$constructor($enum_name::$first).unwrap();
                     assert_eq!(&context, attribute.context());
-                    assert_eq!(attribute.value(), $enum_name::$first);
-                    assert_eq!($enum_name::from_value(attribute.value().value()), Some($enum_name::$first));
+                    assert_eq!(attribute.value().unwrap(), $enum_name::$first);
+                    assert_eq!($enum_name::from_value(attribute.value().unwrap().value()), Some($enum_name::$first));
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_equality>]() {
                     let context = Context::new();
-                    let attribute_1 = context.$constructor($enum_name::$first);
-                    let attribute_2 = context.$constructor($enum_name::$first);
+                    let attribute_1 = context.$constructor($enum_name::$first).unwrap();
+                    let attribute_2 = context.$constructor($enum_name::$first).unwrap();
                     assert_eq!(attribute_1, attribute_2);
 
-                    let attribute_2 = context.$constructor($enum_name::$second);
+                    let attribute_2 = context.$constructor($enum_name::$second).unwrap();
                     assert_ne!(attribute_1, attribute_2);
 
                     let context = Context::new();
-                    let attribute_2 = context.$constructor($enum_name::$first);
+                    let attribute_2 = context.$constructor($enum_name::$first).unwrap();
                     assert_ne!(attribute_1, attribute_2);
                 }
 
                 #[test]
                 fn [<test_ $test_name _attribute_display_and_debug>]() {
                     let context = Context::new();
-                    let attribute = context.$constructor($enum_name::$first);
+                    let attribute = context.$constructor($enum_name::$first).unwrap();
                     let expected = format!("{}{}>", $expected_prefix, $enum_name::$first.as_str());
                     test_attribute_display_and_debug(attribute, Box::leak(expected.into_boxed_str()));
                 }
@@ -1053,8 +1066,8 @@ mod tests {
                 #[test]
                 fn [<test_ $test_name _attribute_parsing>]() {
                     let context = Context::new();
-                    context.load_dialect(DialectHandle::sparse_tensor());
-                    let attribute = context.$constructor($enum_name::$first);
+                    context.load_dialect(DialectHandle::sparse_tensor().unwrap()).unwrap();
+                    let attribute = context.$constructor($enum_name::$first).unwrap();
                     let source = format!("{}{}>", $expected_prefix, $enum_name::$first.as_str());
                     assert_eq!(
                         context.parse_attribute(&source).unwrap().cast::<$attribute_name>().unwrap(),
@@ -1065,7 +1078,7 @@ mod tests {
                 #[test]
                 fn [<test_ $test_name _attribute_casting>]() {
                     let context = Context::new();
-                    let attribute = context.$constructor($enum_name::$first);
+                    let attribute = context.$constructor($enum_name::$first).unwrap();
                     test_attribute_casting(attribute);
                 }
             }
