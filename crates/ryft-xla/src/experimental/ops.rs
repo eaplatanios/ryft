@@ -14,7 +14,7 @@ use ryft_core::operations::constants::{
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{AtomId, TracingError};
-use ryft_core::tracing_v2::differentiation::{JvpTracer, TangentValue};
+use ryft_core::tracing_v2::differentiation::{JvpTracer, Tangent};
 use ryft_core::tracing_v2::operations::{
     ConditionOperation, CosOperation, MatMulOperation, MatrixTransposeOperation, NegOperation, ReshapeOperation,
     ScaleOperation, SinOperation, SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsNeg,
@@ -326,7 +326,7 @@ impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
             .iter()
             .map(|output| {
                 let outputs = context.stage(
-                    LinearArrayOperation::<TangentValue<ArrayType, Infallible>, ArrayType>::Zero(ZeroOperation::new(
+                    LinearArrayOperation::<Tangent<ArrayType, Infallible>, ArrayType>::Zero(ZeroOperation::new(
                         output.r#type().into_owned(),
                     )),
                     &[],

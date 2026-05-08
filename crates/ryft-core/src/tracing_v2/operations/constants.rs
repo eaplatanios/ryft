@@ -9,7 +9,7 @@ use crate::operations::constants::{
 };
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, TangentValue};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{DataType, Type};
 
@@ -219,53 +219,53 @@ mod tests {
 
     use crate::tracing::Program;
     use crate::tracing::engines::{ScalarEngine, TracingEngine};
-    use crate::tracing_v2::{Cos, Differentiable, ScalarOperation, Sin, TangentValue};
+    use crate::tracing_v2::{Cos, Differentiable, ScalarOperation, Sin, Tangent};
     use crate::types::DataType;
 
     #[test]
     fn test_scalar_types_are_differentiable() {
         assert_eq!(
             TypeId::of::<<bool as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<TangentValue<DataType, Infallible>>()
+            TypeId::of::<Tangent<DataType, Infallible>>()
         );
         assert_eq!(
             TypeId::of::<<i8 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<TangentValue<DataType, Infallible>>()
+            TypeId::of::<Tangent<DataType, Infallible>>()
         );
         assert_eq!(
             TypeId::of::<<i16 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<TangentValue<DataType, Infallible>>()
+            TypeId::of::<Tangent<DataType, Infallible>>()
         );
         assert_eq!(
             TypeId::of::<<i32 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<TangentValue<DataType, Infallible>>()
+            TypeId::of::<Tangent<DataType, Infallible>>()
         );
         assert_eq!(
             TypeId::of::<<i64 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<TangentValue<DataType, Infallible>>()
+            TypeId::of::<Tangent<DataType, Infallible>>()
         );
         assert_eq!(
             TypeId::of::<<u8 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<TangentValue<DataType, Infallible>>()
+            TypeId::of::<Tangent<DataType, Infallible>>()
         );
         assert_eq!(
             TypeId::of::<<u16 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<TangentValue<DataType, Infallible>>()
+            TypeId::of::<Tangent<DataType, Infallible>>()
         );
         assert_eq!(
             TypeId::of::<<u32 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<TangentValue<DataType, Infallible>>()
+            TypeId::of::<Tangent<DataType, Infallible>>()
         );
         assert_eq!(
             TypeId::of::<<u64 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<TangentValue<DataType, Infallible>>()
+            TypeId::of::<Tangent<DataType, Infallible>>()
         );
         assert_eq!(TypeId::of::<<bf16 as Differentiable<DataType>>::Tangent>(), TypeId::of::<bf16>());
         assert_eq!(TypeId::of::<<f16 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f16>());
         assert_eq!(TypeId::of::<<f32 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f32>());
         assert_eq!(TypeId::of::<<f64 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f64>());
-        assert_eq!(false.tangent_type().unwrap(), TangentValue::zero(DataType::Boolean));
-        assert_eq!(3i32.tangent_type().unwrap(), TangentValue::zero(DataType::I32));
+        assert_eq!(false.tangent_type().unwrap(), Tangent::zero(DataType::Boolean));
+        assert_eq!(3i32.tangent_type().unwrap(), Tangent::zero(DataType::I32));
         assert_eq!(2.0f64.tangent_type().unwrap(), 0.0);
     }
 

@@ -1536,7 +1536,7 @@ mod tests {
     use ryft_core::tracing::transposition::TranspositionContext;
     use ryft_core::tracing::{Atom, AtomId, ProgramBuilder, Traceable};
     use ryft_core::tracing_v2::differentiation::JvpTracer;
-    use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext, LinearArrayOperation, TangentValue};
+    use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext, LinearArrayOperation, Tangent};
     use ryft_core::types::{ArrayType, DataType, Typed};
 
     use crate::experimental::ops::XlaOperation;
@@ -1757,8 +1757,8 @@ mod tests {
         let operation = make_linear_tensor_shard_map(&body).expect("linear tensor shard_map should be buildable");
         let tangent_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
-            TangentValue<ArrayType, Infallible>,
-            LinearArrayOperation<TangentValue<ArrayType, Infallible>, ArrayType>,
+            Tangent<ArrayType, Infallible>,
+            LinearArrayOperation<Tangent<ArrayType, Infallible>, ArrayType>,
         >::new()));
         let tangent_atom = tangent_builder.borrow_mut().add_input(test_array_type());
         let engine = crate::experimental::engines::XlaEngine::token();
@@ -1777,7 +1777,7 @@ mod tests {
             .expect("traced shard_map jvp should not leak linear terms")
             .into_inner();
         let tangent_program = tangent_builder
-            .build::<Vec<TangentValue<ArrayType, Infallible>>, Vec<TangentValue<ArrayType, Infallible>>>(
+            .build::<Vec<Tangent<ArrayType, Infallible>>, Vec<Tangent<ArrayType, Infallible>>>(
                 output_atoms,
                 vec![Placeholder],
                 vec![Placeholder],

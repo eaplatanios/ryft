@@ -17,7 +17,7 @@ use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::engines::Tracer;
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, TangentValue};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
@@ -43,8 +43,8 @@ use super::right_matmul::SupportsRightMatMul;
 use super::scale::SupportsScale;
 use super::sin::SupportsSin;
 
-type ZeroScalarTangent = TangentValue<DataType, Infallible>;
-type ZeroArrayTangent = TangentValue<ArrayType, Infallible>;
+type ZeroScalarTangent = Tangent<DataType, Infallible>;
+type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
 
 /// Default closed carrier for ordinary staged programs.
 ///
@@ -1017,7 +1017,7 @@ fn symbolic_zero_one_error<T: Type>(r#type: &T) -> TypeError {
 
 fn infer_zero_only_tangent_output_types<T, O>(
     operation: &O,
-    inputs: &[TangentValue<T, Infallible>],
+    inputs: &[Tangent<T, Infallible>],
 ) -> Result<Vec<T>, TracingError>
 where
     T: Type,
@@ -1029,22 +1029,22 @@ where
 
 fn interpret_zero_only_tangent_operation<T, O>(
     operation: &O,
-    inputs: &[TangentValue<T, Infallible>],
-) -> Result<Vec<TangentValue<T, Infallible>>, TracingError>
+    inputs: &[Tangent<T, Infallible>],
+) -> Result<Vec<Tangent<T, Infallible>>, TracingError>
 where
     T: Type,
     O: Operation<T>,
 {
     Ok(infer_zero_only_tangent_output_types(operation, inputs)?
         .into_iter()
-        .map(TangentValue::zero)
+        .map(Tangent::zero)
         .collect())
 }
 
 fn reject_zero_only_tangent_one_operation<T, O>(
     operation: &O,
-    inputs: &[TangentValue<T, Infallible>],
-) -> Result<Vec<TangentValue<T, Infallible>>, TracingError>
+    inputs: &[Tangent<T, Infallible>],
+) -> Result<Vec<Tangent<T, Infallible>>, TracingError>
 where
     T: Type,
     O: Operation<T>,
@@ -1056,7 +1056,7 @@ where
 
 fn infer_tangent_value_output_types<T, V, O>(
     operation: &O,
-    inputs: &[TangentValue<T, V>],
+    inputs: &[Tangent<T, V>],
 ) -> Result<Vec<T>, TracingError>
 where
     T: Type,
@@ -1067,26 +1067,26 @@ where
     Ok(operation.infer_output_types(input_types.as_slice())?)
 }
 
-fn symbolic_zero_tangent_value_outputs<T, V>(output_types: Vec<T>) -> Vec<TangentValue<T, V>>
+fn symbolic_zero_tangent_value_outputs<T, V>(output_types: Vec<T>) -> Vec<Tangent<T, V>>
 where
     T: Type,
     V: Traceable<T>,
 {
-    output_types.into_iter().map(TangentValue::Zero).collect()
+    output_types.into_iter().map(Tangent::Zero).collect()
 }
 
-fn materialize_tangent_value<T, V>(value: &TangentValue<T, V>) -> Result<V, TracingError>
+fn materialize_tangent_value<T, V>(value: &Tangent<T, V>) -> Result<V, TracingError>
 where
     T: Type,
     V: Traceable<T> + Zero<T>,
 {
     match value {
-        TangentValue::Zero(r#type) => V::zero(r#type),
-        TangentValue::NonZero(value) => Ok(value.clone()),
+        Tangent::Zero(r#type) => V::zero(r#type),
+        Tangent::NonZero(value) => Ok(value.clone()),
     }
 }
 
-fn materialize_tangent_value_inputs<T, V>(inputs: &[TangentValue<T, V>]) -> Result<Vec<V>, TracingError>
+fn materialize_tangent_value_inputs<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<V>, TracingError>
 where
     T: Type,
     V: Traceable<T> + Zero<T>,
@@ -1096,8 +1096,8 @@ where
 
 fn interpret_materialized_tangent_value_operation<T, V, O>(
     operation: &O,
-    inputs: &[TangentValue<T, V>],
-) -> Result<Vec<TangentValue<T, V>>, TracingError>
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
     T: Type,
     V: Traceable<T> + Zero<T>,
@@ -1106,7 +1106,7 @@ where
     Ok(operation
         .interpret(materialize_tangent_value_inputs(inputs)?.as_slice())?
         .into_iter()
-        .map(TangentValue::NonZero)
+        .map(Tangent::NonZero)
         .collect())
 }
 
@@ -1118,7 +1118,7 @@ where
     value.r#type().as_ref() == output_type
 }
 
-fn interpret_tangent_value_add<T, V>(inputs: &[TangentValue<T, V>]) -> Result<Vec<TangentValue<T, V>>, TracingError>
+fn interpret_tangent_value_add<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
     T: PartialEq + Type,
     V: Traceable<T> + Add<Output = V> + Zero<T>,
@@ -1126,26 +1126,26 @@ where
 {
     let output_types = infer_tangent_value_output_types(&AddOperation, inputs)?;
     check_count!("output", output_types, 1, TracingError);
-    if inputs.iter().all(TangentValue::is_zero) {
+    if inputs.iter().all(Tangent::is_zero) {
         return Ok(symbolic_zero_tangent_value_outputs(output_types));
     }
     let output_type = &output_types[0];
     match inputs {
-        [TangentValue::NonZero(value), TangentValue::Zero(_)]
+        [Tangent::NonZero(value), Tangent::Zero(_)]
             if tangent_value_non_zero_type_matches(value, output_type) =>
         {
-            Ok(vec![TangentValue::NonZero(value.clone())])
+            Ok(vec![Tangent::NonZero(value.clone())])
         }
-        [TangentValue::Zero(_), TangentValue::NonZero(value)]
+        [Tangent::Zero(_), Tangent::NonZero(value)]
             if tangent_value_non_zero_type_matches(value, output_type) =>
         {
-            Ok(vec![TangentValue::NonZero(value.clone())])
+            Ok(vec![Tangent::NonZero(value.clone())])
         }
         _ => interpret_materialized_tangent_value_operation(&AddOperation, inputs),
     }
 }
 
-fn interpret_tangent_value_sub<T, V>(inputs: &[TangentValue<T, V>]) -> Result<Vec<TangentValue<T, V>>, TracingError>
+fn interpret_tangent_value_sub<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
     T: PartialEq + Type,
     V: Traceable<T> + Neg<Output = V> + Sub<Output = V> + Zero<T>,
@@ -1153,26 +1153,26 @@ where
 {
     let output_types = infer_tangent_value_output_types(&SubOperation, inputs)?;
     check_count!("output", output_types, 1, TracingError);
-    if inputs.iter().all(TangentValue::is_zero) {
+    if inputs.iter().all(Tangent::is_zero) {
         return Ok(symbolic_zero_tangent_value_outputs(output_types));
     }
     let output_type = &output_types[0];
     match inputs {
-        [TangentValue::NonZero(value), TangentValue::Zero(_)]
+        [Tangent::NonZero(value), Tangent::Zero(_)]
             if tangent_value_non_zero_type_matches(value, output_type) =>
         {
-            Ok(vec![TangentValue::NonZero(value.clone())])
+            Ok(vec![Tangent::NonZero(value.clone())])
         }
-        [TangentValue::Zero(_), TangentValue::NonZero(value)]
+        [Tangent::Zero(_), Tangent::NonZero(value)]
             if tangent_value_non_zero_type_matches(value, output_type) =>
         {
-            Ok(vec![TangentValue::NonZero(-value.clone())])
+            Ok(vec![Tangent::NonZero(-value.clone())])
         }
         _ => interpret_materialized_tangent_value_operation(&SubOperation, inputs),
     }
 }
 
-fn interpret_tangent_value_neg<T, V>(inputs: &[TangentValue<T, V>]) -> Result<Vec<TangentValue<T, V>>, TracingError>
+fn interpret_tangent_value_neg<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
     T: Type,
     V: Traceable<T> + Neg<Output = V>,
@@ -1181,11 +1181,11 @@ where
     let output_types = infer_tangent_value_output_types(&NegOperation, inputs)?;
     check_count!("output", output_types, 1, TracingError);
     match inputs {
-        [TangentValue::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [TangentValue::NonZero(value)] => Ok(NegOperation
+        [Tangent::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
+        [Tangent::NonZero(value)] => Ok(NegOperation
             .interpret(std::slice::from_ref(value))?
             .into_iter()
-            .map(TangentValue::NonZero)
+            .map(Tangent::NonZero)
             .collect()),
         _ => unreachable!("neg output type inference validates the input count"),
     }
@@ -1193,8 +1193,8 @@ where
 
 fn interpret_tangent_value_zero_like<T, V, O>(
     operation: &O,
-    inputs: &[TangentValue<T, V>],
-) -> Result<Vec<TangentValue<T, V>>, TracingError>
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
     T: Type,
     V: Traceable<T>,
@@ -1204,8 +1204,8 @@ where
 }
 
 fn interpret_tangent_value_one_like<T, V>(
-    inputs: &[TangentValue<T, V>],
-) -> Result<Vec<TangentValue<T, V>>, TracingError>
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
     T: Type,
     V: Traceable<T> + OneLike,
@@ -1214,17 +1214,17 @@ where
     let output_types = infer_tangent_value_output_types(&OneLikeOperation, inputs)?;
     check_count!("output", output_types, 1, TracingError);
     match inputs {
-        [TangentValue::Zero(r#type)] => Err(symbolic_zero_one_error(r#type).into()),
-        [TangentValue::NonZero(value)] => Ok(vec![TangentValue::NonZero(value.one_like())]),
+        [Tangent::Zero(r#type)] => Err(symbolic_zero_one_error(r#type).into()),
+        [Tangent::NonZero(value)] => Ok(vec![Tangent::NonZero(value.one_like())]),
         _ => unreachable!("one_like output type inference validates the input count"),
     }
 }
 
 fn interpret_tangent_value_scale<T, V, O>(
     operation: &O,
-    factor: &TangentValue<T, V>,
-    inputs: &[TangentValue<T, V>],
-) -> Result<Vec<TangentValue<T, V>>, TracingError>
+    factor: &Tangent<T, V>,
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
     T: Type,
     V: Traceable<T> + Mul<Output = V>,
@@ -1235,14 +1235,14 @@ where
     check_count!("output", output_types, 1, TracingError);
     match inputs {
         [input] if factor.is_zero() || input.is_zero() => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [TangentValue::NonZero(input)] => {
-            let TangentValue::NonZero(factor) = factor else {
+        [Tangent::NonZero(input)] => {
+            let Tangent::NonZero(factor) = factor else {
                 unreachable!("zero factors are handled before concrete scale interpretation")
             };
             Ok(ScaleOperation::new(factor.clone())
                 .interpret(std::slice::from_ref(input))?
                 .into_iter()
-                .map(TangentValue::NonZero)
+                .map(Tangent::NonZero)
                 .collect())
         }
         _ => unreachable!("scale output type inference validates the input count"),
@@ -1252,8 +1252,8 @@ where
 fn interpret_tangent_value_unary_non_zero_or_zero<T, V, MetadataOperation, ConcreteOperation>(
     metadata_operation: &MetadataOperation,
     concrete_operation: &ConcreteOperation,
-    inputs: &[TangentValue<T, V>],
-) -> Result<Vec<TangentValue<T, V>>, TracingError>
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
     T: Type,
     V: Traceable<T>,
@@ -1263,11 +1263,11 @@ where
     let output_types = infer_tangent_value_output_types(metadata_operation, inputs)?;
     check_count!("output", output_types, 1, TracingError);
     match inputs {
-        [TangentValue::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [TangentValue::NonZero(input)] => Ok(concrete_operation
+        [Tangent::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
+        [Tangent::NonZero(input)] => Ok(concrete_operation
             .interpret(std::slice::from_ref(input))?
             .into_iter()
-            .map(TangentValue::NonZero)
+            .map(Tangent::NonZero)
             .collect()),
         _ => unreachable!("unary output type inference validates the input count"),
     }
@@ -1585,8 +1585,8 @@ impl InterpretableOperation<DataType, ZeroScalarTangent> for LinearScalarOperati
     }
 }
 
-impl<V: Traceable<DataType>> InterpretableOperation<DataType, TangentValue<DataType, V>>
-    for LinearScalarOperation<TangentValue<DataType, V>>
+impl<V: Traceable<DataType>> InterpretableOperation<DataType, Tangent<DataType, V>>
+    for LinearScalarOperation<Tangent<DataType, V>>
 where
     V: Parameter
         + Add<Output = V>
@@ -1597,10 +1597,10 @@ where
         + One<DataType>
         + OneLike,
 {
-    fn interpret(&self, inputs: &[TangentValue<DataType, V>]) -> Result<Vec<TangentValue<DataType, V>>, TracingError> {
+    fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
         match self {
-            Self::Zero(zero) => Ok(vec![TangentValue::Zero(zero.r#type)]),
-            Self::One(one) => Ok(vec![TangentValue::NonZero(V::one(&one.r#type)?)]),
+            Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type)]),
+            Self::One(one) => Ok(vec![Tangent::NonZero(V::one(&one.r#type)?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
             Self::Add => interpret_tangent_value_add(inputs),
@@ -1812,8 +1812,8 @@ impl InterpretableOperation<ArrayType, ZeroArrayTangent> for LinearArrayOperatio
     }
 }
 
-impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, TangentValue<ArrayType, V>>
-    for LinearArrayOperation<TangentValue<ArrayType, V>, ArrayType>
+impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, Tangent<ArrayType, V>>
+    for LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>
 where
     V: Parameter
         + Add<Output = V>
@@ -1829,11 +1829,11 @@ where
 {
     fn interpret(
         &self,
-        inputs: &[TangentValue<ArrayType, V>],
-    ) -> Result<Vec<TangentValue<ArrayType, V>>, TracingError> {
+        inputs: &[Tangent<ArrayType, V>],
+    ) -> Result<Vec<Tangent<ArrayType, V>>, TracingError> {
         match self {
-            Self::Zero(zero) => Ok(vec![TangentValue::Zero(zero.r#type.clone())]),
-            Self::One(one) => Ok(vec![TangentValue::NonZero(V::one(&one.r#type)?)]),
+            Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type.clone())]),
+            Self::One(one) => Ok(vec![Tangent::NonZero(V::one(&one.r#type)?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
             Self::Add => interpret_tangent_value_add(inputs),
@@ -1852,14 +1852,14 @@ where
                     [input] if factor.is_zero() || input.is_zero() => {
                         Ok(symbolic_zero_tangent_value_outputs(output_types))
                     }
-                    [TangentValue::NonZero(input)] => {
-                        let TangentValue::NonZero(factor) = factor else {
+                    [Tangent::NonZero(input)] => {
+                        let Tangent::NonZero(factor) = factor else {
                             unreachable!("zero factors are handled before concrete left_matmul interpretation")
                         };
                         Ok(LeftMatMulOperation::new(factor.clone())
                             .interpret(std::slice::from_ref(input))?
                             .into_iter()
-                            .map(TangentValue::NonZero)
+                            .map(Tangent::NonZero)
                             .collect())
                     }
                     _ => unreachable!("left_matmul output type inference validates the input count"),
@@ -1872,14 +1872,14 @@ where
                     [input] if factor.is_zero() || input.is_zero() => {
                         Ok(symbolic_zero_tangent_value_outputs(output_types))
                     }
-                    [TangentValue::NonZero(input)] => {
-                        let TangentValue::NonZero(factor) = factor else {
+                    [Tangent::NonZero(input)] => {
+                        let Tangent::NonZero(factor) = factor else {
                             unreachable!("zero factors are handled before concrete right_matmul interpretation")
                         };
                         Ok(RightMatMulOperation::new(factor.clone())
                             .interpret(std::slice::from_ref(input))?
                             .into_iter()
-                            .map(TangentValue::NonZero)
+                            .map(Tangent::NonZero)
                             .collect())
                     }
                     _ => unreachable!("right_matmul output type inference validates the input count"),
@@ -1895,13 +1895,13 @@ where
                 let (predicate, operands) = match condition.predicate {
                     ConditionPredicate::RuntimeInput(_) => {
                         let predicate = match &inputs[0] {
-                            TangentValue::Zero(_) => {
+                            Tangent::Zero(_) => {
                                 return Err(ControlFlowError::MissingTransformRule {
                                     transform: "runtime-predicate mixed symbolic-zero condition interpretation",
                                 }
                                 .into());
                             }
-                            TangentValue::NonZero(predicate) => predicate.control_flow_predicate()?,
+                            Tangent::NonZero(predicate) => predicate.control_flow_predicate()?,
                         };
                         (predicate, &inputs[1..])
                     }
@@ -1919,13 +1919,13 @@ where
                     let condition_outputs = while_operation.condition.interpret(state.clone())?;
                     check_count!("output", condition_outputs, 1, TracingError);
                     let predicate = match &condition_outputs[0] {
-                        TangentValue::Zero(_) => {
+                        Tangent::Zero(_) => {
                             return Err(ControlFlowError::MissingTransformRule {
                                 transform: "mixed symbolic-zero while predicate interpretation",
                             }
                             .into());
                         }
-                        TangentValue::NonZero(predicate) => predicate.control_flow_predicate()?,
+                        Tangent::NonZero(predicate) => predicate.control_flow_predicate()?,
                     };
                     if !predicate {
                         check_count!("output", state, output_types.len(), TracingError);
@@ -1989,8 +1989,8 @@ impl InterpretableOperation<DataType, ZeroScalarTangent> for LinearArrayOperatio
     }
 }
 
-impl<V: Traceable<DataType>> InterpretableOperation<DataType, TangentValue<DataType, V>>
-    for LinearArrayOperation<TangentValue<DataType, V>, DataType>
+impl<V: Traceable<DataType>> InterpretableOperation<DataType, Tangent<DataType, V>>
+    for LinearArrayOperation<Tangent<DataType, V>, DataType>
 where
     V: Parameter
         + Add<Output = V>
@@ -2001,10 +2001,10 @@ where
         + One<DataType>
         + OneLike,
 {
-    fn interpret(&self, inputs: &[TangentValue<DataType, V>]) -> Result<Vec<TangentValue<DataType, V>>, TracingError> {
+    fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
         match self {
-            Self::Zero(zero) => Ok(vec![TangentValue::Zero(zero.r#type)]),
-            Self::One(one) => Ok(vec![TangentValue::NonZero(V::one(&one.r#type)?)]),
+            Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type)]),
+            Self::One(one) => Ok(vec![Tangent::NonZero(V::one(&one.r#type)?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
             Self::Add => interpret_tangent_value_add(inputs),
@@ -2178,31 +2178,31 @@ fn transpose_array_type_metadata(r#type: &ArrayType) -> Result<ArrayType, Tracin
 
 fn transpose_zero_only_tangent_array_metadata(factor: &ZeroArrayTangent) -> Result<ZeroArrayTangent, TracingError> {
     let factor_type = factor.r#type();
-    Ok(TangentValue::zero(transpose_array_type_metadata(factor_type.as_ref())?))
+    Ok(Tangent::zero(transpose_array_type_metadata(factor_type.as_ref())?))
 }
 
 fn transpose_tangent_value_array_factor<V>(
-    factor: &TangentValue<ArrayType, V>,
-) -> Result<TangentValue<ArrayType, V>, TracingError>
+    factor: &Tangent<ArrayType, V>,
+) -> Result<Tangent<ArrayType, V>, TracingError>
 where
     V: Traceable<ArrayType> + MatrixOps,
 {
     match factor {
-        TangentValue::Zero(r#type) => Ok(TangentValue::Zero(transpose_array_type_metadata(r#type)?)),
-        TangentValue::NonZero(value) => Ok(TangentValue::NonZero(value.clone().transpose_matrix())),
+        Tangent::Zero(r#type) => Ok(Tangent::Zero(transpose_array_type_metadata(r#type)?)),
+        Tangent::NonZero(value) => Ok(Tangent::NonZero(value.clone().transpose_matrix())),
     }
 }
 
 impl<V: Traceable<DataType>>
-    LinearOperation<DataType, TangentValue<DataType, V>, LinearScalarOperation<TangentValue<DataType, V>>>
-    for LinearScalarOperation<TangentValue<DataType, V>>
+    LinearOperation<DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>
+    for LinearScalarOperation<Tangent<DataType, V>>
 {
     fn transpose(
         &self,
         context: &mut crate::tracing::transposition::TranspositionContext<
             DataType,
-            TangentValue<DataType, V>,
-            LinearScalarOperation<TangentValue<DataType, V>>,
+            Tangent<DataType, V>,
+            LinearScalarOperation<Tangent<DataType, V>>,
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
@@ -2331,8 +2331,8 @@ impl LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArray
 }
 
 impl<V: Traceable<ArrayType>>
-    LinearOperation<ArrayType, TangentValue<ArrayType, V>, LinearArrayOperation<TangentValue<ArrayType, V>, ArrayType>>
-    for LinearArrayOperation<TangentValue<ArrayType, V>, ArrayType>
+    LinearOperation<ArrayType, Tangent<ArrayType, V>, LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>>
+    for LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>
 where
     V: MatrixOps,
 {
@@ -2340,8 +2340,8 @@ where
         &self,
         context: &mut crate::tracing::transposition::TranspositionContext<
             ArrayType,
-            TangentValue<ArrayType, V>,
-            LinearArrayOperation<TangentValue<ArrayType, V>, ArrayType>,
+            Tangent<ArrayType, V>,
+            LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>,
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
@@ -2426,15 +2426,15 @@ where
 }
 
 impl<V: Traceable<DataType>>
-    LinearOperation<DataType, TangentValue<DataType, V>, LinearArrayOperation<TangentValue<DataType, V>, DataType>>
-    for LinearArrayOperation<TangentValue<DataType, V>, DataType>
+    LinearOperation<DataType, Tangent<DataType, V>, LinearArrayOperation<Tangent<DataType, V>, DataType>>
+    for LinearArrayOperation<Tangent<DataType, V>, DataType>
 {
     fn transpose(
         &self,
         context: &mut crate::tracing::transposition::TranspositionContext<
             DataType,
-            TangentValue<DataType, V>,
-            LinearArrayOperation<TangentValue<DataType, V>, DataType>,
+            Tangent<DataType, V>,
+            LinearArrayOperation<Tangent<DataType, V>, DataType>,
         >,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
@@ -3087,9 +3087,9 @@ mod tests {
     type ZeroArrayOperation = LinearArrayOperation<ZeroArrayTangent, ArrayType>;
     type ZeroArrayProgram =
         Program<ArrayType, ZeroArrayTangent, ZeroArrayOperation, Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>;
-    type MixedScalar = TangentValue<DataType, f64>;
+    type MixedScalar = Tangent<DataType, f64>;
     type MixedScalarOperation = LinearScalarOperation<MixedScalar>;
-    type MixedArray = TangentValue<ArrayType, TestArray>;
+    type MixedArray = Tangent<ArrayType, TestArray>;
     type MixedArrayOperation = LinearArrayOperation<MixedArray, ArrayType>;
 
     fn array_type(dimensions: &[usize]) -> ArrayType {
@@ -3133,7 +3133,7 @@ mod tests {
 
     #[test]
     fn test_linear_scalar_zero_only_tangent_interpretation_uses_inferred_metadata() {
-        let tangent = TangentValue::zero(DataType::F32);
+        let tangent = Tangent::zero(DataType::F32);
         let add = LinearScalarOperation::<ZeroScalarTangent>::Add;
         let neg = LinearScalarOperation::<ZeroScalarTangent>::Neg;
         let zero = LinearScalarOperation::<ZeroScalarTangent>::Zero(ZeroOperation::new(DataType::F32));
@@ -3173,8 +3173,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            program.interpret(vec![TangentValue::zero(input_type.clone())]),
-            Ok(vec![TangentValue::zero(input_type)])
+            program.interpret(vec![Tangent::zero(input_type.clone())]),
+            Ok(vec![Tangent::zero(input_type)])
         );
     }
 
@@ -3182,19 +3182,19 @@ mod tests {
     fn test_linear_array_zero_only_tangent_matmul_metadata() {
         let input_type = array_type(&[2, 3]);
         let right_factor_type = array_type(&[3, 4]);
-        let right_matmul = ZeroArrayOperation::RightMatMul { factor: TangentValue::zero(right_factor_type) };
+        let right_matmul = ZeroArrayOperation::RightMatMul { factor: Tangent::zero(right_factor_type) };
 
         assert_eq!(
-            right_matmul.interpret(&[TangentValue::zero(input_type.clone())]),
-            Ok(vec![TangentValue::zero(array_type(&[2, 4]))])
+            right_matmul.interpret(&[Tangent::zero(input_type.clone())]),
+            Ok(vec![Tangent::zero(array_type(&[2, 4]))])
         );
 
         let left_factor_type = array_type(&[4, 2]);
-        let left_matmul = ZeroArrayOperation::LeftMatMul { factor: TangentValue::zero(left_factor_type) };
+        let left_matmul = ZeroArrayOperation::LeftMatMul { factor: Tangent::zero(left_factor_type) };
 
         assert_eq!(
-            left_matmul.interpret(&[TangentValue::zero(input_type)]),
-            Ok(vec![TangentValue::zero(array_type(&[4, 3]))])
+            left_matmul.interpret(&[Tangent::zero(input_type)]),
+            Ok(vec![Tangent::zero(array_type(&[4, 3]))])
         );
     }
 
@@ -3208,15 +3208,15 @@ mod tests {
         ));
 
         assert_eq!(
-            condition.interpret(&[TangentValue::zero(state_type.clone())]),
-            Ok(vec![TangentValue::zero(state_type.clone())])
+            condition.interpret(&[Tangent::zero(state_type.clone())]),
+            Ok(vec![Tangent::zero(state_type.clone())])
         );
 
         let condition = ZeroArrayOperation::Condition(Box::new(
             ConditionOperation::with_captured_predicate(false, true_branch, false_branch).unwrap(),
         ));
         assert_eq!(
-            condition.interpret(&[TangentValue::zero(state_type.clone())]).unwrap_err().to_string(),
+            condition.interpret(&[Tangent::zero(state_type.clone())]).unwrap_err().to_string(),
             format!("zero tangent space has no one value for {state_type}")
         );
 
@@ -3229,8 +3229,8 @@ mod tests {
         ));
 
         assert_eq!(
-            while_operation.interpret(&[TangentValue::zero(state_type.clone())]),
-            Ok(vec![TangentValue::zero(state_type)])
+            while_operation.interpret(&[Tangent::zero(state_type.clone())]),
+            Ok(vec![Tangent::zero(state_type)])
         );
     }
 
@@ -3350,11 +3350,11 @@ mod tests {
         }
     }
 
-    impl InterpretableOperation<DataType, TangentValue<DataType, f32>> for TestCustomOperation {
+    impl InterpretableOperation<DataType, Tangent<DataType, f32>> for TestCustomOperation {
         fn interpret(
             &self,
-            inputs: &[TangentValue<DataType, f32>],
-        ) -> Result<Vec<TangentValue<DataType, f32>>, TracingError> {
+            inputs: &[Tangent<DataType, f32>],
+        ) -> Result<Vec<Tangent<DataType, f32>>, TracingError> {
             Ok(symbolic_zero_tangent_value_outputs(infer_tangent_value_output_types(self, inputs)?))
         }
     }
@@ -3362,16 +3362,16 @@ mod tests {
     impl
         LinearOperation<
             DataType,
-            TangentValue<DataType, f32>,
-            LinearArrayOperation<TangentValue<DataType, f32>, DataType>,
+            Tangent<DataType, f32>,
+            LinearArrayOperation<Tangent<DataType, f32>, DataType>,
         > for TestCustomOperation
     {
         fn transpose(
             &self,
             _context: &mut TranspositionContext<
                 DataType,
-                TangentValue<DataType, f32>,
-                LinearArrayOperation<TangentValue<DataType, f32>, DataType>,
+                Tangent<DataType, f32>,
+                LinearArrayOperation<Tangent<DataType, f32>, DataType>,
             >,
             _output_cotangents: &[Option<AtomId>],
         ) -> Result<Vec<Option<AtomId>>, TracingError> {
@@ -3410,9 +3410,9 @@ mod tests {
 
     #[test]
     fn test_linear_scalar_tangent_value_custom_interpretation_is_explicitly_unsupported() {
-        let primitive: CustomPrimitive<DataType, TangentValue<DataType, f32>> =
+        let primitive: CustomPrimitive<DataType, Tangent<DataType, f32>> =
             CustomPrimitive::new(TestCustomOperation).with_transpose_rule(TestCustomOperation);
-        let custom = LinearScalarOperation::<TangentValue<DataType, f32>>::custom(primitive).unwrap();
+        let custom = LinearScalarOperation::<Tangent<DataType, f32>>::custom(primitive).unwrap();
 
         assert_eq!(
             custom.interpret(&[]).unwrap_err().to_string(),

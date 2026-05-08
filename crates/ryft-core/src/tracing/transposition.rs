@@ -10,6 +10,42 @@ use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
 use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::types::{Type, Typed};
 
+/// Operation-level contract for staged linear maps that can be transposed.
+///
+/// A [`LinearOperation`] is the capability an operation carrier provides after a primal program has
+/// been linearized. Implementors describe how one staged linear instruction contributes to the
+/// reverse linear program used by VJP and reverse-mode gradient transforms. The trait is
+/// implemented by primitive operation types, such as [`AddOperation`](crate::AddOperation), and by carrier enums,
+/// such as [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation), that delegate to primitive rules.
+///
+/// For a linear instruction `y = L(x)`, [`transpose`](Self::transpose) receives symbolic cotangent
+/// atoms for `y` and returns symbolic cotangent contributions for `x`. Rules may reuse existing
+/// cotangent atoms, return `None` for structural zeros, or stage additional linear operations in
+/// the active [`TranspositionContext`]. The rule does not receive concrete primal values; any
+/// required metadata must be encoded in the operation itself or in staged atom types.
+///
+/// Structural validation happens when the linear program is built and when transpose rules stage
+/// additional operations in the transpose builder.
+pub trait LinearOperation<T: Type, V: Traceable<T>, O: Clone + Operation<T>>: Operation<T> {
+    /// Applies this operation's transpose rule to symbolic output cotangents.
+    ///
+    /// The returned vector must contain one entry per operation input. Each `Some(atom)` is a
+    /// staged cotangent contribution in the active transpose builder, and each `None` means the
+    /// corresponding input receives a structural zero from this operation.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active transpose context used to stage any new linear operations required by
+    ///     the rule.
+    ///   - `output_cotangents`: Cotangent atoms aligned with this operation's outputs. `None`
+    ///     entries represent structural zeros.
+    fn transpose(
+        &self,
+        context: &mut TranspositionContext<T, V, O>,
+        output_cotangents: &[Option<AtomId>],
+    ) -> Result<Vec<Option<AtomId>>, TracingError>;
+}
+
 /// Context that is used while _transposing_ [`Program`](crate::Program)s. This context is threaded through the
 /// transposition transformation using [`LinearOperation::transpose`]. It owns the active [`ProgramBuilder`] that is
 /// used for building the transposed [`Program`](crate::Program).
@@ -51,45 +87,8 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> TranspositionContext<T, 
     }
 }
 
-/// Operation-level contract for staged linear maps that can be transposed.
-///
-/// A [`LinearOperation`] is the capability an operation carrier provides after a primal program has
-/// been linearized. Implementors describe how one staged linear instruction contributes to the
-/// reverse linear program used by VJP and reverse-mode gradient transforms. The trait is
-/// implemented by primitive operation types, such as [`AddOperation`](crate::AddOperation), and by carrier enums,
-/// such as [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation), that delegate to primitive rules.
-///
-/// For a linear instruction `y = L(x)`, [`transpose`](Self::transpose) receives symbolic cotangent
-/// atoms for `y` and returns symbolic cotangent contributions for `x`. Rules may reuse existing
-/// cotangent atoms, return `None` for structural zeros, or stage additional linear operations in
-/// the active [`TranspositionContext`]. The rule does not receive concrete primal values; any
-/// required metadata must be encoded in the operation itself or in staged atom types.
-///
-/// Structural validation happens when the linear program is built and when transpose rules stage
-/// additional operations in the transpose builder.
-pub trait LinearOperation<T: Type, V: Traceable<T>, O: Clone + Operation<T>>: Operation<T> {
-    /// Applies this operation's transpose rule to symbolic output cotangents.
-    ///
-    /// The returned vector must contain one entry per operation input. Each `Some(atom)` is a
-    /// staged cotangent contribution in the active transpose builder, and each `None` means the
-    /// corresponding input receives a structural zero from this operation.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Active transpose context used to stage any new linear operations required by
-    ///     the rule.
-    ///   - `output_cotangents`: Cotangent atoms aligned with this operation's outputs. `None`
-    ///     entries represent structural zeros.
-    fn transpose(
-        &self,
-        context: &mut TranspositionContext<T, V, O>,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError>;
-}
-
-impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O>> TranspositionContext<T, V, O>
-where
-    O: SupportsZero<T, V> + SupportsAdd<T, V>,
+impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>>
+    TranspositionContext<T, V, O>
 {
     /// Transposes a complete linear [`Program`] using this context's current builder.
     ///
