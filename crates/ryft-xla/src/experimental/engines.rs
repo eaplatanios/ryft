@@ -13,10 +13,12 @@ use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
 use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearizableEngine, TangentValue};
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
-use super::arrays::{Array, ArrayError};
 use super::ops::{LinearXlaOperation, XlaOperation};
 use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
+use crate::arrays::{Array, ArrayError};
 
+#[cfg(test)]
+use crate::arrays::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes, static_shape};
 #[cfg(test)]
 use crate::pjrt::ToPjrt;
 #[cfg(test)]
@@ -221,7 +223,7 @@ impl<'c> XlaEngine<'c> {
             ArrayType::new(array_type.data_type, array_type.shape.clone(), array_type.layout.clone(), Some(sharding))
                 .map_err(ArrayError::from)?;
         let addressable_device_ids = addressable_mesh_device_ids(self.client(), self.mesh())?;
-        let element_size_in_bytes = dense_element_size_in_bytes(array_type.data_type)?;
+        let element_size_in_bytes = device_put_element_size_in_bytes(array_type.data_type)?;
 
         let mut addressable_buffers = Vec::with_capacity(addressable_device_ids.len());
         for shard in shards_for_type(&effective_type, self.mesh())? {
@@ -252,7 +254,7 @@ impl<'c> XlaEngine<'c> {
             addressable_buffers.push(buffer);
         }
 
-        Array::new(effective_type, self.mesh().clone(), addressable_buffers).map_err(Into::into)
+        Array::from_addressable_buffers(effective_type, self.mesh().clone(), addressable_buffers).map_err(Into::into)
     }
 
     /// Renders a traced XLA program as a StableHLO/Shardy MLIR module.
@@ -341,7 +343,7 @@ impl<'c> XlaEngine<'c> {
             let resolved_type =
                 ArrayType::new(output_type.data_type, output_type.shape, output_type.layout, Some(sharding))
                     .map_err(ArrayError::from)?;
-            outputs.push(Array::new(resolved_type, self.mesh().clone(), addressable_buffers)?);
+            outputs.push(Array::from_addressable_buffers(resolved_type, self.mesh().clone(), addressable_buffers)?);
         }
         Ok(outputs)
     }
@@ -404,39 +406,6 @@ fn static_shape_or_panic(array_type: &ArrayType) -> Vec<usize> {
         .collect()
 }
 
-/// Returns the per-element dense host-buffer size in bytes for `data_type`.
-///
-/// Types whose host encoding is unambiguous (e.g., sub-byte or opaque types) are rejected; the
-/// supported set matches the types accepted by [`Array::from_host_buffer`].
-#[cfg(test)]
-fn dense_element_size_in_bytes(data_type: DataType) -> Result<usize, ArrayError> {
-    match data_type {
-        DataType::Boolean
-        | DataType::I8
-        | DataType::U8
-        | DataType::F8E3M4
-        | DataType::F8E4M3
-        | DataType::F8E4M3FN
-        | DataType::F8E4M3FNUZ
-        | DataType::F8E4M3B11FNUZ
-        | DataType::F8E5M2
-        | DataType::F8E5M2FNUZ
-        | DataType::F8E8M0FNU => Ok(1),
-        DataType::I16 | DataType::U16 | DataType::BF16 | DataType::F16 => Ok(2),
-        DataType::I32 | DataType::U32 | DataType::F32 => Ok(4),
-        DataType::I64 | DataType::U64 | DataType::F64 | DataType::C64 => Ok(8),
-        DataType::C128 => Ok(16),
-        DataType::Token
-        | DataType::I1
-        | DataType::I2
-        | DataType::I4
-        | DataType::U1
-        | DataType::U2
-        | DataType::U4
-        | DataType::F4E2M1FN => Err(ArrayError::UnsupportedDevicePutElementType { element_type: data_type }),
-    }
-}
-
 /// Returns a dense row-major host buffer encoding `element_count` copies of `kind` for
 /// `data_type`.
 ///
@@ -491,7 +460,7 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
         }
         // 8-bit floating-point types do not have a canonical Rust representation; encoding `1.0`
         // as a raw byte pattern would depend on the exact FP8 variant. These variants are rejected
-        // earlier by [`dense_element_size_in_bytes`] for `XlaEngine::one`, so this arm is only
+        // earlier by [`device_put_element_size_in_bytes`] for `XlaEngine::one`, so this arm is only
         // reachable for the supported set above.
         DataType::F8E3M4
         | DataType::F8E4M3
@@ -528,21 +497,12 @@ fn addressable_mesh_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result
     Ok(addressable)
 }
 
-/// Returns the shards implied by `array_type` and `mesh`, wrapping any sharding error as an
-/// [`ArrayError`].
-///
-/// This goes through a stub [`Array`] constructed with no addressable buffers so we reuse
-/// [`Array::new`]'s existing shard-descriptor bookkeeping and avoid re-exposing
-/// `compute_shard_descriptors`.
+/// Returns the shard descriptors implied by `array_type` and `mesh`.
 #[cfg(test)]
-fn shards_for_type<'o>(
-    array_type: &ArrayType,
-    mesh: &DeviceMesh,
-) -> Result<Vec<super::arrays::ArrayShard<'o>>, ArrayError> {
-    // Using the non-addressable stub trick keeps the shard-descriptor logic centralized inside
-    // [`Array::new`] rather than exposing a private helper from `arrays.rs`.
-    let stub = Array::new(array_type.clone(), mesh.clone(), Vec::new())?;
-    Ok(stub.shards().to_vec())
+fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, ArrayError> {
+    let global_shape = static_shape(array_type)?;
+    let sharding = array_type.sharding.as_ref().ok_or(ArrayError::MissingArraySharding)?;
+    Ok(ShardLayout::new(global_shape.as_slice(), mesh, sharding)?.descriptors().to_vec())
 }
 
 #[cfg(test)]

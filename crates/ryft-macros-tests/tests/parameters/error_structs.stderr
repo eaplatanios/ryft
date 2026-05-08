@@ -47,11 +47,11 @@ error[E0283]: type annotations needed
    = note: cannot satisfy `_: ryft::Parameter`
    = help: the following types implement trait `ryft::Parameter`:
              ArrayBatch<V>
+             ArrayPlacement
              ArrayType
              Atom<T, V>
              AtomId
-             DevicePutPlacement
-             DevicePutSharding
+             DevicePutTarget
              Infallible
              JvpTracer<V, T>
            and $N others
