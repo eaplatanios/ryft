@@ -110,7 +110,7 @@ mod tests {
     use ryft_core::operations::arithmetic::ADD_OPERATION_NAME;
     use ryft_core::tracing::TracingError;
     use ryft_core::tracing::engines::{Engine, TracingEngine};
-    use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiationError, MatrixOps, Sin};
+    use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiationError, MatMul, Sin};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::Array;
