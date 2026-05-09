@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
@@ -10,7 +9,7 @@ use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
-use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearizableEngine, Tangent};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine};
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::ops::{LinearXlaOperation, XlaOperation};
@@ -146,50 +145,48 @@ impl<'c> TracingEngine for XlaEngine<'c> {
     type OperationCarrier = XlaOperation;
 }
 
-impl<'c> LinearizableEngine for XlaEngine<'c> {
-    type LinearOperationCarrier = LinearXlaOperation<ShardMapTensor>;
-}
-
-/// Stateless linear engine used by XLA AD paths when tangents are represented as symbolic zeros.
+/// Stateless linear [`TracingEngine`] for XLA tangent and cotangent programs over abstract tensor leaves.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct XlaSymbolicZeroEngine;
+pub struct LinearXlaEngine;
 
-impl XlaSymbolicZeroEngine {
-    /// Returns the singleton symbolic-zero linear engine.
+impl LinearXlaEngine {
+    /// Returns the singleton linear XLA engine.
     #[inline]
     pub fn token() -> &'static Self {
-        static TOKEN: XlaSymbolicZeroEngine = XlaSymbolicZeroEngine;
+        static TOKEN: LinearXlaEngine = LinearXlaEngine;
         &TOKEN
     }
 }
 
-impl Engine for XlaSymbolicZeroEngine {
+impl Engine for LinearXlaEngine {
     type Type = ArrayType;
-    type Value = Tangent<ArrayType, Infallible>;
+    type Value = ShardMapTensor;
 
     #[inline]
     fn zero(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Ok(Tangent::zero(array_type.clone()))
+        validate_identity_synthesis(ZERO_OPERATION_NAME, array_type)?;
+        Ok(ShardMapTensor::zero(array_type.clone()))
     }
 
     #[inline]
     fn one(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Err(TypeError { message: format!("zero tangent space has no one value for {array_type}") }.into())
+        validate_identity_synthesis(ONE_OPERATION_NAME, array_type)?;
+        Ok(ShardMapTensor::one(array_type.clone()))
     }
 }
 
-impl LinearizableEngine for XlaSymbolicZeroEngine {
-    type LinearOperationCarrier = LinearXlaOperation<Tangent<ArrayType, Infallible>>;
+impl TracingEngine for LinearXlaEngine {
+    type OperationCarrier = LinearXlaOperation<ShardMapTensor>;
 }
 
 impl<'c> DifferentiableEngine for XlaEngine<'c> {
-    type Tangent = Tangent<ArrayType, Infallible>;
-    type LinearEngine = XlaSymbolicZeroEngine;
+    type Tangent = ShardMapTensor;
+    type LinearEngine = LinearXlaEngine;
     type DifferentiableOperationCarrier = XlaOperation;
 
     #[inline]
     fn linear_engine(&self) -> &Self::LinearEngine {
-        XlaSymbolicZeroEngine::token()
+        LinearXlaEngine::token()
     }
 }
 

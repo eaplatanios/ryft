@@ -2546,7 +2546,7 @@ mod tests {
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::{
         ArrayOperation, CoordinateValue, Cos, CustomPrimitive, Differentiable, DifferentiableEngine,
-        DifferentiableTracingEngine, LinearArrayOperation, LinearizableEngine, MatrixOps, ReshapeOps, Sin,
+        DifferentiableTracingEngine, LinearArrayOperation, MatrixOps, ReshapeOps, Sin,
     };
     use ryft_core::types::{Shape, TypeError, Typed};
     #[cfg(feature = "ndarray")]
@@ -3053,17 +3053,35 @@ mod tests {
         type OperationCarrier = ArrayOperation<TestArray, ArrayType>;
     }
 
-    impl LinearizableEngine for TestArrayEngine {
-        type LinearOperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
+    #[derive(Copy, Clone, Debug)]
+    struct TestArrayLinearEngine;
+
+    impl Engine for TestArrayLinearEngine {
+        type Type = ArrayType;
+        type Value = TestArray;
+
+        fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
+            TestArray::zero(r#type)
+        }
+
+        fn one(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
+            TestArray::one(r#type)
+        }
     }
+
+    impl TracingEngine for TestArrayLinearEngine {
+        type OperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
+    }
+
+    static TEST_ARRAY_LINEAR_ENGINE: TestArrayLinearEngine = TestArrayLinearEngine;
 
     impl DifferentiableEngine for TestArrayEngine {
         type Tangent = TestArray;
-        type LinearEngine = Self;
+        type LinearEngine = TestArrayLinearEngine;
         type DifferentiableOperationCarrier = ArrayOperation<TestArray, ArrayType>;
 
         fn linear_engine(&self) -> &Self::LinearEngine {
-            self
+            &TEST_ARRAY_LINEAR_ENGINE
         }
     }
 

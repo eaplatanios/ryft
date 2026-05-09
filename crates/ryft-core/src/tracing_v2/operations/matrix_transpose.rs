@@ -78,7 +78,7 @@ impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
 where
     E: DifferentiableEngine<Type = ArrayType>,
     E::Value: MatrixValue + Differentiable<ArrayType>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
         SupportsMatrixTranspose<ArrayType, E::Tangent>,
 {
     fn jvp(
@@ -89,7 +89,7 @@ where
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().transpose_matrix();
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsMatrixTranspose<
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsMatrixTranspose<
                 ArrayType,
                 E::Tangent,
             >>::matrix_transpose_operation(),

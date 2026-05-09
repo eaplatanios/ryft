@@ -11,7 +11,7 @@ use ryft_macros::Parameter;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
 use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::operations::primitive::ScalarOperation;
+use crate::tracing_v2::operations::primitive::{LinearScalarOperation, ScalarOperation};
 use crate::types::{DataType, Type, TypeError, Typed};
 
 /// [`Engine`]s provide backend-specific functionality related to tracing, just-in-time compilation, automatic
@@ -146,12 +146,42 @@ pub trait TracingEngine: Engine {
 /// [`DataType`]-driven construction of scalar values.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ScalarEngine<V> {
-    /// Phantom marker that ties this zero-sized [`ScalarEngine`] to its scalar value type.
-    marker: PhantomData<fn() -> V>,
+    /// [`LinearScalarEngine`] to be used by automatic differentiation transforms.
+    pub linear_engine: LinearScalarEngine<V>,
 }
 
 impl<V> ScalarEngine<V> {
     /// Creates a new [`ScalarEngine`].
+    #[inline]
+    pub const fn new() -> Self {
+        Self { linear_engine: LinearScalarEngine::new() }
+    }
+}
+
+/// Stateless linear [`TracingEngine`] for scalar tangent and cotangent [`Program`]s. This is the linear compliment of
+/// [`ScalarEngine`]. They both use the same scalar type (i.e, [`DataType`]) and the same runtime scalar values (i.e.,
+/// `f32`, `f64`, etc.); they differ only in the operation carrier type selected by [`TracingEngine`]:
+///
+/// - [`ScalarEngine`] records ordinary scalar programs using [`ScalarOperation`].
+/// - [`LinearScalarEngine`] records linear tangent and cotangent programs using [`LinearScalarOperation`].
+///
+/// This separate engine is needed because [`TracingEngine::OperationCarrier`] is an associated type. Once
+/// [`ScalarEngine`] says "ordinary scalar traces store [`ScalarOperation`] instructions", the same engine type cannot
+/// also say "linear scalar traces store [`LinearScalarOperation`] instructions". Automatic differentiation therefore
+/// keeps a tiny companion engine for linear [`Program`]s.
+///
+/// For example, tracing `f(x) = x * x` with [`ScalarEngine<f64>`] records an ordinary multiplication. Linearizing that
+/// program at `x = 3.0` produces a tangent program equivalent to `δx -> 3.0 * δx + 3.0 * δx`; that tangent program is
+/// stored with [`LinearScalarOperation`] instructions such as `scale` and `add`. [`LinearScalarEngine`] is what tells
+/// the generic tracing machinery to use that linear operation carrier instead of the standard operation carrier.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct LinearScalarEngine<V> {
+    /// [`PhantomData`] marker that ties this zero-sized [`LinearScalarEngine`] to its scalar value type.
+    marker: PhantomData<fn() -> V>,
+}
+
+impl<V> LinearScalarEngine<V> {
+    /// Creates a new [`LinearScalarEngine`].
     #[inline]
     pub const fn new() -> Self {
         Self { marker: PhantomData }
@@ -189,6 +219,25 @@ macro_rules! impl_tracing_engine_for_scalar {
 
         impl TracingEngine for ScalarEngine<$ty> {
             type OperationCarrier = ScalarOperation<$ty>;
+        }
+
+        impl Engine for LinearScalarEngine<$ty> {
+            type Type = DataType;
+            type Value = $ty;
+
+            #[inline]
+            fn zero(&self, r#type: &DataType) -> Result<$ty, TracingError> {
+                ScalarEngine::<$ty>::new().zero(r#type)
+            }
+
+            #[inline]
+            fn one(&self, r#type: &DataType) -> Result<$ty, TracingError> {
+                ScalarEngine::<$ty>::new().one(r#type)
+            }
+        }
+
+        impl TracingEngine for LinearScalarEngine<$ty> {
+            type OperationCarrier = LinearScalarOperation<$ty>;
         }
     };
 }

@@ -1035,10 +1035,7 @@ where
     T: Type,
     O: Operation<T>,
 {
-    Ok(infer_zero_only_tangent_output_types(operation, inputs)?
-        .into_iter()
-        .map(Tangent::zero)
-        .collect())
+    Ok(infer_zero_only_tangent_output_types(operation, inputs)?.into_iter().map(Tangent::zero).collect())
 }
 
 fn reject_zero_only_tangent_one_operation<T, O>(
@@ -1054,10 +1051,7 @@ where
     Err(symbolic_zero_one_error(&output_types[0]).into())
 }
 
-fn infer_tangent_value_output_types<T, V, O>(
-    operation: &O,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<T>, TracingError>
+fn infer_tangent_value_output_types<T, V, O>(operation: &O, inputs: &[Tangent<T, V>]) -> Result<Vec<T>, TracingError>
 where
     T: Type,
     V: Traceable<T>,
@@ -1131,14 +1125,10 @@ where
     }
     let output_type = &output_types[0];
     match inputs {
-        [Tangent::NonZero(value), Tangent::Zero(_)]
-            if tangent_value_non_zero_type_matches(value, output_type) =>
-        {
+        [Tangent::NonZero(value), Tangent::Zero(_)] if tangent_value_non_zero_type_matches(value, output_type) => {
             Ok(vec![Tangent::NonZero(value.clone())])
         }
-        [Tangent::Zero(_), Tangent::NonZero(value)]
-            if tangent_value_non_zero_type_matches(value, output_type) =>
-        {
+        [Tangent::Zero(_), Tangent::NonZero(value)] if tangent_value_non_zero_type_matches(value, output_type) => {
             Ok(vec![Tangent::NonZero(value.clone())])
         }
         _ => interpret_materialized_tangent_value_operation(&AddOperation, inputs),
@@ -1158,14 +1148,10 @@ where
     }
     let output_type = &output_types[0];
     match inputs {
-        [Tangent::NonZero(value), Tangent::Zero(_)]
-            if tangent_value_non_zero_type_matches(value, output_type) =>
-        {
+        [Tangent::NonZero(value), Tangent::Zero(_)] if tangent_value_non_zero_type_matches(value, output_type) => {
             Ok(vec![Tangent::NonZero(value.clone())])
         }
-        [Tangent::Zero(_), Tangent::NonZero(value)]
-            if tangent_value_non_zero_type_matches(value, output_type) =>
-        {
+        [Tangent::Zero(_), Tangent::NonZero(value)] if tangent_value_non_zero_type_matches(value, output_type) => {
             Ok(vec![Tangent::NonZero(-value.clone())])
         }
         _ => interpret_materialized_tangent_value_operation(&SubOperation, inputs),
@@ -1182,11 +1168,9 @@ where
     check_count!("output", output_types, 1, TracingError);
     match inputs {
         [Tangent::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [Tangent::NonZero(value)] => Ok(NegOperation
-            .interpret(std::slice::from_ref(value))?
-            .into_iter()
-            .map(Tangent::NonZero)
-            .collect()),
+        [Tangent::NonZero(value)] => {
+            Ok(NegOperation.interpret(std::slice::from_ref(value))?.into_iter().map(Tangent::NonZero).collect())
+        }
         _ => unreachable!("neg output type inference validates the input count"),
     }
 }
@@ -1203,9 +1187,7 @@ where
     Ok(symbolic_zero_tangent_value_outputs(infer_tangent_value_output_types(operation, inputs)?))
 }
 
-fn interpret_tangent_value_one_like<T, V>(
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError>
+fn interpret_tangent_value_one_like<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
     T: Type,
     V: Traceable<T> + OneLike,
@@ -1827,10 +1809,7 @@ where
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
 {
-    fn interpret(
-        &self,
-        inputs: &[Tangent<ArrayType, V>],
-    ) -> Result<Vec<Tangent<ArrayType, V>>, TracingError> {
+    fn interpret(&self, inputs: &[Tangent<ArrayType, V>]) -> Result<Vec<Tangent<ArrayType, V>>, TracingError> {
         match self {
             Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type.clone())]),
             Self::One(one) => Ok(vec![Tangent::NonZero(V::one(&one.r#type)?)]),
@@ -2059,7 +2038,7 @@ where
 impl<'engine, E> InterpretableOperation<ArrayType, Tracer<'engine, E>>
     for LinearArrayOperation<Tracer<'engine, E>, ArrayType>
 where
-    E: DifferentiableTracingEngine<Type = ArrayType> + 'static,
+    E: DifferentiableTracingEngine<Type = ArrayType>,
     Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
         + Sub<Output = Tracer<'engine, E>>
         + Neg<Output = Tracer<'engine, E>>
@@ -2614,37 +2593,34 @@ where
     }
 }
 
-impl<V: Value<DataType>, E> DifferentiableOperation<E> for ScalarOperation<V>
+impl<F, E> DifferentiableOperation<E> for ScalarOperation<F>
 where
-    V: Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Div<Output = V>
-        + Neg<Output = V>
+    F: Traceable<DataType> + Parameter + Clone,
+    E: DifferentiableEngine<Type = DataType>,
+    E::Value: Add<Output = E::Value>
+        + Sub<Output = E::Value>
+        + Mul<Output = E::Value>
+        + Div<Output = E::Value>
+        + Neg<Output = E::Value>
         + Sin
         + Cos
         + ZeroLike
         + OneLike
-        + Zero<DataType>
-        + One<DataType>
-        + Parameterized<V>
-        + Differentiable<DataType, Tangent = E::Tangent>
-        + 'static,
-    E: DifferentiableEngine<Type = DataType, Value = V> + 'static,
-    V::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: SupportsZero<DataType, E::Tangent>
-        + SupportsZeroLike<DataType, E::Tangent>
+        + Parameterized<E::Value>
+        + Differentiable<DataType, Tangent = E::Tangent>,
+    <E::Value as Parameterized<E::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
+    Vec<E::Value>: Parameterized<E::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
+    ScaleOperation<DataType, F>: DifferentiableOperation<E>,
+    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<DataType, E::Tangent>
         + super::SupportsNeg<DataType, E::Tangent>
-        + SupportsAdd<DataType, E::Tangent>
         + SupportsSub<DataType, E::Tangent>
-        + super::SupportsScale<DataType, E::Tangent, V>,
+        + super::SupportsScale<DataType, E::Tangent, E::Value>,
 {
     fn jvp(
         &self,
         context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<V, AtomId>],
-    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -2658,93 +2634,6 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::Custom(_) => {
-                Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
-                    .into())
-            }
-        }
-    }
-}
-
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for ScalarOperation<V>
-where
-    V: Value<DataType>
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Div<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Zero<DataType>
-        + One<DataType>
-        + Parameterized<V>
-        + Differentiable<DataType>
-        + 'static,
-    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, OperationCarrier = ScalarOperation<V>> + 'static,
-    V::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearScalarOperation<V>: Clone
-        + SupportsZero<DataType, V>
-        + SupportsZeroLike<DataType, V>
-        + super::SupportsNeg<DataType, V>
-        + SupportsAdd<DataType, V>
-        + SupportsSub<DataType, V>
-        + super::SupportsScale<DataType, V>
-        + InterpretableOperation<DataType, V>
-        + LinearOperation<DataType, V, LinearScalarOperation<V>>,
-    Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
-        + Sub<Output = Tracer<'engine, EInner>>
-        + Mul<Output = Tracer<'engine, EInner>>
-        + Div<Output = Tracer<'engine, EInner>>
-        + Neg<Output = Tracer<'engine, EInner>>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike,
-    EInner::LinearOperationCarrier<'engine>: Clone
-        + InterpretableOperation<DataType, Tracer<'engine, EInner>>
-        + LinearOperation<DataType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
-        + SupportsZero<DataType, Tracer<'engine, EInner>>
-        + SupportsZeroLike<DataType, Tracer<'engine, EInner>>
-        + SupportsAdd<DataType, Tracer<'engine, EInner>>
-        + SupportsSub<DataType, Tracer<'engine, EInner>>
-        + SupportsScale<DataType, Tracer<'engine, EInner>>,
-{
-    fn jvp(
-        &self,
-        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
-        match self {
-            Self::Zero(zero) => zero.jvp(context, inputs),
-            Self::One(one) => one.jvp(context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(context, inputs),
-            Self::Add => AddOperation.jvp(context, inputs),
-            Self::Sub => SubOperation.jvp(context, inputs),
-            Self::Mul => MulOperation.jvp(context, inputs),
-            Self::Div => DivOperation.jvp(context, inputs),
-            Self::Neg => NegOperation.jvp(context, inputs),
-            Self::Sin => SinOperation.jvp(context, inputs),
-            Self::Cos => CosOperation.jvp(context, inputs),
-            Self::Scale { factor } => {
-                check_count!("input", inputs, 1, TracingError);
-                let input = &inputs[0];
-                let factor_tracer = context.engine.constant(factor.clone());
-                let tangent_outputs = context.stage(
-                    <EInner::LinearOperationCarrier<'engine> as SupportsScale<
-                        DataType,
-                        Tracer<'engine, EInner>,
-                    >>::scale_operation(factor_tracer.clone()),
-                    &[input.tangent],
-                )?;
-                check_count!("output", tangent_outputs, 1, TracingError);
-                Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs[0] }])
-            }
             Self::Custom(_) => {
                 Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
                     .into())
@@ -2780,10 +2669,8 @@ where
             To<E::Tangent> = Vec<E::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: SupportsZero<ArrayType, E::Tangent>
-        + SupportsZeroLike<ArrayType, E::Tangent>
+    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<ArrayType, E::Tangent>
         + super::SupportsNeg<ArrayType, E::Tangent>
-        + SupportsAdd<ArrayType, E::Tangent>
         + SupportsSub<ArrayType, E::Tangent>
         + super::SupportsScale<ArrayType, E::Tangent, V>
         + super::SupportsLeftMatMul<ArrayType, E::Tangent, V>
@@ -2842,10 +2729,8 @@ where
     E: DifferentiableEngine<Type = DataType, Value = V> + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: SupportsZero<DataType, E::Tangent>
-        + SupportsZeroLike<DataType, E::Tangent>
+    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<DataType, E::Tangent>
         + super::SupportsNeg<DataType, E::Tangent>
-        + SupportsAdd<DataType, E::Tangent>
         + SupportsSub<DataType, E::Tangent>
         + super::SupportsScale<DataType, E::Tangent, V>,
 {
@@ -2935,17 +2820,11 @@ where
         + MatrixOps
         + ZeroLike
         + OneLike,
-    EInner::LinearOperationCarrier<'engine>: Clone
-        + InterpretableOperation<ArrayType, Tracer<'engine, EInner>>
-        + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
-        + SupportsZero<ArrayType, Tracer<'engine, EInner>>
-        + SupportsZeroLike<ArrayType, Tracer<'engine, EInner>>
-        + SupportsAdd<ArrayType, Tracer<'engine, EInner>>
+    EInner::LinearOperationCarrier<'engine>: SupportsZeroLike<ArrayType, Tracer<'engine, EInner>>
         + SupportsSub<ArrayType, Tracer<'engine, EInner>>
         + SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>
         + SupportsRightMatMul<ArrayType, Tracer<'engine, EInner>>
         + SupportsMatrixTranspose<ArrayType, Tracer<'engine, EInner>>
-        + SupportsScale<ArrayType, Tracer<'engine, EInner>>
         + SupportsReshape<ArrayType, Tracer<'engine, EInner>>,
 {
     fn jvp(
@@ -3018,14 +2897,8 @@ where
         + Cos
         + ZeroLike
         + OneLike,
-    EInner::LinearOperationCarrier<'engine>: Clone
-        + InterpretableOperation<DataType, Tracer<'engine, EInner>>
-        + LinearOperation<DataType, Tracer<'engine, EInner>, EInner::LinearOperationCarrier<'engine>>
-        + SupportsZero<DataType, Tracer<'engine, EInner>>
-        + SupportsZeroLike<DataType, Tracer<'engine, EInner>>
-        + SupportsAdd<DataType, Tracer<'engine, EInner>>
-        + SupportsSub<DataType, Tracer<'engine, EInner>>
-        + SupportsScale<DataType, Tracer<'engine, EInner>>,
+    EInner::LinearOperationCarrier<'engine>:
+        SupportsZeroLike<DataType, Tracer<'engine, EInner>> + SupportsSub<DataType, Tracer<'engine, EInner>>,
 {
     fn jvp(
         &self,
@@ -3172,10 +3045,7 @@ mod tests {
             .build::<Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        assert_eq!(
-            program.interpret(vec![Tangent::zero(input_type.clone())]),
-            Ok(vec![Tangent::zero(input_type)])
-        );
+        assert_eq!(program.interpret(vec![Tangent::zero(input_type.clone())]), Ok(vec![Tangent::zero(input_type)]));
     }
 
     #[test]
@@ -3192,10 +3062,7 @@ mod tests {
         let left_factor_type = array_type(&[4, 2]);
         let left_matmul = ZeroArrayOperation::LeftMatMul { factor: Tangent::zero(left_factor_type) };
 
-        assert_eq!(
-            left_matmul.interpret(&[Tangent::zero(input_type)]),
-            Ok(vec![Tangent::zero(array_type(&[4, 3]))])
-        );
+        assert_eq!(left_matmul.interpret(&[Tangent::zero(input_type)]), Ok(vec![Tangent::zero(array_type(&[4, 3]))]));
     }
 
     #[test]
@@ -3351,20 +3218,13 @@ mod tests {
     }
 
     impl InterpretableOperation<DataType, Tangent<DataType, f32>> for TestCustomOperation {
-        fn interpret(
-            &self,
-            inputs: &[Tangent<DataType, f32>],
-        ) -> Result<Vec<Tangent<DataType, f32>>, TracingError> {
+        fn interpret(&self, inputs: &[Tangent<DataType, f32>]) -> Result<Vec<Tangent<DataType, f32>>, TracingError> {
             Ok(symbolic_zero_tangent_value_outputs(infer_tangent_value_output_types(self, inputs)?))
         }
     }
 
-    impl
-        LinearOperation<
-            DataType,
-            Tangent<DataType, f32>,
-            LinearArrayOperation<Tangent<DataType, f32>, DataType>,
-        > for TestCustomOperation
+    impl LinearOperation<DataType, Tangent<DataType, f32>, LinearArrayOperation<Tangent<DataType, f32>, DataType>>
+        for TestCustomOperation
     {
         fn transpose(
             &self,

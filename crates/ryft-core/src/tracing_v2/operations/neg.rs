@@ -124,8 +124,7 @@ where
     E: DifferentiableEngine,
     NegOperation: Operation<E::Type>,
     E::Value: Neg<Output = E::Value> + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsNeg<E::Type, E::Tangent>,
+    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsNeg<E::Type, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -134,7 +133,7 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsNeg<
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsNeg<
                 E::Type,
                 E::Tangent,
             >>::neg_operation(),

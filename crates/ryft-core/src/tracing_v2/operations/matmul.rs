@@ -58,9 +58,8 @@ impl<E> DifferentiableOperation<E> for MatMulOperation
 where
     E: DifferentiableEngine<Type = ArrayType>,
     E::Value: MatrixValue + Differentiable<ArrayType>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: SupportsAdd<ArrayType, E::Tangent>
-        + SupportsLeftMatMul<ArrayType, E::Tangent, E::Value>
-        + SupportsRightMatMul<ArrayType, E::Tangent, E::Value>,
+    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
+        SupportsLeftMatMul<ArrayType, E::Tangent, E::Value> + SupportsRightMatMul<ArrayType, E::Tangent, E::Value>,
 {
     fn jvp(
         &self,
@@ -72,29 +71,25 @@ where
         let right = &inputs[1];
         let primal = left.primal.clone().matmul(right.primal.clone());
         let left_term_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsRightMatMul<
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsRightMatMul<
                 ArrayType,
                 E::Tangent,
                 E::Value,
-            >>::right_matmul_operation(
-                right.primal.clone(),
-            ),
+            >>::right_matmul_operation(right.primal.clone()),
             &[left.tangent],
         )?;
         check_count!("output", left_term_outputs, 1, TracingError);
         let right_term_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsLeftMatMul<
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsLeftMatMul<
                 ArrayType,
                 E::Tangent,
                 E::Value,
-            >>::left_matmul_operation(
-                left.primal.clone(),
-            ),
+            >>::left_matmul_operation(left.primal.clone()),
             &[right.tangent],
         )?;
         check_count!("output", right_term_outputs, 1, TracingError);
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsAdd<
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsAdd<
                 ArrayType,
                 E::Tangent,
             >>::add_operation(),

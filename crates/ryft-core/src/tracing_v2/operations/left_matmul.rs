@@ -108,7 +108,7 @@ impl<V, E> DifferentiableOperation<E> for LeftMatMulOperation<V>
 where
     V: MatrixValue + ZeroLike + Differentiable<ArrayType>,
     E: DifferentiableEngine<Type = ArrayType, Value = V>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
         SupportsLeftMatMul<ArrayType, E::Tangent, V>,
 {
     fn jvp(
@@ -119,9 +119,11 @@ where
         check_count!("input", inputs, 1, TracingError);
         let primal = self.factor.clone().matmul(inputs[0].primal.clone());
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsLeftMatMul<ArrayType, E::Tangent, V>>::left_matmul_operation(
-                self.factor.clone(),
-            ),
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsLeftMatMul<
+                ArrayType,
+                E::Tangent,
+                V,
+            >>::left_matmul_operation(self.factor.clone()),
             &[inputs[0].tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

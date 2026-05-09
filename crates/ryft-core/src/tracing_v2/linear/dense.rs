@@ -41,9 +41,6 @@ impl<F> JacFwd<F> {
             Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
         )
             -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-        <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-            InterpretableOperation<ArrayType, E::Tangent>,
-        E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
     {
         jacfwd_at::<E, F, Input, Output, V>(engine, self.function, primals)
     }
@@ -85,15 +82,6 @@ impl<F> JacFwd<Grad<F>> {
             + SupportsZeroLike<ArrayType, V>
             + SupportsAdd<ArrayType, V>
             + 'static,
-        <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
-            + InterpretableOperation<ArrayType, Tracer<'engine, E>>
-            + LinearOperation<
-                ArrayType,
-                Tracer<'engine, E>,
-                <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
-            > + SupportsZero<ArrayType, Tracer<'engine, E>>,
-        <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-            InterpretableOperation<ArrayType, E::Tangent>,
         AddOperation: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
     {
         hessian_at(engine, self.function.into_function(), primals)
@@ -148,15 +136,6 @@ impl<F> Hessian<F> {
             + SupportsZeroLike<ArrayType, V>
             + SupportsAdd<ArrayType, V>
             + 'static,
-        <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
-            + InterpretableOperation<ArrayType, Tracer<'engine, E>>
-            + LinearOperation<
-                ArrayType,
-                Tracer<'engine, E>,
-                <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
-            > + SupportsZero<ArrayType, Tracer<'engine, E>>,
-        <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-            InterpretableOperation<ArrayType, E::Tangent>,
         AddOperation: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
     {
         JacFwd::new(Grad::new(self.function)).evaluate_gradient(engine, primals)
@@ -390,7 +369,7 @@ fn materialize_dense_jacobian_from_pushforward<E, Input, Output, V>(
     pushforward: Program<
         ArrayType,
         E::Tangent,
-        <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+        <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
         Input::To<E::Tangent>,
         Output::To<E::Tangent>,
     >,
@@ -403,8 +382,6 @@ where
     Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
     Input::Family: ParameterizedFamily<E::Tangent> + ParameterizedFamily<ReferenceBatch<E::Tangent>>,
     Output::Family: ParameterizedFamily<E::Tangent> + ParameterizedFamily<ReferenceBatch<E::Tangent>>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        InterpretableOperation<ArrayType, E::Tangent>,
 {
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let tangent_parameters = input_parameters
@@ -462,9 +439,6 @@ where
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        InterpretableOperation<ArrayType, E::Tangent>,
-    E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -505,15 +479,6 @@ where
     F: FnOnce(
         Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
     ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        Clone
-            + InterpretableOperation<ArrayType, E::Tangent>
-            + LinearOperation<
-                ArrayType,
-                E::Tangent,
-                <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
-            > + crate::operations::constants::SupportsZero<ArrayType, E::Tangent>,
-    E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -581,15 +546,6 @@ where
         + SupportsZeroLike<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + 'static,
-    <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
-        + InterpretableOperation<ArrayType, Tracer<'engine, E>>
-        + LinearOperation<
-            ArrayType,
-            Tracer<'engine, E>,
-            <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
-        > + SupportsZero<ArrayType, Tracer<'engine, E>>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        InterpretableOperation<ArrayType, E::Tangent>,
     AddOperation: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
 {
     let input_structure = primals.parameter_structure();

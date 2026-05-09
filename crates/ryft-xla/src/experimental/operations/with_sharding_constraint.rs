@@ -130,11 +130,16 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
 impl<'c> DifferentiableOperation<crate::experimental::engines::XlaEngine<'c>> for WithShardingConstraintOperation {
     fn jvp(
         &self,
-        _context: &mut JvpContext<'_, crate::experimental::engines::XlaEngine<'c>>,
+        context: &mut JvpContext<'_, crate::experimental::engines::XlaEngine<'c>>,
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: inputs[0].primal.clone(), tangent: inputs[0].tangent }])
+        let primal_outputs = self.interpret(&[inputs[0].primal.clone()])?;
+        check_count!("output", primal_outputs, 1, TracingError);
+        let tangent_outputs =
+            context.stage(LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, &[inputs[0].tangent])?;
+        check_count!("output", tangent_outputs, 1, TracingError);
+        Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs[0] }])
     }
 }
 

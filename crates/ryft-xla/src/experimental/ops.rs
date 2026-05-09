@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
@@ -14,7 +13,7 @@ use ryft_core::operations::constants::{
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{AtomId, TracingError};
-use ryft_core::tracing_v2::differentiation::{JvpTracer, Tangent};
+use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
     ConditionOperation, CosOperation, MatMulOperation, MatrixTransposeOperation, NegOperation, ReshapeOperation,
     ScaleOperation, SinOperation, SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsNeg,
@@ -23,7 +22,7 @@ use ryft_core::tracing_v2::operations::{
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableOperation, JvpContext, LinearArrayOperation,
 };
-use ryft_core::types::{ArrayType, Shape, TypeError, Typed};
+use ryft_core::types::{ArrayType, Shape, TypeError};
 
 use crate::experimental::engines::XlaEngine;
 use crate::experimental::operations::{
@@ -320,26 +319,33 @@ impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
         context: &mut JvpContext<'_, XlaEngine<'c>>,
         inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_outputs = self.interpret(primal_inputs.as_slice())?;
-        let tangent_outputs = primal_outputs
-            .iter()
-            .map(|output| {
-                let outputs = context.stage(
-                    LinearArrayOperation::<Tangent<ArrayType, Infallible>, ArrayType>::Zero(ZeroOperation::new(
-                        output.r#type().into_owned(),
-                    )),
-                    &[],
-                )?;
-                check_count!("output", outputs, 1, TracingError);
-                Ok(outputs[0])
-            })
-            .collect::<Result<Vec<_>, TracingError>>()?;
-        Ok(primal_outputs
-            .into_iter()
-            .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent })
-            .collect())
+        match self {
+            Self::Zero(zero) => zero.jvp(context, inputs),
+            Self::One(one) => one.jvp(context, inputs),
+            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
+            Self::OneLike => OneLikeOperation.jvp(context, inputs),
+            Self::Add => AddOperation.jvp(context, inputs),
+            Self::Sub => SubOperation.jvp(context, inputs),
+            Self::Mul => MulOperation.jvp(context, inputs),
+            Self::Div => DivOperation.jvp(context, inputs),
+            Self::Neg => NegOperation.jvp(context, inputs),
+            Self::Sin => SinOperation.jvp(context, inputs),
+            Self::Cos => CosOperation.jvp(context, inputs),
+            Self::MatrixMultiply => MatMulOperation.jvp(context, inputs),
+            Self::Transpose => MatrixTransposeOperation.jvp(context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
+            Self::Reshape { input_shape, output_shape } => {
+                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
+            }
+            Self::Condition(condition) => condition.jvp(context, inputs),
+            Self::While(while_operation) => while_operation.jvp(context, inputs),
+            Self::ShardMap(op) => op.jvp(context, inputs),
+            Self::LinearShardMap(op) => op.jvp(context, inputs),
+            Self::WithShardingConstraint(op) => op.jvp(context, inputs),
+            Self::Custom(op) => {
+                Err(CustomOperationError::MissingRule { op: op.name(), transform: "concrete linearization" }.into())
+            }
+        }
     }
 }
 

@@ -3,12 +3,11 @@ use std::fmt::Debug;
 use std::rc::Rc;
 
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
-use crate::operations::constants::{One, SupportsZero, Zero};
+use crate::operations::constants::{One, Zero};
 use crate::operations::constants::{OneLike, SupportsZeroLike, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
-use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Program, ProgramBuilder, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::JvpTracer;
 use crate::tracing_v2::{

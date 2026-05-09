@@ -31,8 +31,6 @@ where
     E: DifferentiableEngine,
     ZeroOperation<E::Type>: Operation<E::Type>,
     E::Value: Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsZero<E::Type, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -41,7 +39,7 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 0, TracingError);
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZero<
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsZero<
                 E::Type,
                 E::Tangent,
             >>::zero_operation(self.r#type.clone()),
@@ -70,8 +68,6 @@ where
     E: DifferentiableEngine,
     OneOperation<E::Type>: Operation<E::Type>,
     E::Value: Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsZero<E::Type, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -80,7 +76,7 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 0, TracingError);
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZero<
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsZero<
                 E::Type,
                 E::Tangent,
             >>::zero_operation(self.r#type.clone()),
@@ -109,7 +105,7 @@ where
     E: DifferentiableEngine,
     ZeroLikeOperation: Operation<E::Type>,
     E::Value: ZeroLike + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
         SupportsZeroLike<E::Type, E::Tangent>,
 {
     fn jvp(
@@ -119,7 +115,7 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZeroLike<
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsZeroLike<
                 E::Type,
                 E::Tangent,
             >>::zero_like_operation(),
@@ -148,7 +144,7 @@ where
     E: DifferentiableEngine,
     OneLikeOperation: Operation<E::Type>,
     E::Value: OneLike + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
         SupportsZeroLike<E::Type, E::Tangent>,
 {
     fn jvp(
@@ -158,7 +154,7 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZeroLike<
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsZeroLike<
                 E::Type,
                 E::Tangent,
             >>::zero_like_operation(),

@@ -182,27 +182,7 @@ impl<'engine, E: TracingEngine<Value: Differentiable<E::Type>>> Differentiable<E
     }
 }
 
-/// Extension of [`Engine`] for backends that can stage linear tangent and cotangent programs.
-///
-/// [`LinearizableEngine`] is the part of the automatic-differentiation contract needed by
-/// operation-level JVP rules: it selects the linear operation carrier used by [`JvpContext`].
-/// A carrier is the concrete operation representation stored in staged [`Program`](crate::tracing::Program)
-/// instructions. Linear carriers store operations for tangent and cotangent programs and expose the
-/// common linear constructors required by the standard AD transforms. Backends that also support
-/// tracing differentiable primal programs implement [`DifferentiableEngine`].
-pub trait LinearizableEngine: Engine {
-    /// Linear operation carrier selected by this engine for tangent and cotangent programs.
-    ///
-    /// Linear programs produced by [`linearize`](crate::tracing_v2::linearize),
-    /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
-    type LinearOperationCarrier: Clone
-        + LinearOperation<Self::Type, Self::Value, Self::LinearOperationCarrier>
-        + SupportsNeg<Self::Type, Self::Value>
-        + SupportsAdd<Self::Type, Self::Value>
-        + SupportsScale<Self::Type, Self::Value>;
-}
-
-/// Extension of [`LinearizableEngine`] for backends that support automatic differentiation.
+/// Extension of [`Engine`] for backends that support automatic differentiation.
 ///
 /// Engines that only need ordinary tracing implement [`TracingEngine`] without this extension. AD
 /// transforms such as [`DifferentiableEngine::jvp`], [`DifferentiableEngine::grad`], and
@@ -213,12 +193,20 @@ pub trait LinearizableEngine: Engine {
 /// [`TracingEngine::OperationCarrier`] is [`DifferentiableEngine::DifferentiableOperationCarrier`]. That keeps
 /// ordinary tracing free to use a wider operation carrier while making differentiation reject
 /// unsupported operations at type-check time when the differentiation carrier omits them.
-pub trait DifferentiableEngine: LinearizableEngine {
+pub trait DifferentiableEngine: Engine
+where
+    Self::LinearEngine: TracingEngine<Type = Self::Type, Value = Self::Tangent>,
+    <Self::LinearEngine as TracingEngine>::OperationCarrier: Clone
+        + InterpretableOperation<Self::Type, Self::Tangent>
+        + LinearOperation<Self::Type, Self::Tangent, <Self::LinearEngine as TracingEngine>::OperationCarrier>
+        + SupportsZero<Self::Type, Self::Tangent>
+        + SupportsAdd<Self::Type, Self::Tangent>,
+{
     /// Tangent and cotangent leaf type selected by this differentiable engine.
     type Tangent: Traceable<Self::Type>;
 
-    /// Linearizable engine selected by this differentiable engine for tangent and cotangent programs.
-    type LinearEngine: LinearizableEngine<Type = Self::Type, Value = Self::Tangent>;
+    /// Tracing engine selected by this differentiable engine for tangent and cotangent programs.
+    type LinearEngine;
 
     /// Operation carrier selected by this engine for tracing differentiable primal programs.
     ///
@@ -315,9 +303,6 @@ pub trait DifferentiableEngine: LinearizableEngine {
             Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>,
         )
             -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>, TracingError>,
-        <Self::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-            InterpretableOperation<ArrayType, Self::Tangent>,
-        Self::DifferentiableOperationCarrier: DifferentiableOperation<Self>,
     {
         crate::tracing_v2::linear::JacFwd::new(function).evaluate::<Self, Input, Output, V>(self, primals)
     }
@@ -363,15 +348,6 @@ pub trait DifferentiableEngine: LinearizableEngine {
             + SupportsZeroLike<ArrayType, V>
             + SupportsAdd<ArrayType, V>
             + 'static,
-        <Self as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>: Clone
-            + InterpretableOperation<ArrayType, Tracer<'engine, Self>>
-            + LinearOperation<
-                ArrayType,
-                Tracer<'engine, Self>,
-                <Self as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
-            > + SupportsZero<ArrayType, Tracer<'engine, Self>>,
-        <Self::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-            InterpretableOperation<ArrayType, Self::Tangent>,
         AddOperation: InterpretableOperation<ArrayType, Tracer<'engine, Self>>,
     {
         crate::tracing_v2::linear::Hessian::new(function).evaluate(self, primals)
@@ -419,9 +395,7 @@ pub struct JvpContext<'a, E: DifferentiableEngine> {
 
     /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::tracing::Program) that is currently being
     /// traced.
-    pub builder: Rc<
-        RefCell<ProgramBuilder<E::Type, E::Tangent, <E::LinearEngine as LinearizableEngine>::LinearOperationCarrier>>,
-    >,
+    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, <E::LinearEngine as TracingEngine>::OperationCarrier>>>,
 }
 
 impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
@@ -434,7 +408,7 @@ impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
                 ProgramBuilder<
                     E::Type,
                     E::Tangent,
-                    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+                    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
                 >,
             >,
         >,
@@ -445,7 +419,7 @@ impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
     /// Stages one operation in the currently active linear program.
     pub fn stage(
         &self,
-        operation: <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+        operation: <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
         inputs: &[AtomId],
     ) -> Result<Vec<AtomId>, TracingError> {
         let mut builder_borrow = self.builder.borrow_mut();
@@ -522,7 +496,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         Program<
             T,
             E::Tangent,
-            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+            <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
             Input::To<E::Tangent>,
             Output::To<E::Tangent>,
         >,
@@ -558,7 +532,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             T,
             E::Tangent,
-            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+            <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
         >::new()));
         let mut primals: Vec<Option<V>> = vec![None; self.atoms.len()];
         let mut tangents: Vec<Option<AtomId>> = vec![None; self.atoms.len()];
@@ -588,7 +562,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                         tangent: tangent_for_atom::<
                             T,
                             V,
-                            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+                            <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
                         >(
                             primals.as_slice(), &builder, tangents.as_mut_slice(), input_atom
                         )?,
@@ -603,18 +577,18 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             }
         }
 
-        let output_tangents = self
-            .output_ids
-            .iter()
-            .copied()
-            .map(|output_atom| {
-                tangent_for_atom::<
-                    T,
-                    V,
-                    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
-                >(primals.as_slice(), &builder, tangents.as_mut_slice(), output_atom)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let output_tangents =
+            self.output_ids
+                .iter()
+                .copied()
+                .map(|output_atom| {
+                    tangent_for_atom::<
+                        T,
+                        V,
+                        <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
+                    >(primals.as_slice(), &builder, tangents.as_mut_slice(), output_atom)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
         drop(context);
         drop(tangents);
         let builder = match Rc::try_unwrap(builder) {
@@ -642,6 +616,7 @@ pub trait DifferentiableTracingEngine: TracingEngine {
     /// This carrier is stored in nested linear programs whose leaves are [`Tracer`] values from an
     /// active outer trace.
     type LinearOperationCarrier<'engine>: Clone
+        + InterpretableOperation<Self::Type, Tracer<'engine, Self>>
         + LinearOperation<Self::Type, Tracer<'engine, Self>, Self::LinearOperationCarrier<'engine>>
         + SupportsZero<Self::Type, Tracer<'engine, Self>>
         + SupportsNeg<Self::Type, Tracer<'engine, Self>>
@@ -721,11 +696,11 @@ impl<E: DifferentiableEngine> TracingEngine for DifferentiableOperationTracingEn
     type OperationCarrier = E::DifferentiableOperationCarrier;
 }
 
-impl<'engine, E> LinearizableEngine for TracingContext<'engine, E>
+impl<'engine, E> TracingEngine for TracingContext<'engine, E>
 where
     E: DifferentiableTracingEngine,
 {
-    type LinearOperationCarrier = E::LinearOperationCarrier<'engine>;
+    type OperationCarrier = E::LinearOperationCarrier<'engine>;
 }
 
 impl<'engine, E> DifferentiableEngine for TracingContext<'engine, E>
@@ -747,18 +722,14 @@ where
 
 macro_rules! impl_differentiable_engine_for_scalar {
     ($ty:ty) => {
-        impl LinearizableEngine for ScalarEngine<$ty> {
-            type LinearOperationCarrier = LinearScalarOperation<$ty>;
-        }
-
         impl DifferentiableEngine for ScalarEngine<$ty> {
             type Tangent = $ty;
-            type LinearEngine = Self;
+            type LinearEngine = crate::tracing::engines::LinearScalarEngine<$ty>;
             type DifferentiableOperationCarrier = ScalarOperation<$ty>;
 
             #[inline]
             fn linear_engine(&self) -> &Self::LinearEngine {
-                self
+                &self.linear_engine
             }
         }
 

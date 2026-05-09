@@ -37,8 +37,7 @@ where
 impl<E: DifferentiableEngine> DifferentiableOperation<E> for SubOperation
 where
     E::Value: Sub<Output = E::Value> + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsSub<E::Type, E::Tangent>,
+    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsSub<E::Type, E::Tangent>,
     SubOperation: Operation<E::Type>,
 {
     #[inline]
@@ -50,7 +49,7 @@ where
         check_count!("input", inputs, 2, TracingError);
         let tangent_inputs = &[inputs[0].tangent, inputs[1].tangent];
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsSub<
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsSub<
                 E::Type,
                 E::Tangent,
             >>::sub_operation(),

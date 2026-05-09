@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
-use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearizableEngine};
+use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine};
 use ryft_core::types::{ArrayType, TypeError};
 
 use crate::arrays::{Array, NdArrayElement};
@@ -15,6 +15,9 @@ use crate::operations::{LinearNdarrayOperation, NdarrayOperation};
 /// because all execution happens eagerly on host CPU buffers.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct NdArrayEngine<T = f64> {
+    /// Linear ndarray engine used by automatic-differentiation transforms.
+    linear_engine: NdArrayLinearEngine<T>,
+
     /// Phantom marker tying the zero-sized engine to its element type.
     marker: PhantomData<fn() -> T>,
 }
@@ -23,7 +26,7 @@ impl<T> NdArrayEngine<T> {
     /// Returns a new [`NdArrayEngine`].
     #[inline]
     pub const fn new() -> Self {
-        Self { marker: PhantomData }
+        Self { linear_engine: NdArrayLinearEngine::new(), marker: PhantomData }
     }
 }
 
@@ -44,18 +47,46 @@ impl<T: NdArrayElement> TracingEngine for NdArrayEngine<T> {
     type OperationCarrier = NdarrayOperation<Array<T>>;
 }
 
-impl<T: NdArrayElement> LinearizableEngine for NdArrayEngine<T> {
-    type LinearOperationCarrier = LinearNdarrayOperation<Array<T>>;
+/// Stateless `ndarray` backend token for linear tangent and cotangent programs.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct NdArrayLinearEngine<T = f64> {
+    /// Phantom marker tying the zero-sized linear engine to its element type.
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T> NdArrayLinearEngine<T> {
+    /// Returns a new [`NdArrayLinearEngine`].
+    #[inline]
+    pub const fn new() -> Self {
+        Self { marker: PhantomData }
+    }
+}
+
+impl<T: NdArrayElement> Engine for NdArrayLinearEngine<T> {
+    type Type = ArrayType;
+    type Value = Array<T>;
+
+    fn zero(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
+        Array::zeros(array_type).map_err(array_error_to_tracing_error)
+    }
+
+    fn one(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
+        Array::ones(array_type).map_err(array_error_to_tracing_error)
+    }
+}
+
+impl<T: NdArrayElement> TracingEngine for NdArrayLinearEngine<T> {
+    type OperationCarrier = LinearNdarrayOperation<Array<T>>;
 }
 
 impl<T: NdArrayElement> DifferentiableEngine for NdArrayEngine<T> {
     type Tangent = Array<T>;
-    type LinearEngine = Self;
+    type LinearEngine = NdArrayLinearEngine<T>;
     type DifferentiableOperationCarrier = NdarrayOperation<Array<T>>;
 
     #[inline]
     fn linear_engine(&self) -> &Self::LinearEngine {
-        self
+        &self.linear_engine
     }
 }
 

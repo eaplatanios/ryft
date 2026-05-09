@@ -175,7 +175,7 @@ fn replay_linear_program_on_atoms<E: DifferentiableEngine<Type = ArrayType>>(
     program: &Program<
         ArrayType,
         E::Tangent,
-        <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+        <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
         Vec<E::Tangent>,
         Vec<E::Tangent>,
     >,
@@ -451,7 +451,6 @@ where
     V: ControlFlowValue + Differentiable<ArrayType, Tangent = E::Tangent>,
     E: DifferentiableEngine<Type = ArrayType, Value = V>,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Operation<ArrayType>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<E::Tangent>,
@@ -477,7 +476,7 @@ where
         let primal_outputs = branch.interpret(primal_operands.clone())?;
         let pushforward: FlatProgram<
             E::Tangent,
-            <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+            <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
         > = branch.linearize(context.engine, primal_operands)?;
         let tangent_outputs = replay_linear_program_on_atoms::<E>(context, &pushforward, tangent_operands.as_slice())?;
         Ok(primal_outputs
@@ -657,7 +656,6 @@ where
     V: ControlFlowValue + Differentiable<ArrayType, Tangent = E::Tangent>,
     E: DifferentiableEngine<Type = ArrayType, Value = V>,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: Operation<ArrayType>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<E::Tangent>,
@@ -688,7 +686,7 @@ where
 
             let pushforward: FlatProgram<
                 E::Tangent,
-                <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+                <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
             > = self.body.linearize(context.engine, state_primals.clone())?;
             let next_primals = self.body.interpret(state_primals)?;
             let next_tangents = replay_linear_program_on_atoms::<E>(context, &pushforward, state_tangents.as_slice())?;
@@ -1115,17 +1113,35 @@ mod tests {
         type OperationCarrier = TestDifferentiableOperation;
     }
 
-    impl crate::tracing_v2::LinearizableEngine for TestEngine {
-        type LinearOperationCarrier = TestLinearOperation;
+    #[derive(Copy, Clone, Debug)]
+    struct TestLinearEngine;
+
+    impl Engine for TestLinearEngine {
+        type Type = ArrayType;
+        type Value = TestValue;
+
+        fn zero(&self, r#type: &ArrayType) -> Result<TestValue, TracingError> {
+            if r#type.data_type == DataType::Boolean { Ok(TestValue::Bool(false)) } else { Ok(TestValue::Number(0.0)) }
+        }
+
+        fn one(&self, _type: &ArrayType) -> Result<TestValue, TracingError> {
+            Ok(TestValue::Number(1.0))
+        }
     }
+
+    impl TracingEngine for TestLinearEngine {
+        type OperationCarrier = TestLinearOperation;
+    }
+
+    static TEST_LINEAR_ENGINE: TestLinearEngine = TestLinearEngine;
 
     impl crate::tracing_v2::DifferentiableEngine for TestEngine {
         type Tangent = TestValue;
-        type LinearEngine = Self;
+        type LinearEngine = TestLinearEngine;
         type DifferentiableOperationCarrier = TestDifferentiableOperation;
 
         fn linear_engine(&self) -> &Self::LinearEngine {
-            self
+            &TEST_LINEAR_ENGINE
         }
     }
 

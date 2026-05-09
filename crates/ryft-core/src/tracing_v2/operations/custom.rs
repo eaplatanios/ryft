@@ -1,22 +1,25 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
+use std::ops::{Add, Mul, Neg, Sub};
 use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
-use crate::parameters::Parameter;
-use crate::tracing::engines::{Tracer, TracingContext};
+use crate::parameters::{Parameter, Parameterized};
+use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpTracer};
-use crate::tracing_v2::{
-    DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, LinearizableEngine,
-};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
+use super::control_flow::ControlFlowValue;
+use super::matrix::MatrixOps;
 use super::primitive::{ArrayOperation, LinearArrayOperation};
+use super::reshape::ReshapeOps;
 /// Error type for rule-based custom staged operations.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CustomOperationError {
@@ -244,13 +247,26 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
         E: DifferentiableEngine<
                 Type = ArrayType,
                 Value = V,
-                LinearEngine: LinearizableEngine<
+                Tangent = V,
+                LinearEngine: TracingEngine<
                     Type = ArrayType,
                     Value = V,
-                    LinearOperationCarrier = LinearArrayOperation<V, ArrayType>,
+                    OperationCarrier = LinearArrayOperation<V, ArrayType>,
                 >,
             > + 'static,
-        V: Differentiable<ArrayType>,
+        V: Differentiable<ArrayType, Tangent = V>
+            + Add<Output = V>
+            + Sub<Output = V>
+            + Mul<Output = V>
+            + Neg<Output = V>
+            + Zero<ArrayType>
+            + One<ArrayType>
+            + ZeroLike
+            + OneLike
+            + MatrixOps
+            + ReshapeOps
+            + ControlFlowValue,
+        Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
         Rule: DifferentiableOperation<E> + 'static,
     {
         self.with_jvp_rule_for::<E, _>(rule)
@@ -281,17 +297,31 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
     /// transposed linear program.
     pub fn with_derivative_rule<E, Rule>(self, rule: Rule) -> Self
     where
-        V: Value<ArrayType> + Differentiable<ArrayType>,
         E: DifferentiableEngine<
                 Type = ArrayType,
                 Value = V,
-                LinearEngine: LinearizableEngine<
+                Tangent = V,
+                LinearEngine: TracingEngine<
                     Type = ArrayType,
                     Value = V,
-                    LinearOperationCarrier = LinearArrayOperation<V, ArrayType>,
+                    OperationCarrier = LinearArrayOperation<V, ArrayType>,
                 >,
             > + DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
             + 'static,
+        V: Value<ArrayType>
+            + Differentiable<ArrayType, Tangent = V>
+            + Add<Output = V>
+            + Sub<Output = V>
+            + Mul<Output = V>
+            + Neg<Output = V>
+            + Zero<ArrayType>
+            + One<ArrayType>
+            + ZeroLike
+            + OneLike
+            + MatrixOps
+            + ReshapeOps
+            + ControlFlowValue,
+        Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
         Rule: Clone + DifferentiableOperation<E> + CustomTracedLinearizationRule<V, E> + 'static,
     {
         self.with_jvp_rule::<E, _>(rule.clone()).with_traced_linearization_rule::<E, _>(rule)

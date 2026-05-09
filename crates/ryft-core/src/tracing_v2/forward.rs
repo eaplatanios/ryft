@@ -8,7 +8,6 @@ use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
 use crate::tracing_v2::linear::linearize;
-use crate::tracing_v2::operations::{SupportsNeg, SupportsScale};
 use crate::tracing_v2::{
     DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine, DifferentiableTracingEngine,
     DifferentiationError,
@@ -105,11 +104,6 @@ impl<
         >,
 > JvpDispatch<'engine, E, Input, Output, JvpDispatchValueMarker> for V
 where
-    E::DifferentiableOperationCarrier: DifferentiableOperation<E>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier: InterpretableOperation<E::Type, E::Tangent>
-        + SupportsNeg<E::Type, E::Tangent>
-        + SupportsAdd<E::Type, E::Tangent>
-        + SupportsScale<E::Type, E::Tangent>,
     Input::Family: ParameterizedFamily<E::Tangent>,
     Output::Family: ParameterizedFamily<E::Tangent>,
 {
@@ -137,7 +131,7 @@ where
             Program<
                 E::Type,
                 E::Tangent,
-                <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier,
+                <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
                 Input::To<E::Tangent>,
                 Output::To<E::Tangent>,
             >,
@@ -160,7 +154,6 @@ impl<
 where
     E::OperationCarrier:
         DifferentiableOperation<TracingContext<'engine, E>> + SupportsZeroLike<E::Type, V> + SupportsAdd<E::Type, V>,
-    E::LinearOperationCarrier<'engine>: InterpretableOperation<E::Type, Tracer<'engine, E>>,
     Input: Parameterized<Tracer<'engine, E>, To<Tracer<'engine, E>> = Input>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<E::Type>,
     Input::To<E::Type>: Parameterized<E::Type, To<Tracer<'engine, E>> = Input>,
@@ -237,7 +230,7 @@ mod tests {
     use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
     use crate::tracing_v2::operations::{NegOperation, SupportsNeg, SupportsScale};
-    use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearizableEngine};
+    use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
     use crate::tracing_v2::{LinearScalarOperation, ScalarOperation, Sin};
     use crate::types::{DataType, Typed};
 
@@ -573,8 +566,8 @@ mod tests {
         }
     }
 
-    impl LinearizableEngine for DistinctTangentEngine {
-        type LinearOperationCarrier = DistinctLinearOperation;
+    impl TracingEngine for DistinctTangentEngine {
+        type OperationCarrier = DistinctLinearOperation;
     }
 
     #[derive(Clone, Debug)]
@@ -623,9 +616,7 @@ mod tests {
     impl<E: DifferentiableEngine<Type = DataType, Value = DistinctPrimal>> DifferentiableOperation<E>
         for DistinctPrimalOperation
     where
-        <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-            SupportsAdd<DataType, E::Tangent>,
-        <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+        <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
             SupportsScale<DataType, E::Tangent, DistinctPrimal>,
     {
         fn jvp(
@@ -666,10 +657,6 @@ mod tests {
 
     impl TracingEngine for DistinctPrimalEngine {
         type OperationCarrier = DistinctPrimalOperation;
-    }
-
-    impl LinearizableEngine for DistinctPrimalEngine {
-        type LinearOperationCarrier = LinearScalarOperation<DistinctPrimal>;
     }
 
     impl DifferentiableEngine for DistinctPrimalEngine {

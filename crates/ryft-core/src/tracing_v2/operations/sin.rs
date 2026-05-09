@@ -104,7 +104,7 @@ where
     E: DifferentiableEngine,
     SinOperation: Operation<E::Type>,
     E::Value: Sin + Cos + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
+    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
         SupportsScale<E::Type, E::Tangent, E::Value>,
 {
     fn jvp(
@@ -115,7 +115,7 @@ where
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsScale<
+            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsScale<
                 E::Type,
                 E::Tangent,
                 E::Value,
