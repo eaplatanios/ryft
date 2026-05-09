@@ -4,11 +4,11 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use ryft_core::differentiation::LinearOperation;
 use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
-use ryft_core::differentiation::LinearOperation;
 use ryft_core::tracing::engines::{Tracer, TracingContext};
 use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::{Differentiable, JvpTracer};
@@ -606,11 +606,7 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
 /// structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
 fn materialize_optional_cotangent<V>(
-    context: &ryft_core::differentiation::TranspositionContext<
-        ArrayType,
-        V,
-        LinearArrayOperation<V, ArrayType>,
-    >,
+    context: &ryft_core::differentiation::TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
     cotangent: &Option<AtomId>,
     output_type: &ArrayType,
 ) -> AtomId
@@ -1583,9 +1579,9 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use ryft_core::differentiation::TranspositionContext;
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use ryft_core::differentiation::TranspositionContext;
     use ryft_core::tracing::{Atom, AtomId, ProgramBuilder, Traceable};
     use ryft_core::tracing_v2::differentiation::JvpTracer;
     use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext, LinearArrayOperation};
@@ -1844,9 +1840,8 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let mut context = test_transposition_context(builder);
 
-        let contributions =
-            ryft_core::differentiation::LinearOperation::transpose(&operation, &mut context, &[])
-                .expect("zero-output linear shard_map transpose should succeed");
+        let contributions = ryft_core::differentiation::LinearOperation::transpose(&operation, &mut context, &[])
+            .expect("zero-output linear shard_map transpose should succeed");
 
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_none());
@@ -1858,9 +1853,8 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let mut context = test_transposition_context(builder);
 
-        let contributions =
-            ryft_core::differentiation::LinearOperation::transpose(&operation, &mut context, &[])
-                .expect("zero-output traced linear shard_map transpose should succeed");
+        let contributions = ryft_core::differentiation::LinearOperation::transpose(&operation, &mut context, &[])
+            .expect("zero-output traced linear shard_map transpose should succeed");
 
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_none());

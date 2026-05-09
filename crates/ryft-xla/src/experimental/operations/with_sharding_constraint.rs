@@ -1,10 +1,10 @@
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
+use ryft_core::differentiation::LinearOperation;
 use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::sharding::Sharding;
-use ryft_core::differentiation::LinearOperation;
 use ryft_core::tracing::engines::Tracer;
 use ryft_core::tracing::{AtomId, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
@@ -202,10 +202,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use ryft_core::differentiation::{LinearOperation, TranspositionContext};
     use ryft_core::operations::Operation;
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::differentiation::{LinearOperation, TranspositionContext};
     use ryft_core::tracing::{ProgramBuilder, Traceable};
     use ryft_core::tracing_v2::LinearArrayOperation;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
