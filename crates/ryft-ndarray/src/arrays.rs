@@ -5,6 +5,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 use ndarray::{Array2, ArrayD, Ix2, IxDyn, Zip};
 use thiserror::Error;
 
+use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
 use ryft_core::parameters::Parameter;
 use ryft_core::tracing::{Traceable, TracingError, Value};
@@ -360,6 +361,15 @@ impl<T: NdArrayElement> Mul for Array<T> {
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         binary_elementwise(self, rhs, T::multiply)
+    }
+}
+
+impl<T: NdArrayElement> Scale for Array<T> {
+    type Output = Self;
+
+    #[inline]
+    fn scale(self, factor: Self) -> Self::Output {
+        factor * self
     }
 }
 

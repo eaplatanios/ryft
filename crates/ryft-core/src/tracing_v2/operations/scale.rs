@@ -63,14 +63,6 @@ where
     }
 }
 
-/// JVP rule for `ScaleOperation` under the
-/// [`TracingContext`](TracingContext) wrapper.
-///
-/// The operation's captured factor is `V_inner` (the underlying engine's value type), but the
-/// wrapper engine's [`Value`](crate::tracing::engines::Engine::Value) is
-/// [`Tracer`](crate::tracing::engines::Tracer). The rule lifts the captured
-/// factor into a `Tracer` constant in the outer trace and then stages both the primal product
-/// and the tangent scale on traced primals.
 impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>> for ScaleOperation<DataType, V>
 where
     V: Value<DataType> + Differentiable<DataType>,
