@@ -518,8 +518,8 @@ mod tests {
     use crate::operations::arithmetic::{ADD_OPERATION_NAME, AddOperation, SupportsAdd, SupportsNeg, SupportsScale};
     use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
     use crate::operations::{InterpretableOperation, Operation};
+    use crate::tracing::differentiation::LinearOperation;
     use crate::tracing::engines::{ScalarEngine, Tracer};
-    use crate::tracing::transposition::LinearOperation;
     use crate::tracing::{Traceable, TracingError, Value};
     use crate::tracing_v2::{Differentiable, DifferentiationError};
     use crate::types::{Type, TypeError, Typed};
@@ -713,7 +713,11 @@ mod tests {
     impl LinearOperation<TestType, TestValue, TestLinearOperation> for TestLinearOperation {
         fn transpose(
             &self,
-            context: &mut crate::tracing::transposition::TranspositionContext<TestType, TestValue, TestLinearOperation>,
+            context: &mut crate::tracing::differentiation::TranspositionContext<
+                TestType,
+                TestValue,
+                TestLinearOperation,
+            >,
             output_cotangents: &[Option<crate::tracing::AtomId>],
         ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
             check_count!("output", output_cotangents, 1, TracingError);

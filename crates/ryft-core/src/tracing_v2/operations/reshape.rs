@@ -3,8 +3,8 @@ use std::fmt::Display;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::sharding::{Sharding, ShardingDimension};
+use crate::tracing::differentiation::LinearOperation;
 use crate::tracing::engines::{Tracer, TracingEngine};
-use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearArrayOperation};
@@ -273,7 +273,7 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
 impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for ReshapeOperation {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
+        context: &mut crate::tracing::differentiation::TranspositionContext<
             ArrayType,
             V,
             LinearArrayOperation<V, ArrayType>,

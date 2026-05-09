@@ -7,8 +7,8 @@ use crate::operations::Operation;
 use crate::operations::constants::{
     OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
+use crate::tracing::differentiation::{LinearOperation, TranspositionContext};
 use crate::tracing::engines::Tracer;
-use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};

@@ -7,8 +7,8 @@ use crate::TracingContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{Scale, ScaleOperation, SupportsAdd, SupportsScale};
+use crate::tracing::differentiation::{LinearOperation, TranspositionContext};
 use crate::tracing::engines::Tracer;
-use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
@@ -116,7 +116,7 @@ mod tests {
 
     use crate::parameters::Placeholder;
     use crate::tracing::ProgramBuilder;
-    use crate::tracing::transposition::TranspositionContext;
+    use crate::tracing::differentiation::TranspositionContext;
     use crate::tracing_v2::LinearArrayOperation;
     use crate::tracing_v2::test_util::TestArray;
 

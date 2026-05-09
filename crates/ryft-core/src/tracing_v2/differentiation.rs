@@ -14,9 +14,10 @@ use crate::operations::constants::{One, SupportsZero, SupportsZeroLike, Zero, Ze
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
+use crate::tracing::differentiation::LinearOperation;
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
-use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
+use crate::tracing_v2::forward::JvpDispatch;
 use crate::types::{ArrayType, Type, Typed};
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
@@ -222,13 +223,12 @@ pub trait DifferentiableEngine: Engine {
     ///
     /// The returned pair is `(primal_output, tangent_output)`. This is the canonical user-facing forward-mode
     /// Jacobian-Vector Product (JVP) entry point for differentiable engines.
-    #[allow(private_bounds, private_interfaces)]
     fn jvp<
         'engine,
         F: FnOnce(D::FunctionInput) -> D::FunctionOutput,
         Input: Parameterized<D, ParameterStructure: std::fmt::Debug + PartialEq>,
         Output: Parameterized<D>,
-        D: crate::tracing_v2::forward::JvpDispatch<'engine, Self, Input, Output, Marker>,
+        D: JvpDispatch<'engine, Self, Input, Output, Marker>,
         Marker,
     >(
         &'engine self,
@@ -247,7 +247,6 @@ pub trait DifferentiableEngine: Engine {
     ///
     /// This is the canonical user-facing reverse-mode entry point for differentiable engines. The function must return
     /// exactly one rank-0 scalar array leaf.
-    #[allow(private_bounds, private_interfaces)]
     fn grad<
         'engine,
         F,

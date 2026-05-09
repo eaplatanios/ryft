@@ -22,7 +22,6 @@ use crate::types::Typed;
 /// the inputs are already symbolic. Primitive-specific local JVP rules live in
 /// [`crate::tracing_v2::operations`]; this kernel is the orchestration layer that selects the
 /// concrete or traced execution path.
-#[allow(private_bounds, private_interfaces)]
 pub(crate) fn jvp_at<
     'engine,
     E: Engine,
@@ -57,8 +56,7 @@ pub struct JvpDispatchTracerMarker;
 ///
 /// The public transform is intentionally small; this trait is where the concrete, traced, and
 /// batched execution strategies branch apart.
-pub(crate) trait JvpDispatch<'engine, E: Engine, Input, Output, Marker>:
-    Differentiable<E::Type> + Parameter + Sized
+pub trait JvpDispatch<'engine, E: Engine, Input, Output, Marker>: Differentiable<E::Type> + Parameter + Sized
 where
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<Self>,
@@ -221,8 +219,8 @@ mod tests {
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::operations::trigonometric::Sin;
     use crate::parameters::{ParameterError, Parameterized};
+    use crate::tracing::differentiation::LinearOperation;
     use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
-    use crate::tracing::transposition::LinearOperation;
     use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TranspositionContext, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
     use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};

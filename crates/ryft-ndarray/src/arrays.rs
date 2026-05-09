@@ -536,8 +536,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::parameters::Placeholder;
     use ryft_core::tracing::ProgramBuilder;
+    use ryft_core::tracing::differentiation::{LinearOperation, TranspositionContext};
     use ryft_core::tracing::engines::TracingEngine;
-    use ryft_core::tracing::transposition::{LinearOperation, TranspositionContext};
     use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation};
     use ryft_core::tracing_v2::{MatMul, MatrixTranspose, Reshape};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};

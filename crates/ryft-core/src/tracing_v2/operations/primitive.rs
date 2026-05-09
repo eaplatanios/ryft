@@ -19,8 +19,8 @@ use crate::operations::trigonometric::{
 };
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
+use crate::tracing::differentiation::LinearOperation;
 use crate::tracing::engines::{Tracer, TracingContext};
-use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
 use crate::tracing_v2::operations::control_flow::{
@@ -1723,7 +1723,7 @@ impl<V: Traceable<DataType>>
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
+        context: &mut crate::tracing::differentiation::TranspositionContext<
             DataType,
             Tangent<DataType, V>,
             LinearScalarOperation<Tangent<DataType, V>>,
@@ -1774,7 +1774,7 @@ impl LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArray
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
+        context: &mut crate::tracing::differentiation::TranspositionContext<
             ArrayType,
             ZeroArrayTangent,
             LinearArrayOperation<ZeroArrayTangent, ArrayType>,
@@ -1862,7 +1862,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
+        context: &mut crate::tracing::differentiation::TranspositionContext<
             ArrayType,
             Tangent<ArrayType, V>,
             LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>,
@@ -1955,7 +1955,7 @@ impl<V: Traceable<DataType>>
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
+        context: &mut crate::tracing::differentiation::TranspositionContext<
             DataType,
             Tangent<DataType, V>,
             LinearArrayOperation<Tangent<DataType, V>, DataType>,
@@ -2011,7 +2011,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<DataType, V, LinearScalarOperation<V>>,
+        context: &mut crate::tracing::differentiation::TranspositionContext<DataType, V, LinearScalarOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         match self {
@@ -2070,7 +2070,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
+        context: &mut crate::tracing::differentiation::TranspositionContext<
             ArrayType,
             V,
             LinearArrayOperation<V, ArrayType>,
@@ -2111,7 +2111,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
+        context: &mut crate::tracing::differentiation::TranspositionContext<
             DataType,
             V,
             LinearArrayOperation<V, DataType>,
@@ -2484,7 +2484,7 @@ mod tests {
 
     use crate::operations::InterpretableOperation as _;
     use crate::parameters::Placeholder;
-    use crate::tracing::transposition::{LinearOperation, TranspositionContext};
+    use crate::tracing::differentiation::{LinearOperation, TranspositionContext};
     use crate::tracing::{AtomId, Program, ProgramBuilder};
     use crate::tracing_v2::test_util::TestArray;
     use crate::types::Size;

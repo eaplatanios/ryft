@@ -4,8 +4,8 @@ use half::{bf16, f16};
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
+use crate::tracing::differentiation::LinearOperation;
 use crate::tracing::engines::{Tracer, TracingEngine};
-use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
@@ -99,7 +99,7 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOpe
 impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for MatrixTransposeOperation {
     fn transpose(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
+        context: &mut crate::tracing::differentiation::TranspositionContext<
             ArrayType,
             V,
             LinearArrayOperation<V, ArrayType>,
