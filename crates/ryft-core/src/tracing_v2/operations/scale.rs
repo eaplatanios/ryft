@@ -12,6 +12,7 @@ use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
 use crate::types::{ArrayType, DataType, Type};
+use crate::{TracingContext, TracingEngine};
 
 impl<T: Type, V: Traceable<T>, O: Clone + Operation<T> + SupportsScale<T, V>> LinearOperation<T, V, O>
     for ScaleOperation<T, V>
@@ -36,13 +37,14 @@ where
     }
 }
 
-impl<V, E> DifferentiableOperation<E> for ScaleOperation<ArrayType, V>
+impl<T: Type, V, E> DifferentiableOperation<E> for ScaleOperation<T, V>
 where
-    V: Differentiable<ArrayType> + Mul<Output = V>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V>,
-    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
-        SupportsScale<ArrayType, E::Tangent, V>,
+    V: Differentiable<T> + Mul<Output = V>,
+    E: DifferentiableEngine<Type = T, Value = V>,
+    <E::LinearEngine as TracingEngine>::OperationCarrier: SupportsScale<T, E::Tangent, V>,
+    ScaleOperation<T, V>: Operation<T>,
 {
+    #[inline]
     fn jvp(
         &self,
         context: &mut JvpContext<'_, E>,
@@ -51,38 +53,9 @@ where
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsScale<
-                ArrayType,
-                E::Tangent,
-                V,
-            >>::scale_operation(self.factor.clone()),
-            &[input.tangent],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: self.factor.clone() * input.primal.clone(), tangent: tangent_outputs[0] }])
-    }
-}
-
-impl<V, E> DifferentiableOperation<E> for ScaleOperation<DataType, V>
-where
-    V: Differentiable<DataType> + Mul<Output = V>,
-    E: DifferentiableEngine<Type = DataType, Value = V>,
-    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
-        SupportsScale<DataType, E::Tangent, V>,
-{
-    fn jvp(
-        &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<V, AtomId>],
-    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
-        let input = &inputs[0];
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsScale<
-                DataType,
-                E::Tangent,
-                V,
-            >>::scale_operation(self.factor.clone()),
+            <<E::LinearEngine as TracingEngine>::OperationCarrier as SupportsScale<T, E::Tangent, V>>::scale_operation(
+                self.factor.clone(),
+            ),
             &[input.tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -91,25 +64,25 @@ where
 }
 
 /// JVP rule for `ScaleOperation` under the
-/// [`TracingContext`](crate::tracing::engines::TracingContext) wrapper.
+/// [`TracingContext`](TracingContext) wrapper.
 ///
 /// The operation's captured factor is `V_inner` (the underlying engine's value type), but the
 /// wrapper engine's [`Value`](crate::tracing::engines::Engine::Value) is
 /// [`Tracer`](crate::tracing::engines::Tracer). The rule lifts the captured
 /// factor into a `Tracer` constant in the outer trace and then stages both the primal product
 /// and the tangent scale on traced primals.
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for ScaleOperation<ArrayType, V>
+impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>> for ScaleOperation<DataType, V>
 where
-    V: Value<ArrayType> + Differentiable<ArrayType>,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V>,
-    EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
+    V: Value<DataType> + Differentiable<DataType>,
+    EInner: DifferentiableTracingEngine<Type = DataType, Value = V>,
+    EInner::OperationCarrier: SupportsAdd<DataType, V>,
     Tracer<'engine, EInner>: Mul<Output = Tracer<'engine, EInner>>,
-    EInner::LinearOperationCarrier<'engine>: SupportsScale<ArrayType, Tracer<'engine, EInner>>,
+    EInner::LinearOperationCarrier<'engine>: SupportsScale<DataType, Tracer<'engine, EInner>>,
 {
+    #[inline]
     fn jvp(
         &self,
-        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
+        context: &mut JvpContext<'_, TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
@@ -117,7 +90,7 @@ where
         let factor_tracer = context.engine.constant(self.factor.clone());
         let tangent_outputs = context.stage(
             <EInner::LinearOperationCarrier<'engine> as SupportsScale<
-                ArrayType,
+                DataType,
                 Tracer<'engine, EInner>,
             >>::scale_operation(factor_tracer.clone()),
             &[input.tangent],
@@ -127,18 +100,18 @@ where
     }
 }
 
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for ScaleOperation<DataType, V>
+impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>> for ScaleOperation<ArrayType, V>
 where
-    V: Value<DataType> + Differentiable<DataType>,
-    EInner: DifferentiableTracingEngine<Type = DataType, Value = V>,
-    EInner::OperationCarrier: SupportsAdd<DataType, V>,
+    V: Value<ArrayType> + Differentiable<ArrayType>,
+    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V>,
+    EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
     Tracer<'engine, EInner>: Mul<Output = Tracer<'engine, EInner>>,
-    EInner::LinearOperationCarrier<'engine>: SupportsScale<DataType, Tracer<'engine, EInner>>,
+    EInner::LinearOperationCarrier<'engine>: SupportsScale<ArrayType, Tracer<'engine, EInner>>,
 {
+    #[inline]
     fn jvp(
         &self,
-        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
+        context: &mut JvpContext<'_, TracingContext<'engine, EInner>>,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
@@ -146,7 +119,7 @@ where
         let factor_tracer = context.engine.constant(self.factor.clone());
         let tangent_outputs = context.stage(
             <EInner::LinearOperationCarrier<'engine> as SupportsScale<
-                DataType,
+                ArrayType,
                 Tracer<'engine, EInner>,
             >>::scale_operation(factor_tracer.clone()),
             &[input.tangent],
