@@ -19,9 +19,9 @@ use crate::operations::trigonometric::{
 };
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::engines::Tracer;
+use crate::tracing::engines::{Tracer, TracingContext};
 use crate::tracing::transposition::LinearOperation;
-use crate::tracing::{AtomId, Traceable, TracingError, Value};
+use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
@@ -2161,11 +2161,11 @@ where
         + SupportsSub<DataType, E::Tangent>
         + SupportsScale<DataType, E::Tangent, E::Value>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -2196,6 +2196,7 @@ where
         + Neg<Output = V>
         + Sin
         + Cos
+        + Scale<Output = V>
         + ZeroLike
         + OneLike
         + Zero<ArrayType>
@@ -2223,11 +2224,11 @@ where
         + super::SupportsMatrixTranspose<ArrayType, E::Tangent>
         + super::SupportsReshape<ArrayType, E::Tangent>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<V, AtomId>],
-    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -2264,6 +2265,7 @@ where
         + Neg<Output = V>
         + Sin
         + Cos
+        + Scale<Output = V>
         + ZeroLike
         + OneLike
         + Zero<DataType>
@@ -2279,11 +2281,11 @@ where
         + SupportsSub<DataType, E::Tangent>
         + SupportsScale<DataType, E::Tangent, V>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<V, AtomId>],
-    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -2317,8 +2319,7 @@ where
 /// [`Scale`](Self::Scale), the [`Condition`](Self::Condition) / [`While`](Self::While) stub impls
 /// (predicate extraction does not work at trace time), and the [`Custom`](Self::Custom) bridge to
 /// the registered traced linearization rule.
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for ArrayOperation<V, ArrayType>
+impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>> for ArrayOperation<V, ArrayType>
 where
     V: Value<ArrayType>
         + Add<Output = V>
@@ -2372,11 +2373,12 @@ where
         + SupportsMatrixTranspose<ArrayType, Tracer<'engine, EInner>>
         + SupportsReshape<ArrayType, Tracer<'engine, EInner>>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
+        inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
+    {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -2402,8 +2404,7 @@ where
     }
 }
 
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for ArrayOperation<V, DataType>
+impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>> for ArrayOperation<V, DataType>
 where
     V: Value<DataType>
         + Add<Output = V>
@@ -2445,11 +2446,12 @@ where
     EInner::LinearOperationCarrier<'engine>:
         SupportsZeroLike<DataType, Tracer<'engine, EInner>> + SupportsSub<DataType, Tracer<'engine, EInner>>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
+        inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
+    {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -2483,7 +2485,7 @@ mod tests {
     use crate::operations::InterpretableOperation as _;
     use crate::parameters::Placeholder;
     use crate::tracing::transposition::{LinearOperation, TranspositionContext};
-    use crate::tracing::{Program, ProgramBuilder};
+    use crate::tracing::{AtomId, Program, ProgramBuilder};
     use crate::tracing_v2::test_util::TestArray;
     use crate::types::Size;
 

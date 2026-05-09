@@ -2,8 +2,9 @@ use std::fmt::Display;
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
+use crate::tracing::engines::Tracer;
 use crate::tracing::transposition::LinearOperation;
-use crate::tracing::{AtomId, Traceable, TracingError};
+use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, Type, TypeError};
@@ -80,16 +81,16 @@ where
     E::Value: MatrixValue + Differentiable<ArrayType>,
     E::LinearOperationCarrier: SupportsMatrixTranspose<ArrayType, E::Tangent>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().transpose_matrix();
-        let tangent_outputs =
-            context.stage(E::LinearOperationCarrier::matrix_transpose_operation(), &[inputs[0].tangent])?;
+        let mut tangent_outputs =
+            context.stage(E::LinearOperationCarrier::matrix_transpose_operation(), &[inputs[0].tangent.clone()])?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
     }
 }

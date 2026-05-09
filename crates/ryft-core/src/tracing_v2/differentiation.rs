@@ -373,11 +373,11 @@ pub trait DifferentiableOperation<E: DifferentiableEngine>: Operation<E::Type> {
     ///   - `context`: Active JVP context used to stage tangent operations and access the
     ///     differentiable engine.
     ///   - `inputs`: Traced inputs aligned with this operation's inputs.
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError>;
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError>;
 }
 
 /// Concrete state threaded through forward-mode JVP rules.
@@ -391,6 +391,9 @@ pub struct JvpContext<'a, E: DifferentiableEngine> {
     /// Differentiable engine borrowed by this [`JvpContext`] for primal semantics and linear-engine selection.
     pub engine: &'a E,
 
+    /// [`TracingContext`] used to stage tangent operations into the active linear program.
+    pub linear_context: TracingContext<'a, E::LinearEngine>,
+
     /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::tracing::Program) that is currently being
     /// traced.
     pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, E::LinearOperationCarrier>>>,
@@ -403,11 +406,25 @@ impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
         engine: &'a E,
         builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, E::LinearOperationCarrier>>>,
     ) -> Self {
-        Self { engine, builder }
+        Self { engine, linear_context: TracingContext::new(engine.linear_engine(), builder.clone()), builder }
     }
 
     /// Stages one operation in the currently active linear program.
-    pub fn stage(&self, operation: E::LinearOperationCarrier, inputs: &[AtomId]) -> Result<Vec<AtomId>, TracingError> {
+    pub fn stage(
+        &self,
+        operation: E::LinearOperationCarrier,
+        inputs: &[Tracer<'a, E::LinearEngine>],
+    ) -> Result<Vec<Tracer<'a, E::LinearEngine>>, TracingError> {
+        let input_refs = inputs.iter().collect::<Vec<_>>();
+        self.linear_context.trace(operation, input_refs.as_slice())
+    }
+
+    /// Stages one operation from raw atom identifiers in the currently active linear program.
+    pub fn stage_atom_ids(
+        &self,
+        operation: E::LinearOperationCarrier,
+        inputs: &[AtomId],
+    ) -> Result<Vec<AtomId>, TracingError> {
         let mut builder_borrow = self.builder.borrow_mut();
         let input_types =
             inputs.iter().map(|atom| builder_borrow.atoms[atom.index].r#type().into_owned()).collect::<Vec<_>>();
@@ -420,8 +437,8 @@ impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
     }
 
     /// Stages a constant tangent on the active linear builder.
-    pub fn add_constant(&self, value: E::Tangent) -> AtomId {
-        self.builder.borrow_mut().add_constant(value)
+    pub fn add_constant(&self, value: E::Tangent) -> Tracer<'a, E::LinearEngine> {
+        self.linear_context.constant(value)
     }
 }
 
@@ -433,9 +450,10 @@ impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
 /// carries the directional derivative information flowing alongside it.
 ///
 /// The type parameters have no bounds on the struct itself so that `JvpTracer` can appear in
-/// signatures without eagerly propagating all tangent requirements. `tracing_v2` uses `T = AtomId`
-/// for the rule-based JVP path threaded through [`JvpContext`], where rules manipulate symbolic
-/// tangent atoms directly.
+/// signatures without eagerly propagating all tangent requirements. `tracing_v2` uses
+/// `Tracer<'_, E::LinearEngine>` values for the rule-based JVP path threaded through
+/// [`JvpContext`], so local primitive rules can stage tangent operations using the same
+/// value-level traits as ordinary tracing.
 #[derive(Clone, Debug, Parameter)]
 pub struct JvpTracer<V, T> {
     /// The primal value.
@@ -488,32 +506,33 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         Output::Family: ParameterizedFamily<E::Tangent>,
         O: DifferentiableOperation<E>,
     {
-        fn tangent_for_atom<T, V, LinearOperationCarrier>(
+        fn tangent_for_atom<'jvp, T, V, E>(
             primal_values: &[Option<V>],
-            builder: &Rc<RefCell<ProgramBuilder<T, V::Tangent, LinearOperationCarrier>>>,
-            tangents: &mut [Option<AtomId>],
+            context: &JvpContext<'jvp, E>,
+            tangents: &mut [Option<Tracer<'jvp, E::LinearEngine>>],
             atom_id: AtomId,
-        ) -> Result<AtomId, TracingError>
+        ) -> Result<Tracer<'jvp, E::LinearEngine>, TracingError>
         where
             T: Type,
-            V: Differentiable<T>,
-            LinearOperationCarrier: Clone + Operation<T>,
+            V: Differentiable<T, Tangent = E::Tangent>,
+            E: DifferentiableEngine<Type = T>,
         {
-            if let Some(atom) = tangents[atom_id.index] {
-                return Ok(atom);
+            if let Some(tangent) = &tangents[atom_id.index] {
+                return Ok(tangent.clone());
             }
             let primal = primal_values[atom_id.index].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-            let atom = builder.borrow_mut().add_constant(primal.tangent_type()?);
-            tangents[atom_id.index] = Some(atom);
-            Ok(atom)
+            let tangent = context.add_constant(primal.tangent_type()?);
+            tangents[atom_id.index] = Some(tangent.clone());
+            Ok(tangent)
         }
 
         check_count!("input", input_primals, self.input_ids.len(), TracingError);
         let builder = Rc::new(RefCell::new(ProgramBuilder::<T, E::Tangent, E::LinearOperationCarrier>::new()));
         let mut primals: Vec<Option<V>> = vec![None; self.atoms.len()];
-        let mut tangents: Vec<Option<AtomId>> = vec![None; self.atoms.len()];
+        let mut tangents: Vec<Option<Tracer<'_, E::LinearEngine>>> = vec![None; self.atoms.len()];
+        let mut context = JvpContext::new(engine, builder.clone());
         for (input_atom, input_primal) in self.input_ids.iter().copied().zip(input_primals.into_iter()) {
-            let tangent_atom = builder.borrow_mut().add_input(input_primal.r#type().into_owned());
+            let tangent_atom = context.linear_context.input(input_primal.r#type().into_owned());
             tangents[input_atom.index] = Some(tangent_atom);
             primals[input_atom.index] = Some(input_primal);
         }
@@ -524,7 +543,6 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             }
         }
 
-        let mut context = JvpContext::new(engine, builder.clone());
         for instruction in &self.instructions {
             let input_duals = instruction
                 .inputs
@@ -535,9 +553,9 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                         primal: primals[input_atom.index]
                             .clone()
                             .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
-                        tangent: tangent_for_atom::<T, V, E::LinearOperationCarrier>(
+                        tangent: tangent_for_atom::<T, V, E>(
                             primals.as_slice(),
-                            &builder,
+                            &context,
                             tangents.as_mut_slice(),
                             input_atom,
                         )?,
@@ -557,14 +575,11 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             .iter()
             .copied()
             .map(|output_atom| {
-                tangent_for_atom::<T, V, E::LinearOperationCarrier>(
-                    primals.as_slice(),
-                    &builder,
-                    tangents.as_mut_slice(),
-                    output_atom,
-                )
+                tangent_for_atom::<T, V, E>(primals.as_slice(), &context, tangents.as_mut_slice(), output_atom)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let output_tangent_atoms = output_tangents.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+        drop(output_tangents);
         drop(context);
         drop(tangents);
         let builder = match Rc::try_unwrap(builder) {
@@ -574,7 +589,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             }
         };
         builder
-            .build(output_tangents, self.input_structure.clone(), self.output_structure.clone())?
+            .build(output_tangent_atoms, self.input_structure.clone(), self.output_structure.clone())?
             .simplified()
     }
 }

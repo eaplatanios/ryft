@@ -546,14 +546,14 @@ mod tests {
             Rc::new(RefCell::new(
                 ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
             ));
-        let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let mut context = JvpContext::new(&TestArrayEngine, builder.clone());
+        let tangent_input = context.linear_context.input(ArrayType::scalar(DataType::F64));
         let outputs = condition
             .jvp(&mut context, &[JvpTracer { primal: TestArray::scalar(4.0), tangent: tangent_input }])
             .unwrap();
 
         assert_eq!(outputs[0].primal.values[0], 8.0);
-        let tangent_output = outputs[0].tangent;
+        let tangent_output = outputs[0].tangent.atom_id().unwrap();
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
@@ -613,34 +613,40 @@ mod tests {
     }
 
     impl DifferentiableOperation<TestArrayEngine> for ShiftOp {
-        fn jvp(
+        fn jvp<'jvp>(
             &self,
-            _context: &mut JvpContext<'_, TestArrayEngine>,
-            inputs: &[JvpTracer<TestArray, AtomId>],
-        ) -> Result<Vec<JvpTracer<TestArray, AtomId>>, TracingError> {
+            _context: &mut JvpContext<'jvp, TestArrayEngine>,
+            inputs: &[JvpTracer<TestArray, Tracer<'jvp, TestArrayLinearEngine>>],
+        ) -> Result<Vec<JvpTracer<TestArray, Tracer<'jvp, TestArrayLinearEngine>>>, TracingError> {
             check_count!("input", inputs, 1, TracingError);
             Ok(vec![JvpTracer {
                 primal: TestArray {
                     r#type: inputs[0].primal.r#type.clone(),
                     values: inputs[0].primal.values.iter().map(|value| value + self.amount).collect(),
                 },
-                tangent: inputs[0].tangent,
+                tangent: inputs[0].tangent.clone(),
             }])
         }
     }
 
     impl CustomTracedLinearizationRule<TestArray, TestArrayEngine> for ShiftOp {
-        fn jvp_traced_linearization<'engine>(
+        fn jvp_traced_linearization<'jvp, 'engine>(
             &self,
-            _context: &mut JvpContext<'_, TracingContext<'engine, TestArrayEngine>>,
-            inputs: &[JvpTracer<Tracer<'engine, TestArrayEngine>, AtomId>],
-        ) -> Result<Vec<JvpTracer<Tracer<'engine, TestArrayEngine>, AtomId>>, TracingError> {
+            _context: &mut JvpContext<'jvp, TracingContext<'engine, TestArrayEngine>>,
+            inputs: &[JvpTracer<
+                Tracer<'engine, TestArrayEngine>,
+                Tracer<'jvp, TracingContext<'engine, TestArrayEngine>>,
+            >],
+        ) -> Result<
+            Vec<JvpTracer<Tracer<'engine, TestArrayEngine>, Tracer<'jvp, TracingContext<'engine, TestArrayEngine>>>>,
+            TracingError,
+        > {
             check_count!("input", inputs, 1, TracingError);
             let primal = apply_custom_traced_unary(
                 inputs[0].primal.clone(),
                 CustomPrimitive::<ArrayType, TestArray>::new(self.clone()),
             )?;
-            Ok(vec![JvpTracer { primal, tangent: inputs[0].tangent }])
+            Ok(vec![JvpTracer { primal, tangent: inputs[0].tangent.clone() }])
         }
     }
 

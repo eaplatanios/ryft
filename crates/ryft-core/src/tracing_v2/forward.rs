@@ -221,7 +221,7 @@ mod tests {
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::operations::trigonometric::Sin;
     use crate::parameters::{ParameterError, Parameterized};
-    use crate::tracing::engines::{Engine, ScalarEngine, TracingContext, TracingEngine};
+    use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
     use crate::tracing::transposition::LinearOperation;
     use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TranspositionContext, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
@@ -612,11 +612,11 @@ mod tests {
     where
         E::LinearOperationCarrier: SupportsScale<DataType, E::Tangent, DistinctPrimal>,
     {
-        fn jvp(
+        fn jvp<'jvp>(
             &self,
-            context: &mut JvpContext<'_, E>,
-            inputs: &[JvpTracer<DistinctPrimal, AtomId>],
-        ) -> Result<Vec<JvpTracer<DistinctPrimal, AtomId>>, TracingError> {
+            context: &mut JvpContext<'jvp, E>,
+            inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+        ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
             match self {
                 Self::Add => AddOperation.jvp(context, inputs),
                 Self::Mul => MulOperation.jvp(context, inputs),
@@ -681,9 +681,9 @@ mod tests {
             Tracer<'_, ScalarEngine<f64>>,
             LinearScalarOperation<Tracer<'_, ScalarEngine<f64>>>,
         >::new()));
-        let tangent_a = linear_builder.borrow_mut().add_input(crate::types::DataType::F64);
-        let tangent_b = linear_builder.borrow_mut().add_input(crate::types::DataType::F64);
         let mut context = JvpContext::new(&outer_tracing_context, linear_builder.clone());
+        let tangent_a = context.linear_context.input(crate::types::DataType::F64);
+        let tangent_b = context.linear_context.input(crate::types::DataType::F64);
 
         let outputs = AddOperation
             .jvp(

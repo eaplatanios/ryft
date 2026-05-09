@@ -2,7 +2,8 @@ use std::ops::Add;
 
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{AddOperation, SupportsAdd};
+use crate::operations::arithmetic::AddOperation;
+use crate::tracing::engines::Tracer;
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError, TranspositionContext};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
@@ -30,15 +31,15 @@ where
     AddOperation: Operation<E::Type>,
 {
     #[inline]
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
-        let tangent_inputs = &[inputs[0].tangent, inputs[1].tangent];
-        let tangent_outputs = context.stage(E::LinearOperationCarrier::add_operation(), tangent_inputs)?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: inputs[0].primal.clone() + inputs[1].primal.clone(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer {
+            primal: inputs[0].primal.clone() + inputs[1].primal.clone(),
+            tangent: inputs[0].tangent.clone() + inputs[1].tangent.clone(),
+        }])
     }
 }

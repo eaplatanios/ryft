@@ -2,9 +2,10 @@ use std::ops::{Div, Mul, Neg};
 
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{DivOperation, SupportsAdd, SupportsScale};
+use crate::operations::arithmetic::{DivOperation, Scale, SupportsScale};
 use crate::operations::constants::OneLike;
-use crate::tracing::{AtomId, TracingError};
+use crate::tracing::TracingError;
+use crate::tracing::engines::Tracer;
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 
@@ -20,26 +21,20 @@ where
         + Differentiable<E::Type>,
     E::LinearOperationCarrier: SupportsScale<E::Type, E::Tangent, E::Value>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
         let left_factor = right.primal.one_like() / right.primal.clone();
         let right_factor = -(left.primal.clone() / (right.primal.clone() * right.primal.clone()));
-        let left_term_outputs =
-            context.stage(E::LinearOperationCarrier::scale_operation(left_factor), &[left.tangent])?;
-        check_count!("output", left_term_outputs, 1, TracingError);
-        let right_term_outputs =
-            context.stage(E::LinearOperationCarrier::scale_operation(right_factor), &[right.tangent])?;
-        check_count!("output", right_term_outputs, 1, TracingError);
-        let tangent_outputs = context
-            .stage(E::LinearOperationCarrier::add_operation(), &[left_term_outputs[0], right_term_outputs[0]])?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: left.primal.clone() / right.primal.clone(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer {
+            primal: left.primal.clone() / right.primal.clone(),
+            tangent: left.tangent.clone().scale(left_factor) + right.tangent.clone().scale(right_factor),
+        }])
     }
 }
 

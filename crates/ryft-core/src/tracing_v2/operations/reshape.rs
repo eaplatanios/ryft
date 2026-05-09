@@ -5,7 +5,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
-use crate::tracing::{AtomId, Traceable, TracingError};
+use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearArrayOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
@@ -300,19 +300,19 @@ where
     E::Value: ReshapeValue + Differentiable<ArrayType>,
     E::LinearOperationCarrier: SupportsReshape<ArrayType, E::Tangent>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().reshape(self.output_shape.clone())?;
-        let tangent_outputs = context.stage(
+        let mut tangent_outputs = context.stage(
             E::LinearOperationCarrier::reshape_operation(self.input_shape.clone(), self.output_shape.clone()),
-            &[inputs[0].tangent],
+            &[inputs[0].tangent.clone()],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
     }
 }
 

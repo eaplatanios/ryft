@@ -4,6 +4,7 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::sharding::Sharding;
+use ryft_core::tracing::engines::Tracer;
 use ryft_core::tracing::transposition::LinearOperation;
 use ryft_core::tracing::{AtomId, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
@@ -13,6 +14,7 @@ use ryft_core::tracing_v2::{
 use ryft_core::types::{ArrayType, TypeError};
 use ryft_mlir::{Block, Operation as MlirOperation, Value};
 
+use crate::experimental::engines::LinearXlaEngine;
 use crate::experimental::lowering::{
     LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
 };
@@ -128,18 +130,18 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
 }
 
 impl<'c> DifferentiableOperation<crate::experimental::engines::XlaEngine<'c>> for WithShardingConstraintOperation {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, crate::experimental::engines::XlaEngine<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, AtomId>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, crate::experimental::engines::XlaEngine<'c>>,
+        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal_outputs = self.interpret(&[inputs[0].primal.clone()])?;
         check_count!("output", primal_outputs, 1, TracingError);
-        let tangent_outputs =
-            context.stage(LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, &[inputs[0].tangent])?;
+        let mut tangent_outputs = context
+            .stage(LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, &[inputs[0].tangent.clone()])?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs.remove(0) }])
     }
 }
 

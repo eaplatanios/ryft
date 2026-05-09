@@ -7,6 +7,7 @@ use crate::operations::Operation;
 use crate::operations::constants::{
     OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
+use crate::tracing::engines::Tracer;
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
@@ -32,15 +33,15 @@ where
     ZeroOperation<E::Type>: Operation<E::Type>,
     E::Value: Differentiable<E::Type>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 0, TracingError);
-        let tangent_outputs = context.stage(E::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
+        let mut tangent_outputs = context.stage(E::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: context.engine.zero(&self.r#type)?, tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal: context.engine.zero(&self.r#type)?, tangent: tangent_outputs.remove(0) }])
     }
 }
 
@@ -63,15 +64,15 @@ where
     OneOperation<E::Type>: Operation<E::Type>,
     E::Value: Differentiable<E::Type>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 0, TracingError);
-        let tangent_outputs = context.stage(E::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
+        let mut tangent_outputs = context.stage(E::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: context.engine.one(&self.r#type)?, tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal: context.engine.one(&self.r#type)?, tangent: tangent_outputs.remove(0) }])
     }
 }
 
@@ -95,15 +96,13 @@ where
     E::Value: ZeroLike + Differentiable<E::Type>,
     E::LinearOperationCarrier: SupportsZeroLike<E::Type, E::Tangent>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
-        let tangent_outputs = context.stage(E::LinearOperationCarrier::zero_like_operation(), &[inputs[0].tangent])?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent: inputs[0].tangent.zero_like() }])
     }
 }
 
@@ -127,15 +126,13 @@ where
     E::Value: OneLike + Differentiable<E::Type>,
     E::LinearOperationCarrier: SupportsZeroLike<E::Type, E::Tangent>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
-        let tangent_outputs = context.stage(E::LinearOperationCarrier::zero_like_operation(), &[inputs[0].tangent])?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: inputs[0].primal.one_like(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal: inputs[0].primal.one_like(), tangent: inputs[0].tangent.zero_like() }])
     }
 }
 

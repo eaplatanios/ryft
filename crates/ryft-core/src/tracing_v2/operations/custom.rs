@@ -13,7 +13,7 @@ use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::engines::{Tracer, TracingContext};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{Differentiable, JvpTracer};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -112,11 +112,11 @@ where
         + 'static,
 {
     /// Applies the custom primitive's traced-linearization JVP rule.
-    fn jvp_traced_linearization<'engine>(
+    fn jvp_traced_linearization<'jvp, 'engine>(
         &self,
-        context: &mut crate::tracing_v2::JvpContext<'_, TracingContext<'engine, E>>,
-        inputs: &[JvpTracer<Tracer<'engine, E>, crate::tracing::AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, E>, crate::tracing::AtomId>>, TracingError>;
+        context: &mut JvpContext<'jvp, TracingContext<'engine, E>>,
+        inputs: &[JvpTracer<Tracer<'engine, E>, Tracer<'jvp, TracingContext<'engine, E>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, E>, Tracer<'jvp, TracingContext<'engine, E>>>>, TracingError>;
 }
 
 /// Engine-keyed wrapper for one traced-linearization rule stored inside [`CustomPrimitiveExtensions`].
@@ -381,28 +381,28 @@ where
     V: Differentiable<ArrayType> + 'static,
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut crate::tracing_v2::JvpContext<'_, E>,
-        inputs: &[JvpTracer<V, crate::tracing::AtomId>],
-    ) -> Result<Vec<JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         self.jvp_rule::<E>()?.jvp(context, inputs)
     }
 }
 
 /// JVP rule for `CustomPrimitive` under [`TracingContext`].
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for CustomPrimitive<ArrayType, V>
+impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>> for CustomPrimitive<ArrayType, V>
 where
     V: Value<ArrayType> + Differentiable<ArrayType> + 'static,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
         + 'static,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut crate::tracing_v2::JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, crate::tracing::AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, crate::tracing::AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
+        inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
+    {
         self.traced_linearization_rule::<EInner>()?.jvp_traced_linearization(context, inputs)
     }
 }

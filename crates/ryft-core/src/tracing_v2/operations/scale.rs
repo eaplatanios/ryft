@@ -6,7 +6,7 @@ use indoc::indoc;
 use crate::TracingContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{ScaleOperation, SupportsAdd, SupportsScale};
+use crate::operations::arithmetic::{Scale, ScaleOperation, SupportsAdd, SupportsScale};
 use crate::tracing::engines::Tracer;
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
@@ -39,23 +39,23 @@ where
 
 impl<T: Type, V, E> DifferentiableOperation<E> for ScaleOperation<T, V>
 where
-    V: Differentiable<T> + Mul<Output = V>,
+    V: Differentiable<T> + Scale<Output = V>,
     E: DifferentiableEngine<Type = T, Value = V>,
     E::LinearOperationCarrier: SupportsScale<T, E::Tangent, V>,
     ScaleOperation<T, V>: Operation<T>,
 {
     #[inline]
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<V, AtomId>],
-    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let tangent_outputs =
-            context.stage(E::LinearOperationCarrier::scale_operation(self.factor.clone()), &[input.tangent])?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: self.factor.clone() * input.primal.clone(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer {
+            primal: input.primal.clone().scale(self.factor.clone()),
+            tangent: input.tangent.clone().scale(self.factor.clone()),
+        }])
     }
 }
 
@@ -68,20 +68,21 @@ where
     EInner::LinearOperationCarrier<'engine>: SupportsScale<DataType, Tracer<'engine, EInner>>,
 {
     #[inline]
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
+        inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
+    {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let factor_tracer = context.engine.constant(self.factor.clone());
-        let tangent_outputs = context.stage(
+        let mut tangent_outputs = context.stage(
             EInner::LinearOperationCarrier::<'engine>::scale_operation(factor_tracer.clone()),
-            &[input.tangent],
+            &[input.tangent.clone()],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs.remove(0) }])
     }
 }
 
@@ -94,20 +95,21 @@ where
     EInner::LinearOperationCarrier<'engine>: SupportsScale<ArrayType, Tracer<'engine, EInner>>,
 {
     #[inline]
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
+        inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
+    {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let factor_tracer = context.engine.constant(self.factor.clone());
-        let tangent_outputs = context.stage(
+        let mut tangent_outputs = context.stage(
             EInner::LinearOperationCarrier::<'engine>::scale_operation(factor_tracer.clone()),
-            &[input.tangent],
+            &[input.tangent.clone()],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs.remove(0) }])
     }
 }
 

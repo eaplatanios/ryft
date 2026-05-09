@@ -1,5 +1,5 @@
 use crate::macros::check_count;
-use crate::tracing::engines::TracingContext;
+use crate::tracing::engines::{Tracer, TracingContext};
 use crate::tracing::{Atom, AtomId};
 use crate::tracing_v2::JvpContext;
 use crate::types::Type;
@@ -47,33 +47,27 @@ impl<'engine, E: DifferentiableTracingEngine> TracingContext<'engine, E> {
         E::OperationCarrier: SupportsZeroLike<T, V> + SupportsAdd<T, V> + 'static,
         AddOperation: InterpretableOperation<T, Tracer<'engine, E>>,
     {
-        fn tangent_for_atom<'engine, T, V, E>(
+        fn tangent_for_atom<'jvp, 'engine, T, V, E>(
             primal_values: &[Option<Tracer<'engine, E>>],
-            builder: &Rc<
-                RefCell<
-                    ProgramBuilder<
-                        T,
-                        Tracer<'engine, E>,
-                        <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
-                    >,
-                >,
-            >,
-            tangents: &mut [Option<AtomId>],
+            context: &JvpContext<'jvp, TracingContext<'engine, E>>,
+            tangents: &mut [Option<Tracer<'jvp, TracingContext<'engine, E>>>],
             atom_id: AtomId,
-        ) -> Result<AtomId, TracingError>
+        ) -> Result<Tracer<'jvp, TracingContext<'engine, E>>, TracingError>
         where
             T: Type,
-            V: Traceable<T>,
+            V: Traceable<T> + Differentiable<T>,
             E: DifferentiableTracingEngine<Type = T, Value = V>,
+            E::OperationCarrier: SupportsAdd<T, V>,
+            AddOperation: InterpretableOperation<T, Tracer<'engine, E>>,
             Tracer<'engine, E>: Differentiable<T, Tangent = Tracer<'engine, E>>,
         {
-            if let Some(atom) = tangents[atom_id.index] {
-                return Ok(atom);
+            if let Some(tangent) = &tangents[atom_id.index] {
+                return Ok(tangent.clone());
             }
             let primal = primal_values[atom_id.index].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-            let atom = builder.borrow_mut().add_constant(primal.tangent_type()?);
-            tangents[atom_id.index] = Some(atom);
-            Ok(atom)
+            let tangent = context.add_constant(primal.tangent_type()?);
+            tangents[atom_id.index] = Some(tangent.clone());
+            Ok(tangent)
         }
 
         let input_count = primals.len();
@@ -86,10 +80,11 @@ impl<'engine, E: DifferentiableTracingEngine> TracingContext<'engine, E> {
             <E as DifferentiableTracingEngine>::LinearOperationCarrier<'engine>,
         >::new()));
         let mut primal_values: Vec<Option<Tracer<'engine, E>>> = vec![None; program.atoms.len()];
-        let mut tangents: Vec<Option<AtomId>> = vec![None; program.atoms.len()];
+        let mut tangents: Vec<Option<Tracer<'_, TracingContext<'engine, E>>>> = vec![None; program.atoms.len()];
+        let mut context = JvpContext::new(self, builder.clone());
 
         for (input_atom, primal) in program.input_ids.iter().copied().zip(primals.into_iter()) {
-            let tangent = builder.borrow_mut().add_input(primal.r#type().into_owned());
+            let tangent = context.linear_context.input(primal.r#type().into_owned());
             primal_values[input_atom.index] = Some(primal);
             tangents[input_atom.index] = Some(tangent);
         }
@@ -99,7 +94,6 @@ impl<'engine, E: DifferentiableTracingEngine> TracingContext<'engine, E> {
             }
         }
 
-        let mut context = JvpContext::new(self, builder.clone());
         for instruction in &program.instructions {
             let input_duals = instruction
                 .inputs
@@ -112,7 +106,7 @@ impl<'engine, E: DifferentiableTracingEngine> TracingContext<'engine, E> {
                             .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
                         tangent: tangent_for_atom::<T, V, E>(
                             primal_values.as_slice(),
-                            &builder,
+                            &context,
                             tangents.as_mut_slice(),
                             input_atom,
                         )?,
@@ -138,9 +132,11 @@ impl<'engine, E: DifferentiableTracingEngine> TracingContext<'engine, E> {
             .iter()
             .copied()
             .map(|output| {
-                tangent_for_atom::<T, V, E>(primal_values.as_slice(), &builder, tangents.as_mut_slice(), output)
+                tangent_for_atom::<T, V, E>(primal_values.as_slice(), &context, tangents.as_mut_slice(), output)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let tangent_output_atoms = tangent_outputs.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+        drop(tangent_outputs);
         drop(context);
         drop(tangents);
         let builder = match Rc::try_unwrap(builder) {
@@ -150,7 +146,7 @@ impl<'engine, E: DifferentiableTracingEngine> TracingContext<'engine, E> {
             }
         };
         let program = builder
-            .build(tangent_outputs, vec![Placeholder; input_count], vec![Placeholder; primal_outputs.len()])?
+            .build(tangent_output_atoms, vec![Placeholder; input_count], vec![Placeholder; primal_outputs.len()])?
             .simplified()?;
         Ok((primal_outputs, program))
     }

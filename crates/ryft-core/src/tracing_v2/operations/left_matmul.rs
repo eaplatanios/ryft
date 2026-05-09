@@ -3,9 +3,9 @@ use std::fmt::Display;
 use crate::macros::check_count;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::engines::Tracer;
+use crate::tracing::engines::{Tracer, TracingContext};
 use crate::tracing::transposition::LinearOperation;
-use crate::tracing::{AtomId, Traceable, TracingError, Value};
+use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
@@ -111,24 +111,25 @@ where
     E: DifferentiableEngine<Type = ArrayType, Value = V>,
     E::LinearOperationCarrier: SupportsLeftMatMul<ArrayType, E::Tangent, V>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<V, AtomId>],
-    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal = self.factor.clone().matmul(inputs[0].primal.clone());
-        let tangent_outputs = context
-            .stage(E::LinearOperationCarrier::left_matmul_operation(self.factor.clone()), &[inputs[0].tangent])?;
+        let mut tangent_outputs = context.stage(
+            E::LinearOperationCarrier::left_matmul_operation(self.factor.clone()),
+            &[inputs[0].tangent.clone()],
+        )?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
     }
 }
 
 /// JVP rule for `LeftMatMulOperation` under
 /// [`TracingContext`](crate::tracing::engines::TracingContext).
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for LeftMatMulOperation<V>
+impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>> for LeftMatMulOperation<V>
 where
     V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType>,
     EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V>,
@@ -136,19 +137,20 @@ where
     EInner::LinearOperationCarrier<'engine>: SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>,
     Tracer<'engine, EInner>: MatrixOps,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
+        inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
+    {
         check_count!("input", inputs, 1, TracingError);
         let factor_tracer = context.engine.constant(self.factor.clone());
         let primal = factor_tracer.clone().matmul(inputs[0].primal.clone());
-        let tangent_outputs = context.stage(
+        let mut tangent_outputs = context.stage(
             EInner::LinearOperationCarrier::<'engine>::left_matmul_operation(factor_tracer),
-            &[inputs[0].tangent],
+            &[inputs[0].tangent.clone()],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
     }
 }

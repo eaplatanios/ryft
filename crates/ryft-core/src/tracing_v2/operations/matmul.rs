@@ -2,7 +2,8 @@ use std::fmt::Display;
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::{AtomId, Traceable, TracingError};
+use crate::tracing::engines::Tracer;
+use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, Type, TypeError};
@@ -61,24 +62,26 @@ where
     E::LinearOperationCarrier:
         SupportsLeftMatMul<ArrayType, E::Tangent, E::Value> + SupportsRightMatMul<ArrayType, E::Tangent, E::Value>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
         let primal = left.primal.clone().matmul(right.primal.clone());
-        let left_term_outputs =
-            context.stage(E::LinearOperationCarrier::right_matmul_operation(right.primal.clone()), &[left.tangent])?;
+        let left_term_outputs = context
+            .stage(E::LinearOperationCarrier::right_matmul_operation(right.primal.clone()), &[left.tangent.clone()])?;
         check_count!("output", left_term_outputs, 1, TracingError);
-        let right_term_outputs =
-            context.stage(E::LinearOperationCarrier::left_matmul_operation(left.primal.clone()), &[right.tangent])?;
+        let right_term_outputs = context
+            .stage(E::LinearOperationCarrier::left_matmul_operation(left.primal.clone()), &[right.tangent.clone()])?;
         check_count!("output", right_term_outputs, 1, TracingError);
-        let tangent_outputs = context
-            .stage(E::LinearOperationCarrier::add_operation(), &[left_term_outputs[0], right_term_outputs[0]])?;
+        let mut tangent_outputs = context.stage(
+            E::LinearOperationCarrier::add_operation(),
+            &[left_term_outputs[0].clone(), right_term_outputs[0].clone()],
+        )?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
     }
 }

@@ -2,8 +2,9 @@ use std::ops::Mul;
 
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{MulOperation, SupportsAdd, SupportsScale};
-use crate::tracing::{AtomId, TracingError};
+use crate::operations::arithmetic::{MulOperation, Scale, SupportsScale};
+use crate::tracing::TracingError;
+use crate::tracing::engines::Tracer;
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 
@@ -14,24 +15,19 @@ where
     E::Value: Mul<Output = E::Value> + Differentiable<E::Type>,
     E::LinearOperationCarrier: SupportsScale<E::Type, E::Tangent, E::Value>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
+    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
-        let left_term_outputs =
-            context.stage(E::LinearOperationCarrier::scale_operation(right.primal.clone()), &[left.tangent])?;
-        check_count!("output", left_term_outputs, 1, TracingError);
-        let right_term_outputs =
-            context.stage(E::LinearOperationCarrier::scale_operation(left.primal.clone()), &[right.tangent])?;
-        check_count!("output", right_term_outputs, 1, TracingError);
-        let tangent_outputs = context
-            .stage(E::LinearOperationCarrier::add_operation(), &[left_term_outputs[0], right_term_outputs[0]])?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: left.primal.clone() * right.primal.clone(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer {
+            primal: left.primal.clone() * right.primal.clone(),
+            tangent: left.tangent.clone().scale(right.primal.clone())
+                + right.tangent.clone().scale(left.primal.clone()),
+        }])
     }
 }
 

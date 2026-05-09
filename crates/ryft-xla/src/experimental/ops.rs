@@ -13,8 +13,8 @@ use ryft_core::operations::constants::{
 };
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation, SupportsCos, SupportsSin};
 use ryft_core::operations::{InterpretableOperation, Operation};
-use ryft_core::tracing::engines::TracingContext;
-use ryft_core::tracing::{AtomId, TracingError};
+use ryft_core::tracing::TracingError;
+use ryft_core::tracing::engines::{Tracer, TracingContext};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
     ConditionOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, SupportsCustom, SupportsMatMul,
@@ -25,7 +25,7 @@ use ryft_core::tracing_v2::{
 };
 use ryft_core::types::{ArrayType, Shape, TypeError};
 
-use crate::experimental::engines::XlaEngine;
+use crate::experimental::engines::{LinearXlaEngine, XlaEngine};
 use crate::experimental::operations::{
     LinearShardMapOperation, ShardMapCustomReplayExtension, ShardMapOperation, ShardMapReplayContext,
     WithShardingConstraintOperation,
@@ -316,11 +316,11 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
 }
 
 impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, XlaEngine<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, AtomId>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, XlaEngine<'c>>,
+        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -352,11 +352,12 @@ impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
 }
 
 impl DifferentiableOperation<TracingContext<'static, XlaEngine<'static>>> for XlaOperation {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, TracingContext<'static, XlaEngine<'static>>>,
-        inputs: &[JvpTracer<ShardMapTracer, AtomId>],
-    ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, TracingContext<'static, XlaEngine<'static>>>,
+        inputs: &[JvpTracer<ShardMapTracer, Tracer<'jvp, TracingContext<'static, XlaEngine<'static>>>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTracer, Tracer<'jvp, TracingContext<'static, XlaEngine<'static>>>>>, TracingError>
+    {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -388,12 +389,12 @@ impl DifferentiableOperation<TracingContext<'static, XlaEngine<'static>>> for Xl
                 let primal_outputs =
                     input.primal.context.trace(XlaOperation::WithShardingConstraint(op.clone()), &[&input.primal])?;
                 check_count!("output", primal_outputs, 1, TracingError);
-                let tangent_outputs = context.stage(
+                let mut tangent_outputs = context.stage(
                     LinearArrayOperation::Custom(Arc::new(op.to_tracer_linear_custom_primitive())),
-                    &[input.tangent],
+                    &[input.tangent.clone()],
                 )?;
                 check_count!("output", tangent_outputs, 1, TracingError);
-                Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs[0] }])
+                Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs.remove(0) }])
             }
             Self::Custom(op) => {
                 Err(CustomOperationError::MissingRule { op: op.name(), transform: "traced linearization" }.into())
