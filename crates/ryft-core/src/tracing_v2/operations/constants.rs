@@ -213,9 +213,10 @@ mod tests {
     use half::{bf16, f16};
     use indoc::indoc;
 
+    use crate::operations::scalars::ScalarOperation;
     use crate::tracing::Program;
     use crate::tracing::engines::{ScalarEngine, TracingEngine};
-    use crate::tracing_v2::{Cos, Differentiable, ScalarOperation, Sin, Tangent};
+    use crate::tracing_v2::{Cos, Differentiable, Sin, Tangent};
     use crate::types::DataType;
 
     #[test]

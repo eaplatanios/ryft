@@ -307,9 +307,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::operations::scalars::ScalarOperation;
     use crate::tracing::Program;
     use crate::tracing::engines::{ScalarEngine, TracingEngine};
-    use crate::tracing_v2::ScalarOperation;
     use crate::tracing_v2::Sin;
     use crate::types::DataType;
 

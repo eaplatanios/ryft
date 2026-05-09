@@ -1,20 +1,24 @@
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
+use crate::broadcasting::Broadcastable;
+use crate::macros::check_count;
+use crate::parameters::Parameterized;
+use crate::tracing::{Program, Traceable, TracingError};
+use crate::types::{ArrayType, Type, TypeError, Typed};
+
 /// Elementwise arithmetic operations and carrier capability traits.
 pub mod arithmetic;
 
 /// Type-driven constant operations and carrier capability traits.
 pub mod constants;
 
+/// Scalar operation carriers built from the core primitive operation traits.
+pub mod scalars;
+
 pub use arithmetic::*;
 pub use constants::*;
-
-use crate::broadcasting::Broadcastable;
-use crate::macros::check_count;
-use crate::parameters::Parameterized;
-use crate::tracing::{Program, Traceable, TracingError};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+pub use scalars::*;
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
 /// If the length exceeds this value, then the section contents will be rendered over multiple lines.

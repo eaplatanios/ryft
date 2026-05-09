@@ -8,10 +8,10 @@ use half::{bf16, f16};
 
 use ryft_macros::Parameter;
 
+use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
 use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::operations::primitive::{LinearScalarOperation, ScalarOperation};
 use crate::types::{DataType, Type, TypeError, Typed};
 
 /// [`Engine`]s provide backend-specific functionality related to tracing, just-in-time compilation, automatic

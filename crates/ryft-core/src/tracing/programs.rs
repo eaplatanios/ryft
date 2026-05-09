@@ -827,9 +827,9 @@ mod tests {
 
     use crate::macros::check_count;
     use crate::operations::OperationFormatter;
+    use crate::operations::scalars::ScalarOperation;
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::tracing::TracingError;
-    use crate::tracing_v2::ScalarOperation;
     use crate::types::{DataType, TypeError};
 
     use super::*;

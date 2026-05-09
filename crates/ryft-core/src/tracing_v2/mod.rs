@@ -33,5 +33,5 @@ pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::{
     ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, Cos,
     CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, FlatProgram, LinearArrayOperation,
-    LinearCustomPrimitive, LinearScalarOperation, ScalarOperation, Sin, WhileOperation,
+    LinearCustomPrimitive, Sin, WhileOperation,
 };

@@ -65,7 +65,7 @@ pub use left_matmul::{LeftMatMulOperation, SupportsLeftMatMul};
 pub use matmul::{MatMulOperation, SupportsMatMul};
 pub use matrix_transpose::{MatrixTransposeOperation, SupportsMatrixTranspose};
 pub use neg::{NegOperation, SupportsNeg};
-pub use primitive::{ArrayOperation, LinearArrayOperation, LinearScalarOperation, ScalarOperation};
+pub use primitive::{ArrayOperation, LinearArrayOperation};
 pub use reshape::{ReshapeOperation, SupportsReshape};
 pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
 pub use scale::{ScaleOperation, SupportsScale};

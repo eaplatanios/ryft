@@ -223,15 +223,16 @@ mod tests {
     use crate::operations::constants::{
         One, OneLike, OneOperation, SupportsOne, SupportsZero, Zero, ZeroLike, ZeroOperation,
     };
+    use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::parameters::{ParameterError, Parameterized};
     use crate::tracing::TranspositionContext;
     use crate::tracing::engines::{Engine, ScalarEngine, TracingContext, TracingEngine};
     use crate::tracing::transposition::LinearOperation;
     use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, Value};
+    use crate::tracing_v2::Sin;
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
     use crate::tracing_v2::operations::{NegOperation, SupportsNeg, SupportsScale};
     use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
-    use crate::tracing_v2::{LinearScalarOperation, ScalarOperation, Sin};
     use crate::types::{DataType, Typed};
 
     use super::*;
