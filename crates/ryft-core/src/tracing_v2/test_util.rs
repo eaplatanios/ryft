@@ -5,13 +5,14 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 use crate::broadcasting::Broadcastable;
 use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
+use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
 use crate::tracing::engines::{Engine, Tracer, TracingEngine};
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use crate::tracing_v2::{
-    ArrayOperation, CoordinateValue, Cos, Differentiable, DifferentiableEngine, DifferentiableTracingEngine,
-    LinearArrayOperation, MatrixOps, ReshapeOps, Sin,
+    ArrayOperation, CoordinateValue, Differentiable, DifferentiableEngine, DifferentiableTracingEngine,
+    LinearArrayOperation, MatrixOps, ReshapeOps,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 

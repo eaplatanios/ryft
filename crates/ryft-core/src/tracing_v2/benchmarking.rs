@@ -308,9 +308,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::scalars::ScalarOperation;
+    use crate::operations::trigonometric::Sin;
     use crate::tracing::Program;
     use crate::tracing::engines::{ScalarEngine, TracingEngine};
-    use crate::tracing_v2::Sin;
     use crate::types::DataType;
 
     use super::*;

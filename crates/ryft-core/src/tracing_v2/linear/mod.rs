@@ -33,9 +33,10 @@ pub use reverse::{
 #[cfg(test)]
 mod tests {
     use crate::operations::scalars::LinearScalarOperation;
+    use crate::operations::trigonometric::Sin;
     use crate::tracing::Program;
     use crate::tracing::engines::ScalarEngine;
-    use crate::tracing_v2::{Sin, linearize};
+    use crate::tracing_v2::linearize;
     use crate::types::DataType;
     use indoc::indoc;
 

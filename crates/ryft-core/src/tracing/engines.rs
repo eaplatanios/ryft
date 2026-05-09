@@ -513,8 +513,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::constants::{OneLike, ZeroLike};
+    use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
-    use crate::tracing_v2::operations::sin::Sin;
     use crate::types::{DataType, TypeError, Typed};
 
     use super::*;

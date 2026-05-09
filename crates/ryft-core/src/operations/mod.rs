@@ -16,9 +16,13 @@ pub mod constants;
 /// Scalar operation carriers built from the core primitive operation traits.
 pub mod scalars;
 
+/// Elementwise trigonometric operations and carrier capability traits.
+pub mod trigonometric;
+
 pub use arithmetic::*;
 pub use constants::*;
 pub use scalars::*;
+pub use trigonometric::*;
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
 /// If the length exceeds this value, then the section contents will be rendered over multiple lines.

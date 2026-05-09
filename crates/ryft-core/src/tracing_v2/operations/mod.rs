@@ -1,7 +1,7 @@
 /// Elementwise addition linearization and differentiation rules.
 pub mod add;
 
-/// Elementwise cosine.
+/// Elementwise cosine differentiation rules.
 pub mod cos;
 
 /// Value-level identity helpers and built-in scalar constant traits.
@@ -46,7 +46,7 @@ pub mod right_matmul;
 /// Scalar and tensor scaling.
 pub mod scale;
 
-/// Elementwise sine.
+/// Elementwise sine differentiation rules.
 pub mod sin;
 
 /// Elementwise subtraction linearization and differentiation rules.
@@ -56,7 +56,6 @@ pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
     flat_program_input_types, flat_program_output_types,
 };
-pub use cos::{Cos, CosOperation, SupportsCos};
 pub use custom::{
     CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, LinearCustomPrimitive, SupportsCustom,
     SupportsLinearCustom,
@@ -67,4 +66,3 @@ pub use matrix_transpose::{MatrixTransposeOperation, SupportsMatrixTranspose};
 pub use primitive::{ArrayOperation, LinearArrayOperation};
 pub use reshape::{ReshapeOperation, SupportsReshape};
 pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
-pub use sin::{Sin, SinOperation, SupportsSin};

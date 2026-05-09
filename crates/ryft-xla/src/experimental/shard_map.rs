@@ -16,6 +16,7 @@ use thiserror::Error;
 use ryft_core::macros::check_count;
 use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, Scale, SubOperation};
 use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
+use ryft_core::operations::trigonometric::{Cos, Sin};
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
@@ -24,7 +25,7 @@ use ryft_core::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, Traci
 use ryft_core::tracing_v2::operations::{
     ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation,
 };
-use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin};
+use ryft_core::tracing_v2::{Differentiable, MatrixOps};
 
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::XlaOperation;
@@ -1952,8 +1953,9 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use ryft_core::operations::constants::OneLike;
+    use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{DifferentiableEngine, Sin};
+    use ryft_core::tracing_v2::DifferentiableEngine;
     use ryft_core::types::data_types::DataType;
 
     use crate::mlir::ToMlir;

@@ -11,13 +11,14 @@ use ryft_core::operations::constants::{
     ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
     SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
 };
+use ryft_core::operations::trigonometric::{CosOperation, SinOperation, SupportsCos, SupportsSin};
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{AtomId, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
-    ConditionOperation, CosOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, SinOperation,
-    SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsReshape, SupportsSin, WhileOperation,
+    ConditionOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, SupportsCustom, SupportsMatMul,
+    SupportsMatrixTranspose, SupportsReshape, WhileOperation,
 };
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableOperation, JvpContext, LinearArrayOperation,

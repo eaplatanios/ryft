@@ -14,6 +14,9 @@ use crate::operations::constants::{
     SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
+use crate::operations::trigonometric::{
+    COS_OPERATION_NAME, Cos, CosOperation, SIN_OPERATION_NAME, Sin, SinOperation, SupportsCos, SupportsSin,
+};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::engines::Tracer;
@@ -26,22 +29,17 @@ use crate::tracing_v2::operations::control_flow::{
 use crate::tracing_v2::operations::left_matmul::left_matmul_abstract_eval;
 use crate::tracing_v2::operations::right_matmul::right_matmul_abstract_eval;
 use crate::tracing_v2::operations::{
-    CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation,
-    RightMatMulOperation, SinOperation,
+    LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, RightMatMulOperation,
 };
-use crate::tracing_v2::{
-    Cos, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, MatrixOps, Sin,
-};
+use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, MatrixOps};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
-use super::cos::SupportsCos;
 use super::custom::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, SupportsLinearCustom};
 use super::left_matmul::SupportsLeftMatMul;
 use super::matmul::SupportsMatMul;
 use super::matrix_transpose::SupportsMatrixTranspose;
 use super::reshape::SupportsReshape;
 use super::right_matmul::SupportsRightMatMul;
-use super::sin::SupportsSin;
 
 type ZeroScalarTangent = Tangent<DataType, Infallible>;
 type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
@@ -530,8 +528,8 @@ where
             Self::Mul => MUL_OPERATION_NAME,
             Self::Div => DIV_OPERATION_NAME,
             Self::Neg => NEG_OPERATION_NAME,
-            Self::Sin => "sin",
-            Self::Cos => "cos",
+            Self::Sin => SIN_OPERATION_NAME,
+            Self::Cos => COS_OPERATION_NAME,
             Self::MatrixMultiply => "matmul",
             Self::Transpose => "matrix_transpose",
             Self::Scale { .. } => SCALE_OPERATION_NAME,

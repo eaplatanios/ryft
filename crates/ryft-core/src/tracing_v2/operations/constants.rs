@@ -214,9 +214,10 @@ mod tests {
     use indoc::indoc;
 
     use crate::operations::scalars::ScalarOperation;
+    use crate::operations::trigonometric::{Cos, Sin};
     use crate::tracing::Program;
     use crate::tracing::engines::{ScalarEngine, TracingEngine};
-    use crate::tracing_v2::{Cos, Differentiable, Sin, Tangent};
+    use crate::tracing_v2::{Differentiable, Tangent};
     use crate::types::DataType;
 
     #[test]

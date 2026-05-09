@@ -10,13 +10,13 @@ use crate::operations::constants::{
     ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
     SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
 };
+use crate::operations::trigonometric::{
+    COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
+};
 use crate::operations::{Operation, OperationFormatter};
 use crate::parameters::Parameter;
 use crate::tracing::{Traceable, TracingError};
-use crate::tracing_v2::operations::{
-    CosOperation, CustomPrimitive, LinearCustomPrimitive, SinOperation, SupportsCos, SupportsCustom,
-    SupportsLinearCustom, SupportsSin,
-};
+use crate::tracing_v2::operations::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, SupportsLinearCustom};
 use crate::types::{DataType, TypeError};
 
 /// Closed scalar operation carrier for ordinary staged scalar programs.
@@ -376,8 +376,8 @@ where
             Self::Mul => MUL_OPERATION_NAME,
             Self::Div => DIV_OPERATION_NAME,
             Self::Neg => NEG_OPERATION_NAME,
-            Self::Sin => "sin",
-            Self::Cos => "cos",
+            Self::Sin => SIN_OPERATION_NAME,
+            Self::Cos => COS_OPERATION_NAME,
             Self::Scale { .. } => SCALE_OPERATION_NAME,
             Self::Custom(op) => op.name(),
         }

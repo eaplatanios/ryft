@@ -1,4 +1,5 @@
 use ryft_core::operations::arithmetic::MUL_OPERATION_NAME;
+use ryft_core::operations::trigonometric::Sin;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::Program;
@@ -6,7 +7,7 @@ use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region, record,
     summarize_program,
 };
-use ryft_core::tracing_v2::{DifferentiableEngine, MatrixOps, Sin};
+use ryft_core::tracing_v2::{DifferentiableEngine, MatrixOps};
 
 use crate::experimental::operations::{LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation};
 use ryft_core::types::{ArrayType, DataType, Shape, Size};

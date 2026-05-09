@@ -2,12 +2,13 @@ use std::ops::{Add, Mul, Neg};
 
 use crate::operations::constants::OneLike;
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
+use crate::operations::trigonometric::{Cos, Sin};
 use crate::tracing::engines::{ScalarEngine, Tracer, TracingEngine};
 use crate::tracing::{Program, Traceable};
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::tracing_v2::{DifferentiableEngine, Sin, linearize, value_and_grad, vjp};
+use crate::tracing_v2::{DifferentiableEngine, linearize, value_and_grad, vjp};
 use crate::types::{DataType, Type};
 
 /// Returns the tracing-only IR benchmark cases.
@@ -59,8 +60,8 @@ fn summarize_tracing_program<
 fn tracing_record<
     T: Type,
     V: Traceable<T>
-        + crate::tracing_v2::Sin
-        + crate::tracing_v2::Cos
+        + Sin
+        + Cos
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>

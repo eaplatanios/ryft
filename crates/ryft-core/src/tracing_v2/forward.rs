@@ -225,12 +225,13 @@ mod tests {
         One, OneLike, OneOperation, SupportsOne, SupportsZero, Zero, ZeroLike, ZeroOperation,
     };
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
+    use crate::operations::trigonometric::Sin;
     use crate::parameters::{ParameterError, Parameterized};
     use crate::tracing::engines::{Engine, ScalarEngine, TracingContext, TracingEngine};
     use crate::tracing::transposition::LinearOperation;
     use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TranspositionContext, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-    use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, Sin};
+    use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
     use crate::types::{DataType, Typed};
 
     use super::*;

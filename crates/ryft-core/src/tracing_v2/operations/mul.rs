@@ -58,9 +58,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::scalars::LinearScalarOperation;
+    use crate::operations::trigonometric::Sin;
     use crate::tracing::Program;
     use crate::tracing::engines::ScalarEngine;
-    use crate::tracing_v2::{DifferentiableEngine, Sin, linearize};
+    use crate::tracing_v2::{DifferentiableEngine, linearize};
     use crate::types::DataType;
 
     fn approx_eq(left: f64, right: f64) {

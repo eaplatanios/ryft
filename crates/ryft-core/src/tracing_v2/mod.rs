@@ -19,6 +19,7 @@ pub mod linear;
 pub mod operations;
 #[cfg(test)]
 pub(crate) mod test_util;
+pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
     Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
@@ -31,7 +32,7 @@ pub use linear::{
 pub use operations::matrix::{MatrixOps, MatrixValue};
 pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::{
-    ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, Cos,
-    CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, FlatProgram, LinearArrayOperation,
-    LinearCustomPrimitive, Sin, WhileOperation,
+    ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, CustomOperationError,
+    CustomPrimitive, CustomPrimitiveExtensions, FlatProgram, LinearArrayOperation, LinearCustomPrimitive,
+    WhileOperation,
 };

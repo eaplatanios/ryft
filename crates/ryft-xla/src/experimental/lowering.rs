@@ -14,13 +14,13 @@ use ryft_core::operations::Operation;
 use ryft_core::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
+use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing::{AtomId, Instruction, Program, Traceable, TracingError};
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use ryft_core::tracing_v2::operations::{
-    CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation,
-    RightMatMulOperation, SinOperation,
+    LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, RightMatMulOperation,
 };
 use ryft_core::tracing_v2::{ArrayOperation, CustomPrimitive, LinearArrayOperation, MatrixOps};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
@@ -2539,7 +2539,9 @@ mod tests {
 
     use ryft_core::broadcasting::Broadcastable;
     use ryft_core::macros::check_count;
+    use ryft_core::operations::arithmetic::Scale;
     use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
+    use ryft_core::operations::trigonometric::{Cos, Sin};
     use ryft_core::operations::{InterpretableOperation, Operation};
     use ryft_core::parameters::{Parameter, Placeholder};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -2547,8 +2549,8 @@ mod tests {
     use ryft_core::tracing::{ProgramBuilder, Traceable, TracingError, Value as TraceValue};
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::{
-        ArrayOperation, CoordinateValue, Cos, CustomPrimitive, Differentiable, DifferentiableEngine,
-        DifferentiableTracingEngine, LinearArrayOperation, MatrixOps, ReshapeOps, Sin,
+        ArrayOperation, CoordinateValue, CustomPrimitive, Differentiable, DifferentiableEngine,
+        DifferentiableTracingEngine, LinearArrayOperation, MatrixOps, ReshapeOps,
     };
     use ryft_core::types::{Shape, TypeError, Typed};
     #[cfg(feature = "ndarray")]
@@ -2695,6 +2697,14 @@ mod tests {
 
         fn mul(self, rhs: Self) -> Self::Output {
             self.binary(rhs, |left, right| left * right)
+        }
+    }
+
+    impl Scale for TestArray {
+        type Output = Self;
+
+        fn scale(self, factor: Self) -> Self::Output {
+            factor * self
         }
     }
 
@@ -3023,14 +3033,14 @@ mod tests {
 
     fn scalar_bilinear_sin<T>(inputs: (T, T)) -> T
     where
-        T: Clone + ryft_core::tracing_v2::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
+        T: Clone + ryft_core::operations::trigonometric::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
         inputs.0.clone() * inputs.1 + inputs.0.sin()
     }
 
     fn scalar_quartic_plus_sin<T>(x: T) -> T
     where
-        T: Clone + ryft_core::tracing_v2::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
+        T: Clone + ryft_core::operations::trigonometric::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
         x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
     }

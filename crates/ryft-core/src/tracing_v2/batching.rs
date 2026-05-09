@@ -10,14 +10,13 @@ use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation,
 };
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
+use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::tracing::engines::Tracer;
 use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::operations::reshape::ReshapeOps;
-use crate::tracing_v2::{
-    ArrayOperation, ControlFlowError, ControlFlowValue, Cos, LinearArrayOperation, MatrixOps, Sin,
-};
+use crate::tracing_v2::{ArrayOperation, ControlFlowError, ControlFlowValue, LinearArrayOperation, MatrixOps};
 use crate::types::{ArrayType, Size, Type, Typed};
 
 /// Errors emitted by explicit batching and `vmap` helpers.
@@ -327,8 +326,8 @@ where
             Self::Mul => batch_by_interpreting_physical_operation(&MulOperation, inputs),
             Self::Div => batch_by_interpreting_physical_operation(&DivOperation, inputs),
             Self::Neg => batch_by_interpreting_physical_operation(&NegOperation, inputs),
-            Self::Sin => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::SinOperation, inputs),
-            Self::Cos => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::CosOperation, inputs),
+            Self::Sin => batch_by_interpreting_physical_operation(&SinOperation, inputs),
+            Self::Cos => batch_by_interpreting_physical_operation(&CosOperation, inputs),
             Self::ZeroLike => {
                 batch_by_interpreting_physical_operation(&crate::operations::constants::ZeroLikeOperation, inputs)
             }
