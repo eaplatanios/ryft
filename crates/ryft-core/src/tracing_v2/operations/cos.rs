@@ -25,20 +25,13 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let scaled_outputs =
-            context.stage(
-                <<E::LinearEngine as TracingEngine>::OperationCarrier as SupportsScale<
-                    E::Type,
-                    E::Tangent,
-                    E::Value,
-                >>::scale_operation(input.primal.clone().sin()),
-                &[input.tangent],
-            )?;
-        check_count!("output", scaled_outputs, 1, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as TracingEngine>::OperationCarrier as SupportsNeg<E::Type, E::Tangent>>::neg_operation(),
-            &[scaled_outputs[0]],
+        let scaled_outputs = context.stage(
+            <E::LinearEngine as TracingEngine>::OperationCarrier::scale_operation(input.primal.clone().sin()),
+            &[input.tangent],
         )?;
+        check_count!("output", scaled_outputs, 1, TracingError);
+        let tangent_outputs = context
+            .stage(<E::LinearEngine as TracingEngine>::OperationCarrier::neg_operation(), &[scaled_outputs[0]])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: input.primal.clone().cos(), tangent: tangent_outputs[0] }])
     }
