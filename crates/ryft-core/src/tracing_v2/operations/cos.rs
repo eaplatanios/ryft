@@ -4,7 +4,7 @@ use std::ops::Neg;
 use half::{bf16, f16};
 
 use crate::macros::check_count;
-use crate::operations::arithmetic::SupportsNeg;
+use crate::operations::arithmetic::{SupportsNeg, SupportsScale};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
@@ -12,7 +12,6 @@ use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-use super::SupportsScale;
 use super::sin::Sin;
 
 /// Trait that represents [`Operation`] carrier types that support/include [`CosOperation`]. Backend-owned closed

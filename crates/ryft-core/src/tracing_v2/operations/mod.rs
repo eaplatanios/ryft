@@ -67,5 +67,4 @@ pub use matrix_transpose::{MatrixTransposeOperation, SupportsMatrixTranspose};
 pub use primitive::{ArrayOperation, LinearArrayOperation};
 pub use reshape::{ReshapeOperation, SupportsReshape};
 pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
-pub use scale::{ScaleOperation, SupportsScale};
 pub use sin::{Sin, SinOperation, SupportsSin};

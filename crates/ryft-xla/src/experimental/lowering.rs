@@ -11,14 +11,16 @@ use ryft_ndarray::Array as NdArrayValue;
 
 use ryft_core::macros::check_count;
 use ryft_core::operations::Operation;
-use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
+use ryft_core::operations::arithmetic::{
+    AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
+};
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing::{AtomId, Instruction, Program, Traceable, TracingError};
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use ryft_core::tracing_v2::operations::{
     CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation,
-    RightMatMulOperation, ScaleOperation, SinOperation,
+    RightMatMulOperation, SinOperation,
 };
 use ryft_core::tracing_v2::{ArrayOperation, CustomPrimitive, LinearArrayOperation, MatrixOps};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};

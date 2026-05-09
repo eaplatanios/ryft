@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
-    NEG_OPERATION_NAME, NegOperation, SUB_OPERATION_NAME, SubOperation, SupportsAdd, SupportsDiv, SupportsMul,
-    SupportsNeg, SupportsSub,
+    NEG_OPERATION_NAME, NegOperation, SCALE_OPERATION_NAME, SUB_OPERATION_NAME, ScaleOperation, SubOperation,
+    SupportsAdd, SupportsDiv, SupportsMul, SupportsNeg, SupportsScale, SupportsSub,
 };
 use crate::operations::constants::{
     ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
@@ -14,8 +14,8 @@ use crate::operations::{Operation, OperationFormatter};
 use crate::parameters::Parameter;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::operations::{
-    CosOperation, CustomPrimitive, LinearCustomPrimitive, ScaleOperation, SinOperation, SupportsCos, SupportsCustom,
-    SupportsLinearCustom, SupportsScale, SupportsSin,
+    CosOperation, CustomPrimitive, LinearCustomPrimitive, SinOperation, SupportsCos, SupportsCustom,
+    SupportsLinearCustom, SupportsSin,
 };
 use crate::types::{DataType, TypeError};
 
@@ -378,7 +378,7 @@ where
             Self::Neg => NEG_OPERATION_NAME,
             Self::Sin => "sin",
             Self::Cos => "cos",
-            Self::Scale { .. } => "scale",
+            Self::Scale { .. } => SCALE_OPERATION_NAME,
             Self::Custom(op) => op.name(),
         }
     }
@@ -398,7 +398,7 @@ where
             Self::Add => ADD_OPERATION_NAME,
             Self::Sub => SUB_OPERATION_NAME,
             Self::Neg => NEG_OPERATION_NAME,
-            Self::Scale { .. } => "scale",
+            Self::Scale { .. } => SCALE_OPERATION_NAME,
             Self::Custom(op) => op.name(),
         }
     }
@@ -441,7 +441,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ScalarOperation
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
-            Self::Scale { .. } => ScaleOperation::<DataType, V>::abstract_eval_static(input_types),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
         }
     }
@@ -473,7 +473,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearScalarOpe
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
-            Self::Scale { .. } => ScaleOperation::<DataType, V>::abstract_eval_static(input_types),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
         }
     }

@@ -539,13 +539,12 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::macros::check_count;
-    use crate::operations::arithmetic::{ADD_OPERATION_NAME, AddOperation, SupportsAdd, SupportsNeg};
+    use crate::operations::arithmetic::{ADD_OPERATION_NAME, AddOperation, SupportsAdd, SupportsNeg, SupportsScale};
     use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
     use crate::operations::{InterpretableOperation, Operation};
     use crate::tracing::engines::{ScalarEngine, Tracer};
     use crate::tracing::transposition::LinearOperation;
     use crate::tracing::{Traceable, TracingError, Value};
-    use crate::tracing_v2::operations::scale::SupportsScale;
     use crate::tracing_v2::{Differentiable, DifferentiationError};
     use crate::types::{Type, TypeError, Typed};
 

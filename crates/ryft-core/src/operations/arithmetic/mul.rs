@@ -3,7 +3,7 @@ use std::ops::Mul;
 
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
-use crate::operations::{ElementwiseArrayOperation, InterpretableOperation, Operation};
+use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -35,7 +35,7 @@ impl Operation<DataType> for MulOperation {
     }
 }
 
-impl ElementwiseArrayOperation for MulOperation {
+impl ElementwiseOperation for MulOperation {
     #[inline]
     fn name(&self) -> &'static str {
         MUL_OPERATION_NAME

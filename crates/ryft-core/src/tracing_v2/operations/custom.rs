@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized};
@@ -259,6 +260,7 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
             + Sub<Output = V>
             + Mul<Output = V>
             + Neg<Output = V>
+            + Scale<Output = V>
             + Zero<ArrayType>
             + One<ArrayType>
             + ZeroLike
@@ -314,6 +316,7 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
             + Sub<Output = V>
             + Mul<Output = V>
             + Neg<Output = V>
+            + Scale<Output = V>
             + Zero<ArrayType>
             + One<ArrayType>
             + ZeroLike

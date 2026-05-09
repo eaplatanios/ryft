@@ -4,8 +4,8 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
-    NEG_OPERATION_NAME, NegOperation, SUB_OPERATION_NAME, SubOperation, SupportsAdd, SupportsDiv, SupportsMul,
-    SupportsNeg, SupportsSub,
+    NEG_OPERATION_NAME, NegOperation, SCALE_OPERATION_NAME, SUB_OPERATION_NAME, ScaleOperation, SubOperation,
+    SupportsAdd, SupportsDiv, SupportsMul, SupportsNeg, SupportsScale, SupportsSub,
 };
 use ryft_core::operations::constants::{
     ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
@@ -16,9 +16,8 @@ use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{AtomId, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
-    ConditionOperation, CosOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, ScaleOperation,
-    SinOperation, SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsReshape, SupportsScale,
-    SupportsSin, WhileOperation,
+    ConditionOperation, CosOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, SinOperation,
+    SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsReshape, SupportsSin, WhileOperation,
 };
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableOperation, JvpContext, LinearArrayOperation,
@@ -172,7 +171,7 @@ impl Operation<ArrayType> for XlaOperation {
             Self::Cos => "cos",
             Self::MatrixMultiply => "matmul",
             Self::Transpose => "matrix_transpose",
-            Self::Scale { .. } => "scale",
+            Self::Scale { .. } => SCALE_OPERATION_NAME,
             Self::Reshape { .. } => "reshape",
             Self::Condition(condition) => condition.name(),
             Self::While(while_operation) => while_operation.name(),
@@ -198,7 +197,7 @@ impl Operation<ArrayType> for XlaOperation {
             Self::Cos => CosOperation.infer_output_types(input_types),
             Self::MatrixMultiply => MatMulOperation.infer_output_types(input_types),
             Self::Transpose => MatrixTransposeOperation.infer_output_types(input_types),
-            Self::Scale { .. } => ScaleOperation::<ArrayType, ShardMapTensor>::abstract_eval_static(input_types),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
             }
@@ -271,8 +270,9 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
             Self::MatrixMultiply => MatMulOperation.interpret(inputs),
             Self::Transpose => MatrixTransposeOperation.interpret(inputs),
             Self::Scale { factor } => {
-                let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
-                ScaleOperation::new(exemplar.context.constant(factor.clone())).interpret(inputs)
+                check_count!("input", inputs, 1, TracingError);
+                let factor = inputs[0].context.constant(factor.clone());
+                Ok(vec![factor * inputs[0].clone()])
             }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
-    NEG_OPERATION_NAME, NegOperation, SUB_OPERATION_NAME, SubOperation, SupportsAdd, SupportsDiv, SupportsMul,
-    SupportsNeg, SupportsSub,
+    NEG_OPERATION_NAME, NegOperation, SCALE_OPERATION_NAME, SUB_OPERATION_NAME, Scale, ScaleOperation, SubOperation,
+    SupportsAdd, SupportsDiv, SupportsMul, SupportsNeg, SupportsScale, SupportsSub,
 };
 use crate::operations::constants::{
     ONE_LIKE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
@@ -27,7 +27,7 @@ use crate::tracing_v2::operations::left_matmul::left_matmul_abstract_eval;
 use crate::tracing_v2::operations::right_matmul::right_matmul_abstract_eval;
 use crate::tracing_v2::operations::{
     CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation,
-    RightMatMulOperation, ScaleOperation, SinOperation,
+    RightMatMulOperation, SinOperation,
 };
 use crate::tracing_v2::{
     Cos, DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, MatrixOps, Sin,
@@ -41,7 +41,6 @@ use super::matmul::SupportsMatMul;
 use super::matrix_transpose::SupportsMatrixTranspose;
 use super::reshape::SupportsReshape;
 use super::right_matmul::SupportsRightMatMul;
-use super::scale::SupportsScale;
 use super::sin::SupportsSin;
 
 type ZeroScalarTangent = Tangent<DataType, Infallible>;
@@ -535,7 +534,7 @@ where
             Self::Cos => "cos",
             Self::MatrixMultiply => "matmul",
             Self::Transpose => "matrix_transpose",
-            Self::Scale { .. } => "scale",
+            Self::Scale { .. } => SCALE_OPERATION_NAME,
             Self::Reshape { .. } => "reshape",
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
@@ -560,7 +559,7 @@ where
             Self::Sub => SUB_OPERATION_NAME,
             Self::Neg => NEG_OPERATION_NAME,
             Self::Transpose => "matrix_transpose",
-            Self::Scale { .. } => "scale",
+            Self::Scale { .. } => SCALE_OPERATION_NAME,
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
@@ -807,7 +806,7 @@ fn interpret_tangent_value_scale<T, V, O>(
 ) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
     T: Type,
-    V: Traceable<T> + Mul<Output = V>,
+    V: Traceable<T> + Scale<Output = V>,
     O: Operation<T>,
     ScaleOperation<T, V>: InterpretableOperation<T, V>,
 {
@@ -874,7 +873,7 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for ArrayOperatio
             Self::Cos => CosOperation.infer_output_types(input_types),
             Self::MatrixMultiply => MatMulOperation.infer_output_types(input_types),
             Self::Transpose => MatrixTransposeOperation.infer_output_types(input_types),
-            Self::Scale { .. } => ScaleOperation::<ArrayType, V>::abstract_eval_static(input_types),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
             }
@@ -920,7 +919,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ArrayOperation<
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
-            Self::Scale { .. } => ScaleOperation::<DataType, V>::abstract_eval_static(input_types),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
             Self::MatrixMultiply | Self::Transpose | Self::Reshape { .. } | Self::Condition(_) | Self::While(_) => {
                 Err(unsupported_scalar_metadata_operation(self.operation_name()))
@@ -961,7 +960,7 @@ impl<V: Traceable<ArrayType> + Parameter> Operation<ArrayType> for LinearArrayOp
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Transpose => MatrixTransposeOperation.infer_output_types(input_types),
-            Self::Scale { .. } => ScaleOperation::<ArrayType, V>::abstract_eval_static(input_types),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::LeftMatMul { factor } => {
                 let factor_type = <V as Typed<ArrayType>>::r#type(factor);
                 left_matmul_abstract_eval(factor_type.as_ref(), input_types)
@@ -1015,7 +1014,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearArrayOper
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
-            Self::Scale { .. } => ScaleOperation::<DataType, V>::abstract_eval_static(input_types),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
             Self::Transpose
             | Self::LeftMatMul { .. }
@@ -1055,6 +1054,7 @@ where
         + Mul<Output = V>
         + Div<Output = V>
         + Neg<Output = V>
+        + Scale<Output = V>
         + Sin
         + Cos
         + Zero<DataType>
@@ -1105,6 +1105,7 @@ where
         + Sub<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
+        + Scale<Output = V>
         + Zero<DataType>
         + One<DataType>
         + OneLike,
@@ -1131,6 +1132,7 @@ where
         + Sub<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
+        + Scale<Output = V>
         + Zero<DataType>
         + One<DataType>
         + ZeroLike
@@ -1190,7 +1192,10 @@ where
             Self::Neg => {
                 <NegOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&NegOperation, inputs)
             }
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Scale { factor } => {
+                check_count!("input", inputs, 1, TracingError);
+                Ok(vec![factor.clone() * inputs[0].clone()])
+            }
             Self::Custom(op) => op.interpret(inputs),
         }
     }
@@ -1210,6 +1215,7 @@ where
         + Mul<Output = V>
         + Div<Output = V>
         + Neg<Output = V>
+        + Scale<Output = V>
         + Sin
         + Cos
         + Zero<ArrayType>
@@ -1255,6 +1261,7 @@ where
         + Mul<Output = V>
         + Div<Output = V>
         + Neg<Output = V>
+        + Scale<Output = V>
         + Sin
         + Cos
         + Zero<DataType>
@@ -1332,6 +1339,7 @@ where
         + Sub<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
+        + Scale<Output = V>
         + Zero<ArrayType>
         + One<ArrayType>
         + OneLike
@@ -1456,6 +1464,7 @@ where
         + Sub<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
+        + Scale<Output = V>
         + Zero<ArrayType>
         + One<ArrayType>
         + ZeroLike
@@ -1506,6 +1515,7 @@ where
         + Sub<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
+        + Scale<Output = V>
         + Zero<DataType>
         + One<DataType>
         + OneLike,
@@ -1538,6 +1548,7 @@ where
         + Sub<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
+        + Scale<Output = V>
         + Zero<DataType>
         + One<DataType>
         + ZeroLike
@@ -1615,7 +1626,10 @@ where
                 inputs,
             ),
             Self::Transpose => MatrixTransposeOperation.interpret(inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Scale { factor } => {
+                check_count!("input", inputs, 1, TracingError);
+                Ok(vec![factor.clone() * inputs[0].clone()])
+            }
             Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).interpret(inputs),
             Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).interpret(inputs),
             Self::Reshape { input_shape, output_shape } => {
@@ -1667,7 +1681,10 @@ where
             Self::Neg => {
                 <NegOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&NegOperation, inputs)
             }
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Scale { factor } => {
+                check_count!("input", inputs, 1, TracingError);
+                Ok(vec![factor.clone() * inputs[0].clone()])
+            }
             Self::Custom(op) => op.interpret(inputs),
             Self::Transpose
             | Self::LeftMatMul { .. }
@@ -2144,7 +2161,7 @@ where
     <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<DataType, E::Tangent>
         + SupportsNeg<DataType, E::Tangent>
         + SupportsSub<DataType, E::Tangent>
-        + super::SupportsScale<DataType, E::Tangent, E::Value>,
+        + SupportsScale<DataType, E::Tangent, E::Value>,
 {
     fn jvp(
         &self,
@@ -2202,7 +2219,7 @@ where
     <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<ArrayType, E::Tangent>
         + SupportsNeg<ArrayType, E::Tangent>
         + SupportsSub<ArrayType, E::Tangent>
-        + super::SupportsScale<ArrayType, E::Tangent, V>
+        + SupportsScale<ArrayType, E::Tangent, V>
         + super::SupportsLeftMatMul<ArrayType, E::Tangent, V>
         + super::SupportsRightMatMul<ArrayType, E::Tangent, V>
         + super::SupportsMatrixTranspose<ArrayType, E::Tangent>
@@ -2262,7 +2279,7 @@ where
     <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<DataType, E::Tangent>
         + SupportsNeg<DataType, E::Tangent>
         + SupportsSub<DataType, E::Tangent>
-        + super::SupportsScale<DataType, E::Tangent, V>,
+        + SupportsScale<DataType, E::Tangent, V>,
 {
     fn jvp(
         &self,
@@ -2333,7 +2350,7 @@ where
         + SupportsNeg<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + SupportsSub<ArrayType, V>
-        + super::SupportsScale<ArrayType, V>
+        + SupportsScale<ArrayType, V>
         + super::SupportsLeftMatMul<ArrayType, V>
         + super::SupportsRightMatMul<ArrayType, V>
         + super::SupportsMatrixTranspose<ArrayType, V>
@@ -2415,7 +2432,7 @@ where
         + SupportsNeg<DataType, V>
         + SupportsAdd<DataType, V>
         + SupportsSub<DataType, V>
-        + super::SupportsScale<DataType, V>
+        + SupportsScale<DataType, V>
         + InterpretableOperation<DataType, V>
         + LinearOperation<DataType, V, LinearArrayOperation<V, DataType>>,
     Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>

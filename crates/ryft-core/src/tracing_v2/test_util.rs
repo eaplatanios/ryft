@@ -3,6 +3,7 @@ use std::fmt::Display;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::broadcasting::Broadcastable;
+use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::parameters::Parameter;
 use crate::tracing::engines::{Engine, Tracer, TracingEngine};
@@ -186,6 +187,14 @@ impl Mul for TestArray {
 
     fn mul(self, rhs: Self) -> Self::Output {
         self.binary(rhs, |left, right| left * right)
+    }
+}
+
+impl Scale for TestArray {
+    type Output = Self;
+
+    fn scale(self, factor: Self) -> Self::Output {
+        factor * self
     }
 }
 

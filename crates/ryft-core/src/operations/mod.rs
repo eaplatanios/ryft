@@ -158,7 +158,7 @@ pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
 /// implementations declare their fixed input count and operation name, while the default type inference implementation
 /// checks the input count, broadcasts all input [`ArrayType`]s while tolerating shardings that differ only by
 /// [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes).
-pub trait ElementwiseArrayOperation: Debug {
+pub trait ElementwiseOperation: Debug {
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
 
@@ -199,15 +199,15 @@ pub trait ElementwiseArrayOperation: Debug {
     }
 }
 
-impl<O: ElementwiseArrayOperation> Operation<ArrayType> for O {
+impl<O: ElementwiseOperation> Operation<ArrayType> for O {
     #[inline]
     fn name(&self) -> &'static str {
-        ElementwiseArrayOperation::name(self)
+        ElementwiseOperation::name(self)
     }
 
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        ElementwiseArrayOperation::infer_output_types(self, input_types)
+        ElementwiseOperation::infer_output_types(self, input_types)
     }
 }
 
@@ -404,7 +404,7 @@ mod tests {
             input_count: usize,
         }
 
-        impl ElementwiseArrayOperation for TestElementwiseArrayOperation {
+        impl ElementwiseOperation for TestElementwiseArrayOperation {
             #[inline]
             fn name(&self) -> &'static str {
                 "elementwise_test"

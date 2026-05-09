@@ -25,8 +25,9 @@ pub trait SupportsLeftMatMul<T: Type, V: Traceable<T>, F: Traceable<T> = V> {
 
 /// Linear map `tangent -> factor @ tangent`.
 ///
-/// [`LeftMatMulOperation`] is the matrix-valued analogue of [`super::ScaleOperation`]: it captures one factor in
-/// the op object and applies that factor to every input it is replayed on.
+/// [`LeftMatMulOperation`] is the matrix-valued analogue of
+/// [`ScaleOperation`](crate::operations::arithmetic::ScaleOperation): it captures one factor in the op object and
+/// applies that factor to every input it is replayed on.
 #[derive(Clone, Debug)]
 pub struct LeftMatMulOperation<V: MatrixValue> {
     /// Matrix factor multiplied on the left of every input.

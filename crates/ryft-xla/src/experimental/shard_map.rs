@@ -14,7 +14,7 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use ryft_core::macros::check_count;
-use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, SubOperation};
+use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, Scale, SubOperation};
 use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
@@ -443,6 +443,14 @@ impl Mul for ShardMapTensor {
             _ => None,
         };
         Self { array_type: output_type, constant_kind }
+    }
+}
+
+impl Scale for ShardMapTensor {
+    type Output = Self;
+
+    fn scale(self, factor: Self) -> Self::Output {
+        factor * self
     }
 }
 

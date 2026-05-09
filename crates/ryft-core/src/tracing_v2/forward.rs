@@ -218,7 +218,8 @@ mod tests {
     use crate::macros::check_count;
     use crate::operations::Operation;
     use crate::operations::arithmetic::{
-        AddOperation, MulOperation, NegOperation, SubOperation, SupportsAdd, SupportsMul, SupportsNeg, SupportsSub,
+        AddOperation, MulOperation, NegOperation, SubOperation, SupportsAdd, SupportsMul, SupportsNeg, SupportsScale,
+        SupportsSub,
     };
     use crate::operations::constants::{
         One, OneLike, OneOperation, SupportsOne, SupportsZero, Zero, ZeroLike, ZeroOperation,
@@ -229,7 +230,6 @@ mod tests {
     use crate::tracing::transposition::LinearOperation;
     use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TranspositionContext, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-    use crate::tracing_v2::operations::SupportsScale;
     use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, Sin};
     use crate::types::{DataType, Typed};
 

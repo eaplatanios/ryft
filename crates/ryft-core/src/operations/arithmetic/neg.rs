@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::ops::Neg;
 
 use crate::macros::check_count;
-use crate::operations::{ElementwiseArrayOperation, InterpretableOperation, Operation};
+use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -32,7 +32,7 @@ impl Operation<DataType> for NegOperation {
     }
 }
 
-impl ElementwiseArrayOperation for NegOperation {
+impl ElementwiseOperation for NegOperation {
     #[inline]
     fn name(&self) -> &'static str {
         NEG_OPERATION_NAME

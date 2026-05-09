@@ -3,12 +3,10 @@ use std::ops::Mul;
 use crate::TracingEngine;
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{MulOperation, SupportsAdd};
+use crate::operations::arithmetic::{MulOperation, SupportsAdd, SupportsScale};
 use crate::tracing::{AtomId, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
-
-use super::SupportsScale;
 
 impl<E> DifferentiableOperation<E> for MulOperation
 where

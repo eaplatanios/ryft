@@ -6,7 +6,9 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::macros::check_count;
-use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
+use crate::operations::arithmetic::{
+    AddOperation, DivOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation,
+};
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
@@ -302,6 +304,7 @@ impl<
         + Mul<Output = V>
         + Div<Output = V>
         + Neg<Output = V>
+        + Scale<Output = V>
         + Sin
         + Cos
         + Zero<ArrayType>
@@ -339,10 +342,9 @@ where
                 &crate::tracing_v2::operations::MatrixTransposeOperation,
                 inputs,
             ),
-            Self::Scale { factor } => batch_by_interpreting_physical_operation(
-                &crate::tracing_v2::operations::ScaleOperation::new(factor.clone()),
-                inputs,
-            ),
+            Self::Scale { factor } => {
+                batch_by_interpreting_physical_operation(&ScaleOperation::new(factor.clone()), inputs)
+            }
             Self::Reshape { input_shape, output_shape } => batch_by_interpreting_physical_operation(
                 &crate::tracing_v2::operations::ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                 inputs,
@@ -360,6 +362,7 @@ impl<
         + Sub<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
+        + Scale<Output = V>
         + Zero<ArrayType>
         + One<ArrayType>
         + ZeroLike

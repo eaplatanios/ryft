@@ -708,12 +708,13 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::operations::arithmetic::{ADD_OPERATION_NAME, SUB_OPERATION_NAME, SupportsAdd, SupportsNeg};
+    use crate::operations::arithmetic::{
+        ADD_OPERATION_NAME, SUB_OPERATION_NAME, SupportsAdd, SupportsNeg, SupportsScale,
+    };
     use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
     use crate::parameters::{Parameter, Placeholder};
     use crate::tracing::engines::Engine;
     use crate::tracing::{ProgramBuilder, Traceable, Value};
-    use crate::tracing_v2::operations::SupportsScale;
     use crate::tracing_v2::{ArrayOperation, Differentiable};
     use crate::types::DataType;
 
