@@ -6,33 +6,33 @@ use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::SupportsZero;
 use crate::parameters::Parameterized;
 use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
-use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, TracingError};
+use crate::tracing::{Instruction, Program, ProgramBuilder, TracingError};
 
 impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
     /// Transposes a traced linear [`Program`] using this [`TracingContext`] for zero materialization.
     ///
-    /// The transpose program itself is staged in a fresh linear-program builder. Any zero operation
+    /// The transposes program itself is staged in a fresh program builder. Any zero operation
     /// produced for a disconnected primal input is then replaced with a traced constant whose
     /// underlying outer-trace value is synthesized through [`Engine::zero`](crate::tracing::engines::Engine::zero).
-    pub fn transpose<Input: Parameterized<Tracer<'engine, E>>, Output: Parameterized<Tracer<'engine, E>>, O>(
+    pub fn transpose<
+        Input: Parameterized<Tracer<'engine, E>>,
+        Output: Parameterized<Tracer<'engine, E>>,
+        O: LinearOperation<E::Type, Tracer<'engine, E>, O>,
+    >(
         &self,
         program: &Program<E::Type, Tracer<'engine, E>, O, Input, Output>,
     ) -> Result<Program<E::Type, Tracer<'engine, E>, O, Output, Input>, TracingError>
     where
         E: 'static,
-        O: Clone
-            + LinearOperation<E::Type, Tracer<'engine, E>, O>
-            + SupportsZero<E::Type, Tracer<'engine, E>>
-            + SupportsAdd<E::Type, Tracer<'engine, E>>,
+        O: Clone + SupportsZero<E::Type, Tracer<'engine, E>> + SupportsAdd<E::Type, Tracer<'engine, E>>,
     {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new()));
         let mut context = TranspositionContext::new(builder);
         let pullback = context.transpose(program)?;
-
         let mut builder = ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new();
         builder.atoms = pullback.atoms.clone();
         builder.input_ids = pullback.input_ids.clone();
-        let mut atom_remapping: Vec<Option<AtomId>> = vec![None; builder.atoms.len()];
+        let mut atom_remapping = vec![None; builder.atoms.len()];
         let mut rewritten_instructions = Vec::with_capacity(pullback.instructions.len());
         for instruction in &pullback.instructions {
             if let Some(zero_operation) = instruction.operation.as_zero_operation()

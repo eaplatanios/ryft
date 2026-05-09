@@ -25,7 +25,7 @@ use crate::types::{Type, Typed};
 ///
 /// Structural validation happens when the linear program is built and when transpose rules stage
 /// additional operations in the transpose builder.
-pub trait LinearOperation<T: Type, V: Traceable<T>, O: Clone + Operation<T>>: Operation<T> {
+pub trait LinearOperation<T: Type, V: Traceable<T>, O: Operation<T>>: Operation<T> {
     /// Applies this operation's transpose rule to symbolic output cotangents.
     ///
     /// The returned vector must contain one entry per operation input. Each `Some(atom)` is a
@@ -48,12 +48,12 @@ pub trait LinearOperation<T: Type, V: Traceable<T>, O: Clone + Operation<T>>: Op
 /// Context that is used while _transposing_ [`Program`](crate::Program)s. This context is threaded through the
 /// transposition transformation using [`LinearOperation::transpose`]. It owns the active [`ProgramBuilder`] that is
 /// used for building the transposed [`Program`](crate::Program).
-pub struct TranspositionContext<T: Type, V: Traceable<T>, O: Clone + Operation<T>> {
+pub struct TranspositionContext<T: Type, V: Traceable<T>, O: Operation<T>> {
     /// [`ProgramBuilder`] that owns the reverse linear [`Program`](crate::tracing::Program) currently being staged.
     pub builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> TranspositionContext<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Operation<T>> TranspositionContext<T, V, O> {
     /// Creates a new [`TranspositionContext`] that stages into the provided [`ProgramBuilder`].
     ///
     /// # Parameters
@@ -86,7 +86,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> TranspositionContext<T, 
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>>
+impl<T: Type, V: Traceable<T>, O: LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>>
     TranspositionContext<T, V, O>
 {
     /// Transposes a complete linear [`Program`] using this context's current builder.
@@ -110,7 +110,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O> + SupportsZer
         &mut self,
         program: &Program<T, V, O, Input, Output>,
     ) -> Result<Program<T, V, O, Output, Input>, TracingError> {
-        fn accumulate<T: Type, V: Traceable<T>, O: Clone + Operation<T>>(
+        fn accumulate<T: Type, V: Traceable<T>, O: Operation<T>>(
             builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
             adjoints: &mut [Option<AtomId>],
             atom: AtomId,
@@ -136,7 +136,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O> + SupportsZer
             Ok(())
         }
 
-        fn stage_zero<T: Type, V: Traceable<T>, O: Clone + Operation<T>>(
+        fn stage_zero<T: Type, V: Traceable<T>, O: Operation<T>>(
             builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
             r#type: T,
         ) -> AtomId
@@ -196,9 +196,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O> + SupportsZer
             Ok(builder) => builder.into_inner(),
             Err(_) => return Err(TracingError::EscapedProgramBuilder),
         };
-        builder
-            .build(outputs, program.output_structure.clone(), program.input_structure.clone())?
-            .simplified()
+        builder.build(outputs, program.output_structure.clone(), program.input_structure.clone())
     }
 
     /// Transposes a nested linear [`Program`] without consuming this context's current builder.
