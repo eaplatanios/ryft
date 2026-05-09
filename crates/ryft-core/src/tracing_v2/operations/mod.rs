@@ -60,9 +60,10 @@ pub use custom::{
     CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, LinearCustomPrimitive, SupportsCustom,
     SupportsLinearCustom,
 };
-pub use left_matmul::{LeftMatMulOperation, SupportsLeftMatMul};
-pub use matmul::{MatMulOperation, SupportsMatMul};
-pub use matrix_transpose::{MatrixTransposeOperation, SupportsMatrixTranspose};
+pub use left_matmul::{LeftMatMul, LeftMatMulOperation, SupportsLeftMatMul};
+pub use matmul::{MatMul, MatMulOperation, SupportsMatMul};
+pub use matrix::{MatrixOps, MatrixValue};
+pub use matrix_transpose::{MatrixTranspose, MatrixTransposeOperation, SupportsMatrixTranspose};
 pub use primitive::{ArrayOperation, LinearArrayOperation};
-pub use reshape::{ReshapeOperation, SupportsReshape};
-pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
+pub use reshape::{Reshape, ReshapeOperation, ReshapeOps, ReshapeValue, SupportsReshape};
+pub use right_matmul::{RightMatMul, RightMatMulOperation, SupportsRightMatMul};

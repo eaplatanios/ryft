@@ -25,7 +25,7 @@ use ryft_core::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, Traci
 use ryft_core::tracing_v2::operations::{
     ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation,
 };
-use ryft_core::tracing_v2::{Differentiable, MatrixOps};
+use ryft_core::tracing_v2::{Differentiable, MatMul, MatrixTranspose};
 
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::XlaOperation;
@@ -506,7 +506,7 @@ impl Cos for ShardMapTensor {
     }
 }
 
-impl MatrixOps for ShardMapTensor {
+impl MatMul for ShardMapTensor {
     fn matmul(self, rhs: Self) -> Self {
         let output_type = MatMulOperation
             .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
@@ -522,7 +522,9 @@ impl MatrixOps for ShardMapTensor {
         };
         Self { array_type: output_type, constant_kind }
     }
+}
 
+impl MatrixTranspose for ShardMapTensor {
     fn transpose_matrix(self) -> Self {
         let output_type = MatrixTransposeOperation
             .infer_output_types(&[self.array_type.clone()])

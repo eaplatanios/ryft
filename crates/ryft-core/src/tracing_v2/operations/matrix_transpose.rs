@@ -1,16 +1,18 @@
 use std::fmt::Display;
 
+use half::{bf16, f16};
+
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::engines::Tracer;
+use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::{ArrayType, Size, Type, TypeError, Typed};
 
 use super::LinearArrayOperation;
-use super::matrix::{MatrixOps, MatrixValue, transpose_abstract};
+use super::matrix::{MatrixValue, transpose_abstract};
 
 /// Trait that represents [`Operation`] carrier types that support/include [`MatrixTransposeOperation`]. Backend-owned
 /// closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this
@@ -19,6 +21,47 @@ use super::matrix::{MatrixOps, MatrixValue, transpose_abstract};
 pub trait SupportsMatrixTranspose<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the matrix transposition [`Operation`].
     fn matrix_transpose_operation() -> Self;
+}
+
+/// Value-level matrix transposition capability.
+///
+/// [`MatrixTranspose`] is the receiver-style entry point for staging or executing [`MatrixTransposeOperation`].
+pub trait MatrixTranspose: Sized {
+    /// Computes the rank-2 matrix transpose of `self`.
+    fn transpose_matrix(self) -> Self;
+}
+
+macro_rules! impl_matrix_transpose_for_scalar {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl MatrixTranspose for $ty {
+                #[inline]
+                fn transpose_matrix(self) -> Self {
+                    self
+                }
+            }
+        )*
+    };
+}
+
+impl_matrix_transpose_for_scalar!(bf16, f16, f32, f64);
+
+impl<'engine, V: Traceable<ArrayType>, E> MatrixTranspose for Tracer<'engine, E>
+where
+    E: TracingEngine<Type = ArrayType, Value = V>,
+    E::OperationCarrier: SupportsMatrixTranspose<ArrayType, V>,
+{
+    #[inline]
+    fn transpose_matrix(self) -> Self {
+        if matrix_transpose_is_identity_type(&self.r#type()) {
+            return self;
+        }
+        self.unary(E::OperationCarrier::matrix_transpose_operation())
+    }
+}
+
+fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
+    matches!(r#type.shape.dimensions.as_slice(), [Size::Static(1), Size::Static(1)])
 }
 
 /// Primitive representing matrix transposition.
@@ -83,14 +126,12 @@ where
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
+        _context: &mut JvpContext<'jvp, E>,
         inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
     ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().transpose_matrix();
-        let mut tangent_outputs =
-            context.stage(E::LinearOperationCarrier::matrix_transpose_operation(), &[inputs[0].tangent.clone()])?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
+        let tangent = inputs[0].tangent.clone().transpose_matrix();
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }

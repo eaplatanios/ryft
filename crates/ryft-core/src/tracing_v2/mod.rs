@@ -29,8 +29,12 @@ pub use linear::{
     ConcreteValueAndGrad, CoordinateValue, DenseJacobian, TracedValueAndGrad, ValueAndGradDispatch, grad_with_aux,
     jacrev, linearize, value_and_grad, value_and_grad_with_aux, vjp,
 };
+pub use operations::left_matmul::LeftMatMul;
+pub use operations::matmul::MatMul;
 pub use operations::matrix::{MatrixOps, MatrixValue};
-pub use operations::reshape::{ReshapeOps, ReshapeValue};
+pub use operations::matrix_transpose::MatrixTranspose;
+pub use operations::reshape::{Reshape, ReshapeOps, ReshapeValue};
+pub use operations::right_matmul::RightMatMul;
 pub use operations::{
     ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, CustomOperationError,
     CustomPrimitive, CustomPrimitiveExtensions, FlatProgram, LinearArrayOperation, LinearCustomPrimitive,

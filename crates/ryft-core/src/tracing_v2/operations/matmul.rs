@@ -1,17 +1,18 @@
 use std::fmt::Display;
 
+use half::{bf16, f16};
+
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::engines::Tracer;
+use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::{ArrayType, Type, TypeError};
 
-use super::left_matmul::SupportsLeftMatMul;
-use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
-use super::right_matmul::SupportsRightMatMul;
-use crate::operations::arithmetic::SupportsAdd;
+use super::left_matmul::{LeftMatMul, SupportsLeftMatMul};
+use super::matrix::{MatrixValue, matmul_abstract};
+use super::right_matmul::{RightMatMul, SupportsRightMatMul};
 
 /// Trait that represents [`Operation`] carrier types that support/include [`MatMulOperation`]. Backend-owned closed
 /// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
@@ -20,6 +21,41 @@ use crate::operations::arithmetic::SupportsAdd;
 pub trait SupportsMatMul<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the matrix multiplication [`Operation`].
     fn matmul_operation() -> Self;
+}
+
+/// Value-level matrix multiplication capability.
+///
+/// [`MatMul`] fills the same role for [`MatMulOperation`] that [`std::ops::Add`] fills for elementwise addition, but
+/// keeps the matrix-specific operation out of the standard operator namespace.
+pub trait MatMul<Rhs = Self>: Sized {
+    /// Computes `self @ rhs`.
+    fn matmul(self, rhs: Rhs) -> Self;
+}
+
+macro_rules! impl_matmul_for_scalar {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl MatMul for $ty {
+                #[inline]
+                fn matmul(self, rhs: Self) -> Self {
+                    self * rhs
+                }
+            }
+        )*
+    };
+}
+
+impl_matmul_for_scalar!(bf16, f16, f32, f64);
+
+impl<'engine, V: Traceable<ArrayType>, E> MatMul for Tracer<'engine, E>
+where
+    E: TracingEngine<Type = ArrayType, Value = V>,
+    E::OperationCarrier: SupportsMatMul<ArrayType, V>,
+{
+    #[inline]
+    fn matmul(self, rhs: Self) -> Self {
+        self.binary(rhs, E::OperationCarrier::matmul_operation())
+    }
 }
 
 /// Primitive representing matrix multiplication.
@@ -64,24 +100,15 @@ where
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
+        _context: &mut JvpContext<'jvp, E>,
         inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
     ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
         let primal = left.primal.clone().matmul(right.primal.clone());
-        let left_term_outputs = context
-            .stage(E::LinearOperationCarrier::right_matmul_operation(right.primal.clone()), &[left.tangent.clone()])?;
-        check_count!("output", left_term_outputs, 1, TracingError);
-        let right_term_outputs = context
-            .stage(E::LinearOperationCarrier::left_matmul_operation(left.primal.clone()), &[right.tangent.clone()])?;
-        check_count!("output", right_term_outputs, 1, TracingError);
-        let mut tangent_outputs = context.stage(
-            E::LinearOperationCarrier::add_operation(),
-            &[left_term_outputs[0].clone(), right_term_outputs[0].clone()],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
+        let tangent = left.tangent.clone().right_matmul(right.primal.clone())
+            + right.tangent.clone().left_matmul(left.primal.clone());
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }

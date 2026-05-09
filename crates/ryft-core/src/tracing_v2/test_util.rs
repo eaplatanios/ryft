@@ -12,7 +12,7 @@ use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use crate::tracing_v2::{
     ArrayOperation, CoordinateValue, Differentiable, DifferentiableEngine, DifferentiableTracingEngine,
-    LinearArrayOperation, MatrixOps, ReshapeOps,
+    LinearArrayOperation, MatMul, MatrixTranspose, Reshape,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
@@ -227,17 +227,19 @@ impl Cos for TestArray {
     }
 }
 
-impl MatrixOps for TestArray {
+impl MatMul for TestArray {
     fn matmul(self, rhs: Self) -> Self {
         self * rhs
     }
+}
 
+impl MatrixTranspose for TestArray {
     fn transpose_matrix(self) -> Self {
         self
     }
 }
 
-impl ReshapeOps for TestArray {
+impl Reshape for TestArray {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let output_type = ArrayType::new(self.r#type.data_type, target_shape, None, None).unwrap();
         assert_eq!(Self::element_count(&self.r#type), Self::element_count(&output_type));

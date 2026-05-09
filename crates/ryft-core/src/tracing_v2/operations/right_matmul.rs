@@ -1,18 +1,19 @@
 use std::fmt::Display;
 
 use crate::macros::check_count;
+use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::engines::{Tracer, TracingContext};
+use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
+use super::matmul::MatMul;
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
 use super::primitive::LinearArrayOperation;
-use crate::operations::arithmetic::SupportsAdd;
 
 /// Trait that represents [`Operation`] carrier types that support/include [`RightMatMulOperation`]. Backend-owned
 /// closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this
@@ -21,6 +22,27 @@ use crate::operations::arithmetic::SupportsAdd;
 pub trait SupportsRightMatMul<T: Type, V: Traceable<T>, F: Traceable<T> = V> {
     /// Constructs the carrier-specific representation of the right matrix multiplication [`Operation`].
     fn right_matmul_operation(factor: F) -> Self;
+}
+
+/// Value-level right matrix multiplication by a captured factor.
+///
+/// [`RightMatMul`] is the receiver-style entry point for staging or executing [`RightMatMulOperation`]. The receiver is
+/// the linear input and `factor` is closed over by the staged operation.
+pub trait RightMatMul<Factor = Self>: Sized {
+    /// Computes `self @ factor`.
+    fn right_matmul(self, factor: Factor) -> Self;
+}
+
+impl<'engine, E, F> RightMatMul<F> for Tracer<'engine, E>
+where
+    E: TracingEngine<Type = ArrayType>,
+    F: Traceable<ArrayType>,
+    E::OperationCarrier: SupportsRightMatMul<ArrayType, E::Value, F>,
+{
+    #[inline]
+    fn right_matmul(self, factor: F) -> Self {
+        self.unary(E::OperationCarrier::right_matmul_operation(factor))
+    }
 }
 
 /// Linear map `tangent -> tangent @ factor`.
@@ -111,17 +133,13 @@ where
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
+        _context: &mut JvpContext<'jvp, E>,
         inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
     ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().matmul(self.factor.clone());
-        let mut tangent_outputs = context.stage(
-            E::LinearOperationCarrier::right_matmul_operation(self.factor.clone()),
-            &[inputs[0].tangent.clone()],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
+        let tangent = inputs[0].tangent.clone().right_matmul(self.factor.clone());
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }
 
@@ -144,11 +162,7 @@ where
         check_count!("input", inputs, 1, TracingError);
         let factor_tracer = context.engine.constant(self.factor.clone());
         let primal = inputs[0].primal.clone().matmul(factor_tracer.clone());
-        let mut tangent_outputs = context.stage(
-            EInner::LinearOperationCarrier::<'engine>::right_matmul_operation(factor_tracer),
-            &[inputs[0].tangent.clone()],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
+        let tangent = inputs[0].tangent.clone().right_matmul(factor_tracer);
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }

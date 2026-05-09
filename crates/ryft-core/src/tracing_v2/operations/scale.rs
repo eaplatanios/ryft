@@ -77,12 +77,9 @@ where
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let factor_tracer = context.engine.constant(self.factor.clone());
-        let mut tangent_outputs = context.stage(
-            EInner::LinearOperationCarrier::<'engine>::scale_operation(factor_tracer.clone()),
-            &[input.tangent.clone()],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs.remove(0) }])
+        let primal = factor_tracer.clone() * input.primal.clone();
+        let tangent = input.tangent.clone().scale(factor_tracer);
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }
 
@@ -104,12 +101,9 @@ where
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let factor_tracer = context.engine.constant(self.factor.clone());
-        let mut tangent_outputs = context.stage(
-            EInner::LinearOperationCarrier::<'engine>::scale_operation(factor_tracer.clone()),
-            &[input.tangent.clone()],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs.remove(0) }])
+        let primal = factor_tracer.clone() * input.primal.clone();
+        let tangent = input.tangent.clone().scale(factor_tracer);
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }
 

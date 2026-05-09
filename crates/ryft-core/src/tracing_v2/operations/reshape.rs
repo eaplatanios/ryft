@@ -172,13 +172,18 @@ pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static st
 ///
 /// This trait is intentionally fallible because keeping the same Rust type before and after the
 /// reshape may rule out some logically valid target shapes for a given leaf representation.
-pub trait ReshapeOps: Sized {
+pub trait Reshape: Sized {
     /// Reshapes `self` to `target_shape`.
     ///
     /// Implementors keep the same Rust type before and after the reshape, so some value types can only accept a
     /// subset of logically valid shapes.
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError>;
 }
+
+/// Convenience trait for values that support reshape.
+pub trait ReshapeOps: Reshape {}
+
+impl<T: Reshape> ReshapeOps for T {}
 
 /// Convenience trait for traceable leaves that can serve as the concrete values of a staged reshape.
 ///
@@ -188,7 +193,7 @@ pub trait ReshapeValue: Traceable<ArrayType> + ReshapeOps {}
 
 impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
-impl<'engine, V: Traceable<ArrayType>, E> ReshapeOps for Tracer<'engine, E>
+impl<'engine, V: Traceable<ArrayType>, E> Reshape for Tracer<'engine, E>
 where
     E: TracingEngine<Type = ArrayType, Value = V>,
     E::OperationCarrier: SupportsReshape<ArrayType, V>,
@@ -302,17 +307,13 @@ where
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
+        _context: &mut JvpContext<'jvp, E>,
         inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
     ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().reshape(self.output_shape.clone())?;
-        let mut tangent_outputs = context.stage(
-            E::LinearOperationCarrier::reshape_operation(self.input_shape.clone(), self.output_shape.clone()),
-            &[inputs[0].tangent.clone()],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
+        let tangent = inputs[0].tangent.clone().reshape(self.output_shape.clone())?;
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }
 

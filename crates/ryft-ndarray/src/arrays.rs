@@ -10,7 +10,9 @@ use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
 use ryft_core::parameters::Parameter;
 use ryft_core::tracing::{Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
-use ryft_core::tracing_v2::{CoordinateValue, Cos, Differentiable, DifferentiationError, MatrixOps, ReshapeOps, Sin};
+use ryft_core::tracing_v2::{
+    CoordinateValue, Cos, Differentiable, DifferentiationError, MatMul, MatrixTranspose, Reshape, Sin,
+};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Element type supported by the `ryft-ndarray` backend.
@@ -405,7 +407,7 @@ impl<T: NdArrayElement> Cos for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> MatrixOps for Array<T> {
+impl<T: NdArrayElement> MatMul for Array<T> {
     fn matmul(self, rhs: Self) -> Self {
         let lhs_shape = self.values.shape().to_vec();
         let rhs_shape = rhs.values.shape().to_vec();
@@ -432,7 +434,9 @@ impl<T: NdArrayElement> MatrixOps for Array<T> {
         }
         Self::new(result.into_dyn())
     }
+}
 
+impl<T: NdArrayElement> MatrixTranspose for Array<T> {
     fn transpose_matrix(self) -> Self {
         let shape = self.values.shape().to_vec();
         let matrix = self
@@ -446,7 +450,7 @@ impl<T: NdArrayElement> MatrixOps for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> ReshapeOps for Array<T> {
+impl<T: NdArrayElement> Reshape for Array<T> {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.r#type().into_owned();
         let output_type =
@@ -535,7 +539,7 @@ mod tests {
     use ryft_core::tracing::engines::TracingEngine;
     use ryft_core::tracing::transposition::{LinearOperation, TranspositionContext};
     use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation};
-    use ryft_core::tracing_v2::{MatrixOps, ReshapeOps};
+    use ryft_core::tracing_v2::{MatMul, MatrixTranspose, Reshape};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
     use crate::{LinearNdarrayOperation, NdArrayEngine};

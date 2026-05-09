@@ -22,7 +22,9 @@ use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, Condit
 use ryft_core::tracing_v2::operations::{
     LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, RightMatMulOperation,
 };
-use ryft_core::tracing_v2::{ArrayOperation, CustomPrimitive, LinearArrayOperation, MatrixOps};
+use ryft_core::tracing_v2::{
+    ArrayOperation, CustomPrimitive, LinearArrayOperation, MatMul, MatrixOps, MatrixTranspose, Reshape,
+};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
 
 use crate::experimental::operations::{
@@ -2550,7 +2552,7 @@ mod tests {
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::{
         ArrayOperation, CoordinateValue, CustomPrimitive, Differentiable, DifferentiableEngine,
-        DifferentiableTracingEngine, LinearArrayOperation, MatrixOps, ReshapeOps,
+        DifferentiableTracingEngine, LinearArrayOperation,
     };
     use ryft_core::types::{Shape, TypeError, Typed};
     #[cfg(feature = "ndarray")]
@@ -2736,17 +2738,19 @@ mod tests {
         }
     }
 
-    impl MatrixOps for TestArray {
+    impl MatMul for TestArray {
         fn matmul(self, rhs: Self) -> Self {
             self * rhs
         }
+    }
 
+    impl MatrixTranspose for TestArray {
         fn transpose_matrix(self) -> Self {
             self
         }
     }
 
-    impl ReshapeOps for TestArray {
+    impl Reshape for TestArray {
         fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
             Ok(Self {
                 r#type: ArrayType::new(self.r#type.data_type, target_shape, None, None).unwrap(),
@@ -2868,7 +2872,7 @@ mod tests {
     #[cfg(feature = "ndarray")]
     fn bilinear_matmul<M>(inputs: (M, M)) -> M
     where
-        M: MatrixOps,
+        M: ryft_core::tracing_v2::MatrixOps,
     {
         inputs.0.matmul(inputs.1)
     }

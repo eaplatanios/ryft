@@ -1,18 +1,19 @@
 use std::fmt::Display;
 
 use crate::macros::check_count;
+use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::engines::{Tracer, TracingContext};
+use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
+use super::matmul::MatMul;
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
 use super::primitive::LinearArrayOperation;
-use crate::operations::arithmetic::SupportsAdd;
 
 /// Trait that represents [`Operation`] carrier types that support/include [`LeftMatMulOperation`]. Backend-owned closed
 /// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
@@ -21,6 +22,28 @@ use crate::operations::arithmetic::SupportsAdd;
 pub trait SupportsLeftMatMul<T: Type, V: Traceable<T>, F: Traceable<T> = V> {
     /// Constructs the carrier-specific representation of the left matrix multiplication [`Operation`].
     fn left_matmul_operation(factor: F) -> Self;
+}
+
+/// Value-level left matrix multiplication by a captured factor.
+///
+/// [`LeftMatMul`] fills the same role for [`LeftMatMulOperation`] that
+/// [`crate::operations::arithmetic::Scale`] fills for scalar scaling: the receiver is the linear input and `factor`
+/// is closed over by the staged operation.
+pub trait LeftMatMul<Factor = Self>: Sized {
+    /// Computes `factor @ self`.
+    fn left_matmul(self, factor: Factor) -> Self;
+}
+
+impl<'engine, E, F> LeftMatMul<F> for Tracer<'engine, E>
+where
+    E: TracingEngine<Type = ArrayType>,
+    F: Traceable<ArrayType>,
+    E::OperationCarrier: SupportsLeftMatMul<ArrayType, E::Value, F>,
+{
+    #[inline]
+    fn left_matmul(self, factor: F) -> Self {
+        self.unary(E::OperationCarrier::left_matmul_operation(factor))
+    }
 }
 
 /// Linear map `tangent -> factor @ tangent`.
@@ -113,17 +136,13 @@ where
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
+        _context: &mut JvpContext<'jvp, E>,
         inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
     ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal = self.factor.clone().matmul(inputs[0].primal.clone());
-        let mut tangent_outputs = context.stage(
-            E::LinearOperationCarrier::left_matmul_operation(self.factor.clone()),
-            &[inputs[0].tangent.clone()],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
+        let tangent = inputs[0].tangent.clone().left_matmul(self.factor.clone());
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }
 
@@ -146,11 +165,7 @@ where
         check_count!("input", inputs, 1, TracingError);
         let factor_tracer = context.engine.constant(self.factor.clone());
         let primal = factor_tracer.clone().matmul(inputs[0].primal.clone());
-        let mut tangent_outputs = context.stage(
-            EInner::LinearOperationCarrier::<'engine>::left_matmul_operation(factor_tracer),
-            &[inputs[0].tangent.clone()],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs.remove(0) }])
+        let tangent = inputs[0].tangent.clone().left_matmul(factor_tracer);
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }
