@@ -192,20 +192,19 @@ impl<'engine, E: TracingEngine<Value: Differentiable<E::Type>>> Differentiable<E
 /// [`TracingEngine::OperationCarrier`] is [`DifferentiableEngine::DifferentiableOperationCarrier`]. That keeps
 /// ordinary tracing free to use a wider operation carrier while making differentiation reject
 /// unsupported operations at type-check time when the differentiation carrier omits them.
-pub trait DifferentiableEngine: Engine
-where
-    Self::LinearEngine: TracingEngine<Type = Self::Type, Value = Self::Tangent>,
-    <Self::LinearEngine as TracingEngine>::OperationCarrier: Clone
-        + InterpretableOperation<Self::Type, Self::Tangent>
-        + LinearOperation<Self::Type, Self::Tangent, <Self::LinearEngine as TracingEngine>::OperationCarrier>
-        + SupportsZero<Self::Type, Self::Tangent>
-        + SupportsAdd<Self::Type, Self::Tangent>,
-{
+pub trait DifferentiableEngine: Engine {
     /// Tangent and cotangent leaf type selected by this differentiable engine.
     type Tangent: Traceable<Self::Type>;
 
     /// Tracing engine selected by this differentiable engine for tangent and cotangent programs.
-    type LinearEngine;
+    type LinearEngine: TracingEngine<Type = Self::Type, Value = Self::Tangent, OperationCarrier = Self::LinearOperationCarrier>;
+
+    /// Operation carrier selected by [`DifferentiableEngine::LinearEngine`] for tangent and cotangent programs.
+    type LinearOperationCarrier: Clone
+        + InterpretableOperation<Self::Type, Self::Tangent>
+        + LinearOperation<Self::Type, Self::Tangent, Self::LinearOperationCarrier>
+        + SupportsZero<Self::Type, Self::Tangent>
+        + SupportsAdd<Self::Type, Self::Tangent>;
 
     /// Operation carrier selected by this engine for tracing differentiable primal programs.
     ///
@@ -394,7 +393,7 @@ pub struct JvpContext<'a, E: DifferentiableEngine> {
 
     /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::tracing::Program) that is currently being
     /// traced.
-    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, <E::LinearEngine as TracingEngine>::OperationCarrier>>>,
+    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, E::LinearOperationCarrier>>>,
 }
 
 impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
@@ -402,25 +401,13 @@ impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
     #[doc(hidden)]
     pub fn new(
         engine: &'a E,
-        builder: Rc<
-            RefCell<
-                ProgramBuilder<
-                    E::Type,
-                    E::Tangent,
-                    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-                >,
-            >,
-        >,
+        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, E::LinearOperationCarrier>>>,
     ) -> Self {
         Self { engine, builder }
     }
 
     /// Stages one operation in the currently active linear program.
-    pub fn stage(
-        &self,
-        operation: <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-        inputs: &[AtomId],
-    ) -> Result<Vec<AtomId>, TracingError> {
+    pub fn stage(&self, operation: E::LinearOperationCarrier, inputs: &[AtomId]) -> Result<Vec<AtomId>, TracingError> {
         let mut builder_borrow = self.builder.borrow_mut();
         let input_types =
             inputs.iter().map(|atom| builder_borrow.atoms[atom.index].r#type().into_owned()).collect::<Vec<_>>();
@@ -492,13 +479,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         engine: &E,
         input_primals: Vec<V>,
     ) -> Result<
-        Program<
-            T,
-            E::Tangent,
-            <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-            Input::To<E::Tangent>,
-            Output::To<E::Tangent>,
-        >,
+        Program<T, E::Tangent, E::LinearOperationCarrier, Input::To<E::Tangent>, Output::To<E::Tangent>>,
         TracingError,
     >
     where
@@ -528,11 +509,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         }
 
         check_count!("input", input_primals, self.input_ids.len(), TracingError);
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<
-            T,
-            E::Tangent,
-            <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-        >::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<T, E::Tangent, E::LinearOperationCarrier>::new()));
         let mut primals: Vec<Option<V>> = vec![None; self.atoms.len()];
         let mut tangents: Vec<Option<AtomId>> = vec![None; self.atoms.len()];
         for (input_atom, input_primal) in self.input_ids.iter().copied().zip(input_primals.into_iter()) {
@@ -558,12 +535,11 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                         primal: primals[input_atom.index]
                             .clone()
                             .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
-                        tangent: tangent_for_atom::<
-                            T,
-                            V,
-                            <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-                        >(
-                            primals.as_slice(), &builder, tangents.as_mut_slice(), input_atom
+                        tangent: tangent_for_atom::<T, V, E::LinearOperationCarrier>(
+                            primals.as_slice(),
+                            &builder,
+                            tangents.as_mut_slice(),
+                            input_atom,
                         )?,
                     })
                 })
@@ -576,18 +552,19 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             }
         }
 
-        let output_tangents =
-            self.output_ids
-                .iter()
-                .copied()
-                .map(|output_atom| {
-                    tangent_for_atom::<
-                        T,
-                        V,
-                        <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-                    >(primals.as_slice(), &builder, tangents.as_mut_slice(), output_atom)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+        let output_tangents = self
+            .output_ids
+            .iter()
+            .copied()
+            .map(|output_atom| {
+                tangent_for_atom::<T, V, E::LinearOperationCarrier>(
+                    primals.as_slice(),
+                    &builder,
+                    tangents.as_mut_slice(),
+                    output_atom,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         drop(context);
         drop(tangents);
         let builder = match Rc::try_unwrap(builder) {
@@ -711,6 +688,7 @@ where
 {
     type Tangent = Tracer<'engine, E>;
     type LinearEngine = Self;
+    type LinearOperationCarrier = E::LinearOperationCarrier<'engine>;
     type DifferentiableOperationCarrier = AddOperation;
 
     #[inline]
@@ -724,6 +702,7 @@ macro_rules! impl_differentiable_engine_for_scalar {
         impl DifferentiableEngine for ScalarEngine<$ty> {
             type Tangent = $ty;
             type LinearEngine = crate::tracing::engines::LinearScalarEngine<$ty>;
+            type LinearOperationCarrier = LinearScalarOperation<$ty>;
             type DifferentiableOperationCarrier = ScalarOperation<$ty>;
 
             #[inline]

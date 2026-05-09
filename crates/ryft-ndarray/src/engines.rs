@@ -82,6 +82,7 @@ impl<T: NdArrayElement> TracingEngine for NdArrayLinearEngine<T> {
 impl<T: NdArrayElement> DifferentiableEngine for NdArrayEngine<T> {
     type Tangent = Array<T>;
     type LinearEngine = NdArrayLinearEngine<T>;
+    type LinearOperationCarrier = LinearNdarrayOperation<Array<T>>;
     type DifferentiableOperationCarrier = NdarrayOperation<Array<T>>;
 
     #[inline]

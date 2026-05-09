@@ -128,13 +128,7 @@ where
 
         let (primal_output, tangent_program): (
             Output,
-            Program<
-                E::Type,
-                E::Tangent,
-                <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-                Input::To<E::Tangent>,
-                Output::To<E::Tangent>,
-            >,
+            Program<E::Type, E::Tangent, E::LinearOperationCarrier, Input::To<E::Tangent>, Output::To<E::Tangent>>,
         ) = linearize(engine, |input| Ok(function(input)), primals)?;
         let tangent_output = tangent_program.interpret(tangents)?;
         Ok((primal_output, tangent_output))
@@ -616,8 +610,7 @@ mod tests {
     impl<E: DifferentiableEngine<Type = DataType, Value = DistinctPrimal>> DifferentiableOperation<E>
         for DistinctPrimalOperation
     where
-        <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
-            SupportsScale<DataType, E::Tangent, DistinctPrimal>,
+        E::LinearOperationCarrier: SupportsScale<DataType, E::Tangent, DistinctPrimal>,
     {
         fn jvp(
             &self,
@@ -662,6 +655,7 @@ mod tests {
     impl DifferentiableEngine for DistinctPrimalEngine {
         type Tangent = DistinctTangent;
         type LinearEngine = DistinctTangentEngine;
+        type LinearOperationCarrier = DistinctLinearOperation;
         type DifferentiableOperationCarrier = DistinctPrimalOperation;
 
         fn linear_engine(&self) -> &Self::LinearEngine {

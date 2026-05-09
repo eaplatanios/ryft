@@ -2,7 +2,6 @@ use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::SupportsScale;
 use crate::operations::trigonometric::{Cos, Sin, SinOperation};
-use crate::tracing::engines::TracingEngine;
 use crate::tracing::{AtomId, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
@@ -12,7 +11,7 @@ where
     E: DifferentiableEngine,
     SinOperation: Operation<E::Type>,
     E::Value: Sin + Cos + Differentiable<E::Type>,
-    <E::LinearEngine as TracingEngine>::OperationCarrier: SupportsScale<E::Type, E::Tangent, E::Value>,
+    E::LinearOperationCarrier: SupportsScale<E::Type, E::Tangent, E::Value>,
 {
     #[inline]
     fn jvp(
@@ -22,10 +21,8 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let tangent_outputs = context.stage(
-            <E::LinearEngine as TracingEngine>::OperationCarrier::scale_operation(input.primal.clone().cos()),
-            &[input.tangent],
-        )?;
+        let tangent_outputs =
+            context.stage(E::LinearOperationCarrier::scale_operation(input.primal.clone().cos()), &[input.tangent])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: input.primal.clone().sin(), tangent: tangent_outputs[0] }])
     }

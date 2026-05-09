@@ -8,7 +8,7 @@ use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
-use ryft_core::tracing::engines::{TracingContext, TracingEngine};
+use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::transposition::LinearOperation;
 use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::{Differentiable, JvpTracer};
@@ -277,8 +277,12 @@ impl ShardMapOperation<ShardMapTracer> {
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError>
     where
-        E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTracer, Tangent = ShardMapTracer>,
-        E::LinearEngine: TracingEngine<OperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>>,
+        E: DifferentiableEngine<
+                Type = ArrayType,
+                Value = ShardMapTracer,
+                Tangent = ShardMapTracer,
+                LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
+            >,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret_with_tracing_builder(tracing_builder, primal_inputs.as_slice())?;
@@ -344,8 +348,12 @@ impl LinearShardMapOperation<ShardMapTensor> {
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError>
     where
-        E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTracer, Tangent = ShardMapTracer>,
-        E::LinearEngine: TracingEngine<OperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>>,
+        E: DifferentiableEngine<
+                Type = ArrayType,
+                Value = ShardMapTracer,
+                Tangent = ShardMapTracer,
+                LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
+            >,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
@@ -710,8 +718,12 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
 
 impl<E> DifferentiableOperation<E> for ShardMapOperation<ShardMapTracer>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTracer, Tangent = ShardMapTracer>,
-    E::LinearEngine: TracingEngine<OperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>>,
+    E: DifferentiableEngine<
+            Type = ArrayType,
+            Value = ShardMapTracer,
+            Tangent = ShardMapTracer,
+            LinearOperationCarrier = LinearArrayOperation<ShardMapTracer, ArrayType>,
+        >,
     ShardMapTracer: Differentiable<ArrayType, Tangent = ShardMapTracer>,
 {
     fn jvp(

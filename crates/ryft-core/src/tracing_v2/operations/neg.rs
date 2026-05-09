@@ -1,6 +1,5 @@
 use std::ops::Neg;
 
-use crate::TracingEngine;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{NegOperation, SupportsNeg};
@@ -35,7 +34,7 @@ where
 impl<E: DifferentiableEngine> DifferentiableOperation<E> for NegOperation
 where
     E::Value: Neg<Output = E::Value> + Differentiable<E::Type>,
-    <E::LinearEngine as TracingEngine>::OperationCarrier: SupportsNeg<E::Type, E::Tangent>,
+    E::LinearOperationCarrier: SupportsNeg<E::Type, E::Tangent>,
     NegOperation: Operation<E::Type>,
 {
     #[inline]
@@ -45,8 +44,7 @@ where
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
-        let tangent_outputs = context
-            .stage(<E::LinearEngine as TracingEngine>::OperationCarrier::neg_operation(), &[inputs[0].tangent])?;
+        let tangent_outputs = context.stage(E::LinearOperationCarrier::neg_operation(), &[inputs[0].tangent])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: tangent_outputs[0] }])
     }

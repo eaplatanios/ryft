@@ -191,13 +191,7 @@ fn ensure_input_count(expected: usize, got: usize, operation: &'static str) -> R
 /// owned by a [`JvpContext`].
 fn replay_linear_program_on_atoms<E: DifferentiableEngine<Type = ArrayType>>(
     context: &JvpContext<'_, E>,
-    program: &Program<
-        ArrayType,
-        E::Tangent,
-        <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-        Vec<E::Tangent>,
-        Vec<E::Tangent>,
-    >,
+    program: &Program<ArrayType, E::Tangent, E::LinearOperationCarrier, Vec<E::Tangent>, Vec<E::Tangent>>,
     inputs: &[crate::tracing::AtomId],
 ) -> Result<Vec<crate::tracing::AtomId>, TracingError> {
     check_count!("input", inputs, program.input_ids.len(), TracingError);
@@ -475,10 +469,8 @@ where
         let tangent_operands = operands.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let branch = self.selected_branch(predicate);
         let primal_outputs = branch.interpret(primal_operands.clone())?;
-        let pushforward: FlatProgram<
-            E::Tangent,
-            <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-        > = branch.linearize(context.engine, primal_operands)?;
+        let pushforward: FlatProgram<E::Tangent, E::LinearOperationCarrier> =
+            branch.linearize(context.engine, primal_operands)?;
         let tangent_outputs = replay_linear_program_on_atoms::<E>(context, &pushforward, tangent_operands.as_slice())?;
         Ok(primal_outputs
             .into_iter()
@@ -668,10 +660,8 @@ where
                     .collect());
             }
 
-            let pushforward: FlatProgram<
-                E::Tangent,
-                <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-            > = self.body.linearize(context.engine, state_primals.clone())?;
+            let pushforward: FlatProgram<E::Tangent, E::LinearOperationCarrier> =
+                self.body.linearize(context.engine, state_primals.clone())?;
             let next_primals = self.body.interpret(state_primals)?;
             let next_tangents = replay_linear_program_on_atoms::<E>(context, &pushforward, state_tangents.as_slice())?;
             check_count!("output", next_primals, state_count, TracingError);
@@ -1121,6 +1111,7 @@ mod tests {
     impl crate::tracing_v2::DifferentiableEngine for TestEngine {
         type Tangent = TestValue;
         type LinearEngine = TestLinearEngine;
+        type LinearOperationCarrier = TestLinearOperation;
         type DifferentiableOperationCarrier = TestDifferentiableOperation;
 
         fn linear_engine(&self) -> &Self::LinearEngine {

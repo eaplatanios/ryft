@@ -1,6 +1,5 @@
 use std::ops::Mul;
 
-use crate::TracingEngine;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{MulOperation, SupportsAdd, SupportsScale};
@@ -13,7 +12,7 @@ where
     E: DifferentiableEngine,
     MulOperation: Operation<E::Type>,
     E::Value: Mul<Output = E::Value> + Differentiable<E::Type>,
-    <E::LinearEngine as TracingEngine>::OperationCarrier: SupportsScale<E::Type, E::Tangent, E::Value>,
+    E::LinearOperationCarrier: SupportsScale<E::Type, E::Tangent, E::Value>,
 {
     fn jvp(
         &self,
@@ -23,20 +22,14 @@ where
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
-        let left_term_outputs = context.stage(
-            <E::LinearEngine as TracingEngine>::OperationCarrier::scale_operation(right.primal.clone()),
-            &[left.tangent],
-        )?;
+        let left_term_outputs =
+            context.stage(E::LinearOperationCarrier::scale_operation(right.primal.clone()), &[left.tangent])?;
         check_count!("output", left_term_outputs, 1, TracingError);
-        let right_term_outputs = context.stage(
-            <E::LinearEngine as TracingEngine>::OperationCarrier::scale_operation(left.primal.clone()),
-            &[right.tangent],
-        )?;
+        let right_term_outputs =
+            context.stage(E::LinearOperationCarrier::scale_operation(left.primal.clone()), &[right.tangent])?;
         check_count!("output", right_term_outputs, 1, TracingError);
-        let tangent_outputs = context.stage(
-            <E::LinearEngine as TracingEngine>::OperationCarrier::add_operation(),
-            &[left_term_outputs[0], right_term_outputs[0]],
-        )?;
+        let tangent_outputs = context
+            .stage(E::LinearOperationCarrier::add_operation(), &[left_term_outputs[0], right_term_outputs[0]])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: left.primal.clone() * right.primal.clone(), tangent: tangent_outputs[0] }])
     }

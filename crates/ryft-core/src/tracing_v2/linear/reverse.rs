@@ -74,16 +74,7 @@ pub fn linearize<
     function: F,
     primals: Input,
 ) -> Result<
-    (
-        Output,
-        Program<
-            E::Type,
-            E::Tangent,
-            <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-            Input::To<E::Tangent>,
-            Output::To<E::Tangent>,
-        >,
-    ),
+    (Output, Program<E::Type, E::Tangent, E::LinearOperationCarrier, Input::To<E::Tangent>, Output::To<E::Tangent>>),
     TracingError,
 >
 where
@@ -130,16 +121,7 @@ pub fn vjp<
     function: F,
     primals: Input,
 ) -> Result<
-    (
-        Output,
-        Program<
-            E::Type,
-            E::Tangent,
-            <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-            Output::To<E::Tangent>,
-            Input::To<E::Tangent>,
-        >,
-    ),
+    (Output, Program<E::Type, E::Tangent, E::LinearOperationCarrier, Output::To<E::Tangent>, Input::To<E::Tangent>>),
     TracingError,
 >
 where
@@ -281,13 +263,7 @@ where
     ) -> Result<(Self::Value, Self::Gradient), TracingError> {
         let (output, pullback): (
             V,
-            Program<
-                E::Type,
-                E::Tangent,
-                <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
-                V::To<E::Tangent>,
-                Self::Gradient,
-            >,
+            Program<E::Type, E::Tangent, E::LinearOperationCarrier, V::To<E::Tangent>, Self::Gradient>,
         ) = vjp(engine, |input| Ok(function(input)), primals)?;
         let seed = V::To::<E::Tangent>::from_parameters(
             output.parameter_structure(),
@@ -809,6 +785,7 @@ mod tests {
     impl DifferentiableEngine for TestEngine {
         type Tangent = TestValue;
         type LinearEngine = TestLinearEngine;
+        type LinearOperationCarrier = TestLinearOperation;
         type DifferentiableOperationCarrier = AddOperation;
 
         fn linear_engine(&self) -> &Self::LinearEngine {

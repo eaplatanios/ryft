@@ -2156,7 +2156,7 @@ where
     <E::Value as Parameterized<E::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<E::Value>: Parameterized<E::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScaleOperation<DataType, F>: DifferentiableOperation<E>,
-    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<DataType, E::Tangent>
+    E::LinearOperationCarrier: SupportsZeroLike<DataType, E::Tangent>
         + SupportsNeg<DataType, E::Tangent>
         + SupportsSub<DataType, E::Tangent>
         + SupportsScale<DataType, E::Tangent, E::Value>,
@@ -2214,7 +2214,7 @@ where
             To<E::Tangent> = Vec<E::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<ArrayType, E::Tangent>
+    E::LinearOperationCarrier: SupportsZeroLike<ArrayType, E::Tangent>
         + SupportsNeg<ArrayType, E::Tangent>
         + SupportsSub<ArrayType, E::Tangent>
         + SupportsScale<ArrayType, E::Tangent, V>
@@ -2274,7 +2274,7 @@ where
     E: DifferentiableEngine<Type = DataType, Value = V> + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<DataType, E::Tangent>
+    E::LinearOperationCarrier: SupportsZeroLike<DataType, E::Tangent>
         + SupportsNeg<DataType, E::Tangent>
         + SupportsSub<DataType, E::Tangent>
         + SupportsScale<DataType, E::Tangent, V>,

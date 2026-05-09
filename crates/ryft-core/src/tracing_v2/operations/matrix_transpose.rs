@@ -2,7 +2,6 @@ use std::fmt::Display;
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::engines::TracingEngine;
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
@@ -79,7 +78,7 @@ impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
 where
     E: DifferentiableEngine<Type = ArrayType>,
     E::Value: MatrixValue + Differentiable<ArrayType>,
-    <E::LinearEngine as TracingEngine>::OperationCarrier: SupportsMatrixTranspose<ArrayType, E::Tangent>,
+    E::LinearOperationCarrier: SupportsMatrixTranspose<ArrayType, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -88,10 +87,8 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().transpose_matrix();
-        let tangent_outputs = context.stage(
-            <E::LinearEngine as TracingEngine>::OperationCarrier::matrix_transpose_operation(),
-            &[inputs[0].tangent],
-        )?;
+        let tangent_outputs =
+            context.stage(E::LinearOperationCarrier::matrix_transpose_operation(), &[inputs[0].tangent])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
     }

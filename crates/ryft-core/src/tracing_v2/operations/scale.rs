@@ -3,6 +3,7 @@ use std::ops::Mul;
 #[cfg(test)]
 use indoc::indoc;
 
+use crate::TracingContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{ScaleOperation, SupportsAdd, SupportsScale};
@@ -12,7 +13,6 @@ use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
 use crate::types::{ArrayType, DataType, Type};
-use crate::{TracingContext, TracingEngine};
 
 impl<T: Type, V: Traceable<T>, O: Clone + Operation<T> + SupportsScale<T, V>> LinearOperation<T, V, O>
     for ScaleOperation<T, V>
@@ -41,7 +41,7 @@ impl<T: Type, V, E> DifferentiableOperation<E> for ScaleOperation<T, V>
 where
     V: Differentiable<T> + Mul<Output = V>,
     E: DifferentiableEngine<Type = T, Value = V>,
-    <E::LinearEngine as TracingEngine>::OperationCarrier: SupportsScale<T, E::Tangent, V>,
+    E::LinearOperationCarrier: SupportsScale<T, E::Tangent, V>,
     ScaleOperation<T, V>: Operation<T>,
 {
     #[inline]
@@ -52,10 +52,8 @@ where
     ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let tangent_outputs = context.stage(
-            <E::LinearEngine as TracingEngine>::OperationCarrier::scale_operation(self.factor.clone()),
-            &[input.tangent],
-        )?;
+        let tangent_outputs =
+            context.stage(E::LinearOperationCarrier::scale_operation(self.factor.clone()), &[input.tangent])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: self.factor.clone() * input.primal.clone(), tangent: tangent_outputs[0] }])
     }

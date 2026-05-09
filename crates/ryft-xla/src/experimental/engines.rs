@@ -182,6 +182,7 @@ impl TracingEngine for LinearXlaEngine {
 impl<'c> DifferentiableEngine for XlaEngine<'c> {
     type Tangent = ShardMapTensor;
     type LinearEngine = LinearXlaEngine;
+    type LinearOperationCarrier = LinearXlaOperation<ShardMapTensor>;
     type DifferentiableOperationCarrier = XlaOperation;
 
     #[inline]

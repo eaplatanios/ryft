@@ -369,7 +369,7 @@ fn materialize_dense_jacobian_from_pushforward<E, Input, Output, V>(
     pushforward: Program<
         ArrayType,
         E::Tangent,
-        <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier,
+        E::LinearOperationCarrier,
         Input::To<E::Tangent>,
         Output::To<E::Tangent>,
     >,

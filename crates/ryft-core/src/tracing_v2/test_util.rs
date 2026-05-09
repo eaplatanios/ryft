@@ -292,6 +292,7 @@ static TEST_ARRAY_LINEAR_ENGINE: TestArrayLinearEngine = TestArrayLinearEngine;
 impl DifferentiableEngine for TestArrayEngine {
     type Tangent = TestArray;
     type LinearEngine = TestArrayLinearEngine;
+    type LinearOperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
     type DifferentiableOperationCarrier = ArrayOperation<TestArray, ArrayType>;
 
     fn linear_engine(&self) -> &Self::LinearEngine {

@@ -10,7 +10,7 @@ use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
+use crate::tracing::engines::{Tracer, TracingContext};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpTracer};
@@ -249,11 +249,7 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
                 Type = ArrayType,
                 Value = V,
                 Tangent = V,
-                LinearEngine: TracingEngine<
-                    Type = ArrayType,
-                    Value = V,
-                    OperationCarrier = LinearArrayOperation<V, ArrayType>,
-                >,
+                LinearOperationCarrier = LinearArrayOperation<V, ArrayType>,
             > + 'static,
         V: Differentiable<ArrayType, Tangent = V>
             + Add<Output = V>
@@ -303,11 +299,7 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
                 Type = ArrayType,
                 Value = V,
                 Tangent = V,
-                LinearEngine: TracingEngine<
-                    Type = ArrayType,
-                    Value = V,
-                    OperationCarrier = LinearArrayOperation<V, ArrayType>,
-                >,
+                LinearOperationCarrier = LinearArrayOperation<V, ArrayType>,
             > + DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
             + 'static,
         V: Value<ArrayType>
