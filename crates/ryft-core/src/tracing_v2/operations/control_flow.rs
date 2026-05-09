@@ -440,7 +440,7 @@ where
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(output_type.clone());
     builder_borrow.instructions.push(Instruction {
-        operation: <O as crate::operations::constants::SupportsZero<ArrayType, V>>::zero_operation(output_type.clone()),
+        operation: O::zero_operation(output_type.clone()),
         inputs: vec![],
         outputs: vec![output],
     });

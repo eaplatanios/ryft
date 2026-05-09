@@ -3,7 +3,7 @@ use std::fmt::Display;
 use crate::macros::check_count;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::engines::Tracer;
+use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
@@ -107,8 +107,7 @@ impl<V, E> DifferentiableOperation<E> for RightMatMulOperation<V>
 where
     V: MatrixValue + ZeroLike + Differentiable<ArrayType>,
     E: DifferentiableEngine<Type = ArrayType, Value = V>,
-    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
-        SupportsRightMatMul<ArrayType, E::Tangent, V>,
+    <E::LinearEngine as TracingEngine>::OperationCarrier: SupportsRightMatMul<ArrayType, E::Tangent, V>,
 {
     fn jvp(
         &self,
@@ -118,11 +117,7 @@ where
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().matmul(self.factor.clone());
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsRightMatMul<
-                ArrayType,
-                E::Tangent,
-                V,
-            >>::right_matmul_operation(self.factor.clone()),
+            <E::LinearEngine as TracingEngine>::OperationCarrier::right_matmul_operation(self.factor.clone()),
             &[inputs[0].tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -150,10 +145,7 @@ where
         let factor_tracer = context.engine.constant(self.factor.clone());
         let primal = inputs[0].primal.clone().matmul(factor_tracer.clone());
         let tangent_outputs = context.stage(
-            <EInner::LinearOperationCarrier<'engine> as SupportsRightMatMul<
-                ArrayType,
-                Tracer<'engine, EInner>,
-            >>::right_matmul_operation(factor_tracer),
+            EInner::LinearOperationCarrier::<'engine>::right_matmul_operation(factor_tracer),
             &[inputs[0].tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

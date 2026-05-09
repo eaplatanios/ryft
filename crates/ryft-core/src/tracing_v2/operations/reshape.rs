@@ -298,8 +298,7 @@ impl<E> DifferentiableOperation<E> for ReshapeOperation
 where
     E: DifferentiableEngine<Type = ArrayType>,
     E::Value: ReshapeValue + Differentiable<ArrayType>,
-    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
-        SupportsReshape<ArrayType, E::Tangent>,
+    <E::LinearEngine as TracingEngine>::OperationCarrier: SupportsReshape<ArrayType, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -309,10 +308,10 @@ where
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().reshape(self.output_shape.clone())?;
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsReshape<
-                ArrayType,
-                E::Tangent,
-            >>::reshape_operation(self.input_shape.clone(), self.output_shape.clone()),
+            <E::LinearEngine as TracingEngine>::OperationCarrier::reshape_operation(
+                self.input_shape.clone(),
+                self.output_shape.clone(),
+            ),
             &[inputs[0].tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

@@ -53,9 +53,7 @@ where
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as TracingEngine>::OperationCarrier as SupportsScale<T, E::Tangent, V>>::scale_operation(
-                self.factor.clone(),
-            ),
+            <E::LinearEngine as TracingEngine>::OperationCarrier::scale_operation(self.factor.clone()),
             &[input.tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -81,10 +79,7 @@ where
         let input = &inputs[0];
         let factor_tracer = context.engine.constant(self.factor.clone());
         let tangent_outputs = context.stage(
-            <EInner::LinearOperationCarrier<'engine> as SupportsScale<
-                DataType,
-                Tracer<'engine, EInner>,
-            >>::scale_operation(factor_tracer.clone()),
+            EInner::LinearOperationCarrier::<'engine>::scale_operation(factor_tracer.clone()),
             &[input.tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -110,10 +105,7 @@ where
         let input = &inputs[0];
         let factor_tracer = context.engine.constant(self.factor.clone());
         let tangent_outputs = context.stage(
-            <EInner::LinearOperationCarrier<'engine> as SupportsScale<
-                ArrayType,
-                Tracer<'engine, EInner>,
-            >>::scale_operation(factor_tracer.clone()),
+            EInner::LinearOperationCarrier::<'engine>::scale_operation(factor_tracer.clone()),
             &[input.tangent],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

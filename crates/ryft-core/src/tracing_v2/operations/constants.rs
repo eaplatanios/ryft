@@ -7,6 +7,7 @@ use crate::operations::Operation;
 use crate::operations::constants::{
     OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
+use crate::tracing::engines::TracingEngine;
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
@@ -38,13 +39,8 @@ where
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 0, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsZero<
-                E::Type,
-                E::Tangent,
-            >>::zero_operation(self.r#type.clone()),
-            &[],
-        )?;
+        let tangent_outputs = context
+            .stage(<E::LinearEngine as TracingEngine>::OperationCarrier::zero_operation(self.r#type.clone()), &[])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: context.engine.zero(&self.r#type)?, tangent: tangent_outputs[0] }])
     }
@@ -75,13 +71,8 @@ where
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 0, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsZero<
-                E::Type,
-                E::Tangent,
-            >>::zero_operation(self.r#type.clone()),
-            &[],
-        )?;
+        let tangent_outputs = context
+            .stage(<E::LinearEngine as TracingEngine>::OperationCarrier::zero_operation(self.r#type.clone()), &[])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: context.engine.one(&self.r#type)?, tangent: tangent_outputs[0] }])
     }
@@ -105,8 +96,7 @@ where
     E: DifferentiableEngine,
     ZeroLikeOperation: Operation<E::Type>,
     E::Value: ZeroLike + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
-        SupportsZeroLike<E::Type, E::Tangent>,
+    <E::LinearEngine as TracingEngine>::OperationCarrier: SupportsZeroLike<E::Type, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -114,13 +104,8 @@ where
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsZeroLike<
-                E::Type,
-                E::Tangent,
-            >>::zero_like_operation(),
-            &[inputs[0].tangent],
-        )?;
+        let tangent_outputs = context
+            .stage(<E::LinearEngine as TracingEngine>::OperationCarrier::zero_like_operation(), &[inputs[0].tangent])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent: tangent_outputs[0] }])
     }
@@ -144,8 +129,7 @@ where
     E: DifferentiableEngine,
     OneLikeOperation: Operation<E::Type>,
     E::Value: OneLike + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
-        SupportsZeroLike<E::Type, E::Tangent>,
+    <E::LinearEngine as TracingEngine>::OperationCarrier: SupportsZeroLike<E::Type, E::Tangent>,
 {
     fn jvp(
         &self,
@@ -153,13 +137,8 @@ where
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsZeroLike<
-                E::Type,
-                E::Tangent,
-            >>::zero_like_operation(),
-            &[inputs[0].tangent],
-        )?;
+        let tangent_outputs = context
+            .stage(<E::LinearEngine as TracingEngine>::OperationCarrier::zero_like_operation(), &[inputs[0].tangent])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: inputs[0].primal.one_like(), tangent: tangent_outputs[0] }])
     }

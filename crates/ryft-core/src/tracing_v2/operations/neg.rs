@@ -45,10 +45,8 @@ where
         inputs: &[JvpTracer<E::Value, AtomId>],
     ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as TracingEngine>::OperationCarrier as SupportsNeg<E::Type, E::Tangent>>::neg_operation(),
-            &[inputs[0].tangent],
-        )?;
+        let tangent_outputs = context
+            .stage(<E::LinearEngine as TracingEngine>::OperationCarrier::neg_operation(), &[inputs[0].tangent])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: tangent_outputs[0] }])
     }

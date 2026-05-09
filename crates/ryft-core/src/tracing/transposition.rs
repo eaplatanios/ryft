@@ -147,7 +147,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + LinearOperation<T, V, O> + SupportsZer
             let mut builder_borrow = builder.borrow_mut();
             let output = builder_borrow.add_variable(r#type.clone());
             builder_borrow.instructions.push(Instruction {
-                operation: <O as SupportsZero<T, V>>::zero_operation(r#type),
+                operation: O::zero_operation(r#type),
                 inputs: vec![],
                 outputs: vec![output],
             });
