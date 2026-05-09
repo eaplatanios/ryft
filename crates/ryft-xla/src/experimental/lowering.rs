@@ -22,9 +22,7 @@ use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, Condit
 use ryft_core::tracing_v2::operations::{
     LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, RightMatMulOperation,
 };
-use ryft_core::tracing_v2::{
-    ArrayOperation, CustomPrimitive, LinearArrayOperation, MatMul, MatrixOps, MatrixTranspose, Reshape,
-};
+use ryft_core::tracing_v2::{ArrayOperation, CustomPrimitive, LinearArrayOperation, MatrixOps};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
 
 use crate::experimental::operations::{
@@ -2552,7 +2550,7 @@ mod tests {
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::{
         ArrayOperation, CoordinateValue, CustomPrimitive, Differentiable, DifferentiableEngine,
-        DifferentiableTracingEngine, LinearArrayOperation,
+        DifferentiableTracingEngine, LinearArrayOperation, MatMul, MatrixTranspose, Reshape,
     };
     use ryft_core::types::{Shape, TypeError, Typed};
     #[cfg(feature = "ndarray")]
