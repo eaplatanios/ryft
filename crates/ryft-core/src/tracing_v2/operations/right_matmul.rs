@@ -1,10 +1,10 @@
 use std::fmt::Display;
 
+use crate::differentiation::LinearOperation;
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::differentiation::LinearOperation;
 use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
@@ -103,11 +103,7 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for RightMatMulOperati
 impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for RightMatMulOperation<V> {
     fn transpose(
         &self,
-        context: &mut crate::tracing::differentiation::TranspositionContext<
-            ArrayType,
-            V,
-            LinearArrayOperation<V, ArrayType>,
-        >,
+        context: &mut crate::differentiation::TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);

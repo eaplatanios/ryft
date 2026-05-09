@@ -318,10 +318,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::differentiation::{LinearOperation, TranspositionContext};
     use crate::macros::check_count;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
-    use crate::tracing::differentiation::{LinearOperation, TranspositionContext};
     use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
     use crate::tracing::{AtomId, Program, ProgramBuilder};
     use crate::tracing_v2::linear::{Grad, JacFwd};

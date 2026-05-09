@@ -1,9 +1,9 @@
 use std::fmt::Display;
 
+use crate::differentiation::LinearOperation;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::sharding::{Sharding, ShardingDimension};
-use crate::tracing::differentiation::LinearOperation;
 use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
@@ -273,11 +273,7 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
 impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for ReshapeOperation {
     fn transpose(
         &self,
-        context: &mut crate::tracing::differentiation::TranspositionContext<
-            ArrayType,
-            V,
-            LinearArrayOperation<V, ArrayType>,
-        >,
+        context: &mut crate::differentiation::TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);

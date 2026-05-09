@@ -8,13 +8,13 @@ use half::{bf16, f16};
 use ryft_macros::Parameter;
 use thiserror::Error;
 
+use crate::differentiation::LinearOperation;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd, SupportsNeg, SupportsScale};
 use crate::operations::constants::{One, SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
-use crate::tracing::differentiation::LinearOperation;
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::forward::JvpDispatch;
@@ -383,7 +383,7 @@ pub trait DifferentiableOperation<E: DifferentiableEngine>: Operation<E::Type> {
 ///
 /// [`JvpContext`] owns the active linear-program builder where tangent ops are staged. It is the
 /// forward-mode counterpart of
-/// [`TranspositionContext`](crate::tracing::transposition::TranspositionContext): JVP rules call
+/// [`TranspositionContext`](crate::differentiation::TranspositionContext): JVP rules call
 /// [`apply_operation`](Self::apply_operation) to stage tangent ops on the active builder.
 #[doc(hidden)]
 pub struct JvpContext<'a, E: DifferentiableEngine> {

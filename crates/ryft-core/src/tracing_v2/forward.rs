@@ -207,6 +207,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::differentiation::{LinearOperation, TranspositionContext};
     use crate::macros::check_count;
     use crate::operations::Operation;
     use crate::operations::arithmetic::{
@@ -219,9 +220,8 @@ mod tests {
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::operations::trigonometric::Sin;
     use crate::parameters::{ParameterError, Parameterized};
-    use crate::tracing::differentiation::LinearOperation;
     use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
-    use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TranspositionContext, Value};
+    use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
     use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
     use crate::types::{DataType, Typed};

@@ -2,12 +2,12 @@ use std::convert::Infallible;
 
 use half::{bf16, f16};
 
+use crate::differentiation::{LinearOperation, TranspositionContext};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::constants::{
     OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::tracing::differentiation::{LinearOperation, TranspositionContext};
 use crate::tracing::engines::Tracer;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};

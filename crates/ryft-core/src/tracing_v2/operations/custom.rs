@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::differentiation::LinearOperation;
 use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::differentiation::LinearOperation;
 use crate::tracing::engines::{Tracer, TracingContext};
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
@@ -366,7 +366,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::differentiation::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
+        context: &mut crate::differentiation::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         self.transpose_rule
@@ -471,7 +471,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::differentiation::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
+        context: &mut crate::differentiation::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         self.primitive

@@ -2,10 +2,10 @@ use std::fmt::{Debug, Display};
 
 use thiserror::Error;
 
+use crate::differentiation::{LinearOperation, TranspositionContext};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::tracing::differentiation::{LinearOperation, TranspositionContext};
 use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
 use crate::tracing::{Instruction, Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;

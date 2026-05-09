@@ -4,10 +4,10 @@ use std::ops::Mul;
 use indoc::indoc;
 
 use crate::TracingContext;
+use crate::differentiation::{LinearOperation, TranspositionContext};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{Scale, ScaleOperation, SupportsAdd, SupportsScale};
-use crate::tracing::differentiation::{LinearOperation, TranspositionContext};
 use crate::tracing::engines::Tracer;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
@@ -114,9 +114,9 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::differentiation::TranspositionContext;
     use crate::parameters::Placeholder;
     use crate::tracing::ProgramBuilder;
-    use crate::tracing::differentiation::TranspositionContext;
     use crate::tracing_v2::LinearArrayOperation;
     use crate::tracing_v2::test_util::TestArray;
 

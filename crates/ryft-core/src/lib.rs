@@ -1,4 +1,5 @@
 pub mod broadcasting;
+pub mod differentiation;
 pub mod errors;
 pub mod macros;
 pub mod operations;
@@ -9,7 +10,9 @@ pub mod tracing_v2;
 pub mod types;
 pub mod utilities;
 
+// TODO(eaplatanios): Make all of the following more specific.
 pub use broadcasting::*;
+// TODO(eaplatanios): pub use differentiation::*;
 pub use errors::*;
 pub use operations::*;
 pub use parameters::*;

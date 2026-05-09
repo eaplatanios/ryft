@@ -3,6 +3,7 @@ use std::fmt::{Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::Arc;
 
+use crate::differentiation::LinearOperation;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
@@ -19,7 +20,6 @@ use crate::operations::trigonometric::{
 };
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::differentiation::LinearOperation;
 use crate::tracing::engines::{Tracer, TracingContext};
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
@@ -1723,7 +1723,7 @@ impl<V: Traceable<DataType>>
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::differentiation::TranspositionContext<
+        context: &mut crate::differentiation::TranspositionContext<
             DataType,
             Tangent<DataType, V>,
             LinearScalarOperation<Tangent<DataType, V>>,
@@ -1774,7 +1774,7 @@ impl LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArray
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::differentiation::TranspositionContext<
+        context: &mut crate::differentiation::TranspositionContext<
             ArrayType,
             ZeroArrayTangent,
             LinearArrayOperation<ZeroArrayTangent, ArrayType>,
@@ -1862,7 +1862,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::differentiation::TranspositionContext<
+        context: &mut crate::differentiation::TranspositionContext<
             ArrayType,
             Tangent<ArrayType, V>,
             LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>,
@@ -1955,7 +1955,7 @@ impl<V: Traceable<DataType>>
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::differentiation::TranspositionContext<
+        context: &mut crate::differentiation::TranspositionContext<
             DataType,
             Tangent<DataType, V>,
             LinearArrayOperation<Tangent<DataType, V>, DataType>,
@@ -2011,7 +2011,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::differentiation::TranspositionContext<DataType, V, LinearScalarOperation<V>>,
+        context: &mut crate::differentiation::TranspositionContext<DataType, V, LinearScalarOperation<V>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         match self {
@@ -2070,11 +2070,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::differentiation::TranspositionContext<
-            ArrayType,
-            V,
-            LinearArrayOperation<V, ArrayType>,
-        >,
+        context: &mut crate::differentiation::TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         match self {
@@ -2111,11 +2107,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut crate::tracing::differentiation::TranspositionContext<
-            DataType,
-            V,
-            LinearArrayOperation<V, DataType>,
-        >,
+        context: &mut crate::differentiation::TranspositionContext<DataType, V, LinearArrayOperation<V, DataType>>,
         output_cotangents: &[Option<crate::tracing::AtomId>],
     ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         match self {
@@ -2482,9 +2474,9 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::differentiation::{LinearOperation, TranspositionContext};
     use crate::operations::InterpretableOperation as _;
     use crate::parameters::Placeholder;
-    use crate::tracing::differentiation::{LinearOperation, TranspositionContext};
     use crate::tracing::{AtomId, Program, ProgramBuilder};
     use crate::tracing_v2::test_util::TestArray;
     use crate::types::Size;
