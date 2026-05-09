@@ -1,11 +1,11 @@
 use std::ops::Add;
 
+use crate::TracingEngine;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
-use crate::tracing::TranspositionContext;
 use crate::tracing::transposition::LinearOperation;
-use crate::tracing::{AtomId, Traceable, TracingError};
+use crate::tracing::{AtomId, Traceable, TracingError, TranspositionContext};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
 use crate::types::Type;
@@ -39,10 +39,7 @@ where
         check_count!("input", inputs, 2, TracingError);
         let tangent_inputs = &[inputs[0].tangent, inputs[1].tangent];
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsAdd<
-                E::Type,
-                E::Tangent,
-            >>::add_operation(),
+            <<E::LinearEngine as TracingEngine>::OperationCarrier as SupportsAdd<E::Type, E::Tangent>>::add_operation(),
             tangent_inputs,
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

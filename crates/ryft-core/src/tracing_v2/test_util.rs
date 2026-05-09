@@ -7,11 +7,10 @@ use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::parameters::Parameter;
 use crate::tracing::engines::{Engine, Tracer, TracingEngine};
 use crate::tracing::{Traceable, TracingError, Value};
-use crate::tracing_v2::CoordinateValue;
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use crate::tracing_v2::{
-    ArrayOperation, Cos, Differentiable, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation,
-    MatrixOps, ReshapeOps, Sin,
+    ArrayOperation, CoordinateValue, Cos, Differentiable, DifferentiableEngine, DifferentiableTracingEngine,
+    LinearArrayOperation, MatrixOps, ReshapeOps, Sin,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 

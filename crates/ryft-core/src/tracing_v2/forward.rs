@@ -218,21 +218,19 @@ mod tests {
     use crate::macros::check_count;
     use crate::operations::Operation;
     use crate::operations::arithmetic::{
-        AddOperation, MulOperation, SubOperation, SupportsAdd, SupportsMul, SupportsSub,
+        AddOperation, MulOperation, NegOperation, SubOperation, SupportsAdd, SupportsMul, SupportsNeg, SupportsSub,
     };
     use crate::operations::constants::{
         One, OneLike, OneOperation, SupportsOne, SupportsZero, Zero, ZeroLike, ZeroOperation,
     };
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::parameters::{ParameterError, Parameterized};
-    use crate::tracing::TranspositionContext;
     use crate::tracing::engines::{Engine, ScalarEngine, TracingContext, TracingEngine};
     use crate::tracing::transposition::LinearOperation;
-    use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, Value};
-    use crate::tracing_v2::Sin;
+    use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TranspositionContext, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-    use crate::tracing_v2::operations::{NegOperation, SupportsNeg, SupportsScale};
-    use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+    use crate::tracing_v2::operations::SupportsScale;
+    use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, Sin};
     use crate::types::{DataType, Typed};
 
     use super::*;

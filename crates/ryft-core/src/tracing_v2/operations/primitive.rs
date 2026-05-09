@@ -6,7 +6,8 @@ use std::sync::Arc;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
-    SUB_OPERATION_NAME, SubOperation, SupportsAdd, SupportsDiv, SupportsMul, SupportsSub,
+    NEG_OPERATION_NAME, NegOperation, SUB_OPERATION_NAME, SubOperation, SupportsAdd, SupportsDiv, SupportsMul,
+    SupportsNeg, SupportsSub,
 };
 use crate::operations::constants::{
     ONE_LIKE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
@@ -25,7 +26,7 @@ use crate::tracing_v2::operations::control_flow::{
 use crate::tracing_v2::operations::left_matmul::left_matmul_abstract_eval;
 use crate::tracing_v2::operations::right_matmul::right_matmul_abstract_eval;
 use crate::tracing_v2::operations::{
-    CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, NegOperation, ReshapeOperation,
+    CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation,
     RightMatMulOperation, ScaleOperation, SinOperation,
 };
 use crate::tracing_v2::{
@@ -38,7 +39,6 @@ use super::custom::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, Supp
 use super::left_matmul::SupportsLeftMatMul;
 use super::matmul::SupportsMatMul;
 use super::matrix_transpose::SupportsMatrixTranspose;
-use super::neg::SupportsNeg;
 use super::reshape::SupportsReshape;
 use super::right_matmul::SupportsRightMatMul;
 use super::scale::SupportsScale;
@@ -530,7 +530,7 @@ where
             Self::Sub => SUB_OPERATION_NAME,
             Self::Mul => MUL_OPERATION_NAME,
             Self::Div => DIV_OPERATION_NAME,
-            Self::Neg => "neg",
+            Self::Neg => NEG_OPERATION_NAME,
             Self::Sin => "sin",
             Self::Cos => "cos",
             Self::MatrixMultiply => "matmul",
@@ -558,7 +558,7 @@ where
             Self::OneLike => ONE_LIKE_OPERATION_NAME,
             Self::Add => ADD_OPERATION_NAME,
             Self::Sub => SUB_OPERATION_NAME,
-            Self::Neg => "neg",
+            Self::Neg => NEG_OPERATION_NAME,
             Self::Transpose => "matrix_transpose",
             Self::Scale { .. } => "scale",
             Self::LeftMatMul { .. } => "left_matmul",
@@ -2142,7 +2142,7 @@ where
     Vec<E::Value>: Parameterized<E::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScaleOperation<DataType, F>: DifferentiableOperation<E>,
     <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<DataType, E::Tangent>
-        + super::SupportsNeg<DataType, E::Tangent>
+        + SupportsNeg<DataType, E::Tangent>
         + SupportsSub<DataType, E::Tangent>
         + super::SupportsScale<DataType, E::Tangent, E::Value>,
 {
@@ -2200,7 +2200,7 @@ where
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
     <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<ArrayType, E::Tangent>
-        + super::SupportsNeg<ArrayType, E::Tangent>
+        + SupportsNeg<ArrayType, E::Tangent>
         + SupportsSub<ArrayType, E::Tangent>
         + super::SupportsScale<ArrayType, E::Tangent, V>
         + super::SupportsLeftMatMul<ArrayType, E::Tangent, V>
@@ -2260,7 +2260,7 @@ where
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier: SupportsZeroLike<DataType, E::Tangent>
-        + super::SupportsNeg<DataType, E::Tangent>
+        + SupportsNeg<DataType, E::Tangent>
         + SupportsSub<DataType, E::Tangent>
         + super::SupportsScale<DataType, E::Tangent, V>,
 {
@@ -2330,7 +2330,7 @@ where
     LinearArrayOperation<V, ArrayType>: Clone
         + SupportsZero<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>
-        + super::SupportsNeg<ArrayType, V>
+        + SupportsNeg<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + SupportsSub<ArrayType, V>
         + super::SupportsScale<ArrayType, V>
@@ -2412,7 +2412,7 @@ where
     LinearArrayOperation<V, DataType>: Clone
         + SupportsZero<DataType, V>
         + SupportsZeroLike<DataType, V>
-        + super::SupportsNeg<DataType, V>
+        + SupportsNeg<DataType, V>
         + SupportsAdd<DataType, V>
         + SupportsSub<DataType, V>
         + super::SupportsScale<DataType, V>

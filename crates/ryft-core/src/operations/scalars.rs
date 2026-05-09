@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
-    SUB_OPERATION_NAME, SubOperation, SupportsAdd, SupportsDiv, SupportsMul, SupportsSub,
+    NEG_OPERATION_NAME, NegOperation, SUB_OPERATION_NAME, SubOperation, SupportsAdd, SupportsDiv, SupportsMul,
+    SupportsNeg, SupportsSub,
 };
 use crate::operations::constants::{
     ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
@@ -13,8 +14,8 @@ use crate::operations::{Operation, OperationFormatter};
 use crate::parameters::Parameter;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::operations::{
-    CosOperation, CustomPrimitive, LinearCustomPrimitive, NegOperation, ScaleOperation, SinOperation, SupportsCos,
-    SupportsCustom, SupportsLinearCustom, SupportsNeg, SupportsScale, SupportsSin,
+    CosOperation, CustomPrimitive, LinearCustomPrimitive, ScaleOperation, SinOperation, SupportsCos, SupportsCustom,
+    SupportsLinearCustom, SupportsScale, SupportsSin,
 };
 use crate::types::{DataType, TypeError};
 
@@ -374,7 +375,7 @@ where
             Self::Sub => SUB_OPERATION_NAME,
             Self::Mul => MUL_OPERATION_NAME,
             Self::Div => DIV_OPERATION_NAME,
-            Self::Neg => "neg",
+            Self::Neg => NEG_OPERATION_NAME,
             Self::Sin => "sin",
             Self::Cos => "cos",
             Self::Scale { .. } => "scale",
@@ -396,7 +397,7 @@ where
             Self::OneLike => ONE_LIKE_OPERATION_NAME,
             Self::Add => ADD_OPERATION_NAME,
             Self::Sub => SUB_OPERATION_NAME,
-            Self::Neg => "neg",
+            Self::Neg => NEG_OPERATION_NAME,
             Self::Scale { .. } => "scale",
             Self::Custom(op) => op.name(),
         }

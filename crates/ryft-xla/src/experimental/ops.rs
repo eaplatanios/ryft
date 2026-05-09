@@ -4,7 +4,8 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
-    SUB_OPERATION_NAME, SubOperation, SupportsAdd, SupportsDiv, SupportsMul, SupportsSub,
+    NEG_OPERATION_NAME, NegOperation, SUB_OPERATION_NAME, SubOperation, SupportsAdd, SupportsDiv, SupportsMul,
+    SupportsNeg, SupportsSub,
 };
 use ryft_core::operations::constants::{
     ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
@@ -15,9 +16,9 @@ use ryft_core::tracing::engines::TracingContext;
 use ryft_core::tracing::{AtomId, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
-    ConditionOperation, CosOperation, MatMulOperation, MatrixTransposeOperation, NegOperation, ReshapeOperation,
-    ScaleOperation, SinOperation, SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsNeg,
-    SupportsReshape, SupportsScale, SupportsSin, WhileOperation,
+    ConditionOperation, CosOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, ScaleOperation,
+    SinOperation, SupportsCos, SupportsCustom, SupportsMatMul, SupportsMatrixTranspose, SupportsReshape, SupportsScale,
+    SupportsSin, WhileOperation,
 };
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableOperation, JvpContext, LinearArrayOperation,
@@ -166,7 +167,7 @@ impl Operation<ArrayType> for XlaOperation {
             Self::Sub => SUB_OPERATION_NAME,
             Self::Mul => MUL_OPERATION_NAME,
             Self::Div => DIV_OPERATION_NAME,
-            Self::Neg => "neg",
+            Self::Neg => NEG_OPERATION_NAME,
             Self::Sin => "sin",
             Self::Cos => "cos",
             Self::MatrixMultiply => "matmul",

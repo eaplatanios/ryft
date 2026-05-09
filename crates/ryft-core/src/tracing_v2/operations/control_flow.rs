@@ -5,8 +5,7 @@ use thiserror::Error;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::tracing::engines::Tracer;
-use crate::tracing::engines::TracingEngine;
+use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::transposition::{LinearOperation, TranspositionContext};
 use crate::tracing::{Instruction, Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
@@ -709,15 +708,13 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::operations::arithmetic::{ADD_OPERATION_NAME, SUB_OPERATION_NAME, SupportsAdd};
-    use crate::operations::constants::OneLike;
-    use crate::operations::constants::{One, Zero, ZeroLike};
+    use crate::operations::arithmetic::{ADD_OPERATION_NAME, SUB_OPERATION_NAME, SupportsAdd, SupportsNeg};
+    use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
     use crate::parameters::{Parameter, Placeholder};
     use crate::tracing::engines::Engine;
     use crate::tracing::{ProgramBuilder, Traceable, Value};
-    use crate::tracing_v2::ArrayOperation;
-    use crate::tracing_v2::Differentiable;
-    use crate::tracing_v2::operations::{SupportsNeg, SupportsScale};
+    use crate::tracing_v2::operations::SupportsScale;
+    use crate::tracing_v2::{ArrayOperation, Differentiable};
     use crate::types::DataType;
 
     use super::*;

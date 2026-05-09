@@ -1,5 +1,6 @@
 use std::ops::Mul;
 
+use crate::TracingEngine;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{MulOperation, SupportsAdd};
@@ -14,8 +15,7 @@ where
     E: DifferentiableEngine,
     MulOperation: Operation<E::Type>,
     E::Value: Mul<Output = E::Value> + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier:
-        SupportsScale<E::Type, E::Tangent, E::Value>,
+    <E::LinearEngine as TracingEngine>::OperationCarrier: SupportsScale<E::Type, E::Tangent, E::Value>,
 {
     fn jvp(
         &self,
@@ -25,29 +25,28 @@ where
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
-        let left_term_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsScale<
-                E::Type,
-                E::Tangent,
-                E::Value,
-            >>::scale_operation(right.primal.clone()),
-            &[left.tangent],
-        )?;
+        let left_term_outputs =
+            context.stage(
+                <<E::LinearEngine as TracingEngine>::OperationCarrier as SupportsScale<
+                    E::Type,
+                    E::Tangent,
+                    E::Value,
+                >>::scale_operation(right.primal.clone()),
+                &[left.tangent],
+            )?;
         check_count!("output", left_term_outputs, 1, TracingError);
-        let right_term_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsScale<
-                E::Type,
-                E::Tangent,
-                E::Value,
-            >>::scale_operation(left.primal.clone()),
-            &[right.tangent],
-        )?;
+        let right_term_outputs =
+            context.stage(
+                <<E::LinearEngine as TracingEngine>::OperationCarrier as SupportsScale<
+                    E::Type,
+                    E::Tangent,
+                    E::Value,
+                >>::scale_operation(left.primal.clone()),
+                &[right.tangent],
+            )?;
         check_count!("output", right_term_outputs, 1, TracingError);
         let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing::engines::TracingEngine>::OperationCarrier as SupportsAdd<
-                E::Type,
-                E::Tangent,
-            >>::add_operation(),
+            <<E::LinearEngine as TracingEngine>::OperationCarrier as SupportsAdd<E::Type, E::Tangent>>::add_operation(),
             &[left_term_outputs[0], right_term_outputs[0]],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);

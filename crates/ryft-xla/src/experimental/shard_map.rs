@@ -15,8 +15,7 @@ use thiserror::Error;
 
 use ryft_core::macros::check_count;
 use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, SubOperation};
-use ryft_core::operations::constants::{One, Zero};
-use ryft_core::operations::constants::{OneLike, ZeroLike};
+use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};

@@ -5,8 +5,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 use ndarray::{Array2, ArrayD, Ix2, IxDyn, Zip};
 use thiserror::Error;
 
-use ryft_core::operations::constants::{One, Zero};
-use ryft_core::operations::constants::{OneLike, ZeroLike};
+use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
 use ryft_core::parameters::Parameter;
 use ryft_core::tracing::{Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::{ControlFlowError, ControlFlowValue};

@@ -9,7 +9,7 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::macros::check_count;
-use crate::operations::arithmetic::{AddOperation, SupportsAdd};
+use crate::operations::arithmetic::{AddOperation, SupportsAdd, SupportsNeg};
 use crate::operations::constants::{One, SupportsZero, SupportsZeroLike, Zero, ZeroLike};
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::{InterpretableOperation, Operation};
@@ -17,7 +17,7 @@ use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
 use crate::tracing::transposition::LinearOperation;
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::operations::{SupportsNeg, SupportsScale};
+use crate::tracing_v2::operations::SupportsScale;
 use crate::types::{ArrayType, Type, Typed};
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].

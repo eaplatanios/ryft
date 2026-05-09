@@ -6,9 +6,8 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::macros::check_count;
-use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, SubOperation};
-use crate::operations::constants::{One, Zero};
-use crate::operations::constants::{OneLike, ZeroLike};
+use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
+use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::tracing::engines::Tracer;
@@ -324,7 +323,7 @@ where
             Self::Sub => batch_by_interpreting_physical_operation(&SubOperation, inputs),
             Self::Mul => batch_by_interpreting_physical_operation(&MulOperation, inputs),
             Self::Div => batch_by_interpreting_physical_operation(&DivOperation, inputs),
-            Self::Neg => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::NegOperation, inputs),
+            Self::Neg => batch_by_interpreting_physical_operation(&NegOperation, inputs),
             Self::Sin => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::SinOperation, inputs),
             Self::Cos => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::CosOperation, inputs),
             Self::ZeroLike => {

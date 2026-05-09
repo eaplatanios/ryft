@@ -3,8 +3,7 @@ use std::fmt::Debug;
 use std::rc::Rc;
 
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
-use crate::operations::constants::{One, Zero};
-use crate::operations::constants::{OneLike, SupportsZeroLike, ZeroLike};
+use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
