@@ -9,23 +9,25 @@ use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
 use crate::tracing::{Instruction, Program, ProgramBuilder, TracingError};
 
 impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
-    /// Transposes a traced linear [`Program`] using this [`TracingContext`] for zero materialization.
-    ///
-    /// The transposes program itself is staged in a fresh program builder. Any zero operation
-    /// produced for a disconnected primal input is then replaced with a traced constant whose
-    /// underlying outer-trace value is synthesized through [`Engine::zero`](crate::tracing::engines::Engine::zero).
+    /// Transposes the provided linear [`Program`]. The transposed program is first staged as an ordinary linear
+    /// [`Program`]. This is used for transforming _pushforward_ functions into _pullback_ functions during automatic
+    /// differentiation. When a primal input is disconnected from the outputs, transposition represents its cotangent
+    /// as a [`ZeroOperation`](crate::operations::ZeroOperation). Such an input-free operation cannot recover the
+    /// surrounding [`TracingContext`] during later interpretation, and so this method replaces each standalone zero
+    /// operation with a constant [`Tracer`] created in this [`TracingContext`]. The concrete zero value stored in that
+    /// tracer is synthesized through [`Engine::zero`](crate::tracing::Engine::zero), while the final pullback still
+    /// receives and returns traced cotangent values.
     pub fn transpose<
         Input: Parameterized<Tracer<'engine, E>>,
         Output: Parameterized<Tracer<'engine, E>>,
-        O: LinearOperation<E::Type, Tracer<'engine, E>, O>,
+        O: Clone
+            + LinearOperation<E::Type, Tracer<'engine, E>, O>
+            + SupportsZero<E::Type, Tracer<'engine, E>>
+            + SupportsAdd<E::Type, Tracer<'engine, E>>,
     >(
         &self,
         program: &Program<E::Type, Tracer<'engine, E>, O, Input, Output>,
-    ) -> Result<Program<E::Type, Tracer<'engine, E>, O, Output, Input>, TracingError>
-    where
-        E: 'static,
-        O: Clone + SupportsZero<E::Type, Tracer<'engine, E>> + SupportsAdd<E::Type, Tracer<'engine, E>>,
-    {
+    ) -> Result<Program<E::Type, Tracer<'engine, E>, O, Output, Input>, TracingError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new()));
         let mut context = TranspositionContext::new(builder);
         let pullback = context.transpose(program)?;
@@ -39,11 +41,11 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
                 && instruction.outputs.len() == 1
                 && instruction.inputs.is_empty()
             {
-                // Zero ops in traced pullbacks have no inputs from which interpretation can recover a tracing
-                // context, so materialize each one as a constant in this outer trace and remap its uses.
-                let zero_tracer = self.constant(self.engine.zero(&zero_operation.r#type)?);
-                let constant_atom = builder.add_constant(zero_tracer);
-                atom_remapping[instruction.outputs[0].index] = Some(constant_atom);
+                // Zero operations in traced pullbacks have no inputs from which interpretation can recover a tracing
+                // context, and so we materialize each one as a constant in this outer tracing context and remap its
+                // uses.
+                let zero = builder.add_constant(self.constant(self.engine.zero(&zero_operation.r#type)?));
+                atom_remapping[instruction.outputs[0].index] = Some(zero);
             } else {
                 let inputs = instruction
                     .inputs
@@ -65,6 +67,6 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
             .collect::<Vec<_>>();
         builder
             .build(outputs, pullback.input_structure.clone(), pullback.output_structure.clone())?
-            .simplified()
+            .into_simplified()
     }
 }
