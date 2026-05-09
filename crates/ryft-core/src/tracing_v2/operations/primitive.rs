@@ -2464,20 +2464,7 @@ where
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
-            Self::Scale { factor } => {
-                check_count!("input", inputs, 1, TracingError);
-                let input = &inputs[0];
-                let factor_tracer = context.engine.constant(factor.clone());
-                let tangent_outputs = context.stage(
-                    <EInner::LinearOperationCarrier<'engine> as SupportsScale<
-                        DataType,
-                        Tracer<'engine, EInner>,
-                    >>::scale_operation(factor_tracer.clone()),
-                    &[input.tangent],
-                )?;
-                check_count!("output", tangent_outputs, 1, TracingError);
-                Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs[0] }])
-            }
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::MatrixMultiply
             | Self::Transpose
             | Self::Reshape { .. }

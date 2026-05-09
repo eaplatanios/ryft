@@ -65,6 +65,26 @@ where
     }
 }
 
+/// Type metadata that can represent the scalar boolean predicate expected by control-flow operations.
+pub(crate) trait ControlFlowPredicateType: PartialEq + Type {
+    /// Validates that this metadata is the scalar boolean predicate type.
+    fn ensure_scalar_bool_type(&self) -> Result<(), TypeError>;
+}
+
+impl ControlFlowPredicateType for ArrayType {
+    #[inline]
+    fn ensure_scalar_bool_type(&self) -> Result<(), TypeError> {
+        ensure_array_scalar_bool_type(self)
+    }
+}
+
+impl ControlFlowPredicateType for DataType {
+    #[inline]
+    fn ensure_scalar_bool_type(&self) -> Result<(), TypeError> {
+        ensure_data_scalar_bool_type(self)
+    }
+}
+
 /// Predicate source for a [`ConditionOperation`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ConditionPredicate<T: PartialEq + Type = ArrayType> {
@@ -269,16 +289,15 @@ impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> ConditionOpe
         if predicate { &self.true_branch } else { &self.false_branch }
     }
 
-    fn infer_output_types_with_predicate_validator(
-        &self,
-        input_types: &[T],
-        ensure_scalar_bool_type: fn(&T) -> Result<(), TypeError>,
-    ) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types_impl(&self, input_types: &[T]) -> Result<Vec<T>, TypeError>
+    where
+        T: ControlFlowPredicateType,
+    {
         let operand_input_types = self.input_types();
         let operand_start = match &self.predicate {
             ConditionPredicate::RuntimeInput(predicate_type) => {
                 ensure_input_count(operand_input_types.len() + 1, input_types.len(), "condition")?;
-                ensure_scalar_bool_type(&input_types[0])?;
+                input_types[0].ensure_scalar_bool_type()?;
                 if &input_types[0] != predicate_type {
                     return Err(TypeError {
                         message: format!(
@@ -323,33 +342,16 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayType>
-    for ConditionOperation<V, O, ArrayType>
+impl<T: ControlFlowPredicateType, V: Traceable<T>, O: Clone + Operation<T>> Operation<T>
+    for ConditionOperation<V, O, T>
 {
     #[inline]
     fn name(&self) -> &'static str {
         "condition"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        self.infer_output_types_with_predicate_validator(input_types, ensure_array_scalar_bool_type)
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.render_operation(formatter, indentation)
-    }
-}
-
-impl<V: Traceable<DataType>, O: Clone + Operation<DataType>> Operation<DataType>
-    for ConditionOperation<V, O, DataType>
-{
-    #[inline]
-    fn name(&self) -> &'static str {
-        "condition"
-    }
-
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        self.infer_output_types_with_predicate_validator(input_types, ensure_data_scalar_bool_type)
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+        self.infer_output_types_impl(input_types)
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -561,30 +563,13 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayType>
-    for WhileOperation<V, O, ArrayType>
-{
+impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> Operation<T> for WhileOperation<V, O, T> {
     #[inline]
     fn name(&self) -> &'static str {
         "while"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        self.infer_output_types_impl(input_types)
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.render_operation(formatter, indentation)
-    }
-}
-
-impl<V: Traceable<DataType>, O: Clone + Operation<DataType>> Operation<DataType> for WhileOperation<V, O, DataType> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        "while"
-    }
-
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         self.infer_output_types_impl(input_types)
     }
 

@@ -10,7 +10,7 @@ use crate::tracing::engines::{Tracer, TracingEngine};
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::sin::Sin;
 
@@ -85,14 +85,7 @@ impl<T: Type> Operation<T> for CosOperation {
     }
 }
 
-impl<V: Clone + Typed<ArrayType> + Cos> InterpretableOperation<ArrayType, V> for CosOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
-        Ok(vec![inputs[0].clone().cos()])
-    }
-}
-
-impl<V: Clone + Typed<DataType> + Cos> InterpretableOperation<DataType, V> for CosOperation {
+impl<T: Type, V: Clone + Typed<T> + Cos> InterpretableOperation<T, V> for CosOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().cos()])
