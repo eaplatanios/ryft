@@ -1,0 +1,263 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::differentiation::{LinearOperation, TranspositionContext};
+use crate::macros::check_count;
+use crate::operations::Operation;
+use crate::operations::arithmetic::SupportsAdd;
+use crate::operations::constants::SupportsZero;
+use crate::parameters::Parameterized;
+use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
+use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
+use crate::types::{Type, Typed};
+
+impl<T: Type, V: Traceable<T>, O: LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>>
+    TranspositionContext<T, V, O>
+{
+    /// Transposes a complete linear [`Program`] using this context's current builder.
+    ///
+    /// This is the builder-level implementation behind [`Program::transpose`]. See
+    /// [`Program::transpose`] for the conceptual relationship between program transposition,
+    /// algebraic transposition, pushforwards, and pullbacks. This method is for callers that
+    /// already own a [`TranspositionContext`] and need the transposed program to be staged through
+    /// that context's active [`ProgramBuilder`].
+    ///
+    /// The method treats [`builder`](Self::builder) as the destination for the transposed program,
+    /// records cotangent inputs for the primal outputs, walks `program` in reverse instruction
+    /// order, and applies [`LinearOperation::transpose`] to each instruction. The active builder is
+    /// consumed when the pullback is built. On success, this context is left with a fresh empty
+    /// builder. If a transpose rule needs to transpose a nested program while preserving the
+    /// surrounding builder, it should call [`transpose_nested`](Self::transpose_nested) instead.
+    ///
+    /// Most ordinary callers should use [`Program::transpose`] instead of constructing a
+    /// [`TranspositionContext`] directly.
+    pub fn transpose<Input: Parameterized<V>, Output: Parameterized<V>>(
+        &mut self,
+        program: &Program<T, V, O, Input, Output>,
+    ) -> Result<Program<T, V, O, Output, Input>, TracingError> {
+        fn accumulate<T: Type, V: Traceable<T>, O: Operation<T>>(
+            builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
+            adjoints: &mut [Option<AtomId>],
+            atom: AtomId,
+            contribution: AtomId,
+        ) -> Result<(), TracingError>
+        where
+            O: SupportsAdd<T, V>,
+        {
+            adjoints[atom.index] = Some(match adjoints[atom.index] {
+                Some(existing) => {
+                    let mut builder_borrow = builder.borrow_mut();
+                    let abstract_value = builder_borrow.atoms[existing.index].r#type().into_owned();
+                    let output = builder_borrow.add_variable(abstract_value);
+                    builder_borrow.instructions.push(Instruction {
+                        operation: O::add_operation(),
+                        inputs: vec![existing, contribution],
+                        outputs: vec![output],
+                    });
+                    output
+                }
+                None => contribution,
+            });
+            Ok(())
+        }
+
+        fn stage_zero<T: Type, V: Traceable<T>, O: Operation<T>>(
+            builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
+            r#type: T,
+        ) -> AtomId
+        where
+            O: SupportsZero<T, V>,
+        {
+            let mut builder_borrow = builder.borrow_mut();
+            let output = builder_borrow.add_variable(r#type.clone());
+            builder_borrow.instructions.push(Instruction {
+                operation: O::zero_operation(r#type),
+                inputs: vec![],
+                outputs: vec![output],
+            });
+            output
+        }
+
+        let builder = self.builder.clone();
+        let mut output_cotangent_inputs = Vec::with_capacity(program.output_ids.len());
+        for output in program.output_ids.iter() {
+            let output_atom = program.atoms.get(output.index).ok_or(TracingError::UnboundAtomId { id: *output })?;
+            let cotangent_input = builder.borrow_mut().add_input(output_atom.r#type().into_owned());
+            output_cotangent_inputs.push(cotangent_input);
+        }
+
+        let mut adjoints = vec![None; program.atoms.len()];
+        for (cotangent, output) in output_cotangent_inputs.into_iter().zip(program.output_ids.iter().copied()) {
+            accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), output, cotangent)?;
+        }
+
+        for instruction in program.instructions.iter().rev() {
+            if instruction.outputs.iter().all(|output| adjoints[output.index].is_none()) {
+                continue;
+            }
+            let instruction_output_cotangents =
+                instruction.outputs.iter().map(|output| adjoints[output.index]).collect::<Vec<_>>();
+            let input_cotangents = instruction.operation.transpose(self, instruction_output_cotangents.as_slice())?;
+            for (input, contribution) in instruction.inputs.iter().copied().zip(input_cotangents) {
+                if let Some(contribution) = contribution {
+                    accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), input, contribution)?;
+                }
+            }
+        }
+
+        let outputs = program
+            .input_ids
+            .iter()
+            .copied()
+            .map(|input| match adjoints[input.index] {
+                Some(adjoint) => adjoint,
+                None => stage_zero::<T, V, O>(&builder, program.atoms[input.index].r#type().into_owned()),
+            })
+            .collect::<Vec<_>>();
+        drop(builder);
+        let builder = self.builder.clone();
+        self.builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let builder = match Rc::try_unwrap(builder) {
+            Ok(builder) => builder.into_inner(),
+            Err(_) => return Err(TracingError::EscapedProgramBuilder),
+        };
+        builder.build(outputs, program.output_structure.clone(), program.input_structure.clone())
+    }
+
+    /// Transposes a nested linear [`Program`] without consuming this context's current builder.
+    ///
+    /// This is the nested-program variant of [`TranspositionContext::transpose`]. See
+    /// [`Program::transpose`] for the conceptual meaning of transposition. This method is for
+    /// transpose rules that carry linear subprograms as operation metadata, such as captured
+    /// control-flow branches.
+    ///
+    /// It temporarily replaces [`builder`](Self::builder) with a fresh sibling builder, calls
+    /// [`transpose`](Self::transpose) for the nested `program`, and then restores the original
+    /// builder before returning the nested pullback result. This keeps nested transposition from
+    /// appending instructions to the surrounding pullback or consuming the builder that the
+    /// surrounding rule still needs. The original builder is restored whether the nested
+    /// transposition succeeds or returns an error.
+    pub fn transpose_nested<Input: Parameterized<V>, Output: Parameterized<V>>(
+        &mut self,
+        program: &Program<T, V, O, Input, Output>,
+    ) -> Result<Program<T, V, O, Output, Input>, TracingError> {
+        let parent_builder = self.builder.clone();
+        self.builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let result = self.transpose(program);
+        self.builder = parent_builder;
+        result
+    }
+}
+
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Program<T, V, O, Input, Output>
+{
+    /// Transposes this linear pushforward [`Program`] into its reverse-mode pullback.
+    ///
+    /// This is the main entrypoint for transposing a complete linear [`Program`]. In the algebraic
+    /// sense, transposing a linear map `L: X -> Y` gives a map on dual spaces `L^T: Y* -> X*`. In
+    /// finite dimensions this is the same operation represented by a matrix transpose. Here the
+    /// linear map is not stored as a matrix. It is a staged [`Program`] that maps input tangents to
+    /// output tangents, and transposition builds the dual program that maps output cotangents back
+    /// to input cotangents.
+    ///
+    /// Operationally, transposition creates cotangent inputs for this program's outputs, walks the
+    /// instructions in reverse order, and applies each primitive operation's
+    /// [`LinearOperation::transpose`] rule to accumulate cotangent contributions for the original
+    /// inputs. This is the same decomposition of reverse-mode automatic differentiation as in
+    /// [_You Only Linearize Once: Tangents Transpose to
+    /// Gradients_](https://arxiv.org/abs/2204.10923): linearize once to get a tangent pushforward,
+    /// then transpose the linear part to get a gradient-producing pullback.
+    ///
+    /// `output_examples` carries one representative value per primal output and is only used to
+    /// validate the output count; cotangent input types come from this program's own atom metadata.
+    /// Disconnected primal inputs are emitted as zero operations, which the value type's
+    /// [`Zero`](crate::Zero) implementation evaluates at interpretation time. For linear programs
+    /// whose values are [`Tracer`]s from an outer trace, use [`TracingContext::transpose`] instead
+    /// so those disconnected-input zeros can be materialized in the surrounding tracing context.
+    pub fn transpose(&self, output_examples: &[V]) -> Result<Program<T, V, O, Output, Input>, TracingError>
+    where
+        O: LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>,
+    {
+        let expected_output_count = self.output_ids.len();
+        check_count!("output", output_examples, expected_output_count, TracingError);
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new()));
+        let mut context = TranspositionContext::new(builder);
+        context.transpose(self)
+    }
+}
+
+impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
+    /// Transposes a traced linear [`Program`] and materializes standalone zero cotangents. This method performs the
+    /// same program transposition as [`Program::transpose`], but is specialized for linear programs whose values are
+    /// [`Tracer`]s belonging to this [`TracingContext`]. Use it when transposing a linear program inside an outer
+    /// trace, such as when staging a traced reverse-mode pullback.
+    ///
+    /// The transposed program is first staged as an ordinary linear [`Program`]. When a primal input is disconnected
+    /// from the outputs, transposition represents its cotangent as a [`ZeroOperation`](crate::ZeroOperation). Such an
+    /// input-free operation cannot recover the surrounding [`TracingContext`] during later interpretation, and so this
+    /// method replaces each standalone zero operation with a constant [`Tracer`] created in this [`TracingContext`].
+    /// The concrete zero value stored in that tracer is synthesized through [`Engine::zero`](crate::Engine::zero),
+    /// while the final pullback still receives and returns traced cotangent values.
+    pub fn transpose<
+        Input: Parameterized<Tracer<'engine, E>>,
+        Output: Parameterized<Tracer<'engine, E>>,
+        O: Clone
+            + LinearOperation<E::Type, Tracer<'engine, E>, O>
+            + SupportsZero<E::Type, Tracer<'engine, E>>
+            + SupportsAdd<E::Type, Tracer<'engine, E>>,
+    >(
+        &self,
+        program: &Program<E::Type, Tracer<'engine, E>, O, Input, Output>,
+    ) -> Result<Program<E::Type, Tracer<'engine, E>, O, Output, Input>, TracingError> {
+        // First build the ordinary transposed program. At this point disconnected inputs are still represented as
+        // input-free zero operations in the transposed program.
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new()));
+        let mut context = TranspositionContext::new(builder);
+        let transposed_program = context.transpose(program)?;
+
+        // Rewrite the transposed program into a sibling builder. We preserve the existing atom table and inputs,
+        // then use `atom_remapping` only for atoms that need to point at replacement constants.
+        let mut builder = ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new();
+        builder.atoms = transposed_program.atoms.clone();
+        builder.input_ids = transposed_program.input_ids.clone();
+        let mut atom_remapping = vec![None; builder.atoms.len()];
+        let mut rewritten_instructions = Vec::with_capacity(transposed_program.instructions.len());
+        for instruction in &transposed_program.instructions {
+            if let Some(zero_operation) = instruction.operation.as_zero_operation()
+                && instruction.outputs.len() == 1
+                && instruction.inputs.is_empty()
+            {
+                // Zero operations in traced pullbacks have no inputs from which interpretation can recover a tracing
+                // context, and so we materialize each one as a constant in this tracing context and remap its uses.
+                let zero = builder.add_constant(self.constant(self.engine.zero(&zero_operation.r#type)?));
+                atom_remapping[instruction.outputs[0].index] = Some(zero);
+            } else {
+                // Preserve non-zero instructions, rewriting only the inputs that consumed a zero operation
+                // we replaced with a traced constant above.
+                let inputs = instruction
+                    .inputs
+                    .iter()
+                    .map(|atom| atom_remapping[atom.index].unwrap_or(*atom))
+                    .collect::<Vec<_>>();
+                rewritten_instructions.push(Instruction {
+                    operation: instruction.operation.clone(),
+                    inputs,
+                    outputs: instruction.outputs.clone(),
+                });
+            }
+        }
+        builder.instructions = rewritten_instructions;
+
+        // Outputs can also refer directly to replaced zero-operation atoms, and so we apply the same remapping before
+        // building. The subsequent simplification removes the skipped zero instructions and their old output atoms.
+        let outputs = transposed_program
+            .output_ids
+            .iter()
+            .map(|atom| atom_remapping[atom.index].unwrap_or(*atom))
+            .collect::<Vec<_>>();
+        builder
+            .build(outputs, transposed_program.input_structure.clone(), transposed_program.output_structure.clone())?
+            .into_simplified()
+    }
+}
