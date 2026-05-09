@@ -9,14 +9,23 @@ use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
 use crate::tracing::{Instruction, Program, ProgramBuilder, TracingError};
 
 impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
-    /// Transposes the provided linear [`Program`]. The transposed program is first staged as an ordinary linear
-    /// [`Program`]. This is used for transforming _pushforward_ functions into _pullback_ functions during automatic
-    /// differentiation. When a primal input is disconnected from the outputs, transposition represents its cotangent
-    /// as a [`ZeroOperation`](crate::operations::ZeroOperation). Such an input-free operation cannot recover the
-    /// surrounding [`TracingContext`] during later interpretation, and so this method replaces each standalone zero
-    /// operation with a constant [`Tracer`] created in this [`TracingContext`]. The concrete zero value stored in that
-    /// tracer is synthesized through [`Engine::zero`](crate::tracing::Engine::zero), while the final pullback still
-    /// receives and returns traced cotangent values.
+    /// Transposes the provided linear [`Program`] from a _pushforward_ function into a _pullback_ function.
+    ///
+    /// In the algebraic sense, transposing a linear map `L: X -> Y` gives a map on dual spaces `L^T: Y* -> X*`.
+    /// In finite dimensions this is the same operation represented by a matrix transpose. Here the linear map is not
+    /// stored as a matrix. It is a staged [`Program`] that maps input tangents to output tangents, and transposition
+    /// builds the dual program that maps output cotangents back to input cotangents by walking the instructions in
+    /// reverse and applying each primitive operation's [`LinearOperation::transpose`] rule. This is the same
+    /// decomposition of reverse-mode automatic differentiation as in [this paper](https://arxiv.org/abs/2204.10923).
+    /// We linearize once to get a tangent pushforward, and we then transpose the linear part to get a
+    /// gradient-producing pullback.
+    ///
+    /// The transposed program is first staged as an ordinary linear [`Program`]. When a primal input is disconnected
+    /// from the outputs, transposition represents its cotangent as a [`ZeroOperation`](crate::ZeroOperation). Such an
+    /// input-free operation cannot recover the surrounding [`TracingContext`] during later interpretation, and so this
+    /// method replaces each standalone zero operation with a constant [`Tracer`] created in this [`TracingContext`].
+    /// The concrete zero value stored in that tracer is synthesized through [`Engine::zero`](crate::Engine::zero),
+    /// while the final pullback still receives and returns traced cotangent values.
     pub fn transpose<
         Input: Parameterized<Tracer<'engine, E>>,
         Output: Parameterized<Tracer<'engine, E>>,
