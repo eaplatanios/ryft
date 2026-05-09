@@ -28,25 +28,31 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
         &self,
         program: &Program<E::Type, Tracer<'engine, E>, O, Input, Output>,
     ) -> Result<Program<E::Type, Tracer<'engine, E>, O, Output, Input>, TracingError> {
+        // First build the ordinary transposed program. At this point disconnected inputs are still represented as
+        // input-free zero operations in the transposed program.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new()));
         let mut context = TranspositionContext::new(builder);
-        let pullback = context.transpose(program)?;
+        let transposed_program = context.transpose(program)?;
+
+        // Rewrite the transposed program into a sibling builder. We preserve the existing atom table and inputs,
+        // then use `atom_remapping` only for atoms that need to point at replacement constants.
         let mut builder = ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new();
-        builder.atoms = pullback.atoms.clone();
-        builder.input_ids = pullback.input_ids.clone();
+        builder.atoms = transposed_program.atoms.clone();
+        builder.input_ids = transposed_program.input_ids.clone();
         let mut atom_remapping = vec![None; builder.atoms.len()];
-        let mut rewritten_instructions = Vec::with_capacity(pullback.instructions.len());
-        for instruction in &pullback.instructions {
+        let mut rewritten_instructions = Vec::with_capacity(transposed_program.instructions.len());
+        for instruction in &transposed_program.instructions {
             if let Some(zero_operation) = instruction.operation.as_zero_operation()
                 && instruction.outputs.len() == 1
                 && instruction.inputs.is_empty()
             {
                 // Zero operations in traced pullbacks have no inputs from which interpretation can recover a tracing
-                // context, and so we materialize each one as a constant in this outer tracing context and remap its
-                // uses.
+                // context, and so we materialize each one as a constant in this tracing context and remap its uses.
                 let zero = builder.add_constant(self.constant(self.engine.zero(&zero_operation.r#type)?));
                 atom_remapping[instruction.outputs[0].index] = Some(zero);
             } else {
+                // Preserve non-zero instructions, rewriting only the inputs that consumed a zero operation
+                // we replaced with a traced constant above.
                 let inputs = instruction
                     .inputs
                     .iter()
@@ -60,13 +66,16 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
             }
         }
         builder.instructions = rewritten_instructions;
-        let outputs = pullback
+
+        // Outputs can also refer directly to replaced zero-operation atoms, and so we apply the same remapping before
+        // building. The subsequent simplification removes the skipped zero instructions and their old output atoms.
+        let outputs = transposed_program
             .output_ids
             .iter()
             .map(|atom| atom_remapping[atom.index].unwrap_or(*atom))
             .collect::<Vec<_>>();
         builder
-            .build(outputs, pullback.input_structure.clone(), pullback.output_structure.clone())?
+            .build(outputs, transposed_program.input_structure.clone(), transposed_program.output_structure.clone())?
             .into_simplified()
     }
 }
