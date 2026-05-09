@@ -72,7 +72,7 @@ mod tests {
         let engine = ScalarEngine::<f64>::new();
         let (primal, pushforward) =
             linearize(&engine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
-        let pullback = pushforward.transpose(&[primal]).unwrap();
+        let pullback = pushforward.transpose().unwrap();
         let cotangent = pullback.interpret(1.0f64).unwrap();
 
         approx_eq(primal, 2.0 * 3.0 + 2.0f64.sin());
@@ -83,10 +83,10 @@ mod tests {
             indoc! {"
             lambda %0:f64 .
             let %1:f64 = scale [factor=-0.4161468365471424] %0
-                %2:f64 = scale [factor=3] %0
-                %3:f64 = add %1 %2
-                %4:f64 = scale [factor=2] %0
-            in (%3, %4)
+                %2:f64 = scale [factor=2] %0
+                %3:f64 = scale [factor=3] %0
+                %4:f64 = add %1 %3
+            in (%4, %2)
             "}
             .trim_end(),
         );

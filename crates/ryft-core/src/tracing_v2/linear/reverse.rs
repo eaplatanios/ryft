@@ -129,8 +129,7 @@ where
     Output::Family: ParameterizedFamily<E::Tangent>,
 {
     let (output, pushforward) = linearize::<E, F, Input, Output, V>(engine, function, primals)?;
-    let output_examples = output.parameters().map(Differentiable::tangent_type).collect::<Result<Vec<_>, _>>()?;
-    let pullback = pushforward.transpose(output_examples.as_slice())?;
+    let pullback = pushforward.transpose()?;
     Ok((output, pullback))
 }
 
