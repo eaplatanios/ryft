@@ -173,10 +173,8 @@ pub trait Differentiable<T: Type>: Traceable<T> {
     fn tangent_type(&self) -> Result<Self::Tangent, TracingError>;
 }
 
-impl<'domain, D> Differentiable<D::Type> for Tracer<'domain, D>
-where
-    D: RuntimeDomain + TracingDomain,
-    D::Value: Differentiable<D::Type>,
+impl<'domain, D: RuntimeDomain<Value: Differentiable<D::Type>> + TracingDomain> Differentiable<D::Type>
+    for Tracer<'domain, D>
 {
     type Tangent = Self;
 
@@ -390,23 +388,23 @@ pub trait DifferentiableOperation<D: DifferentiableDomain>: Operation<D::Type> {
 /// [`ProgramTracingContext`](crate::tracing::ProgramTracingContext): JVP rules call
 /// [`apply_operation`](Self::apply_operation) to stage tangent ops on the active builder.
 #[doc(hidden)]
-pub struct JvpContext<'a, D: DifferentiableDomain> {
+pub struct JvpContext<'domain, D: DifferentiableDomain> {
     /// Differentiable domain borrowed by this [`JvpContext`] for primal semantics and linear-domain selection.
-    pub domain: &'a D,
+    pub domain: &'domain D,
 
     /// [`TracingContext`] used to stage tangent operations into the active linear program.
-    pub linear_context: TracingContext<'a, D::LinearDomain>,
+    pub linear_context: TracingContext<'domain, D::LinearDomain>,
 
     /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::tracing::Program) that is currently being
     /// traced.
     pub builder: Rc<RefCell<ProgramBuilder<D::Type, D::Tangent, D::LinearOperationCarrier>>>,
 }
 
-impl<'a, D: DifferentiableDomain> JvpContext<'a, D> {
+impl<'domain, D: DifferentiableDomain> JvpContext<'domain, D> {
     /// Creates a JVP context that stages into `builder`.
     #[doc(hidden)]
     pub fn new(
-        domain: &'a D,
+        domain: &'domain D,
         builder: Rc<RefCell<ProgramBuilder<D::Type, D::Tangent, D::LinearOperationCarrier>>>,
     ) -> Self {
         Self { domain, linear_context: TracingContext::new(domain.linear_domain(), builder.clone()), builder }
@@ -416,8 +414,8 @@ impl<'a, D: DifferentiableDomain> JvpContext<'a, D> {
     pub fn stage(
         &self,
         operation: D::LinearOperationCarrier,
-        inputs: &[Tracer<'a, D::LinearDomain>],
-    ) -> Result<Vec<Tracer<'a, D::LinearDomain>>, TracingError> {
+        inputs: &[Tracer<'domain, D::LinearDomain>],
+    ) -> Result<Vec<Tracer<'domain, D::LinearDomain>>, TracingError> {
         let input_refs = inputs.iter().collect::<Vec<_>>();
         self.linear_context.trace(operation, input_refs.as_slice())
     }
@@ -440,7 +438,7 @@ impl<'a, D: DifferentiableDomain> JvpContext<'a, D> {
     }
 
     /// Stages a constant tangent on the active linear builder.
-    pub fn add_constant(&self, value: D::Tangent) -> Tracer<'a, D::LinearDomain> {
+    pub fn add_constant(&self, value: D::Tangent) -> Tracer<'domain, D::LinearDomain> {
         self.linear_context.constant(value)
     }
 }
