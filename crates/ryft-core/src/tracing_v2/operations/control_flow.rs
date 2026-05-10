@@ -694,7 +694,7 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::tracing::domains::{Domain, ProgramTracingDomain, RuntimeDomain, TracingDomain};
     use crate::tracing::{ProgramBuilder, Traceable, Value};
-    use crate::tracing_v2::{ArrayOperation, Differentiable};
+    use crate::tracing_v2::{ArrayOperation, Differentiable, LinearizableDomain};
     use crate::types::DataType;
 
     use super::*;
@@ -1110,11 +1110,8 @@ mod tests {
 
     static TEST_LINEAR_DOMAIN: TestLinearDomain = TestLinearDomain;
 
-    impl crate::tracing_v2::DifferentiableDomain for TestDomain {
-        type Tangent = TestValue;
+    impl LinearizableDomain for TestDomain {
         type LinearDomain = TestLinearDomain;
-        type LinearOperationCarrier = TestLinearOperation;
-        type DifferentiableOperationCarrier = TestDifferentiableOperation;
 
         fn linear_domain(&self) -> &Self::LinearDomain {
             &TEST_LINEAR_DOMAIN

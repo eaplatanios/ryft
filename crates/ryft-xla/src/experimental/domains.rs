@@ -8,8 +8,8 @@ use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing::domains::{Domain, RuntimeDomain, Tracer, TracingDomain};
-use ryft_core::tracing_v2::{DifferentiableDomain, DifferentiableTracingDomain};
+use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
+use ryft_core::tracing_v2::LinearizableDomain;
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::ops::{LinearXlaOperation, XlaOperation};
@@ -182,23 +182,13 @@ impl TracingDomain for LinearXlaDomain {
     type OperationCarrier = LinearXlaOperation<ShardMapTensor>;
 }
 
-impl<'c> DifferentiableDomain for XlaDomain<'c> {
-    type Tangent = ShardMapTensor;
+impl<'c> LinearizableDomain for XlaDomain<'c> {
     type LinearDomain = LinearXlaDomain;
-    type LinearOperationCarrier = LinearXlaOperation<ShardMapTensor>;
-    type DifferentiableOperationCarrier = XlaOperation;
 
     #[inline]
     fn linear_domain(&self) -> &Self::LinearDomain {
         LinearXlaDomain::token()
     }
-}
-
-impl<'c> DifferentiableTracingDomain for XlaDomain<'c> {
-    type LinearOperationCarrier<'domain>
-        = LinearXlaOperation<Tracer<'domain, XlaDomain<'c>>>
-    where
-        Self: 'domain;
 }
 
 fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), TracingError> {

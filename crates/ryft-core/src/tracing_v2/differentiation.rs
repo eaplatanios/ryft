@@ -4,21 +4,23 @@ use std::convert::Infallible;
 use std::fmt::Display;
 use std::rc::Rc;
 
-use half::{bf16, f16};
 use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::differentiation::LinearOperation;
 use crate::macros::check_count;
-use crate::operations::arithmetic::{AddOperation, SupportsAdd, SupportsNeg, SupportsScale};
-use crate::operations::constants::{One, SupportsZero, SupportsZeroLike, Zero, ZeroLike};
-use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
+use crate::operations::arithmetic::{AddOperation, SupportsAdd, SupportsMul, SupportsNeg, SupportsScale, SupportsSub};
+use crate::operations::constants::{One, SupportsOneLike, SupportsZero, SupportsZeroLike, Zero, ZeroLike};
+use crate::operations::scalars::LinearScalarOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
-use crate::tracing::domains::{Domain, RuntimeDomain, ScalarDomain, Tracer, TracingContext, TracingDomain};
+use crate::tracing::domains::{
+    Domain, LinearScalarDomain, RuntimeDomain, ScalarDomain, Tracer, TracingContext, TracingDomain,
+};
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::forward::JvpDispatch;
-use crate::types::{ArrayType, Type, Typed};
+use crate::tracing_v2::operations::{LinearArrayOperation, SupportsMatMul, SupportsMatrixTranspose, SupportsReshape};
+use crate::types::{ArrayType, DataType, Type, Typed};
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -195,6 +197,98 @@ pub(crate) fn ensure_tracers_belong_to_context<'domain, D: TracingDomain>(
     Ok(())
 }
 
+/// Domain capability required for automatic-differentiation transforms that linearize staged programs.
+///
+/// This is the only backend-specific domain fact that `ryft-core` cannot infer from [`RuntimeDomain`] and
+/// [`TracingDomain`]. Once a backend selects a linear domain, core derives the tangent leaf type from
+/// [`Domain::Value`] on that linear domain, derives the tangent operation carrier from
+/// [`TracingDomain::OperationCarrier`] on that linear domain, and uses the backend's ordinary tracing carrier for
+/// differentiable primal programs.
+///
+/// A linearizable domain's selected linear carrier must itself be a [`LinearOperation`] carrier. That invariant lives
+/// here, instead of only on the blanket [`DifferentiableDomain`] implementation, so implementing this trait is a
+/// complete statement that programs over the domain can be linearized.
+pub trait LinearizableDomain: RuntimeDomain + TracingDomain + Sized {
+    /// Tracing domain selected by this domain for tangent and cotangent programs.
+    type LinearDomain: TracingDomain<
+            Type = Self::Type,
+            OperationCarrier: Clone
+                                  + InterpretableOperation<Self::Type, <Self::LinearDomain as Domain>::Value>
+                                  + LinearOperation<
+                Self::Type,
+                <Self::LinearDomain as Domain>::Value,
+                <Self::LinearDomain as TracingDomain>::OperationCarrier,
+            > + SupportsZero<Self::Type, <Self::LinearDomain as Domain>::Value>
+                                  + SupportsAdd<Self::Type, <Self::LinearDomain as Domain>::Value>,
+        >;
+
+    /// Returns the linearizable domain used for tangent and cotangent programs.
+    fn linear_domain(&self) -> &Self::LinearDomain;
+}
+
+/// Type-level family for linear operation carriers that can be reparameterized over a new value type.
+///
+/// [`LinearizableDomain`] identifies the linear domain used for concrete tangent and cotangent programs. For nested
+/// differentiation inside an active trace, `ryft-core` also needs the same linear operation family specialized to
+/// [`Tracer`] leaves. Rust cannot derive that specialization from an arbitrary carrier type:
+/// `LinearArrayOperation<Array<_>, ArrayType>` does not intrinsically tell the compiler that the traced carrier is
+/// `LinearArrayOperation<Tracer<_>, ArrayType>`.
+///
+/// This trait records that relationship for reusable carrier families. It is implemented once for the core scalar and
+/// array linear carriers, and backends that reuse those carriers inherit the traced-AD support automatically. There is
+/// intentionally no paired `ForValue` associated type in this trait: the implementing type already is the carrier
+/// specialized for the concrete value type `V`; [`ForTracer`](Self::ForTracer) names only the extra specialization that
+/// cannot be recovered from `Self`.
+pub trait LinearOperationCarrierFamily<D: TracingDomain, V: Traceable<D::Type>> {
+    /// Same linear carrier family specialized to operate on traced leaves for `D`.
+    type ForTracer<'domain>: Clone
+        + InterpretableOperation<D::Type, Tracer<'domain, D>>
+        + LinearOperation<D::Type, Tracer<'domain, D>, Self::ForTracer<'domain>>
+        + SupportsZero<D::Type, Tracer<'domain, D>>
+        + SupportsNeg<D::Type, Tracer<'domain, D>>
+        + SupportsAdd<D::Type, Tracer<'domain, D>>
+        + SupportsScale<D::Type, Tracer<'domain, D>>
+    where
+        D: 'domain;
+}
+
+impl<D, V> LinearOperationCarrierFamily<D, V> for LinearScalarOperation<V>
+where
+    D: TracingDomain<Type = DataType>,
+    V: Traceable<DataType>,
+    D::OperationCarrier: SupportsAdd<DataType, D::Value>
+        + SupportsSub<DataType, D::Value>
+        + SupportsNeg<DataType, D::Value>
+        + SupportsMul<DataType, D::Value>
+        + SupportsZeroLike<DataType, D::Value>
+        + SupportsOneLike<DataType, D::Value>,
+{
+    type ForTracer<'domain>
+        = LinearScalarOperation<Tracer<'domain, D>>
+    where
+        D: 'domain;
+}
+
+impl<D, V> LinearOperationCarrierFamily<D, V> for LinearArrayOperation<V, ArrayType>
+where
+    D: TracingDomain<Type = ArrayType>,
+    V: Traceable<ArrayType>,
+    D::OperationCarrier: SupportsAdd<ArrayType, D::Value>
+        + SupportsSub<ArrayType, D::Value>
+        + SupportsNeg<ArrayType, D::Value>
+        + SupportsMul<ArrayType, D::Value>
+        + SupportsZeroLike<ArrayType, D::Value>
+        + SupportsOneLike<ArrayType, D::Value>
+        + SupportsMatMul<ArrayType, D::Value>
+        + SupportsMatrixTranspose<ArrayType, D::Value>
+        + SupportsReshape<ArrayType, D::Value>,
+{
+    type ForTracer<'domain>
+        = LinearArrayOperation<Tracer<'domain, D>, ArrayType>
+    where
+        D: 'domain;
+}
+
 /// Extension of [`RuntimeDomain`] for backends that support automatic differentiation.
 ///
 /// Backends that only need ordinary tracing implement [`TracingDomain`] without this extension. AD
@@ -202,11 +296,15 @@ pub(crate) fn ensure_tracers_belong_to_context<'domain, D: TracingDomain>(
 /// [`vjp`](crate::tracing_v2::vjp) require this trait so non-differentiable backends do not need to
 /// define fake tangent carriers.
 ///
-/// Differentiated closures are traced through [`DifferentiableOperationTracingDomain`], whose
-/// [`TracingDomain::OperationCarrier`] is [`DifferentiableDomain::DifferentiableOperationCarrier`]. That keeps
-/// ordinary tracing free to use a wider operation carrier while making differentiation reject
-/// unsupported operations at type-check time when the differentiation carrier omits them.
-pub trait DifferentiableDomain: RuntimeDomain + Sized {
+/// Backends usually do not implement this trait directly. Implement [`LinearizableDomain`] instead and let the
+/// blanket implementation compose the full AD API in `ryft-core`.
+///
+/// Differentiated closures are traced with the domain's ordinary [`TracingDomain::OperationCarrier`]. Individual
+/// transforms that linearize a staged primal program require that carrier to implement [`DifferentiableOperation`] for
+/// the active domain, so backends do not need a second operation-carrier API just for AD.
+pub trait DifferentiableDomain:
+    RuntimeDomain + TracingDomain<OperationCarrier: Clone + InterpretableOperation<Self::Type, Self::Value>> + Sized
+{
     /// Tangent and cotangent leaf type selected by this differentiable domain.
     type Tangent: Traceable<Self::Type>;
 
@@ -219,15 +317,6 @@ pub trait DifferentiableDomain: RuntimeDomain + Sized {
         + LinearOperation<Self::Type, Self::Tangent, Self::LinearOperationCarrier>
         + SupportsZero<Self::Type, Self::Tangent>
         + SupportsAdd<Self::Type, Self::Tangent>;
-
-    /// Operation carrier selected by this domain for tracing differentiable primal programs.
-    ///
-    /// This carrier may be narrower than the ordinary [`TracingDomain::OperationCarrier`]. Every
-    /// operation it stores must be interpretable for primal execution and must provide a
-    /// [`DifferentiableOperation`] rule for linearization.
-    type DifferentiableOperationCarrier: Clone
-        + InterpretableOperation<Self::Type, Self::Value>
-        + DifferentiableOperation<Self>;
 
     /// Returns the linearizable domain used for tangent and cotangent programs.
     fn linear_domain(&self) -> &Self::LinearDomain;
@@ -305,15 +394,13 @@ pub trait DifferentiableDomain: RuntimeDomain + Sized {
         Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
-            + ParameterizedFamily<DifferentiableTracer<'domain, Self>>,
+            + ParameterizedFamily<Tracer<'domain, Self>>,
         Output::Family: ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
-            + ParameterizedFamily<DifferentiableTracer<'domain, Self>>,
-        Output::To<DifferentiableTracer<'domain, Self>>:
-            Parameterized<DifferentiableTracer<'domain, Self>, To<V> = Output>,
-        F: FnOnce(
-            Input::To<DifferentiableTracer<'domain, Self>>,
-        ) -> Result<Output::To<DifferentiableTracer<'domain, Self>>, TracingError>,
+            + ParameterizedFamily<Tracer<'domain, Self>>,
+        Output::To<Tracer<'domain, Self>>: Parameterized<Tracer<'domain, Self>, To<V> = Output>,
+        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Result<Output::To<Tracer<'domain, Self>>, TracingError>,
+        Self::OperationCarrier: DifferentiableOperation<Self>,
     {
         crate::tracing_v2::linear::JacFwd::new(function).evaluate::<Self, Input, Output, V>(self, primals)
     }
@@ -342,15 +429,12 @@ pub trait DifferentiableDomain: RuntimeDomain + Sized {
             + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
             + ParameterizedFamily<Tracer<'domain, Self>>
             + ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<V>
-            + ParameterizedFamily<DifferentiableTracer<'domain, Self>>,
+            + ParameterizedFamily<V>,
         Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
         Input::To<Tracer<'domain, Self>>:
             Parameterized<Tracer<'domain, Self>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
         <Input::To<Tracer<'domain, Self>> as Parameterized<Tracer<'domain, Self>>>::To<ArrayType>:
             Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
-        Input::To<DifferentiableTracer<'domain, Self>>:
-            Parameterized<DifferentiableTracer<'domain, Self>, To<V> = Input>,
         F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Tracer<'domain, Self>,
         Self::OperationCarrier: Clone
             + InterpretableOperation<ArrayType, V>
@@ -362,6 +446,21 @@ pub trait DifferentiableDomain: RuntimeDomain + Sized {
         AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, Self>>,
     {
         crate::tracing_v2::linear::Hessian::new(function).evaluate(self, primals)
+    }
+}
+
+impl<D> DifferentiableDomain for D
+where
+    D: LinearizableDomain,
+    D::Value: Differentiable<D::Type, Tangent = <<D as LinearizableDomain>::LinearDomain as Domain>::Value>,
+    D::OperationCarrier: Clone + InterpretableOperation<D::Type, D::Value>,
+{
+    type Tangent = <<D as LinearizableDomain>::LinearDomain as Domain>::Value;
+    type LinearDomain = <D as LinearizableDomain>::LinearDomain;
+    type LinearOperationCarrier = <<D as LinearizableDomain>::LinearDomain as TracingDomain>::OperationCarrier;
+    #[inline]
+    fn linear_domain(&self) -> &Self::LinearDomain {
+        LinearizableDomain::linear_domain(self)
     }
 }
 
@@ -617,11 +716,9 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
 
 /// Optional extension for tracing domains that support differentiation inside an active trace.
 ///
-/// Plain tracing domains do not need to choose any linear carrier. This trait is the additional
-/// contract required when a [`TracingContext`](crate::tracing::domains::TracingContext) itself needs to act
-/// as a differentiable domain: tangent and cotangent programs then operate on
-/// [`Tracer`] values, so the underlying tracing domain must select a linear operation carrier for
-/// those traced leaves.
+/// Backends usually do not implement this trait directly. Implement [`LinearizableDomain`] instead. If the selected
+/// linear carrier implements [`LinearOperationCarrierFamily`], `ryft-core` derives the traced linear carrier by
+/// reparameterizing that family over [`Tracer`] leaves.
 pub trait DifferentiableTracingDomain: TracingDomain<OperationCarrier: SupportsAdd<Self::Type, Self::Value>> {
     /// Linear operation carrier selected for tangent and cotangent programs over traced values.
     type LinearOperationCarrier<'domain>: Clone
@@ -635,78 +732,20 @@ pub trait DifferentiableTracingDomain: TracingDomain<OperationCarrier: SupportsA
         Self: 'domain;
 }
 
-/// Transparent tracing view used while tracing differentiable primal programs.
-///
-/// Automatic-differentiation transforms need to stage the user's primal closure with
-/// [`DifferentiableDomain::DifferentiableOperationCarrier`] rather than the ordinary
-/// [`TracingDomain::OperationCarrier`] selected by the backend. Those carriers may intentionally differ:
-/// an domain can support a broad ordinary tracing universe while exposing a narrower
-/// differentiable carrier whose variants all have differentiation rules under the real domain. This adapter
-/// only selects that carrier while tracing; the resulting program is still linearized with the wrapped domain.
-///
-/// [`DifferentiableOperationTracingDomain::new`] reborrows an `D: DifferentiableDomain` as a
-/// [`TracingDomain`] without allocation or ownership. AD entry points construct this view at trace
-/// boundaries such as [`linearize`](crate::tracing_v2::linearize),
-/// [`vjp`](crate::tracing_v2::vjp), and [`DifferentiableDomain::grad`], pass it immediately to
-/// ordinary tracing helpers, and keep backend implementations centered on their real domain type.
-/// User-facing ordinary tracing should keep using the backend's own [`TracingDomain`]
-/// implementation; traced tangent and cotangent programs are selected separately through
-/// [`DifferentiableTracingDomain`].
-///
-/// This type is public today because [`DifferentiableTracer`] aliases it. Once public AD APIs hide the concrete active
-/// tracer carrier entirely, this adapter can become a `pub(crate)` implementation detail.
-#[repr(transparent)]
-pub struct DifferentiableOperationTracingDomain<D: DifferentiableDomain> {
-    /// Backend viewed through its differentiable operation carrier.
-    domain: D,
-}
-
-/// [`Tracer`] used while staging a closure with a domain's differentiable operation carrier.
-pub type DifferentiableTracer<'domain, D> = Tracer<'domain, DifferentiableOperationTracingDomain<D>>;
-
-impl<D: DifferentiableDomain> DifferentiableOperationTracingDomain<D> {
-    /// Reborrows `domain` as a differentiable operation tracing view.
-    #[inline]
-    pub const fn new(domain: &D) -> &Self {
-        // SAFETY: `DifferentiableOperationTracingDomain<D>` is `repr(transparent)` over `D` and adds no
-        // fields, so references to `D` and references to this view have identical layout.
-        unsafe { &*(std::ptr::from_ref(domain) as *const Self) }
-    }
-
-    /// Returns the wrapped domain.
-    #[inline]
-    pub const fn inner(&self) -> &D {
-        // SAFETY: `DifferentiableOperationTracingDomain<D>` is `repr(transparent)` over `D` and adds no
-        // fields, so references to this view and references to `D` have identical layout.
-        unsafe { &*(std::ptr::from_ref(self) as *const D) }
-    }
-}
-
-impl<D: DifferentiableDomain> std::fmt::Debug for DifferentiableOperationTracingDomain<D> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("DifferentiableOperationTracingDomain").finish_non_exhaustive()
-    }
-}
-
-impl<D: DifferentiableDomain> Domain for DifferentiableOperationTracingDomain<D> {
-    type Type = D::Type;
-    type Value = D::Value;
-}
-
-impl<D: DifferentiableDomain> RuntimeDomain for DifferentiableOperationTracingDomain<D> {
-    #[inline]
-    fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        self.inner().zero(r#type)
-    }
-
-    #[inline]
-    fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        self.inner().one(r#type)
-    }
-}
-
-impl<D: DifferentiableDomain> TracingDomain for DifferentiableOperationTracingDomain<D> {
-    type OperationCarrier = D::DifferentiableOperationCarrier;
+impl<D> DifferentiableTracingDomain for D
+where
+    D: LinearizableDomain<OperationCarrier: SupportsAdd<D::Type, D::Value>>,
+    <<D as LinearizableDomain>::LinearDomain as TracingDomain>::OperationCarrier:
+        LinearOperationCarrierFamily<D, <<D as LinearizableDomain>::LinearDomain as Domain>::Value>,
+{
+    type LinearOperationCarrier<'domain>
+        =
+        <<<D as LinearizableDomain>::LinearDomain as TracingDomain>::OperationCarrier as LinearOperationCarrierFamily<
+            D,
+            <<D as LinearizableDomain>::LinearDomain as Domain>::Value,
+        >>::ForTracer<'domain>
+    where
+        Self: 'domain;
 }
 
 impl<'domain, D> TracingDomain for TracingContext<'domain, D>
@@ -721,12 +760,16 @@ where
     D: DifferentiableTracingDomain + RuntimeDomain + 'domain,
     D::Value: Differentiable<D::Type>,
     D::OperationCarrier: SupportsAdd<D::Type, D::Value>,
+    D::LinearOperationCarrier<'domain>: Clone
+        + InterpretableOperation<D::Type, Tracer<'domain, D>>
+        + LinearOperation<D::Type, Tracer<'domain, D>, D::LinearOperationCarrier<'domain>>
+        + SupportsZero<D::Type, Tracer<'domain, D>>
+        + SupportsAdd<D::Type, Tracer<'domain, D>>,
     AddOperation: InterpretableOperation<D::Type, Tracer<'domain, D>>,
 {
     type Tangent = Tracer<'domain, D>;
     type LinearDomain = Self;
     type LinearOperationCarrier = D::LinearOperationCarrier<'domain>;
-    type DifferentiableOperationCarrier = AddOperation;
 
     #[inline]
     fn linear_domain(&self) -> &Self::LinearDomain {
@@ -734,33 +777,24 @@ where
     }
 }
 
-macro_rules! impl_differentiable_domain_for_scalar {
-    ($ty:ty) => {
-        impl DifferentiableDomain for ScalarDomain<$ty> {
-            type Tangent = $ty;
-            type LinearDomain = crate::tracing::domains::LinearScalarDomain<$ty>;
-            type LinearOperationCarrier = LinearScalarOperation<$ty>;
-            type DifferentiableOperationCarrier = ScalarOperation<$ty>;
+impl<V> LinearizableDomain for ScalarDomain<V>
+where
+    V: Traceable<DataType>,
+    ScalarDomain<V>: RuntimeDomain<Type = DataType> + TracingDomain<Type = DataType>,
+    LinearScalarDomain<V>: TracingDomain<Type = DataType, Value = V, OperationCarrier = LinearScalarOperation<V>>,
+    LinearScalarOperation<V>: Clone
+        + InterpretableOperation<DataType, V>
+        + LinearOperation<DataType, V, LinearScalarOperation<V>>
+        + SupportsZero<DataType, V>
+        + SupportsAdd<DataType, V>,
+{
+    type LinearDomain = LinearScalarDomain<V>;
 
-            #[inline]
-            fn linear_domain(&self) -> &Self::LinearDomain {
-                &self.linear_domain
-            }
-        }
-
-        impl DifferentiableTracingDomain for ScalarDomain<$ty> {
-            type LinearOperationCarrier<'domain>
-                = LinearScalarOperation<Tracer<'domain, ScalarDomain<$ty>>>
-            where
-                ScalarDomain<$ty>: 'domain;
-        }
-    };
+    #[inline]
+    fn linear_domain(&self) -> &Self::LinearDomain {
+        &self.linear_domain
+    }
 }
-
-impl_differentiable_domain_for_scalar!(bf16);
-impl_differentiable_domain_for_scalar!(f16);
-impl_differentiable_domain_for_scalar!(f32);
-impl_differentiable_domain_for_scalar!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -804,10 +838,10 @@ mod tests {
 
     #[test]
     fn test_scalar_domain_half_and_float_domains_are_differentiable() {
-        let _: Option<<ScalarDomain<bf16> as DifferentiableDomain>::DifferentiableOperationCarrier> = None;
-        let _: Option<<ScalarDomain<f16> as DifferentiableDomain>::DifferentiableOperationCarrier> = None;
-        let _: Option<<ScalarDomain<f32> as DifferentiableDomain>::DifferentiableOperationCarrier> = None;
-        let _: Option<<ScalarDomain<f64> as DifferentiableDomain>::DifferentiableOperationCarrier> = None;
+        let _: Option<<ScalarDomain<bf16> as DifferentiableDomain>::LinearOperationCarrier> = None;
+        let _: Option<<ScalarDomain<f16> as DifferentiableDomain>::LinearOperationCarrier> = None;
+        let _: Option<<ScalarDomain<f32> as DifferentiableDomain>::LinearOperationCarrier> = None;
+        let _: Option<<ScalarDomain<f64> as DifferentiableDomain>::LinearOperationCarrier> = None;
     }
 
     #[test]

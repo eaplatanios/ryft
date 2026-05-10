@@ -7,12 +7,12 @@ use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
-use crate::tracing::domains::{Domain, RuntimeDomain, Tracer, TracingDomain};
+use crate::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use crate::tracing_v2::{
-    ArrayOperation, CoordinateValue, Differentiable, DifferentiableDomain, DifferentiableTracingDomain,
-    LinearArrayOperation, MatMul, MatrixTranspose, Reshape,
+    ArrayOperation, CoordinateValue, Differentiable, LinearArrayOperation, LinearizableDomain, MatMul, MatrixTranspose,
+    Reshape,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
@@ -295,22 +295,12 @@ impl TracingDomain for TestArrayLinearDomain {
 
 static TEST_ARRAY_LINEAR_DOMAIN: TestArrayLinearDomain = TestArrayLinearDomain;
 
-impl DifferentiableDomain for TestArrayDomain {
-    type Tangent = TestArray;
+impl LinearizableDomain for TestArrayDomain {
     type LinearDomain = TestArrayLinearDomain;
-    type LinearOperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
-    type DifferentiableOperationCarrier = ArrayOperation<TestArray, ArrayType>;
 
     fn linear_domain(&self) -> &Self::LinearDomain {
         &TEST_ARRAY_LINEAR_DOMAIN
     }
-}
-
-impl DifferentiableTracingDomain for TestArrayDomain {
-    type LinearOperationCarrier<'domain>
-        = LinearArrayOperation<Tracer<'domain, TestArrayDomain>, ArrayType>
-    where
-        Self: 'domain;
 }
 
 #[cfg(test)]

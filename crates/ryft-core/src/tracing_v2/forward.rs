@@ -9,8 +9,7 @@ use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, ensure_tracers_belong_to_context};
 use crate::tracing_v2::linear::linearize;
 use crate::tracing_v2::{
-    DifferentiableDomain, DifferentiableOperation, DifferentiableTracer, DifferentiableTracingDomain,
-    DifferentiationError,
+    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiationError,
 };
 use crate::types::Typed;
 
@@ -45,18 +44,19 @@ where
 
 /// Marker selecting concrete-value [`DifferentiableDomain::jvp`] dispatch.
 #[doc(hidden)]
-pub(crate) struct JvpDispatchValueMarker;
+pub struct JvpDispatchValueMarker;
 
 /// Marker selecting already-traced [`DifferentiableDomain::jvp`] dispatch.
 #[doc(hidden)]
-pub(crate) struct JvpDispatchTracerMarker;
+pub struct JvpDispatchTracerMarker;
 
 /// Dispatch trait used by [`DifferentiableDomain::jvp`] so it can operate both on concrete values
 /// and on already traced values.
 ///
 /// The public transform is intentionally small; this trait is where the concrete, traced, and
 /// batched execution strategies branch apart.
-pub(crate) trait JvpDispatch<'domain, D: RuntimeDomain, Input, Output, Marker>:
+#[doc(hidden)]
+pub trait JvpDispatch<'domain, D: RuntimeDomain, Input, Output, Marker>:
     Differentiable<D::Type> + Parameter + Sized
 where
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
@@ -91,23 +91,24 @@ impl<
         + 'domain,
     Input: Parameterized<
             V,
-            Family: for<'call> ParameterizedFamily<DifferentiableTracer<'call, D>>,
+            Family: for<'call> ParameterizedFamily<Tracer<'call, D>>,
             ParameterStructure: Debug + PartialEq,
             To<V> = Input,
         >,
     Output: for<'call> Parameterized<
             V,
-            Family: ParameterizedFamily<DifferentiableTracer<'call, D>>,
-            To<DifferentiableTracer<'call, D>>: Parameterized<DifferentiableTracer<'call, D>, To<V> = Output>,
+            Family: ParameterizedFamily<Tracer<'call, D>>,
+            To<Tracer<'call, D>>: Parameterized<Tracer<'call, D>, To<V> = Output>,
             To<V> = Output,
         >,
 > JvpDispatch<'domain, D, Input, Output, JvpDispatchValueMarker> for V
 where
+    D::OperationCarrier: DifferentiableOperation<D>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Output::Family: ParameterizedFamily<D::Tangent>,
 {
-    type FunctionInput = Input::To<DifferentiableTracer<'domain, D>>;
-    type FunctionOutput = Output::To<DifferentiableTracer<'domain, D>>;
+    type FunctionInput = Input::To<Tracer<'domain, D>>;
+    type FunctionOutput = Output::To<Tracer<'domain, D>>;
 
     fn invoke<F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput>(
         domain: &'domain D,
@@ -226,7 +227,7 @@ mod tests {
     use crate::tracing::domains::{Domain, RuntimeDomain, ScalarDomain, Tracer, TracingContext, TracingDomain};
     use crate::tracing::{Program, ProgramBuilder, ProgramTracingContext, Traceable, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-    use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+    use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearizableDomain};
     use crate::types::{DataType, Typed};
 
     use super::*;
@@ -649,11 +650,8 @@ mod tests {
         type OperationCarrier = DistinctPrimalOperation;
     }
 
-    impl DifferentiableDomain for DistinctPrimalDomain {
-        type Tangent = DistinctTangent;
+    impl LinearizableDomain for DistinctPrimalDomain {
         type LinearDomain = DistinctTangentDomain;
-        type LinearOperationCarrier = DistinctLinearOperation;
-        type DifferentiableOperationCarrier = DistinctPrimalOperation;
 
         fn linear_domain(&self) -> &Self::LinearDomain {
             &self.linear_domain

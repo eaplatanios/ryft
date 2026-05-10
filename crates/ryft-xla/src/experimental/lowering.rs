@@ -2545,12 +2545,12 @@ mod tests {
     use ryft_core::operations::{InterpretableOperation, Operation};
     use ryft_core::parameters::{Parameter, Placeholder};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing::domains::{Domain, RuntimeDomain, Tracer, TracingDomain};
+    use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
     use ryft_core::tracing::{ProgramBuilder, Traceable, TracingError, Value as TraceValue};
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::{
-        ArrayOperation, CoordinateValue, CustomPrimitive, Differentiable, DifferentiableDomain,
-        DifferentiableTracingDomain, LinearArrayOperation, MatMul, MatrixTranspose, Reshape,
+        ArrayOperation, CoordinateValue, CustomPrimitive, Differentiable, DifferentiableDomain, LinearArrayOperation,
+        LinearizableDomain, MatMul, MatrixTranspose, Reshape,
     };
     use ryft_core::types::{Shape, TypeError, Typed};
     #[cfg(feature = "ndarray")]
@@ -3093,22 +3093,12 @@ mod tests {
 
     static TEST_ARRAY_LINEAR_DOMAIN: TestArrayLinearDomain = TestArrayLinearDomain;
 
-    impl DifferentiableDomain for TestArrayDomain {
-        type Tangent = TestArray;
+    impl LinearizableDomain for TestArrayDomain {
         type LinearDomain = TestArrayLinearDomain;
-        type LinearOperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
-        type DifferentiableOperationCarrier = ArrayOperation<TestArray, ArrayType>;
 
         fn linear_domain(&self) -> &Self::LinearDomain {
             &TEST_ARRAY_LINEAR_DOMAIN
         }
-    }
-
-    impl DifferentiableTracingDomain for TestArrayDomain {
-        type LinearOperationCarrier<'domain>
-            = LinearArrayOperation<Tracer<'domain, TestArrayDomain>, ArrayType>
-        where
-            Self: 'domain;
     }
 
     #[test]

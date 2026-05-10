@@ -6,12 +6,10 @@ use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
 use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
-use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
+use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{Program, ProgramBuilder, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{DifferentiableOperationTracingDomain, JvpTracer};
-use crate::tracing_v2::{
-    Differentiable, DifferentiableDomain, DifferentiableOperation, DifferentiableTracer, DifferentiableTracingDomain,
-};
+use crate::tracing_v2::differentiation::JvpTracer;
+use crate::tracing_v2::{Differentiable, DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::{ArrayType, Typed};
 
 /// Dense Jacobian and Hessian materialization helpers.
