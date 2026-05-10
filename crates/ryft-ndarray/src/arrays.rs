@@ -305,7 +305,7 @@ impl<T: NdArrayElement> Differentiable<ArrayType> for Array<T> {
     type Tangent = Self;
 
     #[inline]
-    fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+    fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
         Self::zero(self.r#type().as_ref())
     }
 }

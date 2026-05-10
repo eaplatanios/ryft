@@ -8,10 +8,9 @@ use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLik
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{Program, ProgramBuilder, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::JvpTracer;
+use crate::tracing_v2::differentiation::{DifferentiableOperationTracingDomain, JvpTracer};
 use crate::tracing_v2::{
-    Differentiable, DifferentiableDomain, DifferentiableOperation, DifferentiableOperationTracingDomain,
-    DifferentiableTracingDomain,
+    Differentiable, DifferentiableDomain, DifferentiableOperation, DifferentiableTracer, DifferentiableTracingDomain,
 };
 use crate::types::{ArrayType, Typed};
 
@@ -24,11 +23,8 @@ mod reverse;
 
 pub use dense::{CoordinateValue, DenseJacobian, jacrev};
 pub(crate) use dense::{Hessian, JacFwd};
-pub(crate) use reverse::Grad;
-pub use reverse::{
-    ConcreteValueAndGrad, TracedValueAndGrad, ValueAndGradDispatch, grad_with_aux, linearize, value_and_grad,
-    value_and_grad_with_aux, vjp,
-};
+pub(crate) use reverse::{Grad, TracedValueAndGrad, ValueAndGradDispatch};
+pub use reverse::{grad_with_aux, linearize, value_and_grad, value_and_grad_with_aux, vjp};
 
 #[cfg(test)]
 mod tests {

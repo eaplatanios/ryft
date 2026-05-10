@@ -22,12 +22,11 @@ pub(crate) mod test_util;
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
-    Differentiable, DifferentiableDomain, DifferentiableOperation, DifferentiableOperationTracingDomain,
-    DifferentiableTracingDomain, DifferentiationError, JvpContext, JvpTracer, Tangent,
+    Differentiable, DifferentiableDomain, DifferentiableOperation, DifferentiableTracer, DifferentiableTracingDomain,
+    DifferentiationError, JvpContext, JvpTracer, Tangent,
 };
 pub use linear::{
-    ConcreteValueAndGrad, CoordinateValue, DenseJacobian, TracedValueAndGrad, ValueAndGradDispatch, grad_with_aux,
-    jacrev, linearize, value_and_grad, value_and_grad_with_aux, vjp,
+    CoordinateValue, DenseJacobian, grad_with_aux, jacrev, linearize, value_and_grad, value_and_grad_with_aux, vjp,
 };
 pub use operations::left_matmul::LeftMatMul;
 pub use operations::matmul::MatMul;

@@ -161,7 +161,7 @@ impl<T: Type, V: Traceable<T>> ZeroLike for Tangent<T, V> {
 
 /// Value-level contract for leaves that participate in automatic differentiation over `T`.
 ///
-/// The associated [`Tangent`](Self::Tangent) type makes the tangent representation explicit. [`tangent_type`] returns
+/// The associated [`Tangent`](Self::Tangent) type makes the tangent representation explicit. [`zero_tangent`] returns
 /// the canonical zero tangent/exemplar for this concrete primal value, carrying whatever metadata the tangent
 /// representation needs. Transform code uses this hook when it must synthesize disconnected tangents from primal
 /// values instead of guessing from abstract [`Type`] metadata alone.
@@ -170,7 +170,7 @@ pub trait Differentiable<T: Type>: Traceable<T> {
     type Tangent: Traceable<T>;
 
     /// Returns the canonical zero tangent/exemplar associated with this primal value.
-    fn tangent_type(&self) -> Result<Self::Tangent, TracingError>;
+    fn zero_tangent(&self) -> Result<Self::Tangent, TracingError>;
 }
 
 impl<'domain, D: RuntimeDomain<Value: Differentiable<D::Type>> + TracingDomain> Differentiable<D::Type>
@@ -179,9 +179,20 @@ impl<'domain, D: RuntimeDomain<Value: Differentiable<D::Type>> + TracingDomain> 
     type Tangent = Self;
 
     #[inline]
-    fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+    fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
         self.context.zero(self.r#type().as_ref())
     }
+}
+
+/// Ensures every tracer belongs to `context`.
+pub(crate) fn ensure_tracers_belong_to_context<'domain, D: TracingDomain>(
+    context: &TracingContext<'domain, D>,
+    tracers: &[Tracer<'domain, D>],
+) -> Result<(), TracingError> {
+    if tracers.iter().any(|tracer| !Rc::ptr_eq(&context.builder, &tracer.context.builder)) {
+        return Err(context.error(TracingError::MismatchedProgramBuilders));
+    }
+    Ok(())
 }
 
 /// Extension of [`RuntimeDomain`] for backends that support automatic differentiation.
@@ -225,6 +236,7 @@ pub trait DifferentiableDomain: RuntimeDomain + Sized {
     ///
     /// The returned pair is `(primal_output, tangent_output)`. This is the canonical user-facing forward-mode
     /// Jacobian-Vector Product (JVP) entry point for differentiable domains.
+    #[allow(private_bounds)]
     fn jvp<
         'domain,
         F: FnOnce(Leaf::FunctionInput) -> Leaf::FunctionOutput,
@@ -249,6 +261,7 @@ pub trait DifferentiableDomain: RuntimeDomain + Sized {
     ///
     /// This is the canonical user-facing reverse-mode entry point for differentiable domains. The function must return
     /// exactly one rank-0 scalar array leaf.
+    #[allow(private_bounds, private_interfaces)]
     fn grad<
         'domain,
         F,
@@ -292,16 +305,15 @@ pub trait DifferentiableDomain: RuntimeDomain + Sized {
         Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
-            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>,
+            + ParameterizedFamily<DifferentiableTracer<'domain, Self>>,
         Output::Family: ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
-            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>,
-        Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>:
-            Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>, To<V> = Output>,
+            + ParameterizedFamily<DifferentiableTracer<'domain, Self>>,
+        Output::To<DifferentiableTracer<'domain, Self>>:
+            Parameterized<DifferentiableTracer<'domain, Self>, To<V> = Output>,
         F: FnOnce(
-            Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>,
-        )
-            -> Result<Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>, TracingError>,
+            Input::To<DifferentiableTracer<'domain, Self>>,
+        ) -> Result<Output::To<DifferentiableTracer<'domain, Self>>, TracingError>,
     {
         crate::tracing_v2::linear::JacFwd::new(function).evaluate::<Self, Input, Output, V>(self, primals)
     }
@@ -331,14 +343,14 @@ pub trait DifferentiableDomain: RuntimeDomain + Sized {
             + ParameterizedFamily<Tracer<'domain, Self>>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<V>
-            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>,
+            + ParameterizedFamily<DifferentiableTracer<'domain, Self>>,
         Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
         Input::To<Tracer<'domain, Self>>:
             Parameterized<Tracer<'domain, Self>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
         <Input::To<Tracer<'domain, Self>> as Parameterized<Tracer<'domain, Self>>>::To<ArrayType>:
             Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
-        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>:
-            Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>, To<V> = Input>,
+        Input::To<DifferentiableTracer<'domain, Self>>:
+            Parameterized<DifferentiableTracer<'domain, Self>, To<V> = Input>,
         F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Tracer<'domain, Self>,
         Self::OperationCarrier: Clone
             + InterpretableOperation<ArrayType, V>
@@ -421,14 +433,22 @@ impl<'domain, D: DifferentiableDomain> JvpContext<'domain, D> {
     }
 
     /// Stages one operation from raw atom identifiers in the currently active linear program.
-    pub fn stage_atom_ids(
+    pub(crate) fn stage_atom_ids(
         &self,
         operation: D::LinearOperationCarrier,
         inputs: &[AtomId],
     ) -> Result<Vec<AtomId>, TracingError> {
         let mut builder_borrow = self.builder.borrow_mut();
-        let input_types =
-            inputs.iter().map(|atom| builder_borrow.atoms[atom.index].r#type().into_owned()).collect::<Vec<_>>();
+        let input_types = inputs
+            .iter()
+            .map(|atom| {
+                builder_borrow
+                    .atoms
+                    .get(atom.index)
+                    .map(|atom| atom.r#type().into_owned())
+                    .ok_or(TracingError::UnboundAtomId { id: *atom })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let output_types = operation.infer_output_types(&input_types)?;
         let outputs = output_types.into_iter().map(|r#type| builder_borrow.add_variable(r#type)).collect::<Vec<_>>();
         builder_borrow
@@ -522,7 +542,7 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
                 return Ok(tangent.clone());
             }
             let primal = primal_values[atom_id.index].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-            let tangent = context.add_constant(primal.tangent_type()?);
+            let tangent = context.add_constant(primal.zero_tangent()?);
             tangents[atom_id.index] = Some(tangent.clone());
             Ok(tangent)
         }
@@ -633,14 +653,16 @@ pub trait DifferentiableTracingDomain: TracingDomain<OperationCarrier: SupportsA
 /// implementation; traced tangent and cotangent programs are selected separately through
 /// [`DifferentiableTracingDomain`].
 ///
-/// This type is public today because the public AD closure bounds still mention
-/// `Tracer<'domain, DifferentiableOperationTracingDomain<D>>`. Once those APIs hide the concrete
-/// active tracer carrier, this adapter can become a `pub(crate)` implementation detail.
+/// This type is public today because [`DifferentiableTracer`] aliases it. Once public AD APIs hide the concrete active
+/// tracer carrier entirely, this adapter can become a `pub(crate)` implementation detail.
 #[repr(transparent)]
 pub struct DifferentiableOperationTracingDomain<D: DifferentiableDomain> {
     /// Backend viewed through its differentiable operation carrier.
     domain: D,
 }
+
+/// [`Tracer`] used while staging a closure with a domain's differentiable operation carrier.
+pub type DifferentiableTracer<'domain, D> = Tracer<'domain, DifferentiableOperationTracingDomain<D>>;
 
 impl<D: DifferentiableDomain> DifferentiableOperationTracingDomain<D> {
     /// Reborrows `domain` as a differentiable operation tracing view.

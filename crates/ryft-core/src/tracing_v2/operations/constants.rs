@@ -143,7 +143,7 @@ macro_rules! impl_nondifferentiable_scalar {
             type Tangent = Tangent<DataType, Infallible>;
 
             #[inline]
-            fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+            fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
                 Ok(Tangent::zero($data_type))
             }
         }
@@ -156,7 +156,7 @@ macro_rules! impl_floating_scalar_differentiable {
             type Tangent = Self;
 
             #[inline]
-            fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+            fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
                 Ok($zero)
             }
         }
@@ -234,9 +234,9 @@ mod tests {
         assert_eq!(TypeId::of::<<f16 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f16>());
         assert_eq!(TypeId::of::<<f32 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f32>());
         assert_eq!(TypeId::of::<<f64 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f64>());
-        assert_eq!(false.tangent_type().unwrap(), Tangent::zero(DataType::Boolean));
-        assert_eq!(3i32.tangent_type().unwrap(), Tangent::zero(DataType::I32));
-        assert_eq!(2.0f64.tangent_type().unwrap(), 0.0);
+        assert_eq!(false.zero_tangent().unwrap(), Tangent::zero(DataType::Boolean));
+        assert_eq!(3i32.zero_tangent().unwrap(), Tangent::zero(DataType::I32));
+        assert_eq!(2.0f64.zero_tangent().unwrap(), 0.0);
     }
 
     #[test]

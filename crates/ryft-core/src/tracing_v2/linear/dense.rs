@@ -31,16 +31,14 @@ impl<F> JacFwd<F> {
         Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
         Input::Family: ParameterizedFamily<D::Tangent>
             + ParameterizedFamily<ReferenceBatch<D::Tangent>>
-            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+            + ParameterizedFamily<DifferentiableTracer<'domain, D>>,
         Output::Family: ParameterizedFamily<D::Tangent>
             + ParameterizedFamily<ReferenceBatch<D::Tangent>>
-            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-        Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
-            Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Output>,
+            + ParameterizedFamily<DifferentiableTracer<'domain, D>>,
+        Output::To<DifferentiableTracer<'domain, D>>: Parameterized<DifferentiableTracer<'domain, D>, To<V> = Output>,
         F: FnOnce(
-            Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-        )
-            -> Result<Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>, TracingError>,
+            Input::To<DifferentiableTracer<'domain, D>>,
+        ) -> Result<Output::To<DifferentiableTracer<'domain, D>>, TracingError>,
     {
         jacfwd_at::<D, F, Input, Output, V>(domain, self.function, primals)
     }
@@ -66,14 +64,13 @@ impl<F> JacFwd<Grad<F>> {
             + ParameterizedFamily<Tracer<'domain, D>>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<V>
-            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+            + ParameterizedFamily<DifferentiableTracer<'domain, D>>,
         Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
         Input::To<Tracer<'domain, D>>:
             Parameterized<Tracer<'domain, D>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
         <Input::To<Tracer<'domain, D>> as Parameterized<Tracer<'domain, D>>>::To<ArrayType>:
             Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
-        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
-            Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Input>,
+        Input::To<DifferentiableTracer<'domain, D>>: Parameterized<DifferentiableTracer<'domain, D>, To<V> = Input>,
         F: FnOnce(Input::To<Tracer<'domain, D>>) -> Tracer<'domain, D>,
         D::OperationCarrier: Clone
             + InterpretableOperation<ArrayType, V>
@@ -120,14 +117,13 @@ impl<F> Hessian<F> {
             + ParameterizedFamily<Tracer<'domain, D>>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<V>
-            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+            + ParameterizedFamily<DifferentiableTracer<'domain, D>>,
         Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
         Input::To<Tracer<'domain, D>>:
             Parameterized<Tracer<'domain, D>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
         <Input::To<Tracer<'domain, D>> as Parameterized<Tracer<'domain, D>>>::To<ArrayType>:
             Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
-        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
-            Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Input>,
+        Input::To<DifferentiableTracer<'domain, D>>: Parameterized<DifferentiableTracer<'domain, D>, To<V> = Input>,
         F: FnOnce(Input::To<Tracer<'domain, D>>) -> Tracer<'domain, D>,
         D::OperationCarrier: Clone
             + InterpretableOperation<ArrayType, V>
@@ -430,15 +426,14 @@ where
     Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
     Input::Family: ParameterizedFamily<D::Tangent>
         + ParameterizedFamily<ReferenceBatch<D::Tangent>>
-        + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+        + ParameterizedFamily<DifferentiableTracer<'domain, D>>,
     Output::Family: ParameterizedFamily<D::Tangent>
         + ParameterizedFamily<ReferenceBatch<D::Tangent>>
-        + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-    Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
-        Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Output>,
+        + ParameterizedFamily<DifferentiableTracer<'domain, D>>,
+    Output::To<DifferentiableTracer<'domain, D>>: Parameterized<DifferentiableTracer<'domain, D>, To<V> = Output>,
     F: FnOnce(
-        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-    ) -> Result<Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>, TracingError>,
+        Input::To<DifferentiableTracer<'domain, D>>,
+    ) -> Result<Output::To<DifferentiableTracer<'domain, D>>, TracingError>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -470,15 +465,14 @@ where
     Output: Parameterized<V, To<V> = Output, ParameterStructure: std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<D::Tangent>
         + ParameterizedFamily<ReferenceBatch<D::Tangent>>
-        + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+        + ParameterizedFamily<DifferentiableTracer<'domain, D>>,
     Output::Family: ParameterizedFamily<D::Tangent>
         + ParameterizedFamily<ReferenceBatch<D::Tangent>>
-        + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-    Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
-        Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Output>,
+        + ParameterizedFamily<DifferentiableTracer<'domain, D>>,
+    Output::To<DifferentiableTracer<'domain, D>>: Parameterized<DifferentiableTracer<'domain, D>, To<V> = Output>,
     F: FnOnce(
-        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-    ) -> Result<Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>, TracingError>,
+        Input::To<DifferentiableTracer<'domain, D>>,
+    ) -> Result<Output::To<DifferentiableTracer<'domain, D>>, TracingError>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -530,14 +524,13 @@ where
         + ParameterizedFamily<Tracer<'domain, D>>
         + ParameterizedFamily<ArrayType>
         + ParameterizedFamily<V>
-        + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+        + ParameterizedFamily<DifferentiableTracer<'domain, D>>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
     Input::To<Tracer<'domain, D>>:
         Parameterized<Tracer<'domain, D>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
     <Input::To<Tracer<'domain, D>> as Parameterized<Tracer<'domain, D>>>::To<ArrayType>:
         Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
-    Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
-        Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Input>,
+    Input::To<DifferentiableTracer<'domain, D>>: Parameterized<DifferentiableTracer<'domain, D>, To<V> = Input>,
     F: FnOnce(Input::To<Tracer<'domain, D>>) -> Tracer<'domain, D>,
     D::OperationCarrier: Clone
         + InterpretableOperation<ArrayType, V>

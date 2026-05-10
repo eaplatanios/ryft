@@ -385,7 +385,7 @@ impl Differentiable<ArrayType> for ShardMapTensor {
     type Tangent = Self;
 
     #[inline]
-    fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+    fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
         Ok(Self::zero(self.array_type.clone()))
     }
 }

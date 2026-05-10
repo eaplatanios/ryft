@@ -6,10 +6,10 @@ use crate::operations::constants::SupportsZeroLike;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{Program, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::Differentiable;
+use crate::tracing_v2::differentiation::{Differentiable, ensure_tracers_belong_to_context};
 use crate::tracing_v2::linear::linearize;
 use crate::tracing_v2::{
-    DifferentiableDomain, DifferentiableOperation, DifferentiableOperationTracingDomain, DifferentiableTracingDomain,
+    DifferentiableDomain, DifferentiableOperation, DifferentiableTracer, DifferentiableTracingDomain,
     DifferentiationError,
 };
 use crate::types::Typed;
@@ -45,18 +45,18 @@ where
 
 /// Marker selecting concrete-value [`DifferentiableDomain::jvp`] dispatch.
 #[doc(hidden)]
-pub struct JvpDispatchValueMarker;
+pub(crate) struct JvpDispatchValueMarker;
 
 /// Marker selecting already-traced [`DifferentiableDomain::jvp`] dispatch.
 #[doc(hidden)]
-pub struct JvpDispatchTracerMarker;
+pub(crate) struct JvpDispatchTracerMarker;
 
 /// Dispatch trait used by [`DifferentiableDomain::jvp`] so it can operate both on concrete values
 /// and on already traced values.
 ///
 /// The public transform is intentionally small; this trait is where the concrete, traced, and
 /// batched execution strategies branch apart.
-pub trait JvpDispatch<'domain, D: RuntimeDomain, Input, Output, Marker>:
+pub(crate) trait JvpDispatch<'domain, D: RuntimeDomain, Input, Output, Marker>:
     Differentiable<D::Type> + Parameter + Sized
 where
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
@@ -91,17 +91,14 @@ impl<
         + 'domain,
     Input: Parameterized<
             V,
-            Family: for<'call> ParameterizedFamily<Tracer<'call, DifferentiableOperationTracingDomain<D>>>,
+            Family: for<'call> ParameterizedFamily<DifferentiableTracer<'call, D>>,
             ParameterStructure: Debug + PartialEq,
             To<V> = Input,
         >,
     Output: for<'call> Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'call, DifferentiableOperationTracingDomain<D>>>,
-            To<Tracer<'call, DifferentiableOperationTracingDomain<D>>>: Parameterized<
-                Tracer<'call, DifferentiableOperationTracingDomain<D>>,
-                To<V> = Output,
-            >,
+            Family: ParameterizedFamily<DifferentiableTracer<'call, D>>,
+            To<DifferentiableTracer<'call, D>>: Parameterized<DifferentiableTracer<'call, D>, To<V> = Output>,
             To<V> = Output,
         >,
 > JvpDispatch<'domain, D, Input, Output, JvpDispatchValueMarker> for V
@@ -109,8 +106,8 @@ where
     Input::Family: ParameterizedFamily<D::Tangent>,
     Output::Family: ParameterizedFamily<D::Tangent>,
 {
-    type FunctionInput = Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>;
-    type FunctionOutput = Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>;
+    type FunctionInput = Input::To<DifferentiableTracer<'domain, D>>;
+    type FunctionOutput = Output::To<DifferentiableTracer<'domain, D>>;
 
     fn invoke<F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput>(
         domain: &'domain D,
@@ -183,6 +180,8 @@ where
         let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
             return Err(DifferentiationError::MissingTracedJvpInputLeaves.into());
         };
+        ensure_tracers_belong_to_context(&tracing_context, traced_primals.as_slice())?;
+        ensure_tracers_belong_to_context(&tracing_context, traced_tangents.as_slice())?;
         let staged_input_types = Input::To::<D::Type>::from_parameters(
             primal_structure,
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
@@ -252,7 +251,7 @@ mod tests {
     impl Differentiable<DataType> for DistinctPrimal {
         type Tangent = DistinctTangent;
 
-        fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+        fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
             Ok(DistinctTangent(0.0))
         }
     }
@@ -699,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn concrete_jvp_supports_distinct_primal_and_tangent_types() {
+    fn concrete_jvp_supports_distinct_primal_and_zero_tangents() {
         let domain = DistinctPrimalDomain::new();
 
         let (primal, tangent): (DistinctPrimal, DistinctTangent) = domain
@@ -801,5 +800,26 @@ mod tests {
             result,
             Err(TracingError::Differentiation(DifferentiationError::MissingTracedJvpInputLeaves))
         ));
+    }
+
+    #[test]
+    fn traced_jvp_rejects_mismatched_program_builders() {
+        let domain = ScalarDomain::<f64>::new();
+        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context_a = TracingContext::new(&domain, builder_a);
+        let context_b = TracingContext::new(&domain, builder_b);
+        let primal_a = context_a.input(DataType::F64);
+        let primal_b = context_b.input(DataType::F64);
+        let tangent_a = context_a.input(DataType::F64);
+        let tangent_b = context_a.input(DataType::F64);
+
+        let result: Result<(Tracer<'_, ScalarDomain<f64>>, Tracer<'_, ScalarDomain<f64>>), TracingError> = domain.jvp(
+            |inputs: Vec<Tracer<'_, ScalarDomain<f64>>>| inputs[0].clone() + inputs[1].clone(),
+            vec![primal_a, primal_b],
+            vec![tangent_a, tangent_b],
+        );
+
+        assert!(matches!(result, Err(TracingError::MismatchedProgramBuilders)));
     }
 }

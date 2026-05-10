@@ -140,7 +140,7 @@ impl OneLike for TestArray {
 impl Differentiable<ArrayType> for TestArray {
     type Tangent = Self;
 
-    fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+    fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
         Ok(self.zero_like())
     }
 }

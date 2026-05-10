@@ -780,7 +780,7 @@ mod tests {
     impl Differentiable<ArrayType> for TestValue {
         type Tangent = Self;
 
-        fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+        fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
             Ok(self.zero_like())
         }
     }

@@ -2,6 +2,7 @@ use crate::macros::check_count;
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{Atom, AtomId};
 use crate::tracing_v2::JvpContext;
+use crate::tracing_v2::differentiation::ensure_tracers_belong_to_context;
 
 use super::*;
 
@@ -62,7 +63,7 @@ where
                 return Ok(tangent.clone());
             }
             let primal = primal_values[atom_id.index].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-            let tangent = context.add_constant(primal.tangent_type()?);
+            let tangent = context.add_constant(primal.zero_tangent()?);
             tangents[atom_id.index] = Some(tangent.clone());
             Ok(tangent)
         }
@@ -71,6 +72,7 @@ where
         if input_count != program.input_ids.len() {
             return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_count });
         }
+        ensure_tracers_belong_to_context(self, primals.as_slice())?;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             D::Type,
             Tracer<'domain, D>,

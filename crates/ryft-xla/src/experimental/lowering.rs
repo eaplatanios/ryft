@@ -2649,7 +2649,7 @@ mod tests {
     impl Differentiable<ArrayType> for TestArray {
         type Tangent = Self;
 
-        fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+        fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
             Ok(self.zero_like())
         }
     }
@@ -3207,7 +3207,7 @@ mod tests {
     #[test]
     fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
         // grad(f) wrapped in JIT â€” symbolic, like JAX's jit(grad(f)).
-        // Uses the ValueAndGradDispatch<Tracer<V>> path that traces through vjp+pullback.
+        // Uses the traced value-and-gradient path that traces through vjp+pullback.
         let domain = TestArrayDomain;
         let (_, compiled): (
             (TestArray, TestArray),

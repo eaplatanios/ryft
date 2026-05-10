@@ -1,6 +1,7 @@
 use super::*;
 use crate::parameters::Parameter;
 use crate::tracing_v2::DifferentiationError;
+use crate::tracing_v2::differentiation::ensure_tracers_belong_to_context;
 
 /// Reverse-mode gradient transform.
 pub(crate) struct Grad<F> {
@@ -53,20 +54,17 @@ pub fn linearize<
     'domain,
     D: DifferentiableDomain<Value = V> + 'static,
     F: FnOnce(
-        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-    ) -> Result<Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>, TracingError>,
+        Input::To<DifferentiableTracer<'domain, D>>,
+    ) -> Result<Output::To<DifferentiableTracer<'domain, D>>, TracingError>,
     Input: Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+            Family: ParameterizedFamily<DifferentiableTracer<'domain, D>>,
             ParameterStructure: Debug + PartialEq,
         >,
     Output: Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-            To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>: Parameterized<
-                Tracer<'domain, DifferentiableOperationTracingDomain<D>>,
-                To<V> = Output,
-            >,
+            Family: ParameterizedFamily<DifferentiableTracer<'domain, D>>,
+            To<DifferentiableTracer<'domain, D>>: Parameterized<DifferentiableTracer<'domain, D>, To<V> = Output>,
         >,
     V: Differentiable<D::Type, Tangent = D::Tangent> + 'domain,
 >(
@@ -100,20 +98,17 @@ pub fn vjp<
     'domain,
     D: DifferentiableDomain<Value = V> + 'static,
     F: FnOnce(
-        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-    ) -> Result<Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>, TracingError>,
+        Input::To<DifferentiableTracer<'domain, D>>,
+    ) -> Result<Output::To<DifferentiableTracer<'domain, D>>, TracingError>,
     Input: Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+            Family: ParameterizedFamily<DifferentiableTracer<'domain, D>>,
             ParameterStructure: Debug + PartialEq,
         >,
     Output: Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-            To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>: Parameterized<
-                Tracer<'domain, DifferentiableOperationTracingDomain<D>>,
-                To<V> = Output,
-            >,
+            Family: ParameterizedFamily<DifferentiableTracer<'domain, D>>,
+            To<DifferentiableTracer<'domain, D>>: Parameterized<DifferentiableTracer<'domain, D>, To<V> = Output>,
         >,
     V: Differentiable<D::Type, Tangent = D::Tangent> + 'domain,
 >(
@@ -174,11 +169,11 @@ where
 
 /// Marker selecting concrete-value [`value_and_grad`] dispatch.
 #[doc(hidden)]
-pub struct ConcreteValueAndGrad;
+pub(crate) struct ConcreteValueAndGrad;
 
 /// Marker selecting already-traced [`value_and_grad`] dispatch.
 #[doc(hidden)]
-pub struct TracedValueAndGrad;
+pub(crate) struct TracedValueAndGrad;
 
 /// Dispatch trait shared by [`DifferentiableDomain::grad`] and [`value_and_grad`] so they can operate both on concrete
 /// values and on already traced values.
@@ -188,7 +183,7 @@ pub struct TracedValueAndGrad;
 /// allowing concrete replay, traced replay, and batched replay to specialize
 /// independently.
 #[doc(hidden)]
-pub trait ValueAndGradDispatch<D: RuntimeDomain, Input, Marker>: Parameter + Sized
+pub(crate) trait ValueAndGradDispatch<D: RuntimeDomain, Input, Marker>: Parameter + Sized
 where
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
 {
@@ -225,17 +220,14 @@ impl<
         + 'static
         + for<'domain> Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-            To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>> = Tracer<
-                'domain,
-                DifferentiableOperationTracingDomain<D>,
-            >,
+            Family: ParameterizedFamily<DifferentiableTracer<'domain, D>>,
+            To<DifferentiableTracer<'domain, D>> = DifferentiableTracer<'domain, D>,
             To<V> = V,
             ParameterStructure: Debug + PartialEq,
         >,
     Input: Parameterized<
             V,
-            Family: for<'domain> ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+            Family: for<'domain> ParameterizedFamily<DifferentiableTracer<'domain, D>>,
             To<V> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
@@ -249,11 +241,11 @@ where
     type Gradient = Input::To<D::Tangent>;
 
     type FunctionInput<'domain>
-        = Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>
+        = Input::To<DifferentiableTracer<'domain, D>>
     where
         D: 'domain;
     type FunctionOutput<'domain>
-        = Tracer<'domain, DifferentiableOperationTracingDomain<D>>
+        = DifferentiableTracer<'domain, D>
     where
         D: 'domain;
 
@@ -318,6 +310,7 @@ where
         let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
             return Err(DifferentiationError::MissingTracedReverseModeInputLeaves.into());
         };
+        ensure_tracers_belong_to_context(&tracing_context, traced_primals.as_slice())?;
         let staged_input_types = Input::To::<D::Type>::from_parameters(
             input_structure.clone(),
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
@@ -380,22 +373,19 @@ pub fn value_and_grad_with_aux<
     'domain,
     D: DifferentiableDomain<Value = V> + 'static,
     F: FnOnce(
-        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-    ) -> (
-        Tracer<'domain, DifferentiableOperationTracingDomain<D>>,
-        Aux::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-    ),
+        Input::To<DifferentiableTracer<'domain, D>>,
+    ) -> (DifferentiableTracer<'domain, D>, Aux::To<DifferentiableTracer<'domain, D>>),
     Input: Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+            Family: ParameterizedFamily<DifferentiableTracer<'domain, D>>,
             To<V> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     Aux: Parameterized<
             V,
             Family: ParameterizedFamily<
-                Tracer<'domain, DifferentiableOperationTracingDomain<D>>,
-                To = Aux::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+                DifferentiableTracer<'domain, D>,
+                To = Aux::To<DifferentiableTracer<'domain, D>>,
             >,
             ParameterStructure: Debug + PartialEq,
         >,
@@ -403,14 +393,8 @@ pub fn value_and_grad_with_aux<
         + Differentiable<D::Type, Tangent = D::Tangent>
         + Parameterized<
             V,
-            Family: ParameterizedFamily<
-                Tracer<'domain, DifferentiableOperationTracingDomain<D>>,
-                To = Tracer<'domain, DifferentiableOperationTracingDomain<D>>,
-            >,
-            To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>> = Tracer<
-                'domain,
-                DifferentiableOperationTracingDomain<D>,
-            >,
+            Family: ParameterizedFamily<DifferentiableTracer<'domain, D>, To = DifferentiableTracer<'domain, D>>,
+            To<DifferentiableTracer<'domain, D>> = DifferentiableTracer<'domain, D>,
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
 >(
@@ -427,7 +411,7 @@ where
     let ((output, aux), pullback) = vjp(domain, |input| Ok(function(input)), primals)?;
     let output_cotangent_structure = (output.parameter_structure(), aux.parameter_structure());
     let seed = <D::Tangent as One<D::Type>>::one(output.r#type().as_ref())?;
-    let aux_zeros = aux.parameters().map(Differentiable::tangent_type).collect::<Result<Vec<_>, _>>()?;
+    let aux_zeros = aux.parameters().map(Differentiable::zero_tangent).collect::<Result<Vec<_>, _>>()?;
     let output_cotangent = <(V, Aux) as Parameterized<V>>::To::<D::Tangent>::from_parameters(
         output_cotangent_structure,
         std::iter::once(seed).chain(aux_zeros.into_iter()),
@@ -470,22 +454,19 @@ pub fn grad_with_aux<
     'domain,
     D: DifferentiableDomain<Value = V> + 'static,
     F: FnOnce(
-        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-    ) -> (
-        Tracer<'domain, DifferentiableOperationTracingDomain<D>>,
-        Aux::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
-    ),
+        Input::To<DifferentiableTracer<'domain, D>>,
+    ) -> (DifferentiableTracer<'domain, D>, Aux::To<DifferentiableTracer<'domain, D>>),
     Input: Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+            Family: ParameterizedFamily<DifferentiableTracer<'domain, D>>,
             To<V> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     Aux: Parameterized<
             V,
             Family: ParameterizedFamily<
-                Tracer<'domain, DifferentiableOperationTracingDomain<D>>,
-                To = Aux::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+                DifferentiableTracer<'domain, D>,
+                To = Aux::To<DifferentiableTracer<'domain, D>>,
             >,
             ParameterStructure: Debug + PartialEq,
         >,
@@ -493,14 +474,8 @@ pub fn grad_with_aux<
         + Differentiable<D::Type, Tangent = D::Tangent>
         + Parameterized<
             V,
-            Family: ParameterizedFamily<
-                Tracer<'domain, DifferentiableOperationTracingDomain<D>>,
-                To = Tracer<'domain, DifferentiableOperationTracingDomain<D>>,
-            >,
-            To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>> = Tracer<
-                'domain,
-                DifferentiableOperationTracingDomain<D>,
-            >,
+            Family: ParameterizedFamily<DifferentiableTracer<'domain, D>, To = DifferentiableTracer<'domain, D>>,
+            To<DifferentiableTracer<'domain, D>> = DifferentiableTracer<'domain, D>,
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
 >(
@@ -520,8 +495,10 @@ where
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::cell::RefCell;
     use std::fmt::{self, Display};
     use std::ops::{Add, Neg};
+    use std::rc::Rc;
 
     use ryft_macros::Parameter;
 
@@ -531,11 +508,12 @@ mod tests {
         ADD_OPERATION_NAME, AddOperation, Scale, SupportsAdd, SupportsNeg, SupportsScale,
     };
     use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
+    use crate::operations::scalars::ScalarOperation;
     use crate::operations::{InterpretableOperation, Operation};
-    use crate::tracing::domains::{Domain, ScalarDomain};
-    use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
+    use crate::tracing::domains::{Domain, ScalarDomain, Tracer, TracingContext};
+    use crate::tracing::{ProgramBuilder, ProgramTracingContext, Traceable, TracingError, Value};
     use crate::tracing_v2::{Differentiable, DifferentiationError};
-    use crate::types::{Type, TypeError, Typed};
+    use crate::types::{DataType, Type, TypeError, Typed};
 
     use super::*;
 
@@ -616,7 +594,7 @@ mod tests {
     impl Differentiable<TestType> for TestValue {
         type Tangent = Self;
 
-        fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
+        fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
             Ok(Self(0.0))
         }
     }
@@ -810,7 +788,7 @@ mod tests {
             Program<TestType, TestValue, TestLinearOperation, TestValue, TestValue>,
         ) = linearize(
             &domain,
-            |x: Tracer<'_, DifferentiableOperationTracingDomain<TestDomain>>| Ok(x.clone() + x),
+            |x: DifferentiableTracer<'_, TestDomain>| Ok(x.clone() + x),
             TestValue(3.0),
         )
         .unwrap();
@@ -836,6 +814,25 @@ mod tests {
             result,
             Err(TracingError::Differentiation(DifferentiationError::MissingTracedReverseModeInputLeaves))
         ));
+    }
+
+    #[test]
+    fn test_traced_value_and_grad_rejects_mismatched_program_builders() {
+        let domain = ScalarDomain::<f64>::new();
+        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context_a = TracingContext::new(&domain, builder_a);
+        let context_b = TracingContext::new(&domain, builder_b);
+        let primal_a = context_a.input(DataType::F64);
+        let primal_b = context_b.input(DataType::F64);
+
+        let result = value_and_grad(
+            &domain,
+            |inputs: Vec<Tracer<'_, ScalarDomain<f64>>>| inputs[0].clone() + inputs[1].clone(),
+            vec![primal_a, primal_b],
+        );
+
+        assert!(matches!(result, Err(TracingError::MismatchedProgramBuilders)));
     }
 
     #[test]
