@@ -145,10 +145,10 @@ impl<
 }
 
 impl<'domain, D: RuntimeDomain + TracingDomain> TracingContext<'domain, D> {
-    /// Transposes a traced linear [`Program`] and materializes standalone zero [`Cotangent`]s. This method performs the
-    /// same program transposition as [`Program::transpose`], but is specialized for linear programs whose values are
-    /// [`Tracer`]s belonging to this [`TracingContext`]. Use it when transposing a linear program inside an outer
-    /// trace, such as when staging a traced reverse-mode pullback.
+    /// Transposes the provided traced linear [`Program`] and materializes standalone zero [`Cotangent`]s. This method
+    /// performs the same program transposition as [`Program::transpose`], but is specialized for linear programs whose
+    /// values are [`Tracer`]s belonging to this [`TracingContext`]. Use it when transposing a linear program inside an
+    /// outer trace, such as when staging a traced reverse-mode pullback.
     ///
     /// The transposed program is first staged as an ordinary linear [`Program`]. When a primal input is disconnected
     /// from the outputs, transposition represents its cotangent as a [`ZeroOperation`](crate::ZeroOperation). Such an
@@ -227,23 +227,18 @@ impl<
     O: 'domain + LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>,
 > TracingContext<'domain, ProgramTracingDomain<T, V, O>>
 {
-    /// Transposes a complete linear [`Program`] using this context's current builder.
+    /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`]. This is the
+    /// builder-level implementation behind [`Program::transpose`]. Refer to the documentation of [`Program::transpose`]
+    /// for the conceptual relationship between program transposition, algebraic transposition, pushforward functions,
+    /// and pullback functions. This function is for callers that already own a [`ProgramTracingContext`] and need the
+    /// transposed program to be staged through that context's [`ProgramBuilder`].
     ///
-    /// This is the builder-level implementation behind [`Program::transpose`]. See
-    /// [`Program::transpose`] for the conceptual relationship between program transposition,
-    /// algebraic transposition, pushforwards, and pullbacks. This method is for callers that
-    /// already own a [`ProgramTracingContext`] and need the transposed program to be staged through
-    /// that context's active [`ProgramBuilder`].
-    ///
-    /// The method treats [`builder`](Self::builder) as the destination for the transposed program,
-    /// records cotangent inputs for the primal outputs, walks `program` in reverse instruction
-    /// order, and applies [`LinearOperation::transpose`] to each instruction. The active builder is
-    /// consumed when the pullback is built. On success, this context is left with a fresh empty
-    /// builder. If a transpose rule needs to transpose a nested program while preserving the
-    /// surrounding builder, it should call [`transpose_nested`](Self::transpose_nested) instead.
-    ///
-    /// Most ordinary callers should use [`Program::transpose`] instead of constructing a
-    /// [`ProgramTracingContext`] directly.
+    /// This function treats [`builder`](Self::builder) as the destination for the transposed program, records cotangent
+    /// inputs for the primal outputs, walks `program` in reverse instruction order, and transposes each [`Instruction`]
+    /// using [`LinearOperation::transpose`]. The active [`ProgramBuilder`] is consumed when the pullback is built. On
+    /// success, this context is left with a fresh empty builder. If a transpose rule needs to transpose a nested
+    /// program while preserving the surrounding builder, it should call [`transpose_nested`](Self::transpose_nested)
+    /// instead.
     pub fn transpose<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         program: &Program<T, V, O, Input, Output>,
@@ -343,19 +338,17 @@ impl<
         builder.build(outputs, program.output_structure.clone(), program.input_structure.clone())
     }
 
-    /// Transposes a nested linear [`Program`] without consuming this context's current builder.
+    /// Transposes the provided linear [`Program`] without consuming this [`TracingContext`]'s [`ProgramBuilder`].
+    /// This is the nested-program variant of [`ProgramTracingContext::transpose`]. Refer to the documentation of
+    /// [`Program::transpose`] for the conceptual relationship between program transposition, algebraic transposition,
+    /// pushforward functions, and pullback functions. This function is for transposition rules that carry linear
+    /// sub-programs as operation metadata, such as captured control-flow branches.
     ///
-    /// This is the nested-program variant of [`ProgramTracingContext::transpose`]. See
-    /// [`Program::transpose`] for the conceptual meaning of transposition. This method is for
-    /// transpose rules that carry linear subprograms as operation metadata, such as captured
-    /// control-flow branches.
-    ///
-    /// It temporarily replaces [`builder`](Self::builder) with a fresh sibling builder, calls
-    /// [`transpose`](Self::transpose) for the nested `program`, and then restores the original
-    /// builder before returning the nested pullback result. This keeps nested transposition from
-    /// appending instructions to the surrounding pullback or consuming the builder that the
-    /// surrounding rule still needs. The original builder is restored whether the nested
-    /// transposition succeeds or returns an error.
+    /// This function temporarily replaces [`builder`](Self::builder) with a fresh sibling builder, calls
+    /// [`transpose`](Self::transpose) for the provided [`Program`], and then restores the original [`ProgramBuilder`]
+    /// before returning the nested pullback result. This keeps nested transposition from appending [`Instruction`]s to
+    /// the surrounding pullback or consuming the builder that the surrounding rule still needs. The original builder
+    /// is restored whether the nested transposition succeeds or fails.
     #[inline]
     pub fn transpose_nested<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
@@ -368,3 +361,5 @@ impl<
         result
     }
 }
+
+// TODO(eaplatanios): Add unit tests.
