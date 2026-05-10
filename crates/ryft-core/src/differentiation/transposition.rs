@@ -121,28 +121,20 @@ impl<
     Output: Parameterized<V>,
 > Program<T, V, O, Input, Output>
 {
-    /// Transposes this linear pushforward [`Program`] into its reverse-mode pullback.
+    /// Transposes this linear pushforward [`Program`] into its reverse-mode pullback. This is the main entrypoint for
+    /// transposing linear [`Program`]s. In the algebraic sense, _transposing_ a linear map `L: X -> Y` gives a map on
+    /// _dual_ spaces `L^T: Y* -> X*`. In finite dimensions this is the same operation represented by a matrix
+    /// transpose. Here the linear map is not stored as a matrix. It is a staged [`Program`] that maps input tangents
+    /// to output tangents, and transposition builds the dual program that maps output cotangents back to input
+    /// cotangents. Operationally, transposition creates cotangent inputs for this program's outputs, walks the
+    /// instructions in reverse order, and applies each primitive operation's [`LinearOperation::transpose`] rule
+    /// to accumulate cotangent contributions for the original inputs. This is the same decomposition of reverse-mode
+    /// automatic differentiation as in [this paper](https://arxiv.org/abs/2204.10923).
     ///
-    /// This is the main entrypoint for transposing a complete linear [`Program`]. In the algebraic
-    /// sense, transposing a linear map `L: X -> Y` gives a map on dual spaces `L^T: Y* -> X*`. In
-    /// finite dimensions this is the same operation represented by a matrix transpose. Here the
-    /// linear map is not stored as a matrix. It is a staged [`Program`] that maps input tangents to
-    /// output tangents, and transposition builds the dual program that maps output cotangents back
-    /// to input cotangents.
-    ///
-    /// Operationally, transposition creates cotangent inputs for this program's outputs, walks the
-    /// instructions in reverse order, and applies each primitive operation's
-    /// [`LinearOperation::transpose`] rule to accumulate cotangent contributions for the original
-    /// inputs. This is the same decomposition of reverse-mode automatic differentiation as in
-    /// [this paper](https://arxiv.org/abs/2204.10923): linearize once to get a tangent pushforward,
-    /// then transpose the linear part to get a gradient-producing pullback.
-    ///
-    /// Cotangent input arity, structure, and types come from this program's own output metadata,
-    /// so callers do not need to provide representative output values. Disconnected primal inputs
-    /// are emitted as zero operations, which the value type's [`Zero`](crate::Zero) implementation
-    /// evaluates at interpretation time. For linear programs whose values are [`Tracer`]s from an
-    /// outer trace, use [`TracingContext::transpose`] instead so those disconnected-input zeros can
-    /// be materialized in the surrounding tracing context.
+    /// Disconnected primal inputs are emitted as [`ZeroOperation`](crate::operations::ZeroOperation)s, which the value
+    /// type's [`Zero`](crate::Zero) implementation evaluates at interpretation time. For linear programs whose values
+    /// are [`Tracer`]s from an outer trace, use [`TracingContext::transpose`] instead so that those disconnected-input
+    /// zeros can be materialized in the surrounding tracing context.
     #[inline]
     pub fn transpose(&self) -> Result<Program<T, V, O, Output, Input>, TracingError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new()));
@@ -153,7 +145,7 @@ impl<
 }
 
 impl<'domain, D: RuntimeDomain + TracingDomain> TracingContext<'domain, D> {
-    /// Transposes a traced linear [`Program`] and materializes standalone zero cotangents. This method performs the
+    /// Transposes a traced linear [`Program`] and materializes standalone zero [`Cotangent`]s. This method performs the
     /// same program transposition as [`Program::transpose`], but is specialized for linear programs whose values are
     /// [`Tracer`]s belonging to this [`TracingContext`]. Use it when transposing a linear program inside an outer
     /// trace, such as when staging a traced reverse-mode pullback.
@@ -162,9 +154,8 @@ impl<'domain, D: RuntimeDomain + TracingDomain> TracingContext<'domain, D> {
     /// from the outputs, transposition represents its cotangent as a [`ZeroOperation`](crate::ZeroOperation). Such an
     /// input-free operation cannot recover the surrounding [`TracingContext`] during later interpretation, and so this
     /// method replaces each standalone zero operation with a constant [`Tracer`] created in this [`TracingContext`].
-    /// The concrete zero value stored in that tracer is synthesized through
-    /// [`RuntimeDomain::zero`](crate::RuntimeDomain::zero), while the final pullback still receives and returns traced
-    /// cotangent values.
+    /// The concrete zero value stored in that tracer is synthesized through [`RuntimeDomain::zero`], while the final
+    /// pullback still receives and returns traced [`Cotangent`]s.
     pub fn transpose<
         Input: Parameterized<Tracer<'domain, D>>,
         Output: Parameterized<Tracer<'domain, D>>,
@@ -176,8 +167,8 @@ impl<'domain, D: RuntimeDomain + TracingDomain> TracingContext<'domain, D> {
         &self,
         program: &Program<D::Type, Tracer<'domain, D>, O, Input, Output>,
     ) -> Result<Program<D::Type, Tracer<'domain, D>, O, Output, Input>, TracingError> {
-        // First build the ordinary transposed program. At this point disconnected inputs are still represented as
-        // input-free zero operations in the transposed program.
+        // First build the ordinary transposed program. At this point disconnected inputs are still represented
+        // as input-free zero operations in the transposed program.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<D::Type, Tracer<'domain, D>, O>::new()));
         let domain = ProgramTracingDomain::new();
         let mut context = ProgramTracingContext::new(&domain, builder);
