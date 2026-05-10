@@ -11,35 +11,20 @@ use crate::tracing::domains::{
 use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::types::{Type, Typed};
 
-/// Operation-level contract for staged linear maps that can be transposed.
+/// Represents [`Operation`]s that are _linear_, meaning that they can be _transposed_. For a linear [`Instruction`]
+/// `y = L(x)`, [`transpose`](Self::transpose) receives symbolic cotangent [`Tracer`]s for `y` and returns symbolic
+/// cotangent contributions for `x`, representing the transposed cotangent. Rules may reuse existing cotangents,
+/// return `None` for structural zeros, or stage additional linear operations in the active [`ProgramTracingContext`].
+/// The rule does not receive concrete primal values; any required metadata must be encoded in the operation itself or
+/// in staged atom types.
 ///
-/// A [`LinearOperation`] is the capability an operation carrier provides after a primal program has
-/// been linearized. Implementors describe how one staged linear instruction contributes to the
-/// reverse linear program used by VJP and reverse-mode gradient transforms. The trait is
-/// implemented by primitive operation types, such as [`AddOperation`](crate::AddOperation), and by carrier enums,
-/// such as [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation), that delegate to primitive rules.
-///
-/// For a linear instruction `y = L(x)`, [`transpose`](Self::transpose) receives symbolic cotangent
-/// [`Tracer`]s for `y` and returns symbolic cotangent contributions for `x`. Rules may reuse
-/// existing cotangents, return `None` for structural zeros, or stage additional linear operations
-/// in the active [`ProgramTracingContext`]. The rule does not receive concrete primal values; any
-/// required metadata must be encoded in the operation itself or in staged atom types.
-///
-/// Structural validation happens when the linear program is built and when transpose rules stage
-/// additional operations in the transpose builder.
+/// Refer to the documentation of [`Program::transpose`] for more information what _transposition_ means here and how
+/// it relates to the algebraic notion of transposition.
 pub trait LinearOperation<T: Type + Parameter, V: Traceable<T>, O: Operation<T>>: Operation<T> {
-    /// Applies this operation's transpose rule to symbolic output cotangents.
-    ///
-    /// The returned vector must contain one entry per operation input. Each `Some(cotangent)` is a
-    /// staged cotangent contribution in the active transpose builder, and each `None` means the
-    /// corresponding input receives a structural zero from this operation.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Active transpose context used to stage any new linear operations required by
-    ///     the rule.
-    ///   - `output_cotangents`: Cotangent tracers aligned with this operation's outputs. `None`
-    ///     entries represent structural zeros.
+    /// Applies this operation's transpose rule to the provided symbolic output cotangents. The returned vector must
+    /// contain one entry per operation input. Each `Some(cotangent)` is a staged cotangent contribution in the active
+    /// transpose builder, and each `None` means that the corresponding input receives a structural zero from this
+    /// operation.
     fn transpose<'transpose>(
         &self,
         context: &mut ProgramTracingContext<'transpose, T, V, O>,
@@ -68,8 +53,7 @@ impl<
     /// instructions in reverse order, and applies each primitive operation's
     /// [`LinearOperation::transpose`] rule to accumulate cotangent contributions for the original
     /// inputs. This is the same decomposition of reverse-mode automatic differentiation as in
-    /// [_You Only Linearize Once: Tangents Transpose to
-    /// Gradients_](https://arxiv.org/abs/2204.10923): linearize once to get a tangent pushforward,
+    /// [this paper](https://arxiv.org/abs/2204.10923): linearize once to get a tangent pushforward,
     /// then transpose the linear part to get a gradient-producing pullback.
     ///
     /// Cotangent input arity, structure, and types come from this program's own output metadata,
